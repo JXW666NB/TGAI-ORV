@@ -1,0 +1,15 @@
+feat(qwen): Qwen2.5 引擎原生前向对齐通过（真实权重，rel 5.68e-06）
+
+examples/qwen25_sft.py: 用 tgai_go.train 的**引擎原语**实现 Qwen2.5-0.5B 前向
+  T.nn.Embedding(gather) / T.nn.RMSNorm(融合核) / F.scaled_dot_product_attention / 稠密 SwiGLU
+  与我们的模型(exam2)的关键差异都处理了:
+    GQA(14:2)  -> 在 [B,KV,S,DH] 上 repeat_interleave 到 NH 头, 避免跨 batch 打乱
+    qkv bias   -> Qwen2.5 有, 我们模型没有
+    lm_head    -> 独立 output.weight(转换器默认跳过, 这里单独读出为 lm_head.weight)
+    RoPE       -> 标准 rotate_half(theta=1e6), 先用组合式保证正确性
+
+实测(本机 CPU, 真实 GGUF fp16 权重, 7 token):
+  max|Δ| = 1.155e-04, 相对误差 = 5.682e-06 (判据 <=1e-5) PASS
+  与我们 nn_ops 组合版(6.29e-06)一致, 说明两条路径互相印证
+
+下一步: SFT 训练路径(需要分词器) + A10 上的 GPU 版验证
