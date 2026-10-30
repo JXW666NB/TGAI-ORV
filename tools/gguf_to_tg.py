@@ -1225,7 +1225,7 @@ def maybe_permute_rope(mapped: str, w_bytes, dims, cfg, target_dtype: int):
 # ============================================================================
 # GGUF Tensor Name -> TGAI Standard Name Mapping
 # ============================================================================
-def map_weight_name(gguf_name: str, arch_cfg: dict) -> str | None:
+def map_weight_name(gguf_name: str, arch_cfg: dict, tie_embeddings: bool = True) -> str | None:
     """
     Map a GGUF tensor name to TGAI standard name.
 
@@ -1245,9 +1245,11 @@ def map_weight_name(gguf_name: str, arch_cfg: dict) -> str | None:
     if gguf_name == f'{final_key}.weight':
         return 'final_norm.weight'
 
-    # Output projection (typically weight-tied with embedding, skip it)
+    # Output projection：**只在权重绑定时**才跳过。
+    # Qwen2.5 这类 tie_word_embeddings=False 的模型有独立 lm_head，
+    # 丢掉它会导致 .TG 推理时用错词表投影（logits 全错）。
     if gguf_name == 'output.weight':
-        return None
+        return None if tie_embeddings else 'lm_head.weight'
     if gguf_name == 'output_norm.weight':
         return 'final_norm.weight'
 
@@ -1378,8 +1380,10 @@ def convert_gguf_to_tg(input_path: str, output_path: str,
     converted = 0
 
     # Use OrderedDict iteration to preserve original order
+    # tie_word_embeddings=False（如 Qwen2.5）时保留独立的 lm_head，不能丢
+    tie_emb = bool(reader.metadata.get('%s.tie_word_embeddings' % arch_name, True))
     for name, info in reader.tensors.items():
-        mapped = map_weight_name(name, arch_cfg)
+        mapped = map_weight_name(name, arch_cfg, tie_embeddings=tie_emb)
         if mapped is None:
             skipped += 1
             continue

@@ -162,12 +162,84 @@ class Qwen25:
         return (z @ p["lm_head.weight"].T).reshape(B, S, cfg["V"])
 
 
+# ---------------------------------------------------------------------------
+# SFT（监督微调）
+# ---------------------------------------------------------------------------
+
+def load_tokenizer(path):
+    from tokenizers import Tokenizer
+    return Tokenizer.from_file(path)
+
+
+def build_sequences(tok, data_path, seq_len, limit):
+    """把 jsonl 转成 token id 序列（Qwen 的 <|im_start|> 对话模板）。"""
+    import json
+    seqs = []
+    with open(data_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            user = rec.get("user") or rec.get("q") or rec.get("question") or rec.get("input") or ""
+            asst = (rec.get("assistant") or rec.get("a") or rec.get("answer")
+                    or rec.get("output") or "")
+            if not user or not asst:
+                continue
+            text = "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n%s<|im_end|>" % (
+                user, asst)
+            ids = tok.encode(text).ids[:seq_len]
+            if len(ids) >= 8:
+                seqs.append(ids)
+            if len(seqs) >= limit:
+                break
+    return seqs
+
+
+def sft(model, seqs, steps, lr, seq_len, log_every=1):
+    """最小可用 SFT 循环：AdamW + 交叉熵（全 token）。"""
+    import time
+    cfg = model.cfg
+    opt = T.optim.AdamW(model.params(), lr=lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
+    losses = []
+    t0 = time.time()
+    for step in range(steps):
+        ids = seqs[step % len(seqs)]
+        pad = ids[-1]
+        ids = (ids + [pad] * seq_len)[:seq_len]
+        xb = np.asarray([ids[:-1]], dtype=np.int64)
+        yb = np.asarray([ids[1:]], dtype=np.int64)
+
+        if hasattr(opt, "zero_grad"):
+            opt.zero_grad()
+        else:
+            for prm in model.params():
+                prm.zero_grad()
+
+        logits = model.forward(xb)
+        loss = F.cross_entropy(logits.reshape(xb.size, cfg["V"]), yb.reshape(-1))
+        loss.backward()
+        opt.step()
+
+        losses.append(float(loss.to_numpy()))
+        if (step + 1) % log_every == 0:
+            print("step %3d | loss %.6f | %.1f s/step"
+                  % (step + 1, losses[-1], (time.time() - t0) / (step + 1)))
+    return losses
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", default=r"D:\DSH-Workspace\_gguf_test\qwen2.5-0.5b-fp16.gguf")
     ap.add_argument("--ref", default=os.path.join(REPO, "tools", "_qwen_ref.npz"))
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--forward-only", action="store_true")
+    ap.add_argument("--steps", type=int, default=0, help="SFT 步数（0 表示不训）")
+    ap.add_argument("--data", default="", help="jsonl 语料（user/assistant 字段）")
+    ap.add_argument("--tokenizer", default="", help="tokenizer.json 路径")
+    ap.add_argument("--seq-len", type=int, default=64)
+    ap.add_argument("--limit", type=int, default=8, help="最多取多少条样本")
+    ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--tol", type=float, default=1e-5)
     a = ap.parse_args(argv)
 
@@ -200,7 +272,26 @@ def main(argv=None):
         print("判据 ≤%.0e：%s" % (a.tol, "PASS" if ok else "FAIL"))
         return 0 if ok else 1
 
-    print("SFT 训练路径尚未实现（先用 --forward-only 验证前向）")
+    if a.steps > 0:
+        if not a.data or not a.tokenizer:
+            print("SFT 需要 --data 与 --tokenizer")
+            return 2
+        tok = load_tokenizer(a.tokenizer)
+        seqs = build_sequences(tok, a.data, a.seq_len, a.limit)
+        if not seqs:
+            print("语料里没有可用的 user/assistant 样本")
+            return 2
+        print("样本 %d 条，seq_len=%d，steps=%d，lr=%g"
+              % (len(seqs), a.seq_len, a.steps, a.lr))
+        losses = sft(model, seqs, a.steps, a.lr, a.seq_len)
+        drop = (losses[0] - losses[-1]) / max(abs(losses[0]), 1e-9)
+        print("")
+        print("loss：%.6f → %.6f（变化 %.1f%%）" % (losses[0], losses[-1], 100 * drop))
+        print("结论：%s" % ("PASS —— 真实大模型能在 TGAI ORV 上被微调"
+                            if losses[-1] < losses[0] else "FAIL —— loss 没有下降"))
+        return 0 if losses[-1] < losses[0] else 1
+
+    print("没有指定动作：用 --forward-only 验证前向，或 --steps 做 SFT")
     return 2
 
 

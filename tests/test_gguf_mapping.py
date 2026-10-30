@@ -36,9 +36,19 @@ def test_embed_and_final_norm(conv):
 
 
 def test_output_weight_is_intentionally_skipped(conv):
-    """output.weight 与 token_embedding 权重绑定，转换器有意不写，返回 None。"""
+    """权重绑定时 output.weight 有意不写（返回 None）。"""
     cfg = conv.ARCH_CONFIG["qwen2"]
     assert conv.map_weight_name("output.weight", cfg) is None
+
+
+def test_output_weight_kept_when_not_tied(conv):
+    """Qwen2.5 的 tie_word_embeddings=False ⇒ 必须保留独立 lm_head。
+
+    否则 .TG 推理时拿词嵌入矩阵当输出投影，logits 全错。
+    """
+    cfg = conv.ARCH_CONFIG["qwen2"]
+    got = conv.map_weight_name("output.weight", cfg, tie_embeddings=False)
+    assert got == "lm_head.weight", got
 
 
 def test_block_layer_names(conv):
