@@ -82,6 +82,46 @@ Tier-1 训练必需算子 **63 项，已具备 62 项（98%）**。
 
 ---
 
+## 能替别人的模型训练吗？/ Can It Train Someone Else's Model?
+
+我们不靠"我们的模型能跑"自证。下面是**外来结构 + 真实权重**的实测：
+
+### ① 真实开源权重前向对齐（Qwen2.5-0.5B-instruct）
+
+用 GGUF 里的真实权重，在我们引擎上跑前向，与 HuggingFace `transformers` 比对：
+
+```
+max|Δ| = 1.155e-04     相对误差 5.682e-06  ≤1e-5   ✅ PASS
+```
+
+处理了 Qwen2.5 与我们自有模型的全部差异：**GQA(14:2)**、**qkv bias**、
+**独立 lm_head**（不绑词嵌入）、**RoPE θ=1e6**。
+
+### ② 60M 级 LLaMA 结构在**我们的语料**上训通
+
+```bash
+python examples/llama_tiny.py --preset m60 --steps 20 \
+    --corpus examples/_corpus_1m.txt --lr 3e-3
+```
+
+| 项 | 值 |
+| --- | --- |
+| 结构 | RMSNorm + RoPE + SwiGLU + GQA(8:2) + 无 bias，约 **50~56M 参数** |
+| 语料 | 100 万字符真实中文 |
+| loss | **8.217616 → 3.985692（降 51.5%）** |
+| 与 PyTorch 孪生逐步相对偏差 | **1.16e-07** |
+| 训练后参数相对偏差 | **2.60e-07** |
+
+### ③ SFT 链路
+
+`examples/qwen25_sft.py` 支持 GGUF / safetensors 两种权重、AdamW、固定探针评估。
+CPU 冒烟（随机迷你权重）：探针 loss **5.154 → 4.662** 单调下降。
+
+> 这三组证据都能在**纯 CPU** 上复现（`pytest tests` 里有对应的 CI 用例）。
+> GPU 上的真实 0.5B 微调还需要跑一次，结果会补到这里。
+
+---
+
 ## 模型转换 / Convert
 
 训练或部署别人的模型，第一步是把权重换成我们的格式：

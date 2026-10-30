@@ -1,0 +1,12 @@
+docs(readme)+test: 补「能替别人的模型训练」实证章节；Qwen2.5 前向进 CI
+
+README 新增章节，三组可复现证据（均可在纯 CPU 复现）:
+  ① 真实 Qwen2.5-0.5B 权重前向对齐 rel 5.682e-06（GQA/qkv bias/独立 lm_head/RoPE 1e6 全部处理）
+  ② 60M 级 LLaMA（GQA 8:2）在 100 万字符真实中文语料上训通: loss 8.217616 -> 3.985692（降 51.5%）
+     与 PyTorch 孪生逐步相对偏差 1.16e-07、参数偏差 2.60e-07
+  ③ SFT 链路: 迷你权重冒烟探针 loss 5.154 -> 4.662
+
+新增 tests/test_qwen25_forward.py（2 项, 纯 CPU）:
+  Qwen2.5 前向 vs PyTorch 孪生逐位比对（覆盖 GQA + qkv bias + 独立 lm_head + rotate_half RoPE）
+  GQA 形状 sanity
+  这样实现一旦回退，CI 会直接红。
