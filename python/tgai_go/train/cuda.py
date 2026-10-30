@@ -2298,13 +2298,17 @@ class CudaRuntime:
                 path = _find_file(["cublas64_12.dll", "cublas64_11.dll"], self._dirs)
             if path is None:
                 raise CudaError(
-                    "找不到 cublas64_*.dll。已查目录: %s" % (self._dirs or ["<空>"])
+                    "找不到 cublas64_*.dll。已查目录: %s\n"
+                    "修法：装 CUDA Toolkit 并设 CUDA_PATH，或用 TGAI_CUDA_BIN 指向含 cublas64_*.dll 的目录"
+                    % (self._dirs or ["<空>"])
                 )
             return path
         path = _find_file(["libcublas.so.12", "libcublas.so"], self._dirs)
         if path is None:
             raise CudaError(
-                "找不到 libcublas.so.12。已查目录: %s" % (self._dirs or ["<空>"])
+                "找不到 libcublas.so.12。已查目录: %s\n"
+                "修法：pip install 'tgai-orv[cuda]'（裸机器），或设 TGAI_CUDA_BIN 指向含 libcublas.so.12 的目录"
+                % (self._dirs or ["<空>"])
             )
         return path
 

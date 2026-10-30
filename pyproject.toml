@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # 若被占名，改这一行即可（import 名始终是 tgai_go，不受影响）。
 [project]
 name = "tgai-orv"
-version = "0.1.0"
+version = "0.1.1"
 description = "PyTorch-free LLM engine: train and infer with one codebase. 训推一体，不依赖 PyTorch。"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -21,6 +21,17 @@ classifiers = [
   "Environment :: GPU :: NVIDIA CUDA",
 ]
 dependencies = ["numpy>=1.21"]
+
+# 裸机器（没装 CUDA Toolkit、也没有 torch）时，用
+#     pip install "tgai-orv[cuda]"
+# 把 cuBLAS / NVRTC / CUDA runtime 装进同一个 venv；我们的加载器会自动搜
+# site-packages/nvidia/*/lib。已经有系统 CUDA 或 torch 的机器不需要这一项。
+[project.optional-dependencies]
+cuda = [
+  "nvidia-cuda-runtime-cu12>=12.1; sys_platform == 'linux'",
+  "nvidia-cublas-cu12>=12.1; sys_platform == 'linux'",
+  "nvidia-cuda-nvrtc-cu12>=12.1; sys_platform == 'linux'",
+]
 
 [project.urls]
 Homepage = "https://github.com/JXW666NB/TGAI-ORV"
