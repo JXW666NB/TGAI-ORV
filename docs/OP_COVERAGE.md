@@ -8,24 +8,23 @@
 | --- | --- |
 | PyTorch 公开函数 | 1016 |
 | PyTorch Tensor 方法 | 604 |
-| **Tier-1 训练必需算子** | **64** |
-| 其中我们已具备 | **56（88%）** |
+| **Tier-1 训练必需算子** | **63** |
+| 其中我们已具备 | **62（98%）** |
 
 ## Tier-1：训练别人的模型所必需
 
 | PyTorch 算子 | 我们的对应 | 状态 | 备注 |
 | --- | --- | --- | --- |
 | `torch.matmul` | `@ (Tensor.__matmul__)` | 有 |  |
-| `torch.addmm` | — | 缺 | bias 融合乘加，训练热点 |
+| `torch.addmm` | `nn_ops.addmm` | 有 | 组合实现，已验证形状检查 |
 | `torch.bmm` | `batched @` | 有 | 注意力里的批量矩阵乘 |
-| `torch.einsum` | — | 缺 | 很多实现用它写注意力 |
+| `torch.einsum` | `nn_ops.einsum` | 有 | 支持 1~2 操作数常见形式，已验证 |
 | `torch.nn.functional.linear` | `nn_ops.linear` | 有 | 已验证 |
 | `torch.nn.functional.rms_norm` | `nn_ops.rms_norm` | 有 | 已验证（Qwen2 对齐用到） |
 | `torch.nn.functional.layer_norm` | `nn_ops.layer_norm` | 有 | 已验证 |
-| `torch.nn.functional.batch_norm` | — | 缺 | CNN 系，训练/推理行为不同 |
 | `torch.nn.functional.silu` | `F.silu` | 有 |  |
 | `torch.nn.functional.gelu` | `nn_ops.gelu / contrib.gelu_exact` | 有 | tanh 近似在核心，精确版在 contrib |
-| `torch.nn.functional.relu` | — | 缺 | 基础 |
+| `torch.nn.functional.relu` | `nn_ops.relu` | 有 | 已验证 |
 | `torch.nn.functional.softmax` | `F.softmax` | 有 |  |
 | `torch.nn.functional.log_softmax` | `F.log_softmax` | 有 |  |
 | `torch.nn.functional.scaled_dot_product_attention` | `F.scaled_dot_product_attention` | 有 | GQA/因果掩码要覆盖 |
@@ -70,15 +69,15 @@
 | `torch.from_numpy` | `T.tensor(numpy)` | 有 |  |
 | `Tensor.to(dtype/device)` | `Tensor.to_numpy / .data` | 有 | dtype 转换目前只能绕 |
 | `Tensor.float/half/bfloat16` | — | 缺 | 真 AMP 的前置 |
-| `torch.randn` | — | 缺 | 初始化/dropout |
-| `torch.manual_seed` | — | 缺 | 可复现 |
+| `torch.randn` | `nn_ops.randn` | 有 | 已验证形状/分布 |
+| `torch.manual_seed` | `nn_ops.manual_seed` | 有 | 已验证可复现 |
 | `Tensor.backward` | `Tensor.backward` | 有 |  |
 | `Tensor.detach` | `Tensor.detach` | 有 |  |
 | `torch.optim.AdamW` | `optim.AdamW` | 有 |  |
 | `torch.optim.SGD` | `nn_ops.sgd_step` | 有 | 最常用优化器之一 |
 | `torch.nn.utils.clip_grad_norm_` | `nn_ops.clip_grad_norm_` | 有 | 已验证 |
 | `torch.arange` | `nn_ops.arange` | 有 | 已验证 |
-| `torch.cumsum` | — | 缺 | 部分注意力实现用 |
+| `torch.cumsum` | `nn_ops.cumsum` | 有 | 已验证(含反向) |
 
 ## 范围裁剪：我们不做哪些（明确不做，不是待办）
 

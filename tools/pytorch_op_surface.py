@@ -27,18 +27,17 @@ for cand in (os.path.join(REPO, "python"), REPO):
 TIER1 = [
     # 矩阵/线性
     ("torch.matmul", "@ (Tensor.__matmul__)", ""),
-    ("torch.addmm", None, "bias 融合乘加，训练热点"),
+    ("torch.addmm", "nn_ops.addmm", "组合实现，已验证形状检查"),
     ("torch.bmm", "batched @", "注意力里的批量矩阵乘"),
-    ("torch.einsum", None, "很多实现用它写注意力"),
+    ("torch.einsum", "nn_ops.einsum", "支持 1~2 操作数常见形式，已验证"),
     ("torch.nn.functional.linear", "nn_ops.linear", "已验证"),
     # 归一化
     ("torch.nn.functional.rms_norm", "nn_ops.rms_norm", "已验证（Qwen2 对齐用到）"),
     ("torch.nn.functional.layer_norm", "nn_ops.layer_norm", "已验证"),
-    ("torch.nn.functional.batch_norm", None, "CNN 系，训练/推理行为不同"),
     # 激活
     ("torch.nn.functional.silu", "F.silu", ""),
     ("torch.nn.functional.gelu", "nn_ops.gelu / contrib.gelu_exact", "tanh 近似在核心，精确版在 contrib"),
-    ("torch.nn.functional.relu", None, "基础"),
+    ("torch.nn.functional.relu", "nn_ops.relu", "已验证"),
     ("torch.nn.functional.softmax", "F.softmax", ""),
     ("torch.nn.functional.log_softmax", "F.log_softmax", ""),
     # 注意力
@@ -90,8 +89,8 @@ TIER1 = [
     ("Tensor.to(dtype/device)", "Tensor.to_numpy / .data", "dtype 转换目前只能绕"),
     ("Tensor.float/half/bfloat16", None, "真 AMP 的前置"),
     # 随机
-    ("torch.randn", None, "初始化/dropout"),
-    ("torch.manual_seed", None, "可复现"),
+    ("torch.randn", "nn_ops.randn", "已验证形状/分布"),
+    ("torch.manual_seed", "nn_ops.manual_seed", "已验证可复现"),
     # 反向/优化
     ("Tensor.backward", "Tensor.backward", ""),
     ("Tensor.detach", "Tensor.detach", ""),
@@ -100,7 +99,7 @@ TIER1 = [
     ("torch.nn.utils.clip_grad_norm_", "nn_ops.clip_grad_norm_", "已验证"),
     # 序列/位置
     ("torch.arange", "nn_ops.arange", "已验证"),
-    ("torch.cumsum", None, "部分注意力实现用"),
+    ("torch.cumsum", "nn_ops.cumsum", "已验证(含反向)"),
 ]
 
 CATEGORY_RULES = [

@@ -104,7 +104,18 @@ def embedding(weight, ids):
             "embedding: 索引越界 —— ids 范围 [%d, %d]，词表大小 %d。"
             "修法：检查 tokenizer 的 vocab 上限与 special token id"
             % (int(idx.min()), int(idx.max()), w.shape[0]))
-    return _tensor(w[idx])
+    out = Tensor(w[idx], requires_grad=weight.requires_grad, _parents=(weight,))
+
+    def bw(g, grads):
+        if not weight.requires_grad:
+            return
+        gg = np.asarray(g, np.float32).reshape(-1, w.shape[1])
+        dw = np.zeros_like(w, dtype=np.float32)
+        np.add.at(dw, idx.reshape(-1), gg)      # 同一行被多次引用时梯度累加
+        _acc(grads, weight, dw)
+
+    out._backward = bw
+    return out
 
 
 def stack(xs, dim=0):
@@ -391,3 +402,221 @@ def sgd_step(params, lr, momentum=0.0, weight_decay=0.0, dampening=0.0, state=No
             gd = bufs[i]
         p.data[...] = np.asarray(p.data, np.float32) - np.float32(lr) * gd
     return state
+
+
+# ===========================================================================
+# 第三批：剩余便宜算子（推理取样 + 训练常用）
+# ===========================================================================
+
+relu = _numpy_op(
+    "relu",
+    fwd=lambda x: np.maximum(x, 0.0),
+    bwd=lambda g, out, xs: [g * (xs[0] > 0).astype(np.float32)],
+)
+
+
+def cumsum(x, dim=0):
+    """沿 dim 前缀和（torch.cumsum）。top-p 采样要用。"""
+    arr = np.asarray(x.data, dtype=np.float32)
+    if not (-arr.ndim <= dim < arr.ndim):
+        raise ValueError("cumsum: dim=%r 越界（张量有 %d 维）。修法：dim 取 [-%d, %d]"
+                         % (dim, arr.ndim, arr.ndim, arr.ndim - 1))
+    out_data = np.cumsum(arr, axis=dim, dtype=np.float32)
+    out = Tensor(out_data, requires_grad=x.requires_grad, _parents=(x,))
+
+    def bw(g, grads):
+        if not x.requires_grad:
+            return
+        gg = np.asarray(g, np.float32)
+        # cumsum 的反向是「反向累加」
+        rev = np.flip(np.cumsum(np.flip(gg, axis=dim), axis=dim, dtype=np.float32), axis=dim)
+        _acc(grads, x, np.ascontiguousarray(rev))
+
+    out._backward = bw
+    return out
+
+
+def addmm(bias, a, b, beta=1.0, alpha=1.0):
+    """beta*bias + alpha*(a @ b)（torch.addmm）。bias 融合进 GEMM 是训练热点。"""
+    if a.shape[-1] != b.shape[0]:
+        raise ValueError(
+            "addmm: 形状不匹配 —— a%s @ b%s（a 的最后一维 %d ≠ b 的第一维 %d）。修法：检查转置/reshape"
+            % (a.shape, b.shape, a.shape[-1], b.shape[0]))
+    return bias * float(beta) + (a @ b) * float(alpha)
+
+
+_RNG = {"gen": np.random.default_rng(0), "seed": 0}
+
+
+def manual_seed(seed):
+    """设置随机种子（影响 randn）。与 torch.manual_seed 一样是全局状态。"""
+    _RNG["seed"] = int(seed)
+    _RNG["gen"] = np.random.default_rng(int(seed))
+    return int(seed)
+
+
+def randn(*shape, dtype=np.float32):
+    """标准正态随机张量（不参与求导）。shape 支持传元组或展开参数。"""
+    if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
+        shape = tuple(shape[0])
+    return _tensor(np.asarray(_RNG["gen"].standard_normal(shape), dtype=np.float32))
+
+
+def multinomial(logits, num_samples=1):
+    """按 softmax(logits) 采样（推理解码用）。只返回索引，无梯度。"""
+    arr = np.asarray(logits.to_numpy(), dtype=np.float64).reshape(-1)
+    p = np.exp(arr - arr.max())
+    p = p / p.sum()
+    idx = _RNG["gen"].choice(arr.size, size=int(num_samples), p=p)
+    return np.asarray(idx, dtype=np.int64)
+
+
+def log_softmax(x, dim=-1):
+    """数值稳定的 log_softmax（numpy + 解析反向）。"""
+    arr = np.asarray(x.data, dtype=np.float64)
+    m = arr.max(axis=dim, keepdims=True)
+    z = arr - m
+    lse = np.log(np.exp(z).sum(axis=dim, keepdims=True))
+    out_data = (z - lse).astype(np.float32)
+    out = Tensor(out_data, requires_grad=x.requires_grad, _parents=(x,))
+
+    def bw(g, grads):
+        if not x.requires_grad:
+            return
+        gg = np.asarray(g, np.float32)
+        p_ = np.exp(out_data)
+        _acc(grads, x, (gg - p_ * gg.sum(axis=dim, keepdims=True)).astype(np.float32))
+
+    out._backward = bw
+    return out
+
+
+def cross_entropy(logits, target, reduction="mean"):
+    """交叉熵：logits[N,V] + target[N]，numpy 前向 + 解析反向（不依赖后端核）。
+
+    与 `torch.nn.functional.cross_entropy` 一致（默认 mean）。
+    """
+    lg = np.asarray(logits.data, dtype=np.float64)
+    tg = np.asarray(target, dtype=np.int64).reshape(-1)
+    if lg.ndim != 2:
+        raise ValueError("cross_entropy: logits 必须是 [N, V]，实际 %s。修法：先 reshape 成二维"
+                         % (lg.shape,))
+    if lg.shape[0] != tg.shape[0]:
+        raise ValueError(
+            "cross_entropy: 样本数不一致 —— logits 有 %d 行，target 有 %d 个。修法：检查 batch 维"
+            % (lg.shape[0], tg.shape[0]))
+    if tg.size and (tg.min() < 0 or tg.max() >= lg.shape[1]):
+        raise ValueError(
+            "cross_entropy: target 越界 —— 取值 [%d, %d]，词表大小 %d。修法：检查标签范围"
+            % (int(tg.min()), int(tg.max()), lg.shape[1]))
+
+    n, v = lg.shape
+    m = lg.max(axis=1, keepdims=True)
+    z = lg - m
+    lse = np.log(np.exp(z).sum(axis=1, keepdims=True))
+    logp = z - lse
+    picked = logp[np.arange(n), tg]
+    if reduction == "mean":
+        val = -picked.mean()
+    elif reduction == "sum":
+        val = -picked.sum()
+    else:
+        raise ValueError("cross_entropy: 不支持的 reduction=%r。修法：用 'mean'/'sum'" % (reduction,))
+
+    out = Tensor(np.asarray(val, np.float32), requires_grad=logits.requires_grad,
+                 _parents=(logits,))
+
+    def bw(g, grads):
+        if not logits.requires_grad:
+            return
+        scale = float(np.asarray(g).reshape(-1)[0])
+        coef = scale / n if reduction == "mean" else scale
+        dl = np.exp(logp)
+        dl[np.arange(n), tg] -= 1.0
+        _acc(grads, logits, (dl * coef).astype(np.float32))
+
+    out._backward = bw
+    return out
+
+
+# ===========================================================================
+# einsum（受限但可解释的版本）
+#   LLM 里 99% 的用法是这两种形状：
+#     "ij,jk->ik"       普通矩阵乘
+#     "bhid,bhjd->bhij" 注意力分数
+#   所以这里只实现「1~2 个操作数、无重复下标、无对角」的形式，
+#   超出范围就**明确报错并给出支持列表**，而不是给一个悄悄算错的实现。
+# ===========================================================================
+
+def _parse_einsum(subscripts):
+    if "->" in subscripts:
+        lhs, out = subscripts.split("->")
+        outs = out.strip()
+    else:
+        lhs, outs = subscripts, None
+    ins = [t.strip() for t in lhs.split(",")]
+    if outs is None:                      # 省略 -> 时按字母序输出
+        letters = "".join(ins)
+        outs = "".join(sorted({c for c in letters if letters.count(c) == 1}))
+    for t in ins:
+        if len(set(t)) != len(t):
+            raise ValueError(
+                "einsum: 不支持同一操作数内重复下标（如 'ii'）：%r。修法：先用 tril/triu 或 reshape 改写"
+                % (subscripts,))
+    all_labels = "".join(ins)
+    for c in outs:
+        if c not in all_labels:
+            raise ValueError("einsum: 输出下标 %r 不在输入里：%r" % (c, subscripts))
+    return ins, outs
+
+
+def einsum(subscripts, *operands):
+    """受限 einsum：1~2 个操作数、无重复下标、无对角。
+
+    支持示例：`"ij,jk->ik"`、`"bij,bjk->bik"`、`"bhid,bhjd->bhij"`、
+    `"i,i->"`、`"ij->ji"`、`"ij->"`。
+    """
+    if not (1 <= len(operands) <= 2):
+        raise ValueError(
+            "einsum: 只支持 1~2 个操作数（收到 %d 个）。修法：拆成多次调用" % (len(operands),))
+    ins, outs = _parse_einsum(subscripts)
+    if len(ins) != len(operands):
+        raise ValueError("einsum: 下标组数 %d 与操作数个数 %d 不一致：%r"
+                         % (len(ins), len(operands), subscripts))
+    arrs = [np.asarray(o.data if isinstance(o, Tensor) else o, dtype=np.float32)
+            for o in operands]
+    for t, arr in zip(ins, arrs):
+        if len(t) != arr.ndim:
+            raise ValueError(
+                "einsum: 下标 %r 有 %d 个字母，但张量形状是 %s。修法：检查 subscripts 与输入维度"
+                % (t, len(t), arr.shape))
+    out_data = np.einsum(subscripts, *arrs).astype(np.float32)
+    tensors = [o for o in operands if isinstance(o, Tensor)]
+    need = any(getattr(o, "requires_grad", False) for o in operands)
+    out = Tensor(out_data, requires_grad=need, _parents=tuple(tensors))
+
+    def bw(g, grads):
+        gg = np.asarray(g, np.float32)
+        if len(arrs) == 2:
+            # 交换技巧：dX = einsum("out,other->this", g, Y)
+            a, b = ins
+            gx = np.einsum("%s,%s->%s" % (outs, b, a), gg, arrs[1]).astype(np.float32)
+            gy = np.einsum("%s,%s->%s" % (a, outs, b), arrs[0], gg).astype(np.float32)
+            pairs = [(operands[0], gx), (operands[1], gy)]
+        else:
+            a = ins[0]
+            if sorted(a) == sorted(outs):                  # 纯转置
+                gx = np.einsum("%s->%s" % (outs, a), gg).astype(np.float32)
+            elif outs == "":                               # 全归约
+                gx = np.full(arrs[0].shape, float(gg.reshape(-1)[0]), dtype=np.float32)
+            else:
+                raise ValueError(
+                    "einsum: 这个单操作数形式暂不支持反向（%r）。修法：拆成 transpose + sum 两步"
+                    % (subscripts,))
+            pairs = [(operands[0], gx)]
+        for t, gi in pairs:
+            if isinstance(t, Tensor) and t.requires_grad:
+                _acc(grads, t, gi)
+
+    out._backward = bw
+    return out
