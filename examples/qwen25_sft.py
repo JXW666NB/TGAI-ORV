@@ -192,6 +192,18 @@ def build_sequences(tok, data_path, seq_len, limit):
             user = rec.get("user") or rec.get("q") or rec.get("question") or rec.get("input") or ""
             asst = (rec.get("assistant") or rec.get("a") or rec.get("answer")
                     or rec.get("output") or "")
+            if rec.get("prompt") and rec.get("completion"):
+                # 结构化 SFT：只对 **回答段** 计 loss（提示段用 ignore_index 屏蔽）
+                pid = tok.encode(rec["prompt"]).ids
+                cid = tok.encode(rec["completion"]).ids
+                ids = (pid + cid)[:seq_len]
+                mf = min(len(pid), len(ids))
+                # 回答段至少要留 2 个 token，否则整条样本 loss 全被 mask 掉（无信号）
+                if len(ids) >= 8 and len(cid) >= 2 and mf <= len(ids) - 2:
+                    seqs.append({"ids": ids, "mask_from": mf})
+                if len(seqs) >= limit:
+                    break
+                continue
             if user and asst:
                 # 有问答字段 ⇒ 用 Qwen 的对话模板
                 text = ("<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n%s<|im_end|>"
@@ -203,18 +215,46 @@ def build_sequences(tok, data_path, seq_len, limit):
                 continue
             ids = tok.encode(text).ids[:seq_len]
             if len(ids) >= 8:
-                seqs.append(ids)
+                # 没有分段信息时整段都算 loss（mask_from=0）
+                seqs.append({"ids": ids, "mask_from": 0})
             if len(seqs) >= limit:
                 break
     return seqs
 
 
-def _probe_loss(model, ids, seq_len):
-    """在固定探针序列上算 loss（不建图）：训练过程中唯一可比的指标。"""
+def _make_xy(item, seq_len):
+    """把 {"ids","mask_from"} 变成 (xb, yb)，并把提示段的 yb 置 -100。"""
+    if isinstance(item, dict):
+        ids, mask_from = list(item["ids"]), int(item.get("mask_from", 0))
+    else:
+        ids, mask_from = list(item), 0
     pad = ids[-1]
     ids = (ids + [pad] * seq_len)[:seq_len]
     xb = np.asarray([ids[:-1]], dtype=np.int64)
     yb = np.asarray([ids[1:]], dtype=np.int64)
+    cut = max(0, mask_from - 1)          # 预测 ids[i+1]，回答从 mask_from 开始
+    if cut:
+        yb[:, :cut] = -100
+    return xb, yb
+
+
+def _probe_multi(model, probes, seq_len):
+    """留出集探针：取**多条平均**。单条噪声太大 —— 一条样本 ±1% 的波动
+    就会被误读成"学到了"或"没学到"。"""
+    # 注意：单条探针本身也可能是「token id 列表」，不能只看外层是不是 list，
+    # 要看元素是不是 dict/list（多条）——否则会把 token id 当样本，报 int 不可迭代。
+    if (isinstance(probes, (list, tuple)) and probes
+            and isinstance(probes[0], (dict, list, tuple))):
+        items = list(probes)
+    else:
+        items = [probes]
+    vals = [_probe_loss(model, it, seq_len) for it in items]
+    return float(np.mean(vals))
+
+
+def _probe_loss(model, ids, seq_len):
+    """在固定探针序列上算 loss（不建图）：训练过程中唯一可比的指标。"""
+    xb, yb = _make_xy(ids, seq_len)
     with T.no_grad():
         logits = model.forward(xb)
         loss = F.cross_entropy(logits.reshape(xb.size, model.cfg["V"]), yb.reshape(-1))
@@ -233,11 +273,7 @@ def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None):
     losses, probes = [], []
     t0 = time.time()
     for step in range(steps):
-        ids = seqs[step % len(seqs)]
-        pad = ids[-1]
-        ids = (ids + [pad] * seq_len)[:seq_len]
-        xb = np.asarray([ids[:-1]], dtype=np.int64)
-        yb = np.asarray([ids[1:]], dtype=np.int64)
+        xb, yb = _make_xy(seqs[step % len(seqs)], seq_len)
 
         if hasattr(opt, "zero_grad"):
             opt.zero_grad()
@@ -252,7 +288,7 @@ def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None):
 
         train_loss = float(loss.to_numpy())
         losses.append(train_loss)
-        pl = _probe_loss(model, probe, seq_len) if probe is not None else None
+        pl = _probe_multi(model, probe, seq_len) if probe is not None else None
         if pl is not None:
             probes.append(pl)
         if (step + 1) % log_every == 0:
@@ -482,7 +518,7 @@ def main(argv=None):
               % (len(seqs), a.seq_len, a.steps, a.lr))
         if a.holdout and len(seqs) > a.holdout:
             train_seqs = seqs[:-a.holdout]
-            probe = seqs[-a.holdout]          # 留出集里的第一条：**训练时从未见过**
+            probe = seqs[-a.holdout:]         # 整段留出集：训练时**从未见过**
             print("训练 %d 条 / 留出 %d 条（探针取自留出集，可排除'背下训练样本'）"
                   % (len(train_seqs), a.holdout))
         else:
@@ -495,9 +531,19 @@ def main(argv=None):
         if a.save:
             save_params(model, a.save)
             print("权重已保存：%s" % a.save)
-        print("结论：%s" % ("PASS —— 真实大模型能在 TGAI ORV 上被微调"
-                            if probes[-1] < probes[0] else "FAIL —— loss 没有下降"))
-        return 0 if probes[-1] < probes[0] else 1
+        gain = (probes[0] - probes[-1]) / max(abs(probes[0]), 1e-9)
+        if gain >= 0.05:
+            verdict = "PASS —— 留出集下降 %.1f%%，确实学到了" % (100 * gain)
+            rc = 0
+        elif gain > 0:
+            verdict = ("未学到 —— 留出集只降 %.2f%%，在噪声范围内（判据 ≥5%%）。"
+                       "修法：加步数/加语料/调 lr，别把噪声当成果" % (100 * gain))
+            rc = 1
+        else:
+            verdict = "FAIL —— 留出集反而上升 %.1f%%（过拟合或 lr 过大）" % (-100 * gain)
+            rc = 1
+        print("结论：%s" % (verdict,))
+        return rc
 
     print("没有指定动作：用 --forward-only 验证前向，或 --steps 做 SFT")
     return 2

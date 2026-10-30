@@ -2644,8 +2644,17 @@ def _cross_entropy_cuda_ignore(logits, tgt, ignore_index):
     mask = (tgt_arr != ignore_index)
     nvalid = int(mask.sum())
     if nvalid == 0:
-        return Tensor._from_gpu(rt.h2d(np.zeros(1, np.float32)),
-                                requires_grad=logits.requires_grad, _parents=(logits,))
+        # 没有任何有效行时也要返回 **0 维标量**（与 nvalid>0 的路径一致），
+        # 否则调用方 float(loss) 会报 "only 0-dimensional arrays can be converted"。
+        # 梯度为 0：没有有效行就没有可学的信号。
+        zero = rt.empty((), dtype=np.float32)
+        out = Tensor._from_gpu(zero, requires_grad=logits.requires_grad, _parents=(logits,))
+
+        def bw_noop(g, grads):
+            return
+
+        out._backward = bw_noop
+        return out
     rows = np.flatnonzero(mask)
     ids_buf = rt.h2d(np.ascontiguousarray(rows, dtype=np.int32),
                      dtype=np.int32, cache_slot="ce_ids")
