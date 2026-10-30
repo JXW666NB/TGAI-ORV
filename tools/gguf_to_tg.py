@@ -1381,7 +1381,31 @@ def convert_gguf_to_tg(input_path: str, output_path: str,
 
     # Use OrderedDict iteration to preserve original order
     # tie_word_embeddings=False（如 Qwen2.5）时保留独立的 lm_head，不能丢
-    tie_emb = bool(reader.metadata.get('%s.tie_word_embeddings' % arch_name, True))
+    # 是否保留独立 lm_head：优先看元数据，**元数据没有就直接比对权重数据**。
+    # 踩过的坑：Qwen2.5-0.5B 官方就是绑定权重的（output.weight 与 token_embd.weight
+    # 逐字节相同），而 GGUF 里根本没有 tie_word_embeddings 这个键 ——
+    # 只看元数据会误判，只有比对数据才可靠。
+    _arch = str(cfg.get('arch') or cfg.get('arch_name')
+                or reader.metadata.get('general.architecture', 'llama'))
+    _meta_tie = reader.metadata.get('%s.tie_word_embeddings' % _arch, None)
+    if _meta_tie is not None:
+        tie_emb = bool(_meta_tie)
+    else:
+        tie_emb = True
+        try:
+            import numpy as _np
+            _o = reader.tensors.get('output.weight')
+            _e = reader.tensors.get('token_embd.weight')
+            if _o is not None and _e is not None:
+                _oa = _np.asarray(_o.data).reshape(-1)
+                _ea = _np.asarray(_e.data).reshape(-1)
+                if _oa.size != _ea.size:
+                    tie_emb = True          # 形状都不同，肯定不是绑定；这里保守跳过
+                else:
+                    tie_emb = bool(_np.array_equal(_oa[:4096], _ea[:4096])
+                                   and _np.array_equal(_oa[-4096:], _ea[-4096:]))
+        except Exception:
+            tie_emb = True
     for name, info in reader.tensors.items():
         mapped = map_weight_name(name, arch_cfg, tie_embeddings=tie_emb)
         if mapped is None:

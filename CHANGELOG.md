@@ -3,6 +3,22 @@
 版本遵循 [semver](https://semver.org/lang/zh-CN/)：`0.x` 期间不保证接口稳定，
 但**破坏性改动一定写在这里**。
 
+## [未发布]
+
+### 新增
+- `examples/qwen25_sft.py`：真实 Qwen2.5 前向 + SFT（GGUF / safetensors 两种权重、权重绑定、
+  bf16 权重兜底、`--tiny` 迷你模式、`--holdout` 留出集、固定探针评估）。
+- `tools/qwen25_gpu_parity.py`：现场用 transformers 算参考 logits，与我们的引擎逐位比对。
+- `tests/test_qwen25_forward.py` / `tests/test_qwen_sft_smoke.py`：Qwen2.5 前向与 SFT 链路的 CPU CI 用例。
+
+### 修复
+- 转换器：`tie_word_embeddings` 缺失时改为**比对权重数据**判断是否绑定（元数据里常常没有这个键）。
+- `nn_ops.embedding` 补反向（numpy scatter-add），训练时词嵌入才拿得到梯度。
+
+### 实测
+- 官方 Qwen2.5-0.5B 权重前向对齐：CUDA 上相对误差 **4.816e-06**。
+- 真实 SFT：A10 单卡 30 步，**留出集 loss 0.965 → 0.452（−53.2%）**，0.3 s/step。
+
 ## [0.2.0] - 2026-10-30
 
 这一版的主题是 **「能替别人的模型训练」**：算子面按 PyTorch 对齐、可插拔扩展、真机结构验证。

@@ -1,0 +1,23 @@
+feat(qwen): 真实 Qwen2.5-0.5B 在 A10 上微调成功（留出集 loss -53.2%，前向 rel 4.82e-06）
+
+一、GPU 前向对齐（官方 bf16 safetensors，参考值现场用 transformers 现算）
+  参考 [1,-1,:3] = [1.93114, 7.5822, 3.7172]
+  我们 [1,-1,:3] = [1.93109, 7.58216, 3.71716]
+  max|Δ| = 9.656e-05, 相对误差 4.816e-06 (判据 <=1e-5) PASS
+
+二、真实 SFT（A10 单卡，persona.jsonl 36 条训练 + 4 条留出，30 步, AdamW lr=2e-5）
+  留出集 probe loss 0.965441 -> 0.452237 (降 53.2%)
+  训练集内同指标 0.674009 -> 0.105420 (降 84.4%)
+  0.3 s/step; 结论 PASS
+  留出集是训练时从未见过的样本 => 泛化性下降, 不是背答案
+
+三、过程中修掉的三个真实缺陷
+  1. 权重绑定: Qwen2.5-0.5B/1.5B 官方 tie_word_embeddings=true, safetensors 里没有 lm_head.weight;
+     必须让 lm_head 与词嵌入共享同一个 Parameter 对象(复制会让两条梯度分家)
+  2. bf16 权重: numpy 无 bf16 类型, safetensors.numpy 报 TypeError; 加 torch 兜底 + 修法提示
+  3. 转换器 tie 判定: 元数据常常没有 tie_word_embeddings 键, 改为直接比对 output 与 token_embd 的数据
+
+四、边界（写进文档, 不许吹）
+  只 30 步/36 条/单卡/S=128; 只测 loss 未测生成质量; 0.5B 不代表更大模型
+
+新增 tools/qwen25_gpu_parity.py；CHANGELOG 增加 [未发布] 段。

@@ -84,11 +84,19 @@ def rope_tables(seq, dh, theta):
 class Qwen25:
     """引擎原生 Qwen2.5。参数用 T.nn.Parameter，融合核用 T.nn.RMSNorm。"""
 
-    def __init__(self, cfg, w):
+    def __init__(self, cfg, w, tie=None):
         self.cfg = cfg
         P = T.nn.Parameter
         self.p = {k: P(T.tensor(np.ascontiguousarray(v.astype(np.float32))))
                   for k, v in w.items()}
+        # Qwen2.5-0.5B/1.5B 官方是**权重绑定**的（没有独立 lm_head）：
+        # 这时必须让 lm_head 与词嵌入**共享同一个 Parameter 对象**，
+        # 复制一份会让两条梯度各走各的，训练后两者就分家了。
+        if tie is None:
+            tie = "lm_head.weight" not in self.p
+        self.tie = bool(tie)
+        if self.tie:
+            self.p["lm_head.weight"] = self.p["token_embedding.weight"]
         self.emb = T.nn.Embedding(cfg["V"], cfg["D"])
         self.emb.weight = self.p["token_embedding.weight"]
         self.ln1, self.ln2 = [], []
@@ -184,10 +192,15 @@ def build_sequences(tok, data_path, seq_len, limit):
             user = rec.get("user") or rec.get("q") or rec.get("question") or rec.get("input") or ""
             asst = (rec.get("assistant") or rec.get("a") or rec.get("answer")
                     or rec.get("output") or "")
-            if not user or not asst:
+            if user and asst:
+                # 有问答字段 ⇒ 用 Qwen 的对话模板
+                text = ("<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n%s<|im_end|>"
+                        % (user, asst))
+            elif isinstance(rec.get("text"), str) and rec["text"].strip():
+                # 只有整段文本（如 persona.jsonl 的 <用户>/<TGAI><回答>）⇒ 直接按语言模型目标训
+                text = rec["text"].strip()
+            else:
                 continue
-            text = "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n%s<|im_end|>" % (
-                user, asst)
             ids = tok.encode(text).ids[:seq_len]
             if len(ids) >= 8:
                 seqs.append(ids)
@@ -285,7 +298,20 @@ def load_safetensors_weights(dirpath, cfg):
     if not os.path.isfile(path):
         raise FileNotFoundError(
             "找不到 %s。修法：确认 --safetensors 指向含 model.safetensors 的目录" % (path,))
-    raw = load_file(path)
+    try:
+        raw = load_file(path)
+    except TypeError as exc:
+        # 官方权重常是 bfloat16，numpy 没有 bf16 类型 ⇒ 用 torch 转 fp32；
+        # 没有 torch 就明确告知修法，而不是抛一个看不懂的 TypeError。
+        if "bfloat16" not in str(exc):
+            raise
+        try:
+            from safetensors.torch import load_file as tload
+        except ImportError:
+            raise RuntimeError(
+                "权重是 bfloat16，numpy 无法直接读取。修法：pip install torch（用它转 fp32），"
+                "或先把 safetensors 转成 fp16/fp32 再加载") from exc
+        raw = {k: v.float().numpy() for k, v in tload(path).items()}
     out, unknown = {}, []
     for k, v in raw.items():
         ours = hf_name_to_ours(k)
@@ -295,7 +321,7 @@ def load_safetensors_weights(dirpath, cfg):
         out[ours] = np.asarray(v, dtype=np.float32)
     if unknown:
         print("  注意：%d 个 HF 参数未映射（前 3 个：%s）" % (len(unknown), unknown[:3]))
-    need = ["token_embedding.weight", "lm_head.weight", "final_norm.weight"]
+    need = ["token_embedding.weight", "final_norm.weight"]
     lack = [k for k in need if k not in out]
     if lack:
         raise RuntimeError(
@@ -354,6 +380,8 @@ def main(argv=None):
     ap.add_argument("--tokenizer", default="", help="tokenizer.json 路径")
     ap.add_argument("--seq-len", type=int, default=64)
     ap.add_argument("--limit", type=int, default=8, help="最多取多少条样本")
+    ap.add_argument("--holdout", type=int, default=0,
+                    help="最后 N 条留作留出集（不参与训练），探针用其中第一条")
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--tiny-lr", type=float, default=3e-3)
     ap.add_argument("--tol", type=float, default=1e-5)
@@ -421,8 +449,15 @@ def main(argv=None):
             return 2
         print("样本 %d 条，seq_len=%d，steps=%d，lr=%g"
               % (len(seqs), a.seq_len, a.steps, a.lr))
-        probe = seqs[0]
-        losses, probes = sft(model, seqs, a.steps, a.lr, a.seq_len, probe=probe)
+        if a.holdout and len(seqs) > a.holdout:
+            train_seqs = seqs[:-a.holdout]
+            probe = seqs[-a.holdout]          # 留出集里的第一条：**训练时从未见过**
+            print("训练 %d 条 / 留出 %d 条（探针取自留出集，可排除'背下训练样本'）"
+                  % (len(train_seqs), a.holdout))
+        else:
+            train_seqs = seqs
+            probe = seqs[0]
+        losses, probes = sft(model, train_seqs, a.steps, a.lr, a.seq_len, probe=probe)
         drop = (probes[0] - probes[-1]) / max(abs(probes[0]), 1e-9)
         print("")
         print("探针 loss：%.6f → %.6f（变化 %.1f%%）" % (probes[0], probes[-1], 100 * drop))

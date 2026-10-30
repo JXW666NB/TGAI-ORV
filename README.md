@@ -112,7 +112,18 @@ python examples/llama_tiny.py --preset m60 --steps 20 \
 | 与 PyTorch 孪生逐步相对偏差 | **1.16e-07** |
 | 训练后参数相对偏差 | **2.60e-07** |
 
-### ③ SFT 链路
+### ③ 真实 Qwen2.5-0.5B 微调（A10 GPU）
+
+| 项 | 值 |
+| --- | --- |
+| 前向对齐（官方 bf16 权重 vs transformers，现场算参考） | **相对误差 4.816e-06**（判据 ≤1e-5） |
+| 真实 SFT（36 条训练 + 4 条**留出**，30 步，AdamW） | **留出集 loss 0.965 → 0.452（降 53.2%）** |
+| 速度 | **0.3 s/step**（0.5B，单卡 A10） |
+
+> 留出集探针训练时从未见过 —— 所以这是泛化性的下降，不是背样本。
+> 边界：30 步、36 条、单卡、只测 loss 未测生成质量。细节见 docs/PRODUCTION_READINESS.md。
+
+### ④ SFT 链路（CPU 冒烟）
 
 `examples/qwen25_sft.py` 支持 GGUF / safetensors 两种权重、AdamW、固定探针评估。
 CPU 冒烟（随机迷你权重）：探针 loss **5.154 → 4.662** 单调下降。
