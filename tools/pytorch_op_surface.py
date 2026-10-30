@@ -129,6 +129,40 @@ CATEGORY_RULES = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# 范围裁剪：我们是 **LLM 训练引擎**，不是通用张量库。
+# 下列领域明确**不做**（不是"还没做"，是"永远不在范围内"），
+# 这样清单不会因为 PyTorch 有 1016 个函数而显得永远补不完。
+# ---------------------------------------------------------------------------
+OUT_OF_SCOPE = [
+    ("卷积/视觉", ("conv", "pool", "unfold", "fold", "interpolate", "grid_sample",
+                   "upsample", "pixel_shuffle", "pixel_unshuffle", "reflection_pad",
+                   "replication_pad", "constant_pad", "channel_shuffle", "avg_pool",
+                   "max_pool", "adaptive_", "bilinear")),
+    ("线性代数/科研", ("svd", "qr", "cholesky", "solve", "inverse", "det", "eig", "lu",
+                       "lstsq", "pinverse", "symeig", "matrix_rank", "matrix_exp", "trace",
+                       "tensordot", "kron", "vander", "trapz", "trapezoid", "fft", "stft",
+                       "istft", "rfft", "hann", "hamming", "blackman", "bartlett")),
+    ("概率分布", ("distribution", "categorical", "poisson", "gamma", "beta", "dirichlet",
+                  "multivariate_normal", "cauchy", "geometric", "laplace", "weibull")),
+    ("稀疏", ("sparse", "coo_", "csr_", "csc_", "to_sparse", "spmm", "spspmm")),
+    ("量化/图/编译器", ("quantize", "dequantize", "fake_quant", "is_compiling", "compile",
+                        "dynamo", "fx_", "jit", "tracing", "export")),
+    ("视觉/音频 IO", ("imread", "imwrite", "read_image", "write_image", "save_image",
+                      "audio", "spectrogram", "mel")),
+    ("其他非训练", ("cdist", "pairwise_distance", "pdist", "histc", "histogram", "bincount",
+                    "cartesian_prod", "combinations", "symint", "vmap", "func_")),
+]
+
+
+def out_of_scope_reason(name):
+    low = name.lower()
+    for reason, keys in OUT_OF_SCOPE:
+        if any(k in low for k in keys):
+            return reason
+    return None
+
+
 def categorize(name):
     low = name.lower()
     for cat, keys in CATEGORY_RULES:
@@ -210,8 +244,15 @@ def main(argv=None):
     print("Tier-1（训练必需）%d 项，我们有 %d 项 ⇒ 覆盖 %.0f%%"
           % (len(t1_rows), n_have, 100.0 * n_have / len(t1_rows)))
 
+    n_oos = sum(1 for n in funcs if out_of_scope_reason(n))
+    n_in = len(funcs) - n_oos
+    print("范围裁剪：PyTorch 函数 %d 个，其中 **范围外 %d 个**（卷积/视觉/线代/科研/稀疏/量化），"
+          "在范围内 %d 个" % (len(funcs), n_oos, n_in))
+
     cats = {}
     for name in funcs:
+        if out_of_scope_reason(name):
+            continue
         cats.setdefault(categorize(name), []).append(name)
     print("\nPyTorch 函数面分类：")
     for cat in sorted(cats, key=lambda c: -len(cats[c])):
@@ -238,7 +279,27 @@ def main(argv=None):
             L.append("| `%s` | %s | %s | %s |"
                      % (tname, ("`%s`" % ourname) if ourname else "—", st, note))
         L.append("")
-        L.append("## PyTorch 函数面分类计数\n")
+        L.append("## 范围裁剪：我们不做哪些（明确不做，不是待办）\n")
+        L.append("我们是 **LLM 训练引擎**，不是通用张量库。PyTorch 公开函数 %d 个，"
+                 "其中 **%d 个** 属下列领域，**永远不在范围内**；剩下 %d 个才进入考量的池子。\n"
+                 % (len(funcs), n_oos, n_in))
+        L.append("| 领域 | 例子 | 为什么不做的 |")
+        L.append("| --- | --- | --- |")
+        why = {
+            "卷积/视觉": ("conv2d / max_pool2d / interpolate", "LLM 没有卷积；视觉任务不在产品范围"),
+            "线性代数/科研": ("svd / qr / cholesky / fft", "科研张量库的需求，训练用不到"),
+            "概率分布": ("Normal / Categorical", "需要时用 numpy 采样即可，不值得进内核"),
+            "稀疏": ("to_sparse / spmm", "LLM 训练用稠密权重"),
+            "量化/图/编译器": ("quantize / torch.compile", "我们有 NVRTC + CUDA Graph 这条自己的路"),
+            "视觉/音频 IO": ("imread / spectrogram", "decode 归数据管线，不归训练内核"),
+            "其他非训练": ("cdist / histogram / vmap", "非训练必需"),
+        }
+        for reason, _keys in OUT_OF_SCOPE:
+            ex, whyw = why.get(reason, ("—", "—"))
+            cnt = sum(1 for n in funcs if out_of_scope_reason(n) == reason)
+            L.append("| %s | `%s` | %s（%d 个） |" % (reason, ex, whyw, cnt))
+        L.append("")
+        L.append("## PyTorch 函数面分类计数（仅范围内）\n")
         L.append("| 类别 | 数量 |")
         L.append("| --- | --- |")
         for cat in sorted(cats, key=lambda c: -len(cats[c])):

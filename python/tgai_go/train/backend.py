@@ -93,6 +93,52 @@ GROUPS = {
 
 OPTIONAL_GROUPS = ("MoE（可选）",)
 
+#: 「融合核」这组是**可选**的：新后端可以先不实现，由 Python 组合的等价路径顶上。
+#: 这样接 Vulkan/ROCm 的门槛从 79 个方法降到「核心组」那些。
+FALLBACK_GROUPS = ("融合核（可回退）",)
+
+#: 核心组 = 剩下所有组。**新后端只要实现这些就能训 dense 模型。**
+CORE_GROUPS = tuple(g for g in GROUPS
+                    if g not in OPTIONAL_GROUPS and g not in FALLBACK_GROUPS)
+
+
+def core_methods():
+    """新后端的最小必做集合（dense 模型训练）。"""
+    out = []
+    for g in CORE_GROUPS:
+        out.extend(GROUPS[g])
+    return out
+
+
+def fallback_methods():
+    """可回退组：缺了也能跑（走组合路径），但会慢一些。"""
+    out = []
+    for g in FALLBACK_GROUPS:
+        out.extend(GROUPS[g])
+    return out
+
+
+def report(inst):
+    """给一个后端实例出分层体检报告（接入新后端先跑这个）。"""
+    core = core_methods()
+    fb = fallback_methods()
+    opt = []
+    for g in OPTIONAL_GROUPS:
+        opt.extend(GROUPS[g])
+    miss_core = [m for m in core if not callable(getattr(inst, m, None))]
+    miss_fb = [m for m in fb if not callable(getattr(inst, m, None))]
+    miss_opt = [m for m in opt if not callable(getattr(inst, m, None))]
+    return {
+        "name": getattr(inst, "name", type(inst).__name__),
+        "core": (len(core) - len(miss_core), len(core)),
+        "fallback": (len(fb) - len(miss_fb), len(fb)),
+        "optional": (len(opt) - len(miss_opt), len(opt)),
+        "missing_core": miss_core,
+        "missing_fallback": miss_fb,
+        "missing_optional": miss_opt,
+        "trainable_dense": not miss_core,
+    }
+
 
 def required_methods(include_optional: bool = True):
     """返回接口方法名列表。"""

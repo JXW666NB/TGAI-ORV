@@ -93,6 +93,36 @@ python tools/verify_gguf_tg.py --gguf qwen2.5-0.5b-fp16.gguf --tg qwen25.TG   # 
 
 ---
 
+## 一切皆插件 / Everything Is a Plugin
+
+核心只保留 **LLM 训练必需**的算子；图形学、科研、私有算子**不进核心**，走插件。
+这样核心永远精简可自检，生态由插件自由生长。
+
+```python
+from tgai_go.train import ops_plugin
+
+# 组合式：只用已有算子，反向自动生效
+ops_plugin.register("softplus", lambda x: (x.exp() + 1.0).log(), kind="tensor")
+x.softplus()          # 立即可用，梯度也是对的
+```
+
+```python
+# 自带反向：numpy 前向 + 解析反向（精确 GELU 需要 erf，就不该进核心）
+ops_plugin.register_numpy("gelu_exact", fwd, bwd, kind="tensor")
+```
+
+**实测**（`examples/plugins/`，与 torch 对照）：
+
+| 插件 | 前向 | 反向 |
+| --- | --- | --- |
+| `softplus`（组合式，一行反向都没写） | 2.4e-07 | **6.0e-08** |
+| `gelu_exact`（自带解析反向） | 2.4e-07 | **1.2e-07** |
+
+发现方式：手工 import / `TG_OPS_PATH` 目录 / setuptools 入口点（`pip install` 后自动）。
+细节见 [docs/PLUGINS.md](docs/PLUGINS.md)。
+
+---
+
 ## 装 / Install
 
 ```bash
