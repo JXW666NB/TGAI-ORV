@@ -1670,3 +1670,40 @@ PYTHONPATH=$PWD/python python3 tools/accept.py --quick
 
 `0.1.0`（首发，含算子源码）→ `0.1.1`（加 `[cuda]` extra + 报错修法）→
 `0.1.3`（自动发现 CUDA 库，**开箱即用**）→ `0.1.4`（补齐 `tgai_go` 顶层模块）
+
+
+---
+
+## L3 · 24 小时长稳：已启动（2026-10-30 22:11 → 2026-10-31 22:11）
+
+这个项目**只有一台常开的 GPU**（阿里云 DSW A10，单卡），所以 24h 长稳只能真跑一整天。
+
+```
+命令：TG_BF16=1 python3 tools/soak_test.py --minutes 1440 --sample-steps 5000 \
+        --csv /mnt/workspace/soak24h.csv
+配置：10.062M 参数（D256 NH8 FF1280 L8 S64，batch=64，bf16）
+进程：pid 79349 (timeout 93600) / 79351 (python)，2026-10-30 22:11 启动
+日志：/mnt/workspace/soak24h.log（持久盘，不随隧道断）
+```
+
+**早期读数（启动后 6 分钟 / 10,000 步）**：
+
+| 指标 | 值 |
+| --- | --- |
+| loss | 0.0883（前 5000 步 0.0913） |
+| 显存峰值 | 2.786 GiB（恒定） |
+| 显存 live | 1.332 GiB（**恒定，零漂移**） |
+| cached | 1.454 GiB（恒定） |
+| host RSS | 0.63 GiB（恒定） |
+| NaN | 0 |
+
+判据（来自 L3）：连续 ≥24h 无崩溃、显存/RSS 漂移 ≤3%。
+**结论要等 24 小时后才能下** —— 现在只能说"启动健康、早期零漂移"。
+
+复查方法（隧道重开后）：
+
+```bash
+# A10 上
+tail -n 5 /mnt/workspace/soak24h.log
+# 或把 CSV 取回本地看趋势
+```
