@@ -56,6 +56,29 @@ import tgai_go.train as T           # 现在 / now — 其余代码一行不用�
 
 ---
 
+## 外来模型对齐 / Foreign Model Parity
+
+我们不是只能跑自己写的结构。**真实开源权重 Qwen2.5-0.5B-instruct**（GQA 14:2、qkv bias、RoPE θ=1e6，
+与我们的模型结构不同）跑在我们自己的张量算子上，与 HuggingFace `transformers` 逐位比对：
+
+```
+max|Δ| = 1.278e-04      相对误差 6.29e-06 ≤ 1e-5   ✅ PASS
+我们:  [0.95818734, 6.6607723, 3.1660562, 1.2813374, 3.2732353]
+参考:  [0.9581473,  6.66074,   3.1660404, 1.281328,  3.2732046]
+```
+
+复现（纯 CPU，不需要 GPU）：
+
+```bash
+python tools/qwen_ref.py        # 用 HF 生成参考 logits（一次性）
+python tools/qwen2_parity.py    # 我们的实现 vs 参考，判据 ≤1e-5
+```
+
+**算子覆盖率**（以 PyTorch 公开面为基准，见 [docs/OP_COVERAGE.md](docs/OP_COVERAGE.md)）：
+Tier-1 训练必需算子 **64 项，已具备 46 项（72%）**。
+
+---
+
 ## 模型转换 / Convert
 
 训练或部署别人的模型，第一步是把权重换成我们的格式：
