@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# 包名说明：PyPI 上 `tgai-go` / `tgai-orv` 是否可用请先查
+#   https://pypi.org/project/tgai-go/   https://pypi.org/project/tgai-orv/
+# 若被占名，改这一行即可（import 名始终是 tgai_go，不受影响）。
+[project]
+name = "tgai-orv"
+version = "0.1.0"
+description = "PyTorch-free LLM engine: train and infer with one codebase. 训推一体，不依赖 PyTorch。"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "JXW666NB" }]
+keywords = ["llm", "training", "inference", "cuda", "pytorch-free", "cuda-graph"]
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Environment :: GPU :: NVIDIA CUDA",
+]
+dependencies = ["numpy>=1.21"]
+
+[project.urls]
+Homepage = "https://github.com/JXW666NB/TGAI-ORV"
+Source = "https://github.com/JXW666NB/TGAI-ORV"
+Documentation = "https://github.com/JXW666NB/TGAI-ORV/blob/main/docs/QUICKSTART_TRAIN.md"
+Issues = "https://github.com/JXW666NB/TGAI-ORV/issues"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["tgai_go*"]
+
+# CUDA 算子源码必须随包分发：train/cuda.py 运行时通过 attn_nop_source_path()
+# 从 training/kernels/ 读取 tgai_attn_nop.cu 现编；缺了它 lowmem 注意力路径不可用。
+[tool.setuptools.package-data]
+"tgai_go.train" = ["kernels/*.cu", "kernels/*.cuh"]
