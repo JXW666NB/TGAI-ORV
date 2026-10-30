@@ -181,10 +181,13 @@ def main(argv=None):
     data["doctor"] = d
 
     # 2) 形状矩阵（抽 4 组）
+    # 覆盖 6 组（L1 判据要求 ≥6），含边界：非对齐 FF=1000、极短序列 S=8、深网络 L=8
     shapes = [("D256 NH8 FF1280 L8 S64", dict(D=256, NH=8, FF=1280, L=8, MAXLEN=64)),
               ("D128 NH4 FF512  L4 S64", dict(D=128, NH=4, FF=512, L=4, MAXLEN=64)),
               ("D512 NH8 FF2048 L2 S64", dict(D=512, NH=8, FF=2048, L=2, MAXLEN=64)),
-              ("D192 NH6 FF768  L3 S96", dict(D=192, NH=6, FF=768, L=3, MAXLEN=96))]
+              ("D192 NH6 FF768  L3 S96", dict(D=192, NH=6, FF=768, L=3, MAXLEN=96)),
+              ("D256 NH8 FF1000 L2 S64", dict(D=256, NH=8, FF=1000, L=2, MAXLEN=64)),
+              ("D128 NH4 FF512  L2 S8 ", dict(D=128, NH=4, FF=512, L=2, MAXLEN=8))]
     shape_ok = 0
     shape_detail = []
     for name, over in shapes:
@@ -196,7 +199,7 @@ def main(argv=None):
             shape_detail.append("%s:%.1fms" % (name.split()[0], ms))
         except Exception as exc:                                    # noqa: BLE001
             shape_detail.append("%s:FAIL(%s)" % (name.split()[0], type(exc).__name__))
-    rows.append(("形状矩阵 4 组", "PASS" if shape_ok == len(shapes) else "FAIL",
+    rows.append(("形状矩阵 6 组", "PASS" if shape_ok == len(shapes) else "FAIL",
                  " ".join(shape_detail)))
     data["shapes"] = shape_detail
 
