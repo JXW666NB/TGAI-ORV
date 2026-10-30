@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.5-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.2.0-blue" alt="version">
   <img src="https://img.shields.io/badge/python-3.9+-green" alt="python">
   <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
   <img src="https://img.shields.io/badge/self--test-12%2F12-brightgreen" alt="selftest">
@@ -74,8 +74,11 @@ python tools/qwen_ref.py        # 用 HF 生成参考 logits（一次性）
 python tools/qwen2_parity.py    # 我们的实现 vs 参考，判据 ≤1e-5
 ```
 
+**LLaMA 结构训练对齐**（RMSNorm + RoPE + SwiGLU + GQA，20 步）：
+与 PyTorch 孪生逐步 loss 相对偏差 **1.59e-05**、训练后参数相对偏差 **4.90e-05**、loss 下降 99.1%。
+
 **算子覆盖率**（以 PyTorch 公开面为基准，见 [docs/OP_COVERAGE.md](docs/OP_COVERAGE.md)）：
-Tier-1 训练必需算子 **64 项，已具备 46 项（72%）**。
+Tier-1 训练必需算子 **63 项，已具备 62 项（98%）**。
 
 ---
 
@@ -141,7 +144,7 @@ python -m tgai_go.train.doctor    # 12 项自检，失败会写清哪个算子/�
 > 发布前自检：`python tools/check_package.py --build` —— 检查 wheel 里文件是否齐、
 > `.cu` 是否随包、装进干净 venv 后能否 import（今天两次「装上才发现缺件」都是它挡住的）。
 >
-> PyPI: https://pypi.org/project/tgai-orv/ · 当前 `0.1.5`
+> PyPI: https://pypi.org/project/tgai-orv/ · 当前 `0.2.0`
 
 ---
 
