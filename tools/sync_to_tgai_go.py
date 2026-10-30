@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """把工作目录里的「白名单文件」同步到真正的 TGAI-GO 仓库并推送。
 
 为什么需要它：2026-10-30 我在朋友的展示备份仓库（Shuyuan-Industrial-Engine）上推了一整天，

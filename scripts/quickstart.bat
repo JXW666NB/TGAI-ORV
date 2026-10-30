@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 REM TGAI GO 训练引擎 · 一条命令自检（Windows）
 setlocal
 cd /d "%~dp0.."

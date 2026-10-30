@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # TGAI GO 训练引擎 · 一条命令自检（Linux / macOS / DSW / 容器）
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
