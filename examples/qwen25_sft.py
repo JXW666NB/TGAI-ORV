@@ -39,6 +39,7 @@ for cand in (os.path.join(REPO, "python"), REPO):
 
 import tgai_go.train as T  # noqa: E402
 from tgai_go.train import functional as F  # noqa: E402
+from tgai_go.train import nn_ops as O  # noqa: E402
 
 # Qwen2.5-0.5B-instruct 结构（来自 GGUF 元数据实测）
 CFG = dict(V=151936, D=896, L=24, NH=14, KV=2, FF=4864, THETA=1e6, EPS=1e-6)
@@ -261,7 +262,8 @@ def _probe_loss(model, ids, seq_len):
     return float(loss.to_numpy())
 
 
-def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None):
+def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None, clip=0.0,
+        warmup=0, probe_every=25, batch=1, shuffle=True, seed=0):
     """最小可用 SFT 循环：AdamW + 交叉熵（全 token）。
 
     注意：训练样本轮转 ⇒ **每步 loss 不可比**（不同样本难度不同）。
@@ -272,29 +274,51 @@ def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None):
     opt = T.optim.AdamW(model.params(), lr=lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
     losses, probes = [], []
     t0 = time.time()
+    base_lr = float(lr)
+    rng_s = np.random.default_rng(seed)
+    order = list(range(len(seqs)))
+    # 探针很贵（8 条 × 完整前向 ≈ 0.4 s），不能每步都跑
+    if probe is not None:
+        probes.append(_probe_multi(model, probe, seq_len))
     for step in range(steps):
-        xb, yb = _make_xy(seqs[step % len(seqs)], seq_len)
-
+        # 线性 warmup：真实大模型上 lr 一步到位会炸（实测 probe 0.42 -> 17.2）
+        if warmup and step < warmup:
+            opt.lr = base_lr * float(step + 1) / float(warmup)
+        else:
+            opt.lr = base_lr
         if hasattr(opt, "zero_grad"):
             opt.zero_grad()
         else:
             for prm in model.params():
                 prm.zero_grad()
 
-        logits = model.forward(xb)
-        loss = F.cross_entropy(logits.reshape(xb.size, cfg["V"]), yb.reshape(-1))
-        loss.backward()
+        # mini-batch：逐条前向/反向，梯度自动累加（batch=1 时噪声大到留出集反而变差）
+        idxs = []
+        for k in range(batch):
+            pos = (step * batch + k) % len(order)
+            if pos == 0 and shuffle:
+                rng_s.shuffle(order)
+            idxs.append(order[pos])
+        for k, si in enumerate(idxs):
+            xb, yb = _make_xy(seqs[si], seq_len)
+            logits = model.forward(xb)
+            loss = F.cross_entropy(logits.reshape(xb.size, cfg["V"]), yb.reshape(-1))
+            (loss * (1.0 / batch)).backward()
+        train_loss = float(loss.to_numpy())
+        # 梯度裁剪：真实大模型上 lr 稍大就会炸（实测 probe 从 0.42 冲到 17.2），
+        # 裁剪是把「能训」变成「训得稳」的必要一步。
+        gnorm = O.clip_grad_norm_(model.params(), clip) if clip else 0.0
         opt.step()
 
-        train_loss = float(loss.to_numpy())
         losses.append(train_loss)
-        pl = _probe_multi(model, probe, seq_len) if probe is not None else None
-        if pl is not None:
+        pl = None
+        if probe is not None and ((step + 1) % probe_every == 0 or step + 1 == steps):
+            pl = _probe_multi(model, probe, seq_len)
             probes.append(pl)
         if (step + 1) % log_every == 0:
-            extra = ("| probe %.6f " % probes[-1]) if probes else ""
-            print("step %3d | train %6.4f %s| %.1f s/step"
-                  % (step + 1, train_loss, extra, (time.time() - t0) / (step + 1)))
+            extra = ("| probe %.6f " % probes[-1]) if pl is not None else ""
+            print("step %3d | train %6.4f %s| gnorm %7.2f | %.1f s/step"
+                  % (step + 1, train_loss, extra, gnorm, (time.time() - t0) / (step + 1)))
     return losses, probes
 
 
@@ -450,6 +474,11 @@ def main(argv=None):
     ap.add_argument("--holdout", type=int, default=0,
                     help="最后 N 条留作留出集（不参与训练），探针用其中第一条")
     ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--clip", type=float, default=0.0,
+                    help="梯度 L2 裁剪阈值（0=不裁；注意引擎的 sumsq_sequential 是单线程，"
+                         "大张量上很慢，实测 0.3→36 s/step）")
+    ap.add_argument("--warmup", type=int, default=0, help="线性 warmup 步数")
+    ap.add_argument("--batch", type=int, default=1, help="每步样本数（梯度累加）")
     ap.add_argument("--tiny-lr", type=float, default=3e-3)
     ap.add_argument("--tol", type=float, default=1e-5)
     a = ap.parse_args(argv)
@@ -524,7 +553,9 @@ def main(argv=None):
         else:
             train_seqs = seqs
             probe = seqs[0]
-        losses, probes = sft(model, train_seqs, a.steps, a.lr, a.seq_len, probe=probe)
+        losses, probes = sft(model, train_seqs, a.steps, a.lr, a.seq_len,
+                             probe=probe, clip=a.clip, warmup=a.warmup,
+                             batch=a.batch)
         drop = (probes[0] - probes[-1]) / max(abs(probes[0]), 1e-9)
         print("")
         print("探针 loss：%.6f → %.6f（变化 %.1f%%）" % (probes[0], probes[-1], 100 * drop))

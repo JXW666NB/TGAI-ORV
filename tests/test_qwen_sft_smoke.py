@@ -34,8 +34,9 @@ def test_tiny_sft_probe_loss_decreases():
     model = q.Qwen25(cfg, q.make_tiny_weights(cfg))
     seqs = q.tiny_sequences(cfg, n=3, seq_len=24)
 
-    losses, probes = q.sft(model, seqs, 4, 3e-3, 24, probe=seqs[0])
-    assert len(probes) == 4
+    # 探针现在是「训练前基线 + 定期评估」，所以条数不再等于步数
+    losses, probes = q.sft(model, seqs, 8, 3e-3, 24, probe=seqs[0], probe_every=4)
+    assert len(probes) >= 2, probes
     assert all(np.isfinite(p) for p in probes)
     assert probes[-1] < probes[0], (probes[0], probes[-1])
 

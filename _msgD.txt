@@ -1,0 +1,22 @@
+feat(sft): mini-batch 梯度累加 + warmup + 探针降频；记录三次稳定性失败
+
+一、三次失败（都写进 docs, 因为"能跑通" != "能训出东西"）
+  1. lr=3e-5 无保护: 留出 probe 0.42 -> 17.23 (step 100 爆炸)
+  2. 想用梯度裁剪: 每参数 to_numpy 求范数 => 291 次 D2H, 0.3 -> 7.8 s/step;
+     改用 sumsq_sequential => 36 s/step 更糟, 因为它是**单线程**内核(不适合 1.36 亿元素)
+     => 结论: 大张量要做设备端范数必须写并行归约内核(待办), 先用 warmup 代替
+  3. warmup 止住了爆炸, 但 batch=1 让留出 probe 从 1.5396 单调升到 1.6678
+     => 梯度方差太大, 每步按单条样本猛推, 记住训练样本、泛化变差
+
+二、正确做法（已实现）
+  --batch N   mini-batch 梯度累加(loss/N 后逐条 backward)
+  --shuffle   数据洗牌(默认开)
+  --warmup N  线性升温
+  --probe-every  探针降频(探针要 8 次完整前向 ≈0.4 s, 每步跑会掩盖真实步速)
+
+三、顺带修正
+  clip_grad_norm_ 兼容 numpy 梯度(CPU 路径), 设备路径改用设备端累加避免 291 次 D2H
+  tests 对齐新语义(探针 = 训练前基线 + 定期评估); 105 passed
+
+四、资源说明
+  A10 上 24h 长稳仍占满 GPU => SFT 从 0.3 s/step 降到 5~10 s/step, 属资源争抢非引擎退化
