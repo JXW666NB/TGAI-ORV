@@ -196,12 +196,28 @@ def build_sequences(tok, data_path, seq_len, limit):
     return seqs
 
 
-def sft(model, seqs, steps, lr, seq_len, log_every=1):
-    """最小可用 SFT 循环：AdamW + 交叉熵（全 token）。"""
+def _probe_loss(model, ids, seq_len):
+    """在固定探针序列上算 loss（不建图）：训练过程中唯一可比的指标。"""
+    pad = ids[-1]
+    ids = (ids + [pad] * seq_len)[:seq_len]
+    xb = np.asarray([ids[:-1]], dtype=np.int64)
+    yb = np.asarray([ids[1:]], dtype=np.int64)
+    with T.no_grad():
+        logits = model.forward(xb)
+        loss = F.cross_entropy(logits.reshape(xb.size, model.cfg["V"]), yb.reshape(-1))
+    return float(loss.to_numpy())
+
+
+def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None):
+    """最小可用 SFT 循环：AdamW + 交叉熵（全 token）。
+
+    注意：训练样本轮转 ⇒ **每步 loss 不可比**（不同样本难度不同）。
+    所以这里同时报一条固定 `probe` 序列上的 loss，只看它是否下降。
+    """
     import time
     cfg = model.cfg
     opt = T.optim.AdamW(model.params(), lr=lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
-    losses = []
+    losses, probes = [], []
     t0 = time.time()
     for step in range(steps):
         ids = seqs[step % len(seqs)]
@@ -221,33 +237,155 @@ def sft(model, seqs, steps, lr, seq_len, log_every=1):
         loss.backward()
         opt.step()
 
-        losses.append(float(loss.to_numpy()))
+        train_loss = float(loss.to_numpy())
+        losses.append(train_loss)
+        pl = _probe_loss(model, probe, seq_len) if probe is not None else None
+        if pl is not None:
+            probes.append(pl)
         if (step + 1) % log_every == 0:
-            print("step %3d | loss %.6f | %.1f s/step"
-                  % (step + 1, losses[-1], (time.time() - t0) / (step + 1)))
-    return losses
+            extra = ("| probe %.6f " % probes[-1]) if probes else ""
+            print("step %3d | train %6.4f %s| %.1f s/step"
+                  % (step + 1, train_loss, extra, (time.time() - t0) / (step + 1)))
+    return losses, probes
+
+
+# ---------------------------------------------------------------------------
+# safetensors 加载（HF 官方权重目录）
+# ---------------------------------------------------------------------------
+
+_HF_PATTERNS = [
+    (r"^model\.embed_tokens\.weight$", "token_embedding.weight"),
+    (r"^lm_head\.weight$", "lm_head.weight"),
+    (r"^model\.norm\.weight$", "final_norm.weight"),
+    (r"^model\.layers\.(\d+)\.input_layernorm\.weight$", r"blocks.\1.ln1.weight"),
+    (r"^model\.layers\.(\d+)\.post_attention_layernorm\.weight$", r"blocks.\1.ln2.weight"),
+    (r"^model\.layers\.(\d+)\.self_attn\.q_proj\.(weight|bias)$", r"blocks.\1.attn.q_proj.\2"),
+    (r"^model\.layers\.(\d+)\.self_attn\.k_proj\.(weight|bias)$", r"blocks.\1.attn.k_proj.\2"),
+    (r"^model\.layers\.(\d+)\.self_attn\.v_proj\.(weight|bias)$", r"blocks.\1.attn.v_proj.\2"),
+    (r"^model\.layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$", r"blocks.\1.attn.out_proj.\2"),
+    (r"^model\.layers\.(\d+)\.mlp\.gate_proj\.weight$", r"blocks.\1.ffn.w1.weight"),
+    (r"^model\.layers\.(\d+)\.mlp\.up_proj\.weight$", r"blocks.\1.ffn.w2.weight"),
+    (r"^model\.layers\.(\d+)\.mlp\.down_proj\.weight$", r"blocks.\1.ffn.w3.weight"),
+]
+
+
+def hf_name_to_ours(name):
+    """HF 参数名 → 我们脚本里的命名（与 GGUF 转换器的命名一致）。"""
+    import re as _re
+    for pat, rep in _HF_PATTERNS:
+        if _re.match(pat, name):
+            return _re.sub(pat, rep, name)
+    return None
+
+
+def load_safetensors_weights(dirpath, cfg):
+    """读 HF safetensors 目录 → {我们的名字: np.float32}。"""
+    from safetensors.numpy import load_file
+    path = os.path.join(dirpath, "model.safetensors")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            "找不到 %s。修法：确认 --safetensors 指向含 model.safetensors 的目录" % (path,))
+    raw = load_file(path)
+    out, unknown = {}, []
+    for k, v in raw.items():
+        ours = hf_name_to_ours(k)
+        if ours is None:
+            unknown.append(k)
+            continue
+        out[ours] = np.asarray(v, dtype=np.float32)
+    if unknown:
+        print("  注意：%d 个 HF 参数未映射（前 3 个：%s）" % (len(unknown), unknown[:3]))
+    need = ["token_embedding.weight", "lm_head.weight", "final_norm.weight"]
+    lack = [k for k in need if k not in out]
+    if lack:
+        raise RuntimeError(
+            "缺少关键权重 %s。修法：检查 safetensors 是否为完整 Qwen2 结构" % (lack,))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# tiny 模式：随机权重的迷你 Qwen（用于 CPU/CI 验证 SFT 链路，不需要真权重）
+# ---------------------------------------------------------------------------
+
+TINY_CFG = dict(V=256, D=64, L=2, NH=4, KV=2, FF=128, THETA=1e6, EPS=1e-6)
+
+
+def make_tiny_weights(cfg, seed=0):
+    """随机初始化同结构权重（形状与 Qwen2.5 完全一致，只是小很多）。"""
+    rng = np.random.default_rng(seed)
+    D, L, NH, KV, FF, V = cfg["D"], cfg["L"], cfg["NH"], cfg["KV"], cfg["FF"], cfg["V"]
+    DH = D // NH
+    k = 1.0 / np.sqrt(D)
+    w = {"token_embedding.weight": (rng.normal(0, 0.02, (V, D))).astype(np.float32),
+         "lm_head.weight": (rng.normal(0, 0.02, (V, D))).astype(np.float32),
+         "final_norm.weight": np.ones(D, np.float32)}
+    for i in range(L):
+        b = "blocks.%d." % i
+        w[b + "ln1.weight"] = np.ones(D, np.float32)
+        w[b + "ln2.weight"] = np.ones(D, np.float32)
+        w[b + "attn.q_proj.weight"] = (rng.normal(0, k, (NH * DH, D))).astype(np.float32)
+        w[b + "attn.k_proj.weight"] = (rng.normal(0, k, (KV * DH, D))).astype(np.float32)
+        w[b + "attn.v_proj.weight"] = (rng.normal(0, k, (KV * DH, D))).astype(np.float32)
+        w[b + "attn.out_proj.weight"] = (rng.normal(0, k, (D, NH * DH))).astype(np.float32)
+        w[b + "attn.q_proj.bias"] = np.zeros(NH * DH, np.float32)
+        w[b + "attn.k_proj.bias"] = np.zeros(KV * DH, np.float32)
+        w[b + "attn.v_proj.bias"] = np.zeros(KV * DH, np.float32)
+        w[b + "ffn.w1.weight"] = (rng.normal(0, k, (FF, D))).astype(np.float32)
+        w[b + "ffn.w2.weight"] = (rng.normal(0, k, (FF, D))).astype(np.float32)
+        w[b + "ffn.w3.weight"] = (rng.normal(0, k, (D, FF)) / np.sqrt(FF)).astype(np.float32)
+    return w
+
+
+def tiny_sequences(cfg, n=4, seq_len=32, seed=1):
+    rng = np.random.default_rng(seed)
+    return [rng.integers(0, cfg["V"], size=seq_len).astype(np.int64).tolist() for _ in range(n)]
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
+    ap.add_argument("--safetensors", default="", help="HF 权重目录（含 model.safetensors）")
     ap.add_argument("--gguf", default=r"D:\DSH-Workspace\_gguf_test\qwen2.5-0.5b-fp16.gguf")
     ap.add_argument("--ref", default=os.path.join(REPO, "tools", "_qwen_ref.npz"))
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--forward-only", action="store_true")
     ap.add_argument("--steps", type=int, default=0, help="SFT 步数（0 表示不训）")
+    ap.add_argument("--tiny", action="store_true", help="用随机权重的迷你模型验证 SFT 链路")
     ap.add_argument("--data", default="", help="jsonl 语料（user/assistant 字段）")
     ap.add_argument("--tokenizer", default="", help="tokenizer.json 路径")
     ap.add_argument("--seq-len", type=int, default=64)
     ap.add_argument("--limit", type=int, default=8, help="最多取多少条样本")
     ap.add_argument("--lr", type=float, default=2e-5)
+    ap.add_argument("--tiny-lr", type=float, default=3e-3)
     ap.add_argument("--tol", type=float, default=1e-5)
     a = ap.parse_args(argv)
 
     T.set_default_device(a.device)
     print("device=%s" % (T.get_device(),))
+
+    if a.tiny:
+        cfg = TINY_CFG
+        model = Qwen25(cfg, make_tiny_weights(cfg))
+        seqs = tiny_sequences(cfg)
+        steps = a.steps or 3
+        print("tiny 模式：D=%d L=%d NH=%d KV=%d FF=%d V=%d，样本 %d 条，steps=%d"
+              % (cfg["D"], cfg["L"], cfg["NH"], cfg["KV"], cfg["FF"], cfg["V"],
+                 len(seqs), steps))
+        probe = seqs[0]                     # 固定探针，保证可比
+        losses, probes = sft(model, seqs, steps, a.tiny_lr, a.seq_len, probe=probe)
+        print("")
+        print("训练 loss（轮转样本，不可比）：%.4f → %.4f" % (losses[0], losses[-1]))
+        print("探针 loss（固定序列，可比）：  %.6f → %.6f" % (probes[0], probes[-1]))
+        ok = probes[-1] < probes[0]
+        print("结论：%s" % ("PASS —— SFT 链路可用（前向/反向/AdamW 全通）" if ok else "FAIL"))
+        return 0 if ok else 1
+
     cfg = CFG
-    print("读取 GGUF：%s" % a.gguf)
-    w = load_gguf_weights(a.gguf, cfg)
+    if a.safetensors:
+        print("读取 safetensors 目录：%s" % a.safetensors)
+        w = load_safetensors_weights(a.safetensors, cfg)
+    else:
+        print("读取 GGUF：%s" % a.gguf)
+        w = load_gguf_weights(a.gguf, cfg)
     print("权重 %d 个（含独立 lm_head）" % len(w))
 
     model = Qwen25(cfg, w)
@@ -283,13 +421,14 @@ def main(argv=None):
             return 2
         print("样本 %d 条，seq_len=%d，steps=%d，lr=%g"
               % (len(seqs), a.seq_len, a.steps, a.lr))
-        losses = sft(model, seqs, a.steps, a.lr, a.seq_len)
-        drop = (losses[0] - losses[-1]) / max(abs(losses[0]), 1e-9)
+        probe = seqs[0]
+        losses, probes = sft(model, seqs, a.steps, a.lr, a.seq_len, probe=probe)
+        drop = (probes[0] - probes[-1]) / max(abs(probes[0]), 1e-9)
         print("")
-        print("loss：%.6f → %.6f（变化 %.1f%%）" % (losses[0], losses[-1], 100 * drop))
+        print("探针 loss：%.6f → %.6f（变化 %.1f%%）" % (probes[0], probes[-1], 100 * drop))
         print("结论：%s" % ("PASS —— 真实大模型能在 TGAI ORV 上被微调"
-                            if losses[-1] < losses[0] else "FAIL —— loss 没有下降"))
-        return 0 if losses[-1] < losses[0] else 1
+                            if probes[-1] < probes[0] else "FAIL —— loss 没有下降"))
+        return 0 if probes[-1] < probes[0] else 1
 
     print("没有指定动作：用 --forward-only 验证前向，或 --steps 做 SFT")
     return 2

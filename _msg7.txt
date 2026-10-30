@@ -1,0 +1,20 @@
+feat(qwen-sft): Qwen2.5 微调链路打通（CPU 冒烟通过）+ safetensors 加载 + 探针评估
+
+一、examples/qwen25_sft.py 能力
+  --forward-only  真实权重前向，与 HF 参考对齐（CPU 实测 rel 5.68e-06 PASS）
+  --safetensors   HF 官方目录（safetensors）加载，含 HF 名 -> 我方名的完整映射
+  --steps N       SFT 训练（AdamW + 交叉熵）
+  --tiny          随机权重迷你模型，用于 CPU/CI 验证链路（不需要真权重）
+
+二、修正了一个方法论错误（值得记）
+  SFT 训练时样本轮转 => 每步 loss **不可比**（不同样本难度不同）。
+  我第一版用训练 loss 判定，lr=1e-2 下看到 5.59 -> 6.07 就误判 FAIL；
+  改成「固定探针序列」后: probe 5.154 -> 4.662 单调下降, 链路其实是通的。
+  现在 sft() 同时报 train loss（不可比）与 probe loss（可比, 唯一判据）。
+
+三、测试 tests/test_qwen_sft_smoke.py（3 项, 纯 CPU）
+  迷你 SFT 探针 loss 必须下降; 探针评估不得污染梯度; HF 名映射逐项校验
+
+四、转换器修复（上一提交）：tie_word_embeddings=False 时保留 lm_head
+
+测试总数 103 passed。真实 0.5B 权重的 SFT 需在 A10 上跑（隧道断开中, 权重正在 A10 本地下载）。
