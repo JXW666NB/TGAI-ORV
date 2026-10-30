@@ -16,7 +16,7 @@
 """
 import numpy as np
 
-from . import Tensor
+from . import Tensor, _acc
 from . import tensor as _tensor
 
 
@@ -175,3 +175,219 @@ def clip_grad_norm_(params, max_norm):
                 continue
             p.grad = g * scale
     return norm
+
+
+# ===========================================================================
+# 第二批核心算子（推理 + 训练都用得到）
+#   归约：argmax / amax / amin / norm
+#   损失：nll_loss / mse_loss
+#   形状：chunk / tril / arange
+#   采样：topk_indices（推理解码用）
+#   优化：sgd_step
+# 说明：这里用「numpy 前向 + 解析反向」实现（与 ops_plugin 同机制），
+#       每个都在 tests/test_nn_ops.py 里与 PyTorch 对齐。
+# ===========================================================================
+
+
+def _numpy_op(name, fwd, bwd):
+    """把 (numpy 前向, 解析反向) 包装成带 autograd 的算子（不注册到插件表）。"""
+
+    def op(*args, **kw):
+        tensors = [a for a in args if isinstance(a, Tensor)]
+        arrs = [a.data if isinstance(a, Tensor) else a for a in args]
+        out_data = np.asarray(fwd(*arrs, **kw), dtype=np.float32)
+        need = any(getattr(a, "requires_grad", False) for a in args)
+        out = Tensor(out_data, requires_grad=need, _parents=tuple(tensors))
+
+        def bw(g, grads):
+            gs = bwd(np.asarray(g, np.float32), out_data, arrs, **kw)
+            if not isinstance(gs, (list, tuple)):
+                gs = [gs]
+            for a, gi in zip(args, gs):
+                if isinstance(a, Tensor) and a.requires_grad and gi is not None:
+                    _acc(grads, a, np.asarray(gi, dtype=np.float32))
+
+        out._backward = bw
+        return out
+
+    op.__name__ = name
+    op.__doc__ = "见 nn_ops.%s（与 torch 同名同义）" % (name,)
+    return op
+
+
+argmax = _numpy_op(
+    "argmax",
+    fwd=lambda x, dim=None: (np.argmax(x, axis=dim) if dim is not None else np.argmax(x)),
+    bwd=lambda g, out, xs, dim=None: [np.zeros_like(xs[0], dtype=np.float32)],
+)
+
+
+def _ext_reduce(fn, tag):
+    def fwd(x, dim=None, keepdim=False):
+        if dim is None:
+            return np.asarray(fn(x), dtype=np.float32)
+        return np.asarray(fn(x, axis=dim, keepdims=keepdim), dtype=np.float32)
+
+    def bwd(g, out, xs, dim=None, keepdim=False):
+        # 与 torch 一致：最大值有并列时，梯度在并列位置**均分**（不是每个都给全额）
+        x = xs[0].astype(np.float64)
+        scale = float(np.asarray(g).reshape(-1)[0]) if np.ndim(g) == 0 else None
+        if dim is None:
+            target = np.asarray(fn(x))
+            mask = (x == target).astype(np.float64)
+            cnt = mask.sum()
+            gg = scale if scale is not None else float(np.asarray(g).sum())
+            return [((gg / cnt) * mask).astype(np.float32)]
+        out_exp = np.expand_dims(out, dim) if not keepdim else out
+        mask = (x == out_exp).astype(np.float64)
+        cnt = mask.sum(axis=dim, keepdims=True)
+        g_exp = (np.expand_dims(g, dim) if not keepdim else g).astype(np.float64)
+        return [((g_exp / cnt) * mask).astype(np.float32)]
+
+    return _numpy_op(tag, fwd=fwd, bwd=bwd)
+
+
+amax = _ext_reduce(np.max, "amax")
+amin = _ext_reduce(np.min, "amin")
+
+
+def norm(x, p=2.0, dim=None, keepdim=False, eps=1e-12):
+    """L2 范数（p=2）。梯度裁剪、评估指标都要用。"""
+    if float(p) != 2.0:
+        raise ValueError("norm: 目前只支持 p=2（收到 p=%r）。修法：用 p=2，或先 sqrt((x**2).sum())" % (p,))
+    sq = x * x
+    # 注意：Tensor.sum 的关键字是 keepdims（不是 keepdim）
+    s = sq.sum(dim, keepdims=keepdim) if dim is not None else sq.sum()
+    return (s + eps).sqrt()
+
+
+def mse_loss(a, b, reduction="mean"):
+    """均方误差；reduction 支持 'mean' / 'sum' / 'none'（none 时仍返回已折叠前的张量）。"""
+    d = a - b
+    sq = d * d
+    if reduction == "mean":
+        return sq.mean()
+    if reduction == "sum":
+        return sq.sum()
+    if reduction == "none":
+        return sq
+    raise ValueError("mse_loss: 不支持的 reduction=%r。修法：用 'mean'/'sum'/'none'" % (reduction,))
+
+
+def nll_loss(log_probs, target, reduction="mean"):
+    """负对数似然：log_probs[M,V] 与 target[M]（整数）。
+
+    与 `torch.nn.functional.nll_loss` 一致（target 越界会被明确报错，而不是静默出错）。
+    """
+    lp = np.asarray(log_probs.to_numpy(), dtype=np.float64)
+    tg = np.asarray(target, dtype=np.int64).reshape(-1)
+    if lp.ndim != 2:
+        raise ValueError("nll_loss: log_probs 必须是 [N, V]，实际 %s。修法：先 log_softmax 再 reshape"
+                         % (lp.shape,))
+    if lp.shape[0] != tg.shape[0]:
+        raise ValueError(
+            "nll_loss: 样本数不一致 —— log_probs 有 %d 行，target 有 %d 个。修法：检查 batch 维度"
+            % (lp.shape[0], tg.shape[0]))
+    if tg.size and (tg.min() < 0 or tg.max() >= lp.shape[1]):
+        raise ValueError(
+            "nll_loss: target 越界 —— 取值 [%d, %d]，词表大小 %d。修法：检查标签是否含 ignore_index 之外的值"
+            % (int(tg.min()), int(tg.max()), lp.shape[1]))
+    n = lp.shape[0]
+    picked = lp[np.arange(n), tg]
+    if reduction == "mean":
+        val = -picked.mean()
+    elif reduction == "sum":
+        val = -picked.sum()
+    else:
+        raise ValueError("nll_loss: 不支持的 reduction=%r。修法：用 'mean'/'sum'" % (reduction,))
+
+    out = Tensor(np.asarray(val, np.float32), requires_grad=log_probs.requires_grad,
+                 _parents=(log_probs,))
+
+    def bw(g, grads):
+        if not log_probs.requires_grad:
+            return
+        scale = float(np.asarray(g).reshape(-1)[0])
+        dlp = np.zeros_like(lp)
+        coef = -1.0 / n if reduction == "mean" else -1.0
+        dlp[np.arange(n), tg] = coef
+        _acc(grads, log_probs, (dlp * scale).astype(np.float32))
+
+    out._backward = bw
+    return out
+
+
+def chunk(x, chunks, dim=0):
+    """沿 dim 等分成 chunks 份（与 torch.chunk 一致：除不尽时最后一份更小）。"""
+    if chunks <= 0:
+        raise ValueError("chunk: chunks 必须 > 0，收到 %r" % (chunks,))
+    n = x.shape[dim]
+    size = int(np.ceil(n / chunks))
+    return split(x, size, dim)
+
+
+def tril(x, diagonal=0):
+    """下三角（其余置 0）。与 torch.tril 一致。"""
+    n, m = x.shape[-1], x.shape[-2] if len(x.shape) > 1 else x.shape[-1]
+    rows, cols = np.tril_indices(m, k=diagonal)
+    mask = np.zeros((m, n), dtype=np.float32)
+    mask[rows, cols] = 1.0
+    return x * _tensor(mask)
+
+
+def arange(start, end=None, step=1, dtype=np.float32):
+    """与 torch.arange 一致的区间张量（只读，不参与求导）。"""
+    if end is None:
+        start, end = 0, start
+    if step == 0:
+        raise ValueError("arange: step 不能为 0")
+    return _tensor(np.arange(start, end, step, dtype=np.float32))
+
+
+def topk_indices(x, k, dim=-1, largest=True):
+    """返回 top-k 的**索引**（numpy int64）。推理解码（top-k 采样）要用。
+
+    只返回索引、不带梯度 —— 采样是离散决策，本来就不该有梯度。
+    """
+    arr = np.asarray(x.to_numpy())
+    kk = int(k)
+    if not (1 <= kk <= arr.shape[dim]):
+        raise ValueError(
+            "topk_indices: k=%d 超出范围 [1, %d]。修法：k 不得超过该维长度"
+            % (kk, arr.shape[dim]))
+    if largest:
+        idx = np.argpartition(-arr, kk - 1, axis=dim)[
+            tuple(slice(None) if i != dim % arr.ndim else slice(0, kk)
+                  for i in range(arr.ndim))]
+    else:
+        idx = np.argpartition(arr, kk - 1, axis=dim)[
+            tuple(slice(None) if i != dim % arr.ndim else slice(0, kk)
+                  for i in range(arr.ndim))]
+    return np.asarray(idx, dtype=np.int64)
+
+
+def sgd_step(params, lr, momentum=0.0, weight_decay=0.0, dampening=0.0, state=None):
+    """SGD（可选 momentum / weight_decay），与 torch.optim.SGD 的更新式一致。
+
+    state: dict，跨步保存动量缓冲（传同一个对象进来即可）。
+    返回 state。
+    """
+    if state is None:
+        state = {"momentum_buffers": {}}
+    bufs = state.setdefault("momentum_buffers", {})
+    for i, p in enumerate(params):
+        g = getattr(p, "grad", None)
+        if g is None:
+            continue
+        gd = np.asarray(g, dtype=np.float32)
+        if weight_decay:
+            gd = gd + np.float32(weight_decay) * np.asarray(p.data, np.float32)
+        if momentum:
+            buf = bufs.get(i)
+            if buf is None:
+                bufs[i] = gd.copy()
+            else:
+                bufs[i] = np.float32(momentum) * buf + np.float32(1.0 - dampening) * gd
+            gd = bufs[i]
+        p.data[...] = np.asarray(p.data, np.float32) - np.float32(lr) * gd
+    return state

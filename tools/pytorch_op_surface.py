@@ -45,15 +45,15 @@ TIER1 = [
     ("torch.nn.functional.scaled_dot_product_attention", "F.scaled_dot_product_attention", "GQA/因果掩码要覆盖"),
     # 损失
     ("torch.nn.functional.cross_entropy", "F.cross_entropy", ""),
-    ("torch.nn.functional.nll_loss", None, "log_softmax 之后常用"),
-    ("torch.nn.functional.mse_loss", None, "回归/对齐"),
+    ("torch.nn.functional.nll_loss", "nn_ops.nll_loss", "log_softmax 之后常用"),
+    ("torch.nn.functional.mse_loss", "nn_ops.mse_loss", "回归/对齐"),
     # 归约
     ("torch.sum", "Tensor.sum", "需要支持 dim/keepdim"),
     ("torch.mean", "Tensor.mean", "已支持 dim/keepdim"),
-    ("torch.max", "Tensor.maximum", "逐元素有；沿维取最大值+索引没有"),
-    ("torch.min", None, ""),
-    ("torch.amax", None, ""),
-    ("torch.norm", None, "梯度裁剪要用"),
+    ("torch.max", "nn_ops.amax / Tensor.maximum", "逐元素有；沿维取最大值+索引没有"),
+    ("torch.min", "nn_ops.amin", "已验证"),
+    ("torch.amax", "nn_ops.amax", "已验证"),
+    ("torch.norm", "nn_ops.norm", "p=2 已验证"),
     # 逐元素
     ("torch.add", "Tensor.__add__", ""),
     ("torch.mul", "Tensor.__mul__", ""),
@@ -77,11 +77,11 @@ TIER1 = [
     ("torch.cat", "T.cat", ""),
     ("torch.stack", "nn_ops.stack", "已验证"),
     ("torch.split", "nn_ops.split", "已验证"),
-    ("torch.chunk", None, ""),
-    ("torch.gather", None, "embedding 查表的最小依赖"),
+    ("torch.chunk", "nn_ops.chunk", "已验证"),
+    ("torch.gather", "nn_ops.embedding(仅前向)", "embedding 查表的最小依赖"),
     ("torch.embedding", "nn_ops.embedding", "有，但**不支持反向**（缺 gather 内核）"),
     ("torch.repeat_interleave", "Tensor.repeat_interleave", "GQA 扩头"),
-    ("torch.triu/tril", "nn_ops.triu", "triu 已验证；tril 未实现"),
+    ("torch.triu/tril", "nn_ops.triu / nn_ops.tril", "triu 已验证；tril 未实现"),
     ("torch.where", "nn_ops.where", "已验证"),
     # 类型/设备
     ("torch.tensor", "T.tensor", ""),
@@ -96,10 +96,10 @@ TIER1 = [
     ("Tensor.backward", "Tensor.backward", ""),
     ("Tensor.detach", "Tensor.detach", ""),
     ("torch.optim.AdamW", "optim.AdamW", ""),
-    ("torch.optim.SGD", None, "最常用优化器之一"),
+    ("torch.optim.SGD", "nn_ops.sgd_step", "最常用优化器之一"),
     ("torch.nn.utils.clip_grad_norm_", "nn_ops.clip_grad_norm_", "已验证"),
     # 序列/位置
-    ("torch.arange", None, "位置编码"),
+    ("torch.arange", "nn_ops.arange", "已验证"),
     ("torch.cumsum", None, "部分注意力实现用"),
 ]
 

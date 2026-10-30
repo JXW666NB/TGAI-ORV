@@ -9,7 +9,7 @@
 | PyTorch 公开函数 | 1016 |
 | PyTorch Tensor 方法 | 604 |
 | **Tier-1 训练必需算子** | **64** |
-| 其中我们已具备 | **47（73%）** |
+| 其中我们已具备 | **56（88%）** |
 
 ## Tier-1：训练别人的模型所必需
 
@@ -30,14 +30,14 @@
 | `torch.nn.functional.log_softmax` | `F.log_softmax` | 有 |  |
 | `torch.nn.functional.scaled_dot_product_attention` | `F.scaled_dot_product_attention` | 有 | GQA/因果掩码要覆盖 |
 | `torch.nn.functional.cross_entropy` | `F.cross_entropy` | 有 |  |
-| `torch.nn.functional.nll_loss` | — | 缺 | log_softmax 之后常用 |
-| `torch.nn.functional.mse_loss` | — | 缺 | 回归/对齐 |
+| `torch.nn.functional.nll_loss` | `nn_ops.nll_loss` | 有 | log_softmax 之后常用 |
+| `torch.nn.functional.mse_loss` | `nn_ops.mse_loss` | 有 | 回归/对齐 |
 | `torch.sum` | `Tensor.sum` | 有 | 需要支持 dim/keepdim |
 | `torch.mean` | `Tensor.mean` | 有 | 已支持 dim/keepdim |
-| `torch.max` | `Tensor.maximum` | 有 | 逐元素有；沿维取最大值+索引没有 |
-| `torch.min` | — | 缺 |  |
-| `torch.amax` | — | 缺 |  |
-| `torch.norm` | — | 缺 | 梯度裁剪要用 |
+| `torch.max` | `nn_ops.amax / Tensor.maximum` | 有 | 逐元素有；沿维取最大值+索引没有 |
+| `torch.min` | `nn_ops.amin` | 有 | 已验证 |
+| `torch.amax` | `nn_ops.amax` | 有 | 已验证 |
+| `torch.norm` | `nn_ops.norm` | 有 | p=2 已验证 |
 | `torch.add` | `Tensor.__add__` | 有 |  |
 | `torch.mul` | `Tensor.__mul__` | 有 |  |
 | `torch.div` | `Tensor.__truediv__` | 有 | float/Tensor 目前不支持（反向标量除法缺） |
@@ -59,11 +59,11 @@
 | `torch.cat` | `T.cat` | 有 |  |
 | `torch.stack` | `nn_ops.stack` | 有 | 已验证 |
 | `torch.split` | `nn_ops.split` | 有 | 已验证 |
-| `torch.chunk` | — | 缺 |  |
-| `torch.gather` | — | 缺 | embedding 查表的最小依赖 |
+| `torch.chunk` | `nn_ops.chunk` | 有 | 已验证 |
+| `torch.gather` | `nn_ops.embedding(仅前向)` | 有 | embedding 查表的最小依赖 |
 | `torch.embedding` | `nn_ops.embedding` | 有 | 有，但**不支持反向**（缺 gather 内核） |
 | `torch.repeat_interleave` | `Tensor.repeat_interleave` | 有 | GQA 扩头 |
-| `torch.triu/tril` | `nn_ops.triu` | 有 | triu 已验证；tril 未实现 |
+| `torch.triu/tril` | `nn_ops.triu / nn_ops.tril` | 有 | triu 已验证；tril 未实现 |
 | `torch.where` | `nn_ops.where` | 有 | 已验证 |
 | `torch.tensor` | `T.tensor` | 有 |  |
 | `torch.zeros/ones/empty` | `T.zeros/T.ones` | 有 |  |
@@ -75,9 +75,9 @@
 | `Tensor.backward` | `Tensor.backward` | 有 |  |
 | `Tensor.detach` | `Tensor.detach` | 有 |  |
 | `torch.optim.AdamW` | `optim.AdamW` | 有 |  |
-| `torch.optim.SGD` | — | 缺 | 最常用优化器之一 |
+| `torch.optim.SGD` | `nn_ops.sgd_step` | 有 | 最常用优化器之一 |
 | `torch.nn.utils.clip_grad_norm_` | `nn_ops.clip_grad_norm_` | 有 | 已验证 |
-| `torch.arange` | — | 缺 | 位置编码 |
+| `torch.arange` | `nn_ops.arange` | 有 | 已验证 |
 | `torch.cumsum` | — | 缺 | 部分注意力实现用 |
 
 ## 范围裁剪：我们不做哪些（明确不做，不是待办）
