@@ -367,6 +367,35 @@ def tiny_sequences(cfg, n=4, seq_len=32, seed=1):
     return [rng.integers(0, cfg["V"], size=seq_len).astype(np.int64).tolist() for _ in range(n)]
 
 
+def save_params(model, path):
+    """把当前参数存成 npz（fp32），供后续生成/续训。"""
+    arrays = {k: np.asarray(v.to_numpy(), dtype=np.float32) for k, v in model.p.items()}
+    np.savez(path, **arrays)
+    return path
+
+
+def load_params(model, path):
+    """把 npz 里的权重灌回模型（原地覆盖，保持 Parameter 对象不变）。
+
+    注意：CUDA 张量的数据在 `_gpu`（GpuBuf）里，`.data` 是 None ——
+    直接 `p.data[...] = arr` 会 TypeError。所以要按设备分开处理。
+    权重绑定时 lm_head 与词嵌入是**同一个对象**，只灌一次。
+    """
+    z = np.load(path, allow_pickle=False)
+    seen, n = set(), 0
+    for k, p in model.p.items():
+        if id(p) in seen or k not in z.files:
+            continue
+        arr = np.ascontiguousarray(np.asarray(z[k], dtype=np.float32))
+        if getattr(p, "device", "cpu") == "cuda":
+            p._gpu = T._cuda().h2d(arr)
+        else:
+            p.data[...] = arr
+        seen.add(id(p))
+        n += 1
+    return n
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--safetensors", default="", help="HF 权重目录（含 model.safetensors）")
@@ -380,6 +409,8 @@ def main(argv=None):
     ap.add_argument("--tokenizer", default="", help="tokenizer.json 路径")
     ap.add_argument("--seq-len", type=int, default=64)
     ap.add_argument("--limit", type=int, default=8, help="最多取多少条样本")
+    ap.add_argument("--save", default="", help="训练后保存权重的 npz 路径")
+    ap.add_argument("--load", default="", help="从 npz 加载权重（生成/续训前）")
     ap.add_argument("--holdout", type=int, default=0,
                     help="最后 N 条留作留出集（不参与训练），探针用其中第一条")
     ap.add_argument("--lr", type=float, default=2e-5)
@@ -461,6 +492,9 @@ def main(argv=None):
         drop = (probes[0] - probes[-1]) / max(abs(probes[0]), 1e-9)
         print("")
         print("探针 loss：%.6f → %.6f（变化 %.1f%%）" % (probes[0], probes[-1], 100 * drop))
+        if a.save:
+            save_params(model, a.save)
+            print("权重已保存：%s" % a.save)
         print("结论：%s" % ("PASS —— 真实大模型能在 TGAI ORV 上被微调"
                             if probes[-1] < probes[0] else "FAIL —— loss 没有下降"))
         return 0 if probes[-1] < probes[0] else 1
