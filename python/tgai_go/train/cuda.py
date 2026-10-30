@@ -15,6 +15,7 @@ CUBLAS_COMPUTE_32F_PEDANTIC，避免 Ampere+ 默认 TF32 把 fp32 GEMM 拉到 ~1
 """
 from __future__ import annotations
 
+import glob
 import ctypes
 import os
 import sys
@@ -1900,9 +1901,14 @@ class GpuBuf:
 
 def _dll_dirs():
     dirs = []
+    # TGAI_CUDA_BIN 支持多路径（os.pathsep 分隔）：裸机器上 cuBLAS / NVRTC / CUDA runtime
+    # 往往分散在 nvidia/*/lib 三个目录里，只给一个会找不到另一个。
     extra = os.environ.get("TGAI_CUDA_BIN")
     if extra:
-        dirs.append(extra)
+        for part in extra.split(os.pathsep):
+            part = part.strip()
+            if part:
+                dirs.append(part)
     for key in ("CUDA_PATH", "CUDA_HOME"):
         root = os.environ.get(key)
         if root:
@@ -1995,9 +2001,14 @@ def _dedupe_dirs(dirs):
 def _linux_lib_dirs():
     """Linux 上找 libcuda / libcublas / libnvrtc 的目录。不写 LD_LIBRARY_PATH。"""
     dirs = []
+    # TGAI_CUDA_BIN 支持多路径（os.pathsep 分隔）：裸机器上 cuBLAS / NVRTC / CUDA runtime
+    # 往往分散在 nvidia/*/lib 三个目录里，只给一个会找不到另一个。
     extra = os.environ.get("TGAI_CUDA_BIN")
     if extra:
-        dirs.append(extra)
+        for part in extra.split(os.pathsep):
+            part = part.strip()
+            if part:
+                dirs.append(part)
     for key in ("CUDA_PATH", "CUDA_HOME"):
         root = os.environ.get(key)
         if root:
@@ -2019,6 +2030,29 @@ def _linux_lib_dirs():
                 lib = os.path.join(nvidia, pkg, "lib")
                 if os.path.isdir(lib):
                     dirs.append(lib)
+    # 自动发现：本机任何 Python 环境里的 nvidia/*/lib（很常见的情形是
+    # 系统里装了 torch，CUDA 库随它一起进来，而我们跑在一个干净的 venv 里）。
+    # 这样 `pip install tgai-orv` 在"机器上有 torch 但 venv 里没有"时也能直接用。
+    cands = []
+    for entry in list(sys.path):
+        if entry:
+            cands.append(os.path.join(entry, "nvidia"))
+    cands += glob.glob("/usr/local/lib/python3*/site-packages/nvidia")
+    cands += glob.glob("/usr/local/lib/python3*/dist-packages/nvidia")
+    cands += glob.glob("/usr/lib/python3*/site-packages/nvidia")
+    cands += glob.glob(os.path.expanduser("~/.local/lib/python3*/site-packages/nvidia"))
+    for nv in cands:
+        if not os.path.isdir(nv):
+            continue
+        try:
+            pkgs = sorted(os.listdir(nv))
+        except OSError:
+            continue
+        for pkg in pkgs:
+            for sub in ("lib", "lib64"):
+                d = os.path.join(nv, pkg, sub)
+                if os.path.isdir(d):
+                    dirs.append(d)
     dirs.append("/usr/lib/x86_64-linux-gnu")
     dirs.append("/usr/lib64")
     return _dedupe_dirs(dirs)
