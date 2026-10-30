@@ -1003,7 +1003,14 @@ def serialize_tokenizer(reader: GGUFReader, cfg: dict) -> bytes:
     # Vocabulary strings in ID order
     for tid in range(vocab_size):
         tok_str = tokens.get(tid, f'<T{tid}>')
-        utf8 = tok_str.encode('utf-8')[:255]
+        utf8 = tok_str.encode('utf-8')
+        if len(utf8) > 255:
+            # ★ 截断必须落在字符边界：直接 [:255] 会把某个多字节 UTF-8 字符
+            #   切成两半，产生非法字节序列 —— 读取端 decode 时直接崩。
+            #   （2026-10-30 实测：Qwen2.5 vocab=151936 时触发，read_tg 报
+            #    UnicodeDecodeError: unexpected end of data）
+            utf8 = utf8[:255]
+            utf8 = utf8.decode('utf-8', 'ignore').encode('utf-8')
         buf += struct.pack('<B', len(utf8))
         buf += utf8
 

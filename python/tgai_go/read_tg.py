@@ -44,7 +44,7 @@ def read_tg(path):
     for _ in range(v_size):
         ln = raw[o]
         o += 1
-        tokens.append(raw[o:o + ln].decode("utf-8"))
+        tokens.append(raw[o:o + ln].decode("utf-8", "replace"))
         o += ln
     specials = list(raw[o:o + 16])
     o += 16

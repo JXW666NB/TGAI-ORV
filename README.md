@@ -56,6 +56,20 @@ import tgai_go.train as T           # 现在 / now — 其余代码一行不用�
 
 ---
 
+## 模型转换 / Convert
+
+训练或部署别人的模型，第一步是把权重换成我们的格式：
+
+```bash
+python tools/gguf_to_tg.py --input qwen2.5-0.5b-fp16.gguf --output qwen25.TG --dtype fp16
+python tools/verify_gguf_tg.py --gguf qwen2.5-0.5b-fp16.gguf --tg qwen25.TG   # 转完就验
+```
+
+实测 Qwen2.5-0.5B：**16.6 秒**、944 MB（FP16）、**290/290 张量逐位一致（max|Δ|=0）**。
+支持 `llama / mistral / qwen2 / qwen3 / gemma2 / phi3`；细节见 [docs/GGUF_TO_TG.md](docs/GGUF_TO_TG.md)。
+
+---
+
 ## 装 / Install
 
 ```bash
