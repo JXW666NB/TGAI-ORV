@@ -1,94 +1,136 @@
 ﻿# TGAI ORV — Origin Requiem Vehicle（原生之初）
 
-**一套自研引擎，推理 + 训练，全程不依赖 PyTorch。**
-同一个模型，从训练到部署用同一套代码、同一份量化、同一份词表。
+<p align="center">
+  <strong>Train and infer with one codebase, without PyTorch. / 训推一体，不依赖 PyTorch。</strong>
+</p>
 
-> **ORV = Origin Requiem Vehicle（原生之初）**
-> "Origin" 指它从零写起（内核、autograd、优化器都是自己的）；
-> "Requiem" 是给"必须装 PyTorch 才能训练"那个时代写的挽歌；
-> "Vehicle" 是载体——它承载模型从训练走到部署。
+<p align="center">
+  <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/python-3.9+-green" alt="python">
+  <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
+  <img src="https://img.shields.io/badge/self--test-12%2F12-brightgreen" alt="selftest">
+  <img src="https://img.shields.io/badge/speed-1.16~1.43%C3%97%20vs%20PyTorch-red" alt="speed">
+</p>
 
-## 与 TGAI GO 的关系
+> **Origin** — kernels, autograd and optimizers written from scratch.
+> **Requiem** — a farewell to "you must install PyTorch to train".
+> **Vehicle** — carries one model all the way from training to deployment.
+>
+> **Origin** —— 内核、autograd、优化器全是从零写的。
+> **Requiem** —— 写给"必须装 PyTorch 才能训练"那个年代的挽歌。
+> **Vehicle** —— 载着同一个模型，从训练一路走到部署。
 
-| 仓库 | 定位 |
-| --- | --- |
-| **[TGAI GO](https://github.com/JXW666NB/TGAI-GO)** | **纯推理引擎**。跨平台、零依赖、嵌入式也能跑（ESP32 8MB PSRAM 到 CUDA 服务器） |
-| **TGAI ORV（本仓库）** | **完全体**。推理引擎 **+ 训练引擎**，训完直接部署，不用换栈 |
+---
 
-本仓库包含 TGAI GO 的全部推理能力，并额外提供 `tgai_go.train` 训练栈。
+## 这玩意到底是啥 / What the Hell Is This Thing
 
-## 一条命令开始
+Most "self-built engines" only do inference — the moment you want to train, you are back on PyTorch.
+**TGAI ORV does both**, and it is literally one line of import away:
+
+大多数"自研引擎"只做推理，一到训练就得回头求 PyTorch。
+**TGAI ORV 两边都做了**，而且切换只差一行 import：
+
+```python
+# import torch as T                 # 以前 / before
+import tgai_go.train as T           # 现在 / now — 其余代码不用动
+```
+
+Your PyTorch training script keeps working: `Tensor`, autograd, `optim.AdamW`, `Module`, `functional` —
+same names, same semantics.
+
+原来的 PyTorch 训练脚本不用改逻辑：`Tensor`、autograd、`optim.AdamW`、`Module`、`functional`，名字和语义都对齐。
+
+---
+
+## 吹牛区（但都是实测）/ The Bragging Section (All Measured)
+
+Same training code, same seed, 600 steps each / 同一份训练代码、同种子，各 600 步：
+
+| GPU | ORV | PyTorch | Ratio |
+| --- | --- | --- | --- |
+| RTX 4090 | 18.9 ms/step | 27.1 ms | **1.43× faster** |
+| Tesla V100 | 41.4 ms/step | 52.4 ms | **1.27× faster** |
+| NVIDIA A10 | 49.3 ms/step | 57.0 ms | **1.16× faster** |
+
+- 🧠 **Real kernels, not wrappers** — RMSNorm / RoPE / SwiGLU / attention (incl. flash) / MoE as fused CUDA kernels, plus CUDA Graph.
+  **真算子，不是套壳**：RMSNorm / RoPE / SwiGLU / 注意力（含 flash）/ MoE 都是融合核，还带 CUDA Graph。
+- 🧪 **12-check self test** — `python -m tgai_go.train.doctor`, every failure tells you *which op / what shape / how to fix*.
+  **12 项自检**：每项失败都写清"哪个算子 / 什么形状 / 怎么修"。
+- 📉 **1 GB corpus, 600 MiB RAM** — streaming data pipeline (the old one needed 17.5 GiB).
+  **1 GB 语料只吃 600 MiB 内存**：流式管线（旧实现要 17.5 GiB）。
+- ♻️ **Resume is lossless** — 40+40 steps vs 80 continuous: 0.06% difference.
+  **续训无损**：40+40 步对比连续 80 步，末 loss 差 0.06%。
+- 📐 **14 shape configs verified** — including `dh=8~128`, `S=8~256`, `FF=1000` (not a multiple of 128), `L=16`.
+  **14 组形状实测通过**：含 `dh=8~128`、`S=8~256`、`FF=1000`（非 128 倍数）、`L=16`。
+- ⚡ **Mixed precision** — `TG_BF16=1` / `TG_FP16=1`; bf16 on A10 keeps loss within 0.03% over 600 steps.
+  **混合精度**：bf16 在 A10 上 600 步 loss 偏差 0.03%。
+- 🔗 **Data parallel** — `tools/launch_dp.py`; two ranks on one GPU end with **bit-identical parameters**.
+  **数据并行**：单卡起 2 个 rank，最终参数 SHA256 完全一致。
+
+---
+
+## 一条命令跑起来 / One Command
 
 ```bash
 git clone https://github.com/JXW666NB/TGAI-ORV.git && cd TGAI-ORV
-bash scripts/quickstart.sh        # Windows 用 scripts\quickstart.bat
+bash scripts/quickstart.sh          # Windows: scripts\quickstart.bat
 ```
 
-它会自动检查环境、装 numpy、打印 GPU 信息、设好 `PYTHONPATH`，然后跑 **12 项自检**，
-失败时明确告诉你**哪个算子 / 什么形状 / 怎么修**。
+It checks Python, installs numpy if missing, prints your GPU, sets `PYTHONPATH`,
+then runs the 12-check self test and tells you the next command.
 
-## 训练：改一行 import 就行
+它会查 Python、缺 numpy 就装、打印 GPU、设好 `PYTHONPATH`，然后跑 12 项自检，最后告诉你下一步敲什么。
 
-```python
-# import torch as T                 # 以前
-import tgai_go.train as T           # 现在（其余代码不用动）
-```
-
-`tgai_go.train` 提供 PyTorch 风格的 `Tensor` / autograd / `optim.AdamW` / `Module` / `functional`，
-**已有 PyTorch 训练脚本只需换 import**。
-
-### 实测速度（同一份训练代码、同种子、各 600 步，2026-10-30）
-
-| 机器 | ORV | PyTorch | 比值 |
-| --- | --- | --- | --- |
-| RTX 4090 | 18.9 ms/step | 27.1 ms | **快 1.43×** |
-| Tesla V100 | 41.4 ms/step | 52.4 ms | **快 1.27×** |
-| NVIDIA A10 | 49.3 ms/step | 57.0 ms | **快 1.16×** |
-
-### 能力
-
-- **算子**：RMSNorm / RoPE / SwiGLU / attention（含 flash 版）/ MoE，融合核 + CUDA Graph
-- **混合精度**：`TG_BF16=1` / `TG_FP16=1`（A10 上 bf16 跑 600 步 loss 偏差 0.03%）
-- **数据管线**：流式读取，1 GB 语料 host 内存 **600 MiB**（旧实现要 17.5 GiB）
-- **多卡**：`tools/launch_dp.py` 数据并行（单卡 2 rank 参数 SHA256 一致）
-- **续训**：`--save-resume` / `--resume`，断点处 loss 差 0.06%
-- **形状**：14 组配置实测通过（含 `dh=8~128`、`S=8~256`、`FF=1000` 非 128 倍数、`L=16`）
-
-## 自检与验收
+Want to train something right away / 想直接训一个：
 
 ```bash
-python -m tgai_go.train.doctor     # 12 项算子级自检
-python tools/accept.py             # 6 项端到端验收，输出 PASS/FAIL 表
+PYTHONPATH=$PWD/python python3 examples/exam2_chat10m_tgai.py --device cuda --steps 600 --out chat10m
 ```
 
-## 目录结构
+---
+
+## 它不是什么 / What It's NOT
+
+We would rather undersell than lie / 宁可说少，不说满：
+
+| Gate | Status |
+| --- | --- |
+| L0 correctness / 数值正确 | ✅ |
+| L1 trainability / 能训 | ✅ |
+| L2 usability / 能被人用 | ✅ |
+| L3 production / 生产级 | 🟡 partial — 24h soak and 2-GPU speedup **not verified** (no hardware) |
+
+⇒ Label: **"usable (self / small team)" / 「可用（自用/小团队）」**, not "production-ready".
+⇒ 标签是**「可用（自用/小团队）」**，不是「生产级」。
+
+Every number above is measured on real hardware; evidence lives in [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md).
+上面每个数字都在真机上测过，证据在 [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md)。
+
+---
+
+## 仓库结构 / Layout
 
 ```
 TGAI-ORV/
-├── python/tgai_go/train/    训练引擎（cuda.py 运行时 + autograd + 优化器）
-├── training/kernels/        CUDA 算子源码（.cu，运行时由 NVRTC 编译）
-├── examples/                可跑的示例（10M 对话模型 + 流式数据）
-├── tools/                   验收 / 长稳 / 分层计时 / 发布同步
-├── scripts/                 quickstart.sh / quickstart.bat
+├── python/tgai_go/train/     training engine / 训练引擎（运行时 + autograd + 优化器）
+├── training/kernels/         CUDA operator sources / 算子源码（.cu，NVRTC 运行时编译）
+├── examples/                 runnable samples / 可跑示例（10M 对话模型 + 流式数据）
+├── tools/                    accept / soak / profile / sync
+├── scripts/                  quickstart.sh · quickstart.bat
 ├── docs/
-│   ├── QUICKSTART_TRAIN.md      从零到训出第一个模型（一页 A4）
-│   └── PRODUCTION_READINESS.md  L0–L3 判据与全部实测证据
-├── src/ cuda/ cpu/ embedded/ shaders/ tcc/   推理引擎（与 TGAI GO 同源）
-└── third_party/             上游 vendored 依赖
+│   ├── QUICKSTART_TRAIN.md       zero to your first model / 从零到第一个模型（一页 A4）
+│   └── PRODUCTION_READINESS.md   L0–L3 gates + evidence / 判据与实测证据
+├── src/ cuda/ cpu/ embedded/ shaders/ tcc/   inference engine / 推理引擎
+└── third_party/              vendored upstream / 上游依赖
 ```
 
-## 状态（不夸大）
+## 关联仓库 / Sibling Repo
 
-| 级别 | 状态 |
+| Repo | What |
 | --- | --- |
-| L0 能跑（数值正确） | ✅ |
-| L1 能训（形状/语料/速度/显存） | ✅ |
-| L2 能被人用（自检/文档/报错） | ✅ |
-| L3 生产级（24h 长稳、2 卡加速比） | 🟡 部分（缺硬件未验证） |
+| [**TGAI GO**](https://github.com/JXW666NB/TGAI-GO) | Inference only / 纯推理引擎，跨平台，嵌入式也能跑 |
+| **TGAI ORV** (this / 本仓库) | Inference **+ training** / 完全体，训推一体 |
 
-⇒ 当前标签：**「可用（自用/小团队）」**，尚未达到「生产级」。
-全部判据与实测证据见 [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md)。
+## License
 
-## 许可
-
-见仓库内 `LICENSE`。
+[MIT](LICENSE) © 2026 JXW666NB — do whatever you want, just keep the notice.
