@@ -69,6 +69,59 @@ fwd `2.4e-07`、**bwd `1.2e-07`**。
   （任何后端都能跑，但绕过了融合核）。
 * **卸载**：`unregister(name)`。覆盖过核心的插件无法热恢复，会明确报错让你重启进程。
 
+---
+
+## 官方 contrib：我们相对 PyTorch 缺的算子，按插件提供
+
+核心不装冷门算子，但**必须有官方范例**，否则别人不会用、也不敢自己写。
+所以有一个官方维护的 contrib 包：`tgai_go.train.contrib`。
+
+```python
+from tgai_go.train.contrib import autoload
+autoload()                       # 一行注册全部
+import tgai_go.train as T
+y = T.functional.erf(x)          # 或 x.erf()
+```
+
+**已有 20 个**（每个都与 PyTorch 同名同义，且带解析反向、有对照测试）：
+
+| 类别 | 算子 |
+| --- | --- |
+| 激活/逐元素 | `erf` `gelu_exact` `elu` `selu` `leaky_relu` `softplus` `mish` `hardswish` `hardsigmoid` `log1p` `lerp` |
+| 不可导（反向为 0） | `sign` `floor` `ceil` `trunc` |
+| 形状 | `flip` `roll` `flatten` `unsqueeze` `squeeze` |
+
+测试：`tests/test_contrib_ops.py`（前向 + 反向都与 torch 对比，判据 `allclose(rtol=1e-5)`）。
+
+### 为什么这些进 contrib 而不进核心
+
+判断标准只有一条：**LLM 训练必需吗？**
+
+* `silu` / `gelu(tanh)` / `softmax` / `rmsnorm` / `embedding` / `cross_entropy` → **核心**；
+* `erf`（精确 GELU 才用）、`elu` / `selu` / `mish` / `hardswish`（都是"别的模型的激活"）、
+  `flip` / `roll`（数据增强或特殊布局）→ **contrib**；
+* `conv2d` / `fft` / `svd` / `sparse` → **不在仓库里**，由第三方插件包（如 `tgai-go-ops-vision`）提供。
+
+### 加新 contrib 算子的流程（照抄即可）
+
+```python
+# python/tgai_go/train/contrib/activations.py
+from ._base import numpy_op
+
+@numpy_op("my_act", doc="一句话说明 + 与 torch 哪个算子对应")
+def _():
+    def fwd(x, alpha=1.0):
+        return (alpha * x).astype(F32)          # numpy 前向
+
+    def bwd(g, out, xs, **kw):                   # 反向：额外位置参数从 xs 取
+        alpha = xs[1] if len(xs) > 1 else kw.get("alpha", 1.0)
+        return [(g * alpha).astype(F32)]
+
+    return fwd, bwd
+```
+
+然后在 `tests/test_contrib_ops.py` 的 `DIFF_CASES` 里加一行对照即可。
+
 ## 与「后端移植」的关系
 
 插件算子运行在**张量层**，所以它天然跟后端无关：

@@ -9,7 +9,7 @@
 | PyTorch 公开函数 | 1016 |
 | PyTorch Tensor 方法 | 604 |
 | **Tier-1 训练必需算子** | **64** |
-| 其中我们已具备 | **46（72%）** |
+| 其中我们已具备 | **47（73%）** |
 
 ## Tier-1：训练别人的模型所必需
 
@@ -24,7 +24,7 @@
 | `torch.nn.functional.layer_norm` | `nn_ops.layer_norm` | 有 | 已验证 |
 | `torch.nn.functional.batch_norm` | — | 缺 | CNN 系，训练/推理行为不同 |
 | `torch.nn.functional.silu` | `F.silu` | 有 |  |
-| `torch.nn.functional.gelu` | `nn_ops.gelu` | 有 | 只支持 tanh 近似 |
+| `torch.nn.functional.gelu` | `nn_ops.gelu / contrib.gelu_exact` | 有 | tanh 近似在核心，精确版在 contrib |
 | `torch.nn.functional.relu` | — | 缺 | 基础 |
 | `torch.nn.functional.softmax` | `F.softmax` | 有 |  |
 | `torch.nn.functional.log_softmax` | `F.log_softmax` | 有 |  |
@@ -48,7 +48,7 @@
 | `torch.sqrt` | `Tensor.sqrt` | 有 |  |
 | `torch.rsqrt` | `nn_ops.rsqrt` | 有 | 已验证 |
 | `torch.tanh` | `nn_ops.tanh` | 有 | 已验证 |
-| `torch.erf` | — | 缺 | 精确 GELU 要用 |
+| `torch.erf` | `contrib.erf` | 有 | 官方 contrib 插件 |
 | `torch.sigmoid` | `nn_ops.sigmoid` | 有 | 已验证 |
 | `torch.clamp` | `Tensor.clamp` | 有 |  |
 | `torch.abs` | `Tensor.abs` | 有 |  |
@@ -111,9 +111,6 @@
 | 其他 | 12 |
 
 ## 说明
-
-**范围外的算子怎么办？→ 用插件加，不进核心**（见 [PLUGINS.md](PLUGINS.md)）。
-图形学/科研/私有算子以 `tgai-go-ops-*` 包的形式独立发版，核心不受影响。
 
 - 「有」= 公开 API 里能找到对应实现；不等于已对齐 PyTorch 语义或用例覆盖完整。
 - 很多能力我们**内核里有、但没公开成算子**（如 rmsnorm/rope 在 `cuda.py` 里），清单里按「缺」计，因为它们不能被用户代码直接调用。

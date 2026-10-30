@@ -37,7 +37,7 @@ TIER1 = [
     ("torch.nn.functional.batch_norm", None, "CNN 系，训练/推理行为不同"),
     # 激活
     ("torch.nn.functional.silu", "F.silu", ""),
-    ("torch.nn.functional.gelu", "nn_ops.gelu", "只支持 tanh 近似"),
+    ("torch.nn.functional.gelu", "nn_ops.gelu / contrib.gelu_exact", "tanh 近似在核心，精确版在 contrib"),
     ("torch.nn.functional.relu", None, "基础"),
     ("torch.nn.functional.softmax", "F.softmax", ""),
     ("torch.nn.functional.log_softmax", "F.log_softmax", ""),
@@ -65,7 +65,7 @@ TIER1 = [
     ("torch.sqrt", "Tensor.sqrt", ""),
     ("torch.rsqrt", "nn_ops.rsqrt", "已验证"),
     ("torch.tanh", "nn_ops.tanh", "已验证"),
-    ("torch.erf", None, "精确 GELU 要用"),
+    ("torch.erf", "contrib.erf", "官方 contrib 插件"),
     ("torch.sigmoid", "nn_ops.sigmoid", "已验证"),
     ("torch.clamp", "Tensor.clamp", ""),
     ("torch.abs", "Tensor.abs", ""),
@@ -206,6 +206,12 @@ def our_surface():
     try:
         from tgai_go.train import nn_ops as O
         names |= {n for n in dir(O) if not n.startswith("_")}
+    except Exception:  # noqa: BLE001
+        pass
+    try:                       # 官方 contrib 插件也算「能拿到」
+        from tgai_go.train.contrib import autoload
+        autoload()
+        names |= {n for n in dir(F) if not n.startswith("_")}
     except Exception:  # noqa: BLE001
         pass
     try:

@@ -122,7 +122,14 @@ def test_unregister_unknown_raises():
 
 
 def test_load_from_directory():
-    """按目录加载示例插件（模拟 TG_OPS_PATH）。"""
+    """按目录加载示例插件（模拟 TG_OPS_PATH）。
+
+    注意：contrib 里也有同名的 softplus/gelu_exact，这里先卸载以免重名冲突
+    （真实使用中两者不会同时注册 —— 二选一）。
+    """
+    for nm in ("softplus", "gelu_exact"):
+        if nm in ops_plugin.registered_names():
+            ops_plugin.unregister(nm)
     d = os.path.join(REPO, "examples", "plugins")
     for fn in ("softplus_plugin.py", "gelu_exact_plugin.py"):
         ops_plugin.load_plugin_file(os.path.join(d, fn))

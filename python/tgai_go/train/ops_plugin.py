@@ -146,7 +146,7 @@ def register_numpy(name, forward, backward, *, kind="functional", doc="", replac
         out = Tensor(out_data, requires_grad=need_grad, _parents=tuple(tensors))
 
         def bw(g, grads):
-            grads_in = backward(np.asarray(g, np.float32), out_data, arrays)
+            grads_in = backward(np.asarray(g, np.float32), out_data, arrays, **kwargs)
             if not isinstance(grads_in, (list, tuple)):
                 grads_in = [grads_in]
             for a, gi in zip(args, grads_in):
