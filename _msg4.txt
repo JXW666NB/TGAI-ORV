@@ -1,0 +1,6 @@
+docs: 记录 0.2.0 发布与 A10 真机复核（doctor 12/12、accept 6/6、长稳进度）
+
+发布: PyPI tgai-orv 0.2.0 已上架; git tag v0.2.0; CHANGELOG 覆盖 0.1.0->0.2.0; check_package PASS; CI success
+真机复核(A10, 23:19~23:23): doctor 12/12 PASS(最新代码无回归), accept 6/6 PASS, 形状 6 组 PASS, 存续训 PASS, bf16 偏差 0.01%
+  注: 本次 103.9ms/step 不能作性能结论 —— 24h 长稳同卡并发中
+24h 长稳: 1h08m / 120000 步, loss 0.0867~0.0898, 显存与 RSS 全程恒定; 结论需等 10-31 22:11
