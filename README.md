@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.1.4-blue" alt="version">
   <img src="https://img.shields.io/badge/python-3.9+-green" alt="python">
   <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
   <img src="https://img.shields.io/badge/self--test-12%2F12-brightgreen" alt="selftest">
@@ -71,7 +71,7 @@ python -m tgai_go.train.doctor    # 12 项自检，失败会写清哪个算子/�
 `doctor` **12/12 PASS**。引擎会自动去本机任何 Python 环境里找 `nvidia/*/lib`；
 万一找不到，报错会直接告诉你 `pip install "tgai-orv[cuda]"` 或设 `TGAI_CUDA_BIN`（支持多路径，`:` 分隔）。
 
-> PyPI: https://pypi.org/project/tgai-orv/ · 当前 `0.1.3`
+> PyPI: https://pypi.org/project/tgai-orv/ · 当前 `0.1.4`
 
 ---
 
