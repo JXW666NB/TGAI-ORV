@@ -9,3 +9,5 @@ venv/
 .pytest_cache/
 tools/_qwen_ref.npz
 *_ref.npz
+examples/_corpus_*.txt
+examples/_tiny_sft.jsonl

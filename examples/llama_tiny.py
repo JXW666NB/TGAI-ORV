@@ -35,6 +35,13 @@ from tgai_go.train import nn_ops as O  # noqa: E402
 
 CFG = dict(V=64, D=64, L=2, NH=4, KV=2, FF=176, S=16, B=4, THETA=10000.0, EPS=1e-6)
 
+#: 尺寸预设：tiny 用于 CI，m60 是目标里的「60M 级」LLaMA 结构
+PRESETS = {
+    "tiny": dict(V=64, D=64, L=2, NH=4, KV=2, FF=176, S=16, B=4),
+    # 60M 级：D=768, L=8, FF=2048, V=8192, GQA 8:2 ⇒ 约 63M 参数
+    "m60": dict(V=8192, D=768, L=8, NH=8, KV=2, FF=2048, S=64, B=2),
+}
+
 
 def init_weights(cfg, seed=1234):
     """统一的初始化：两边用**同一组 numpy 权重**，保证是同一只模型。"""
@@ -107,16 +114,32 @@ def ours_forward(w, ids, cfg):
     return O.linear(x, _as(w, "emb"))       # 权重绑定 lm_head
 
 
+def _pairs_from_ids(ids_all, seq, n=4):
+    """从长 id 序列切出 n 个 (输入, 目标) 窗口。"""
+    out = []
+    span = seq + 1
+    for k in range(n):
+        st = k * span
+        if st + span > len(ids_all):
+            break
+        win = ids_all[st:st + span]
+        out.append((win[:-1], win[1:]))
+    return out
+
+
 def ours_train(w, ids, tgt, steps, lr, cfg):
     params = {}
     for k, v in w.items():
         params[k] = T.tensor(v.copy(), requires_grad=True)
+    pairs = (ids if (isinstance(ids, list) and ids and isinstance(ids[0], tuple))
+             else [(ids, tgt)])
     losses, state = [], None
-    for _ in range(steps):
+    for step in range(steps):
+        xb, yb = pairs[step % len(pairs)]
         for p in params.values():
             p.zero_grad()
-        logits = ours_forward(params, ids, cfg)
-        loss = O.cross_entropy(logits.reshape(len(ids), cfg["V"]), tgt)
+        logits = ours_forward(params, xb, cfg)
+        loss = O.cross_entropy(logits.reshape(len(xb), cfg["V"]), yb)
         loss.backward()
         state = O.sgd_step(list(params.values()), lr=lr, momentum=0.9, state=state)
         losses.append(float(loss.to_numpy()))
@@ -131,6 +154,10 @@ def torch_train(w, ids, tgt, steps, lr, cfg, torch):
     seq = len(ids)
     params = {k: torch.nn.Parameter(torch.from_numpy(v.copy())) for k, v in w.items()}
     opt = torch.optim.SGD(list(params.values()), lr=lr, momentum=0.9)
+    # 支持「多窗口轮转」：序列长度从第一对窗口取（我们的窗口等长）
+    pairs = (ids if (isinstance(ids, list) and ids and isinstance(ids[0], tuple))
+             else [(ids, tgt)])
+    seq = int(np.asarray(pairs[0][0]).reshape(-1).shape[0])
     cos, sin = rope_tables(seq, DH, cfg["THETA"])
     c = torch.from_numpy(cos)[None]
     s = torch.from_numpy(sin)[None]
@@ -143,9 +170,10 @@ def torch_train(w, ids, tgt, steps, lr, cfg, torch):
         return t * c + rot * s
 
     losses = []
-    for _ in range(steps):
+    for step in range(steps):
+        xb, yb = pairs[step % len(pairs)]
         opt.zero_grad()
-        x = params["emb"][torch.from_numpy(ids)]
+        x = params["emb"][torch.from_numpy(xb)]
         for i in range(L):
             p = "l%d." % i
             h = TF.rms_norm(x, (D,), params[p + "ln1"], EPS)
@@ -164,7 +192,7 @@ def torch_train(w, ids, tgt, steps, lr, cfg, torch):
             x = x + TF.linear(TF.silu(g) * u, params[p + "w3"])
         x = TF.rms_norm(x, (D,), params["norm"], EPS)
         logits = x @ params["emb"].T
-        loss = TF.cross_entropy(logits, torch.from_numpy(tgt))
+        loss = TF.cross_entropy(logits, torch.from_numpy(yb))
         loss.backward()
         opt.step()
         losses.append(float(loss.detach()))
@@ -174,22 +202,41 @@ def torch_train(w, ids, tgt, steps, lr, cfg, torch):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=20)
+    ap.add_argument("--preset", default="tiny", choices=sorted(PRESETS))
+    ap.add_argument("--corpus", default="", help="用真实语料（字符级词表）代替随机 token")
     ap.add_argument("--lr", type=float, default=0.05)
     ap.add_argument("--tol-loss", type=float, default=1e-3)
     ap.add_argument("--tol-param", type=float, default=1e-3)
     a = ap.parse_args(argv)
 
     T.set_default_device("cpu")
-    cfg = CFG
-    rng = np.random.default_rng(7)
-    ids = rng.integers(0, cfg["V"], size=cfg["S"]).astype(np.int64)
-    tgt = rng.integers(0, cfg["V"], size=cfg["S"]).astype(np.int64)
+    cfg = dict(CFG)
+    cfg.update(PRESETS[a.preset])
+    if a.corpus:
+        text = open(a.corpus, encoding="utf-8", errors="replace").read()
+        chars = sorted(set(text))
+        stoi = {c: i for i, c in enumerate(chars)}
+        cfg = dict(cfg)
+        cfg["V"] = len(chars)
+        need = cfg["S"] * 8 + 8
+        ids_all = np.array([stoi[c] for c in text[:max(need, 4096)]], dtype=np.int64)
+        pairs = _pairs_from_ids(ids_all, cfg["S"], n=4)
+        ids = [(p[0], p[1]) for p in pairs]
+        print("语料：%s（%d 字符，词表 %d，切出 %d 个窗口）"
+              % (os.path.basename(a.corpus), len(text), len(chars), len(pairs)))
+        tgt = None
+    else:
+        rng = np.random.default_rng(7)
+        ids = rng.integers(0, cfg["V"], size=cfg["S"]).astype(np.int64)
+        tgt = rng.integers(0, cfg["V"], size=cfg["S"]).astype(np.int64)
     w = init_weights(cfg)
 
     print("配置：D=%d L=%d NH=%d KV=%d DH=%d FF=%d S=%d V=%d steps=%d lr=%g"
           % (cfg["D"], cfg["L"], cfg["NH"], cfg["KV"], cfg["D"] // cfg["NH"],
              cfg["FF"], cfg["S"], cfg["V"], a.steps, a.lr))
     print("结构：RMSNorm + RoPE + SwiGLU + GQA(%d:%d) + 无 bias + 权重绑定" % (cfg["NH"], cfg["KV"]))
+    n_par = sum(v.size for v in w.values())
+    print("参数量：%.2fM" % (n_par / 1e6))
 
     ours_loss, ours_w = ours_train(w, ids, tgt, a.steps, a.lr, cfg)
     try:
