@@ -163,3 +163,73 @@ python tools/accept.py --json acc.json
 | 显存/内存 | 池峰值 + host 峰值 |
 
 **验收结论 PASS** 才说明这台机器上引擎是好的。无 BF16 硬件的机器会把 bf16 标成 `SKIP` 而不是失败。
+
+---
+
+## 10. 微调真实开源模型（Qwen2.5 / Qwen3）
+
+这一节解决的是「**别人的模型拿来训**」。已验证的两个目标：
+**Qwen2.5-0.5B-Instruct**、**Qwen3-0.6B**（含 Qwen3 特有的 `q_norm/k_norm` 与 `head_dim=128`）。
+
+### 10.1 三个文件就够
+
+| 需要什么 | 说明 |
+| --- | --- |
+| 权重目录 | HF 官方目录（`model.safetensors` + `config.json`）。**必须带 `config.json`** —— `head_dim` / `tie_word_embeddings` 只能从它读 |
+| 词表 | 该模型的 `tokenizer.json` |
+| 语料 | `jsonl`，每行 `{"prompt": "...", "completion": "..."}`，或 `{"text": "..."}`（整段都算 loss） |
+
+### 10.2 先做数据体检（别跳过）
+
+```bash
+python tools/dataset_report.py --data sft.jsonl --tokenizer tokenizer.json --seq-len 256
+```
+
+它会给四条**硬性自检**，任一条不过就非零退出。最常拦下的是**截断率**：
+
+> 实测 `sft_big.jsonl` 在 `seq_len=128` 下 **27.6%** 的样本被从回答中间切断；
+> 改 `seq_len=256` 降到 **2.1%**。截断会让模型学"说到一半就结束"，
+> 而且**在 loss 曲线上完全看不出来**。
+
+### 10.3 开训
+
+```bash
+# Qwen2.5-0.5B
+python examples/qwen25_sft.py   --safetensors /path/Qwen2.5-0.5B-Instruct   --data sft.jsonl --tokenizer /path/Qwen2.5-0.5B-Instruct/tokenizer.json   --seq-len 256 --steps 600 --batch 4 --lr 2e-5 --warmup 40 --clip 1.0   --holdout 8 --device cuda --save out_qwen25.npz
+
+# Qwen3-0.6B（同样的命令，只换目录；结构会自动识别）
+python examples/qwen25_sft.py   --safetensors /path/Qwen3-0.6B   --data sft.jsonl --tokenizer /path/Qwen3-0.6B/tokenizer.json   --seq-len 256 --steps 600 --batch 4 --lr 2e-5 --warmup 40 --clip 1.0   --holdout 8 --device cuda --save out_qwen3.npz
+```
+
+开跑后**第一件事是看这两行**（结构不对就别浪费时间）：
+
+```
+权重 310 个；结构 L=28 D=1024 NH=16/KV=8 DH=128 FF=3072 V=151936；tie=True；QK_NORM=True
+探针基线（训练前，留出集平均）= 3.203617
+```
+
+- `DH` 对 Qwen3-0.6B 必须是 **128**（不是 `1024/16=64`）；`QK_NORM=True`；
+- 训练结束会打印 `gnorm 统计：中位数 X` —— **中位数远高于 clip 阈值说明学习率偏大**。
+
+### 10.4 实测参考值（同口径，可直接对照）
+
+| 模型 | 数据 | 步数 | 探针 loss | 降幅 |
+| --- | --- | --- | --- | --- |
+| Qwen2.5-0.5B | persona 56+4，lr 2e-5，B=2 | 60 | 3.1148 → 1.5576 | **−50.0%** |
+| Qwen3-0.6B | persona 56+4，lr 2e-5，B=2 | 60 | 3.2036 → 1.5000 | **−53.2%** |
+
+异质大数据（`sft_big` 1992 条）在 128 截断下只有 −14.8% 且随后回退 ——
+已定位为**截断 + 学习率**两个因素，扫参见 `docs/FINETUNE_RESULTS.md`。
+
+### 10.5 两个坑（都已修，但要知道）
+
+| 坑 | 症状 |
+| --- | --- |
+| **补位 token 计入 loss** | loss 掉得飞快但模型不会说话。检查方法：`dataset_report` 里「答案 token 数 > 总 token 数」是不可能的 |
+| **`cfg` 写死结构** | `reshape (1,127,1024) -> (1,127,896)`。结构参数必须从检查点派生（`cfg_from_checkpoint`） |
+
+### 10.6 别指望直接导出 `.TG`
+
+`.TG` 头里**没有 `head_dim`** 字段。Qwen3-0.6B 的 `head_dim=128 ≠ 1024/16`，
+所以 `export.save_tg` 会**明确拒绝**导出（而不是产出一个能加载、生成全错的模型）。
+训练产物先用 `.npz`；要部署 Qwen3 需要扩展 `.TG` 格式并同步改 C 引擎。
