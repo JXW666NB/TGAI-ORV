@@ -84,14 +84,32 @@ def main(argv=None):
         if not hit:
             bad.append(pat)
 
-    # 2) wheel 里的 .py 全部能编译（挡住缩进/语法错误）
+    # 2) wheel 里的 .py 全部能编译（挡住缩进/语法错误），
+    #    并检查**用户拿到的东西**本身没有 BOM / CRLF。
+    #    这两条以前只写在文档里、没有自动检查，结果包树里 16 个文件带着 CRLF 发布出去了。
+    zf = zipfile.ZipFile(wheel)
+    bom_hit, crlf_hit = [], []
     for n in sorted(names):
+        if not (n.endswith(".py") or n.endswith(".md") or n.endswith(".txt")
+                or n.endswith(".cu") or n.endswith(".h")):
+            continue
+        raw = zf.read(n)
+        if raw.startswith(b"\xef\xbb\xbf"):
+            bom_hit.append(n)
+        if b"\r\n" in raw:
+            crlf_hit.append(n)
         if n.endswith(".py"):
             try:
-                compile(zipfile.ZipFile(wheel).read(n).decode("utf-8-sig"), n, "exec")
+                compile(raw.decode("utf-8-sig"), n, "exec")
             except SyntaxError as exc:
                 print("  语法错误 %s: %s" % (n, exc))
                 bad.append(n)
+    print("  %-42s %s" % ("wheel 内无 BOM", "OK" if not bom_hit else "FAIL %s" % bom_hit[:3]))
+    print("  %-42s %s" % ("wheel 内无 CRLF", "OK" if not crlf_hit else "FAIL %s" % crlf_hit[:3]))
+    if bom_hit:
+        bad.extend(bom_hit)
+    if crlf_hit:
+        bad.extend(crlf_hit)
 
     # 3) 装进干净 venv 再 import（用系统包避免下载 numpy）
     tmp = tempfile.mkdtemp(prefix="orv_pkgchk_")

@@ -1,7 +1,12 @@
-# 变更记录 CHANGELOG
+## [未发布]
 
-版本遵循 [semver](https://semver.org/lang/zh-CN/)：`0.x` 期间不保证接口稳定，
-但**破坏性改动一定写在这里**。
+### 工程 · 行尾与 BOM 规则自动化
+- 全仓文本文件统一为 **UTF-8 无 BOM + LF**：`python/ tools/ tests/ docs/ .github/` 共 259 个文件
+  （其中包树里 16 个 `.py`/`.c` 之前带着 CRLF 被打进了 wheel）。
+- `tools/check_package.py` 新增**wheel 内** BOM/CRLF 检查 —— 检查的是"用户实际拿到的东西"。
+- 新增 `tests/test_hygiene.py`：包树与 docs/tools/tests 出现 BOM/CRLF 会让 CI 变红。
+- 已知欠账（如实记录）：仓库根目录的历史脚本（`tgai*.py` 等）仍是 CRLF，
+  一次性全改会把这 259 个文件的 diff 混进来，留作单独提交。
 
 ## [0.3.0] - 2026-10-31
 

@@ -132,3 +132,22 @@ python tools/verify_all.py --quick  # 跳过打包，约 40 秒
 
 > 说明：Qwen3 真权重对拍需要本机的 `Qwen3-fix.TG`（1.1 GB，不入库）；
 > 找不到时该项会**跳过并标注**，不会假装通过。
+
+---
+
+## 已经「自动化」的规则（不靠自觉）
+
+| 规则 | 谁在管 | 违反会怎样 |
+| --- | --- | --- |
+| 包树/文档/工具目录无 BOM、无 CRLF | `tests/test_hygiene.py` | CI 红 |
+| **wheel 内**无 BOM、无 CRLF | `tools/check_package.py` | 打包自检 FAIL |
+| wheel 内 `.py` 全部可编译 | `tools/check_package.py` | 打包自检 FAIL |
+| 干净 venv 能 import | `tools/check_package.py` | 打包自检 FAIL |
+| 版本号唯一来源 + CHANGELOG 有对应段落 | `tests/test_version.py` | CI 红 |
+| 数值对齐（LLaMA / Qwen2.5 / Qwen3） | `tests/test_*_forward.py`、`tools/verify_all.py` | CI 红 / 门禁 FAIL |
+| 工具链版本风险（NVRTC vs 驱动） | `tgai_go.train.doctor` | 运行时主动警告 |
+| 补位 token 不计入 loss | `tests/test_qwen3_forward.py::test_pad_targets_are_masked` | CI 红 |
+| 数据截断率 / 答案 token 一致性 | `tools/dataset_report.py` 的硬性自检 | 非零退出 |
+
+> 判断一条规则有没有"自动化"，标准很简单：**违反它的时候，有没有东西会红**。
+> 只写在文档里的规则，等于没有规则。
