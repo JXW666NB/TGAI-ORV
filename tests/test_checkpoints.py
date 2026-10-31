@@ -3,6 +3,8 @@
 
 设计约束：**不需要外部模型文件**（CI 里没有），用 gguf.GGUFWriter 现场造一个迷你 GGUF。
 """
+import os
+
 import numpy as np
 import pytest
 
@@ -317,3 +319,33 @@ def test_tg_depermute_2d_inverts_converter_permutation():
     tg = hf[:, perm, :]
     back = C._tg_depermute(tg.reshape(nh * dh, cols), nh, dh).reshape(nh, dh, cols)
     assert np.allclose(back, hf)
+
+
+# ---------------------------------------------------------------------------
+# cfg 适配（两套命名：checkpoints 用 HF 风格，模型类用 D/L/V）
+# ---------------------------------------------------------------------------
+
+def test_cfg_from_checkpoint_maps_keys(tmp_path):
+    """模型类要的键（D/L/V/...）必须从 Checkpoint 的 HF 风格键正确映射。
+
+    这条防的是"main() 里 cfg 写死成 Qwen2.5 的 896，拿 Qwen3（1024）就 reshape 崩"
+    —— 实测崩溃信息：reshape (1,127,1024) -> (1,127,896)。
+    """
+    import importlib.util
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "python"))
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "examples", "qwen25_sft.py")
+    spec = importlib.util.spec_from_file_location("qwen25_sft_cfg", path)
+    q = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(q)
+
+    ck = C.load_safetensors_dir(str(_write_hf_dir(tmp_path, D=96, NH=4, DH=32, L=1, V=128)))
+    cfg = q.cfg_from_checkpoint(ck)
+    assert cfg["D"] == 96 and cfg["L"] == 1 and cfg["V"] == 128
+    assert cfg["NH"] == 4 and cfg["KV"] == 2
+    assert cfg["DH"] == 32                      # ★ head_dim 来自 config.json
+    assert cfg["DH"] != cfg["D"] // cfg["NH"]   # 32 != 24
+    assert cfg["QK_NORM"] is True
+    assert cfg["TIE"] is True

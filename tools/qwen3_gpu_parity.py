@@ -96,8 +96,7 @@ def main(argv=None):
     print("结构：L=%d D=%d NH=%d KV=%d DH=%d FF=%d V=%d theta=%g eps=%g"
           % (cfg["L"], cfg["D"], cfg["NH"], cfg["KV"], cfg["DH"], cfg["FF"],
              cfg["V"], cfg["THETA"], cfg["EPS"]))
-    print("开关：QK_NORM=%s QKV_BIAS=%s TIE=%s  （DH vs D/NH = %s vs %s）"
-          % (cfg["QK_NORM"], cfg["QKV_BIAS"], cfg["TIE"], cfg["DH"], cfg["D"] // cfg["NH"]))
+    print("config 初值：DH=%s（稍后以权重实际内容为准）" % (cfg["DH"],))
 
     print("== 1) transformers 现场算参考（fp32，TF32 已关）==")
     import torch
@@ -116,8 +115,9 @@ def main(argv=None):
                TIE=bool(ck.config.get("tie_embeddings", True)))
     w = dict(ck.weights)
     cfg = q.cfg_from_checkpoint(ck)
-    print("   权重 %d 个；tie=%s；有 lm_head: %s；QK_NORM=%s"
-          % (len(w), cfg["TIE"], "lm_head.weight" in w, cfg["QK_NORM"]))
+    print("   权重 %d 个；tie=%s；有 lm_head: %s" % (len(w), cfg["TIE"], "lm_head.weight" in w))
+    print("   开关（以权重为准）：QK_NORM=%s QKV_BIAS=%s DH=%s vs D/NH=%s"
+          % (cfg["QK_NORM"], cfg["QKV_BIAS"], cfg["DH"], cfg["D"] // cfg["NH"]))
     model = q.Qwen25(cfg, w)
     del w
     ids = np.asarray(IDS, dtype=np.int64).reshape(1, -1)

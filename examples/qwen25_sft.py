@@ -497,14 +497,19 @@ def main(argv=None):
         print("结论：%s" % ("PASS —— SFT 链路可用（前向/反向/AdamW 全通）" if ok else "FAIL"))
         return 0 if ok else 1
 
-    cfg = CFG
+    # ★ 结构参数必须**从检查点派生**，不能写死：Qwen2.5-0.5B 是 D=896，
+    #   Qwen3-0.6B 是 D=1024（且 head_dim=128≠64）。写死会 reshape 崩或静默错位。
     if a.safetensors:
         print("读取 safetensors 目录：%s" % a.safetensors)
-        w = load_safetensors_weights(a.safetensors, cfg)
+        ck = C.load_safetensors_dir(a.safetensors)
     else:
         print("读取 GGUF：%s" % a.gguf)
-        w = load_gguf_weights(a.gguf, cfg)
-    print("权重 %d 个（含独立 lm_head）" % len(w))
+        ck = C.load_gguf(a.gguf)
+    cfg = cfg_from_checkpoint(ck)
+    w = dict(ck.weights)
+    print("权重 %d 个；结构 L=%d D=%d NH=%d/KV=%d DH=%d FF=%d V=%d；tie=%s；QK_NORM=%s"
+          % (len(w), cfg["L"], cfg["D"], cfg["NH"], cfg["KV"], cfg["DH"], cfg["FF"],
+             cfg["V"], cfg["TIE"], cfg["QK_NORM"]))
 
     model = Qwen25(cfg, w)
     print("参数已上卡：%d 个张量" % len(model.params()))
