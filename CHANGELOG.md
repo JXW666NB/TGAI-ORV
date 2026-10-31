@@ -1,5 +1,15 @@
 ## [未发布]
 
+### 工程 · 错误信息质量（算子 / 形状 / 修法）
+- CPU 路径此前直接抛 numpy 裸异常，用户看到的是
+  `operands could not be broadcast together with shapes (3,4) (7,)`、
+  `index 9 is out of bounds for axis 0 with size 5` —— 看不出是哪个算子、怎么改。
+  现在 `RMSNorm` / `Embedding` / `functional.rms_norm` 都在最前面做形状校验，
+  消息统一为「算子: 形状不匹配 —— 输入最后一维 X，期望 Y（x.shape=…）。修法：…」。
+- `cross_entropy` 现在**接受 Tensor 标签**（以前会报 `int() argument must be … not 'Tensor'`）。
+- 新增 `tests/test_error_messages.py`：7 个故障场景断言消息里必须同时有
+  **算子名**、**具体数字**、**修法**，且不得是 numpy 裸异常。9 项用例。
+
 ### 训练 · 真正可续训（存档带优化器状态）
 - `save_params(model, path, opt=None, step=0)`：除参数外还存 `__step` / `__opt_t` /
   `__opt_m_*` / `__opt_v_*`。此前只存参数，AdamW 的动量一丢，**续训等于重启动量**，

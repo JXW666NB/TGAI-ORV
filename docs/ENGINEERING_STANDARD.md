@@ -147,6 +147,7 @@ python tools/verify_all.py --quick  # 跳过打包，约 40 秒
 | 数值对齐（LLaMA / Qwen2.5 / Qwen3） | `tests/test_*_forward.py`、`tools/verify_all.py` | CI 红 / 门禁 FAIL |
 | 工具链版本风险（NVRTC vs 驱动） | `tgai_go.train.doctor` | 运行时主动警告 |
 | 补位 token 不计入 loss | `tests/test_qwen3_forward.py::test_pad_targets_are_masked` | CI 红 |
+| 错误信息含「算子名 + 形状 + 修法」 | `tests/test_error_messages.py` | CI 红 |
 | 数据截断率 / 答案 token 一致性 | `tools/dataset_report.py` 的硬性自检 | 非零退出 |
 
 > 判断一条规则有没有"自动化"，标准很简单：**违反它的时候，有没有东西会红**。

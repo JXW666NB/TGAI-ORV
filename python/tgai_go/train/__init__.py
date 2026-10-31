@@ -2776,6 +2776,16 @@ class Embedding(Module):
         if isinstance(idx, Tensor):
             idx = idx.to_numpy() if getattr(idx, "device", "cpu") == "cuda" else idx.data
         idx = np.asarray(idx, dtype=np.int64)
+        # CPU 路径原本没有校验，越界直接抛 numpy 的
+        # "index 9 is out of bounds for axis 0 with size 5" —— 看不出是哪个算子、怎么修
+        vocab = int(self.weight.shape[0])
+        if idx.size and ((idx < 0) | (idx >= vocab)).any():
+            bad = idx[(idx < 0) | (idx >= vocab)][:4].tolist()
+            raise IndexError(
+                "Embedding: 下标越界 %s，合法范围是 [0, %d)（词表大小 %d）。"
+                "修法：确认 tokenizer 的 id 空间与该模型一致"
+                "（Qwen2.5/Qwen3 词表都是 151936），或检查 --limit/切片是否压过 vocab"
+                % (bad, vocab, vocab))
         if getattr(self.weight, "device", "cpu") == "cuda":
             return self._forward_cuda(idx)
         return self.weight[idx.reshape(-1)].reshape(idx.shape + (self.weight.shape[1],))
@@ -3022,6 +3032,16 @@ class RMSNorm(Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
+        # 形状校验放在最前（CPU/GPU 共用），否则 CPU 上是 numpy 的
+        # "operands could not be broadcast together with shapes (3,4) (7,)" —— 看不出根因
+        d_w = int(self.weight.numel())
+        d_x = int(x.shape[-1]) if getattr(x, "ndim", 0) else 0
+        if d_x != d_w:
+            raise ValueError(
+                "RMSNorm: 形状不匹配 —— 输入最后一维 %d，归一化维度 %d（x.shape=%s）。"
+                "修法：RMSNorm 只归一化最后一维；Qwen3 的 q_norm/k_norm 是 head_dim"
+                "（0.6B 为 128），不是 hidden（1024）"
+                % (d_x, d_w, tuple(getattr(x, "shape", ()))))
         if getattr(x, "device", "cpu") == "cuda":
             return self._forward_cuda(x)
         var = (x * x).mean(axis=-1, keepdims=True)

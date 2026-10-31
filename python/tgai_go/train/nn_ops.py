@@ -63,7 +63,10 @@ def gelu(x, approximate="tanh"):
 def linear(x, weight, bias=None):
     """y = x @ weight.T + bias —— 与 torch.nn.functional.linear 一致（weight 是 [out, in]）。"""
     if weight.ndim != 2:
-        raise ValueError("linear: weight 必须是 2 维 [out, in]，实际 %s" % (weight.shape,))
+        raise ValueError(
+            "linear: shape 不符 —— weight 必须是 2 维 [out, in]，实际 %s。"
+            "修法：Parameter 的初始形状写错了（例如少了一维），"
+            "或把一维 bias 当成 weight 传进来" % (tuple(getattr(weight, "shape", ())),))
     if x.shape[-1] != weight.shape[1]:
         raise ValueError(
             "linear: 形状不匹配 —— x 最后一维 %d，weight 的 in_features %d。"
@@ -77,6 +80,14 @@ def linear(x, weight, bias=None):
 
 def rms_norm(x, weight, eps=1e-6):
     """x / sqrt(mean(x^2)+eps) * weight —— 与 torch.nn.functional.rms_norm 一致。"""
+    d_w = int(weight.numel() if hasattr(weight, "numel") else weight.size)
+    d_x = int(x.shape[-1]) if getattr(x, "ndim", 0) else 0
+    if d_x != d_w:
+        raise ValueError(
+            "rms_norm: 形状不匹配 —— x 最后一维 %d，weight 长度 %d（x.shape=%s）。"
+            "修法：RMSNorm 归一化的是**最后一维**；Qwen3 的 q_norm/k_norm 归一化 head_dim"
+            "（如 128），不是 hidden（如 1024）"
+            % (d_x, d_w, tuple(getattr(x, "shape", ()))))
     s = (x * x).mean(-1, keepdim=True)
     d = (s + eps).sqrt()
     return (x / d) * weight
@@ -552,6 +563,15 @@ def cross_entropy(logits, target, reduction="mean"):
 
     与 `torch.nn.functional.cross_entropy` 一致（默认 mean）。
     """
+    # target 允许传 Tensor（很多人会直接传），不处理的话会报
+    # "TypeError: int() argument must be ... not 'Tensor'"，完全看不出哪错了
+    if hasattr(target, "to_numpy") or hasattr(target, "data"):
+        try:
+            target = target.to_numpy() if hasattr(target, "to_numpy") else target.data
+        except Exception:                          # noqa: BLE001  设备上的张量
+            raise TypeError(
+                "cross_entropy: target 必须在 CPU 上（或先 .to_numpy()）。"
+                "修法：把标签留在 numpy，只把 logits 放设备")
     lg = np.asarray(logits.data, dtype=np.float64)
     tg = np.asarray(target, dtype=np.int64).reshape(-1)
     if lg.ndim != 2:
