@@ -83,6 +83,10 @@ def main(argv=None):
     ap.add_argument("--data", default=None)
     ap.add_argument("--tokenizer", default=None)
     ap.add_argument("--model", default=None, help="safetensors 目录")
+    # 别名：与 examples/qwen25_sft.py 的参数名一致。
+    # 实测踩过：守护脚本按示例的写法传 --safetensors，这里只有 --model，
+    # 于是 argparse 直接报 unrecognized arguments —— 白等 5 小时。
+    ap.add_argument("--safetensors", default=None, help="同 --model（别名）")
     # 默认 256：实测 sft_big 总长 p90=197 / p99=278，seq_len=128 会截断 **27.6%**
     # 的样本（回答被从中间切断），256 降到 2.1%。截断率是"学不动"的常见隐形原因。
     ap.add_argument("--seq-len", type=int, default=256)
@@ -99,6 +103,8 @@ def main(argv=None):
     lrs = [float(x) for x in a.grid.split("=", 1)[1].split(",")]
     batches = [int(x) for x in a.batch.split(",")]
 
+    if a.safetensors and not a.model:
+        a.model = a.safetensors
     base = []
     if a.tiny:
         base = ["--tiny", "--device", a.device]
