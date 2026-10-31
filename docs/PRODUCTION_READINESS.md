@@ -1949,3 +1949,35 @@ lr 2e-5 + warmup 100：不再爆炸，但 1500 步里留出 probe
 当前正在跑：`batch=8, lr=1e-5, warmup=50, 250 步`。
 注意 **A10 上 24h 长稳仍占满 GPU**，所以 SFT 从 0.3 s/step 降到 5~10 s/step —— 这是资源争抢，
 不是引擎退化；等长稳结束（10-31 22:11）后再做干净的性能基线。
+
+
+---
+
+## 尝试给梯度裁剪加速：并行归约内核在 A10 上加载失败（2026-10-31 01:20）
+
+**动机**：`clip_grad_norm_` 的 CUDA 路径依赖 `sumsq_sequential`（**单线程**内核），
+对 1.36 亿元素的嵌入梯度实测把 0.3 s/step 拖到 **36 s/step**，等于不可用。
+
+**做法**：在 `cuda.py` 里加两段并行归约内核
+`sumsq_partial`（256 线程/block，block 内共享内存折半归约）+ `sumsq_final`（单 block 收尾），
+Python 侧加 `sumsq_parallel()`，并把 `clip_grad_norm_` 指过去。
+
+**结果**：A10 上 `cuModuleLoadData` 报
+```
+CudaError: cuModuleLoadData 失败 rc=222 the provided PTX was compiled with an unsupported toolchain
+```
+—— 是整个模块加载失败，**引擎完全不可用**（doctor 也过不去）。
+
+**因果确认**：`git checkout -- cuda.py` 回滚后立刻 `doctor 12/12 PASS` ⇒ 确认是我加的内核引入的。
+
+**已回滚**。根因尚未定位：NVRTC 编译阶段没有报错（否则会是编译日志错误，而不是加载期 rc=222），
+所以不是源码语法问题，更像是这段新增代码触发了 PTX 版本/架构选择上的差异。
+下一步排查方向：抓 NVRTC 的完整 log、显式指定 `--gpu-architecture`、
+用最小复现（只加一个空内核）判断是"代码内容"还是"源码体积/拼接"导致。
+
+### 结论与当前策略
+
+- 训练默认 **不做全局梯度裁剪**（`--clip 0`），改由 **warmup + mini-batch** 抑制爆炸；
+- 要恢复便宜裁剪，必须先解决上述 toolchain 问题，或换一种不新增内核的算法
+  （例如用现有 `mul` + `sum_all`，但单 block 归约在大张量上仍然慢）；
+- 这是**引擎侧的待办优化项**，不影响"能训练"的结论。

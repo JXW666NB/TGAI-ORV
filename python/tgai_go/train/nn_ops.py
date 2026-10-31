@@ -175,6 +175,12 @@ def clip_grad_norm_(params, max_norm):
     **291 次 D2H + 全同步**，实测把 0.3 s/step 拖到 **7.8 s/step（25×）**。
     现在 CUDA 张量走 `sumsq_sequential` 在**设备端**累加平方和，最后只读一个标量；
     缩放用 `scale_inplace` 原地做。CPU 张量（numpy 梯度）走原来的路径。
+
+    ⚠ 已知限制：`sumsq_sequential` 是**单线程**内核，对大张量（1.36 亿元素的嵌入梯度）
+    实测把一步拖到 36 s。我尝试加并行归约内核（两段 block 归约）时，
+    在 A10 的 NVRTC/驱动组合上 `cuModuleLoadData` 报 rc=222（PTX toolchain 不支持），
+    已回滚。**因此训练默认不做全局裁剪（--clip 0）**，改用 warmup + mini-batch 求稳。
+    要恢复便宜裁剪，需要单独排查该 toolchain 问题（保留 NVRTC 日志 + 试不同 arch）。
     """
     rt = None
     try:

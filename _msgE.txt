@@ -1,0 +1,16 @@
+chore(repo)+docs: 移除误入库的 12 个 .bak_* 备份文件；记录并行归约内核的失败与回滚
+
+一、仓库卫生（违反了自己定的工程标准，现已修正）
+  之前把 12 个 *.bak_* 备份文件提交进了仓库 —— 违反"无临时脚本入库"
+  现全部删除 + .gitignore 忽略 *.bak_* / _*.log / _*.py
+  备份改放到仓库外的 _bak/ 目录
+
+二、并行归约内核尝试（已回滚）
+  动机: clip_grad_norm_ 依赖单线程的 sumsq_sequential, 1.36 亿元素梯度上 0.3 -> 36 s/step
+  做法: 加 sumsq_partial(256线程/block + 共享内存折半) + sumsq_final, Python 侧 sumsq_parallel
+  结果: A10 上 cuModuleLoadData 失败 rc=222 (PTX toolchain 不支持) => 整个模块加载失败, 引擎不可用
+  因果: git checkout cuda.py 后 doctor 立刻 12/12 PASS => 确认由新内核引入
+  处理: 回滚; nn_ops 里写明限制与后续排查方向(NVRTC log/显式 arch/最小复现)
+  策略: 训练默认 --clip 0, 用 warmup + mini-batch 求稳; 便宜裁剪列为引擎待办
+
+测试 105 passed。
