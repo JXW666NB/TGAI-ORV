@@ -1481,6 +1481,74 @@ class Tensor:
         out._backward = bw
         return out
 
+    # ---- 日常表达式（补齐 PyTorch 里最常用的那几个） ----
+    def __rtruediv__(self, other):
+        """`2.0 / x` —— 之前直接 TypeError。用已有的除法反传，不新增内核。"""
+        num = Tensor(np.full(tuple(self.shape), float(other), np.float32))
+        return num / self
+
+    def _cmp(self, other, op):
+        """比较运算统一实现：返回 **numpy bool 数组**。
+
+        为什么不是 Tensor：我们的 Tensor 只装浮点，装不了 bool；
+        而 `where(mask, a, b)` 和 `x[mask]` 都是直接吃 numpy 数组的。
+        CUDA 张量这里会 D2H（有拷贝开销），只在控制流里用一次通常可以接受。
+        """
+        rhs = other.to_numpy() if isinstance(other, Tensor) else other
+        return op(self.to_numpy(), rhs)
+
+    def __gt__(self, other):
+        return self._cmp(other, np.greater)
+
+    def __ge__(self, other):
+        return self._cmp(other, np.greater_equal)
+
+    def __lt__(self, other):
+        return self._cmp(other, np.less)
+
+    def __le__(self, other):
+        return self._cmp(other, np.less_equal)
+
+    def masked_fill(self, mask, value):
+        """`x.masked_fill(mask, v)` —— 掩码处置为 v，其余不变（梯度只在未掩码处流）。"""
+        m = mask.to_numpy() if isinstance(mask, Tensor) else np.asarray(mask, dtype=bool)
+        if m.shape != tuple(self.shape):
+            raise ValueError(
+                "masked_fill: mask 形状 %s 与输入 %s 不一致。修法：先 broadcast_to 或 reshape"
+                % (tuple(m.shape), tuple(self.shape)))
+        out = Tensor(np.where(m, np.float32(value), self.data),
+                     requires_grad=self.requires_grad, _parents=(self,))
+        keep = (~m).astype(np.float32)
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, g * keep)
+        out._backward = bw
+        return out
+
+    def tanh(self):
+        """组合式（2*sigmoid(2x)-1）⇒ CPU/CUDA 都能用。"""
+        from . import nn_ops as _O
+        return _O.tanh(self)
+
+    def gelu(self, approximate="tanh"):
+        from . import nn_ops as _O
+        return _O.gelu(self, approximate=approximate)
+
+    def relu(self):
+        """max(x,0)。当前是 numpy 实现 ⇒ CUDA 上明确报错（不静默算错）。"""
+        if self.device == "cuda":
+            self._cpu_only("relu")
+        out = Tensor(np.maximum(self.data, np.float32(0.0)),
+                     requires_grad=self.requires_grad, _parents=(self,))
+        keep = (self.data > 0).astype(np.float32)
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, g * keep)
+        out._backward = bw
+        return out
+
     # ---- 便利 ----
     def scale(self, c):
         return self * c
@@ -2295,6 +2363,24 @@ def load(f, map_location=None):
 
 # ─────────────────────────── functional ───────────────────────────
 class _Functional:
+    @staticmethod
+    def tanh(x: Tensor) -> Tensor:
+        """组合式（2*sigmoid(2x)-1）⇒ CPU/CUDA 都能用。"""
+        from . import nn_ops as _O
+        return _O.tanh(x)
+
+    @staticmethod
+    def gelu(x: Tensor, approximate: str = "tanh") -> Tensor:
+        from . import nn_ops as _O
+        return _O.gelu(x, approximate=approximate)
+
+    @staticmethod
+    def relu(x: Tensor) -> Tensor:
+        """max(x,0)。CUDA 上走 Tensor.relu 会明确报错（当前是 numpy 实现）。"""
+        if isinstance(x, Tensor):
+            return x.relu()
+        return Tensor(np.maximum(np.asarray(x, np.float32), 0.0))
+
     @staticmethod
     def silu(x: Tensor) -> Tensor:
         if getattr(x, "device", "cpu") == "cuda":

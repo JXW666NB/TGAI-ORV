@@ -92,14 +92,24 @@ _REPLACED_CORE = set()
 _CORE_NAMES = None
 
 
-def _core_names():
-    """核心已提供的名字（用于判断是否在覆盖核心）。"""
+def _core_names(kind="functional"):
+    """核心在**对应命名空间**里已提供的名字。
+
+    为什么按命名空间：`functional` 和 `Tensor` 是两个地方。
+    比如核心有 `Tensor.squeeze`（方法），插件想加 `functional.squeeze`（函数）——
+    两者不冲突，不该判成重名。早期把两边并成一个集合，于是 contrib 的
+    `squeeze` 直接被拒（实测踩过）。
+    """
     global _CORE_NAMES
     if _CORE_NAMES is None:
-        names = {n for n in dir(F) if not n.startswith("_")}
-        names |= {n for n in dir(Tensor) if not n.startswith("_")}
-        _CORE_NAMES = names
-    return _CORE_NAMES
+        _CORE_NAMES = {
+            "functional": {n for n in dir(F) if not n.startswith("_")},
+            "tensor": {n for n in dir(Tensor) if not n.startswith("_")},
+        }
+    if kind == "tensor":
+        # 会同时挂到 functional 与 Tensor，所以两边都要比
+        return _CORE_NAMES["functional"] | _CORE_NAMES["tensor"]
+    return _CORE_NAMES["functional"]
 
 
 def register(name, fn, *, kind="functional", doc="", replace=False):
@@ -117,15 +127,15 @@ def register(name, fn, *, kind="functional", doc="", replace=False):
         raise ValueError(
             "算子 %r 已注册（来源：%s）。修法：换一个名字，或显式 replace=True 覆盖"
             % (name, _REGISTRY[name].get("source", "?")))
-    if name in _core_names() and not replace:
+    if name in _core_names(kind) and not replace:
         raise ValueError(
             "算子 %r 与核心算子重名。修法：换名字；确实要替换核心实现请显式 replace=True"
             % (name,))
-    if name in _core_names():
+    if name in _core_names(kind):
         _REPLACED_CORE.add(name)
 
     _REGISTRY[name] = dict(kind=kind, fn=fn, backward=None, doc=doc, source="manual",
-                           replaced_core=name in _core_names())
+                           replaced_core=name in _core_names(kind))
     setattr(F, name, fn)
     if kind == "tensor":
         setattr(Tensor, name, fn)

@@ -1,0 +1,111 @@
+# -*- coding: utf-8 -*-
+"""日常表达式 API 的完备性：写模型时最常用的那些写法必须能用且**梯度对**。
+
+来源：一次可用性探测（写 15 个常见表达式）发现 6 个缺口 ——
+`2.0/x`、`x.relu()`、`x.tanh()`、`functional.gelu`、`x.unsqueeze()`、`x > 0`。
+这些不是"高级功能"，是新人写第一个模型就会撞上的。
+
+注意探测本身也有坑：上一版用 `hasattr(x, "m") else x` 做兜底，
+结果"属性不存在"被当成通过（`masked_fill` 就是这样被误判为 OK 的）。
+这里一律**直接调用**，不做兜底。
+"""
+import numpy as np
+import pytest
+
+torch = pytest.importorskip("torch")
+
+import tgai_go.train as T
+
+
+@pytest.fixture(autouse=True)
+def _cpu():
+    T.set_default_device("cpu")
+    yield
+
+
+def _np(v):
+    """CPU 上 grad 是 numpy 数组，CUDA 上是 Tensor —— 统一取出数值。"""
+    return np.asarray(v.to_numpy() if hasattr(v, "to_numpy") else v, np.float64)
+
+
+def _x(requires_grad=True, vals=(-1.5, -0.5, 0.5, 1.5)):
+    return T.tensor(np.array([vals], np.float32), requires_grad=requires_grad)
+
+
+def test_right_division_by_scalar_has_correct_grad():
+    """`2.0 / x` 的梯度必须是 -2/x²。"""
+    x = _x(vals=(0.5, 1.0, 2.0, 4.0))
+    y = 2.0 / x
+    assert np.allclose(y.to_numpy(), 2.0 / x.to_numpy(), rtol=1e-6)
+    (y * y).sum().backward()          # d/dx sum((2/x)^2) = -8/x^3
+    got = _np(x.grad)
+    want = -8.0 / (x.to_numpy() ** 3)
+    assert np.allclose(got, want, rtol=1e-5), (got, want)
+
+
+def test_comparisons_return_bool_arrays_usable_as_masks():
+    x = _x()
+    for expr, want in ((x > 0, [False, False, True, True]),
+                       (x >= 0.5, [False, False, True, True]),
+                       (x < 0, [True, True, False, False]),
+                       (x <= -0.5, [True, True, False, False])):
+        assert isinstance(expr, np.ndarray) and expr.dtype == bool
+        assert expr.tolist() == [list(map(bool, want))], (expr, want)
+
+    # 掩码要能直接用于 where 与索引
+    y = T.where(x > 0, x, x * 0.1)
+    assert np.allclose(y.to_numpy(), [[-0.15, -0.05, 0.5, 1.5]])
+    assert x.to_numpy()[x > 0].tolist() == [0.5, 1.5]
+
+
+@pytest.mark.parametrize("name,torch_fn", [
+    ("relu", lambda t: torch.relu(t)),
+    ("tanh", lambda t: torch.tanh(t)),
+    ("gelu", lambda t: torch.nn.functional.gelu(t, approximate="tanh")),
+])
+def test_activations_match_torch_value_and_grad(name, torch_fn):
+    vals = (-2.0, -0.3, 0.0, 0.7, 2.5)
+    x = _x(vals=vals)
+    y = getattr(x, name)()
+    r = torch.tensor([vals], requires_grad=True)
+    rt = torch_fn(r)
+    assert np.allclose(y.to_numpy(), rt.detach().numpy(), rtol=1e-6, atol=1e-7), name
+
+    (y * y).sum().backward()
+    (rt * rt).sum().backward()
+    assert np.allclose(_np(x.grad), r.grad.numpy(), rtol=1e-5, atol=1e-6), name
+
+
+def test_functional_exposes_the_same_three():
+    x = _x()
+    for name in ("relu", "tanh", "gelu"):
+        fn = getattr(T.functional, name, None)
+        assert fn is not None, "T.functional 缺 %s（用户第一反应就是找它）" % name
+        assert np.allclose(fn(x).to_numpy(), getattr(x, name)().to_numpy(), rtol=1e-6)
+
+
+def test_masked_fill_zeroes_grad_at_masked_positions():
+    x = _x()
+    y = x.masked_fill(x < 0, 0.0)
+    assert np.allclose(y.to_numpy(), [[0.0, 0.0, 0.5, 1.5]])
+    (y * y).sum().backward()
+    g = _np(x.grad)
+    assert np.allclose(g, [[0.0, 0.0, 1.0, 3.0]]), g   # 2*x 只在未掩码处
+
+
+def test_masked_fill_shape_mismatch_names_fix():
+    x = _x()
+    with pytest.raises(ValueError) as ei:
+        x.masked_fill(np.zeros((3, 3), bool), 0.0)
+    msg = str(ei.value)
+    assert "masked_fill" in msg and "修法" in msg
+
+
+def test_relu_on_cuda_is_refused_loudly():
+    """relu 当前是 numpy 实现：CUDA 上必须**明确报错**，不能静默算错。"""
+    x = _x(requires_grad=False)
+    x.device = "cuda"                                   # 只在属性上伪装，不碰真设备
+    with pytest.raises(Exception) as ei:
+        x.relu()
+    msg = str(ei.value)
+    assert "relu" in msg
