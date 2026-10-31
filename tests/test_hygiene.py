@@ -71,38 +71,53 @@ def test_package_files_are_utf8():
                 pytest.fail("%s 不是合法 UTF-8：%s" % (os.path.relpath(p, REPO), ex))
 
 
-def test_all_ci_relevant_files_are_tracked():
-    """tests/ 下的每个文件都必须被 git 跟踪 —— 否则 CI 上**根本不存在**。
+def test_ci_relevant_files_are_not_gitignored():
+    """tests/ 与 tools/ 里不能有「**被忽略 且 未跟踪**」的文件。
 
-    踩过的坑：`tests/_dp_runner.py` 被 `.gitignore` 里的 `_*.py` 忽略，
-    本地跑得好好的（文件在磁盘上），CI 上子进程直接 FileNotFoundError。
-    这类"本地绿、CI 红"最难查，所以用测试钉住：
-    磁盘上有、但 git 没跟踪的测试文件，一律失败。
+    踩过的坑：`tests/_dp_runner.py` 被 `.gitignore` 的 `_*.py` 忽略，
+    于是只在本地磁盘上存在、**永远提交不进去** ⇒ CI 上子进程 FileNotFoundError，
+    而本地全绿。这类"本地绿、CI 红"最难查。
+
+    判据的两个必要条件是「且」不是「或」：
+    * 已跟踪的文件**不受 .gitignore 影响**（`tools/_qwen_ref.npz` 就是这种：
+      它命中 `*_ref.npz` 但早就入库了，照样在 CI 上存在）；
+    * 新建但还没 `git add` 的文件也不危险 —— 那是正常过程。
+    只有"被忽略 + 没跟踪"才真的进不了仓库。
     """
     import shutil
     import subprocess
 
     if not shutil.which("git"):
-        pytest.skip("没有 git，无法检查跟踪状态")
-    r = subprocess.run(["git", "ls-files"], cwd=REPO,
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if r.returncode != 0:
-        pytest.skip("不是 git 仓库（或 git 不可用）：%s" % (r.stderr or "").strip()[:120])
-    tracked = {p.replace("\\", "/") for p in r.stdout.split()}
-
-    # tests/ 与 tools/ 都必须被跟踪：
-    #   tests/ —— CI 会跑它们；tools/ —— verify_all.py 与文档引用它们。
-    # 磁盘上有、git 没有 => 别人 clone 下来就缺文件（踩过一次：tests/_dp_runner.py）。
+        pytest.skip("没有 git，无法检查忽略状态")
     on_disk = set()
     for top in ("tests", "tools"):
-        for root, dirs, files in os.walk(os.path.join(REPO, top)):
+        root_dir = os.path.join(REPO, top)
+        if not os.path.isdir(root_dir):
+            continue
+        for root, dirs, files in os.walk(root_dir):
             dirs[:] = [d for d in dirs if d not in {"__pycache__", ".pytest_cache"}]
             for fn in files:
                 if fn.endswith(".pyc"):
                     continue
                 on_disk.add(os.path.relpath(os.path.join(root, fn), REPO).replace("\\", "/"))
+    if not on_disk:
+        pytest.skip("tests/ 与 tools/ 都是空的，跳过")
 
-    missing = sorted(on_disk - tracked)
-    assert not missing, (
-        "这些测试文件没被 git 跟踪，CI 上不存在（检查 .gitignore 是不是命中它们了）：%s"
-        % missing)
+    r = subprocess.run(["git", "ls-files"], cwd=REPO, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        pytest.skip("不是 git 仓库：%s" % (r.stderr or "").strip()[:120])
+    tracked = {x.replace("\\", "/") for x in r.stdout.split()}
+    untracked = sorted(on_disk - tracked)
+    if not untracked:
+        return
+
+    r2 = subprocess.run(["git", "check-ignore"] + untracked, cwd=REPO,
+                        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r2.returncode not in (0, 1):
+        pytest.skip("git check-ignore 不可用：%s" % (r2.stderr or "").strip()[:120])
+    ignored = [x for x in (r2.stdout or "").split("\n") if x.strip()]
+    assert not ignored, (
+        "这些文件被 .gitignore 命中且未被跟踪 ⇒ **永远提交不进仓库**，CI 上会缺：\n  "
+        + "\n  ".join(ignored[:10])
+        + "\n修法：改名（不要以下划线开头），或先 git add -f 入库")
