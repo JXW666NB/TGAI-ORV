@@ -14,3 +14,9 @@ examples/_tiny_sft.jsonl
 *.bak_*
 _*.log
 _*.py
+_msg*.txt
+_z_*.py
+_a10_*.py
+_v100_*.py
+_diag_ptx222.py
+_chk.py
