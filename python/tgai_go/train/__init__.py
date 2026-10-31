@@ -2504,6 +2504,68 @@ class _Functional:
 functional = _Functional()
 
 
+# ─────────────────── 梯度检查点（activation recompute） ───────────────────
+
+def checkpoint(fn, *inputs):
+    """用"重算"换显存：`out = checkpoint(fn, x)` 的数值与 `fn(x)` 完全一致，
+    但前向不保留中间激活，反向时重跑一次 fn。
+
+    典型用法：把 Transformer 的一层或一段包起来
+
+        def block(h):
+            return layer(h)
+        h = T.checkpoint(block, h)
+
+    限制（写清楚，避免误用）：
+      * `fn` 必须返回**单个 Tensor**（多输出请自己包成 tuple 再拆，见下）；
+      * `fn` 必须**可重复执行且确定**（含随机性的算子会让重算结果不一致 ——
+        我们的算子里目前没有 dropout，但你自己加的插件若有随机性就不能用）；
+      * 只有"需要梯度"的输入才会被追踪，纯 numpy 输入原样透传。
+    """
+    ts = [x for x in inputs if isinstance(x, Tensor)]
+    need = [x for x in ts if x.requires_grad and getattr(x, "device", "cpu") == "cpu"]
+    if not need:
+        return fn(*inputs)              # 无可求导输入（或在设备上）：直接算，不折腾
+
+    prev = _GRAD_ENABLED[0]
+    _GRAD_ENABLED[0] = False
+    try:
+        with no_grad():
+            out = fn(*inputs)
+    finally:
+        _GRAD_ENABLED[0] = prev
+
+    if not isinstance(out, Tensor):
+        raise TypeError(
+            "checkpoint: fn 必须返回单个 Tensor，实际 %s。"
+            "修法：多输出请包成 lambda，返回一个 Tensor（例如把 tuple 拼起来），"
+            "或对每个输出分别调用 checkpoint" % type(out).__name__)
+
+    # 关键：不连 _parents —— 中间激活因此可以在前向结束后被释放
+    res = Tensor(np.array(out.data, copy=True),
+                 requires_grad=any(x.requires_grad for x in need))
+
+    def bw(g, grads):
+        # 反向时重跑前向（必须重新打开 grad，否则重算出来的图没有 _backward）
+        prev2 = _GRAD_ENABLED[0]
+        _GRAD_ENABLED[0] = True
+        try:
+            re = fn(*inputs)
+        finally:
+            _GRAD_ENABLED[0] = prev2
+        re.backward(g)                  # 梯度直接累加到 inputs.grad
+
+    res._backward = bw
+    return res
+
+
+def checkpoint_sequential(functions, x):
+    """把一串函数（层）逐个包成 checkpoint，等价于连续调用。"""
+    for fn in functions:
+        x = checkpoint(fn, x)
+    return x
+
+
 def _attn_scores(q, k, scale):
     """scores = (q @ k^T) * scale，[BH,S,DH] → [BH,S,S]。
 
@@ -3693,6 +3755,63 @@ class _Optim:
         raise NotImplementedError
 
 
+class LAMB(_Optim):
+    """LAMB：Adam 的逐层自适应更新 + trust ratio（`||p|| / ||u||`）。
+
+    与 AdamW 的唯一区别是**更新量的缩放方式**：
+        p <- p - lr * trust * u,      trust = ||p|| / ||u||
+    所以每一层的相对步长都约等于 lr，对**层间尺度差异大**的网络（大 batch 训练）
+    比 AdamW 稳。
+
+    目前**仅 CPU**：CUDA 张量会明确报错（修法见消息），不做静默退化。
+    """
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-6,
+                 weight_decay=0.0):
+        super().__init__(params, lr)
+        self.b1, self.b2 = betas
+        self.eps = eps
+        self.wd = weight_decay
+        self.m, self.v = [], []
+        for p in self.params:
+            if getattr(p, "device", "cpu") == "cuda":
+                _shape = getattr(p, "shape", None)
+                _shape = tuple(int(x) for x in _shape) if _shape else "(未知形状)"
+                raise NotImplementedError(
+                    "LAMB 目前只支持 CPU 张量（参数 %s 在 cuda 上）。"
+                    "修法：① 先用 AdamW（CUDA 已支持）；② 或把参数搬到 CPU；"
+                    "③ 要真正在 GPU 上用 LAMB，需要照 AdamW 的 CUDA 分支补一套内核调用"
+                    % (_shape,))
+            self.m.append(np.zeros_like(p.data))
+            self.v.append(np.zeros_like(p.data))
+
+    def step(self):
+        self.t += 1
+        bc1 = 1.0 - self.b1 ** self.t
+        bc2 = 1.0 - self.b2 ** self.t
+        for i, p in enumerate(self.params):
+            if p.grad is None:
+                continue
+            g = np.asarray(p.grad.to_numpy() if hasattr(p.grad, "to_numpy") else p.grad,
+                           np.float64)
+            m, v = self.m[i], self.v[i]
+            m *= self.b1
+            m += (1.0 - self.b1) * g
+            v *= self.b2
+            v += (1.0 - self.b2) * (g * g)
+            mhat = m / bc1
+            vhat = v / bc2
+            u = mhat / (np.sqrt(vhat) + self.eps)
+            if self.wd:
+                u = u + self.wd * np.asarray(p.data, np.float64)
+            p_norm = float(np.linalg.norm(np.asarray(p.data, np.float64)))
+            u_norm = float(np.linalg.norm(u))
+            # trust ratio：任一范数为 0 时按 1 处理（与论文的 "selective" 一致地保守）
+            trust = (p_norm / u_norm) if (p_norm > 0.0 and u_norm > 0.0) else 1.0
+            p.data -= (self.lr * trust * u).astype(np.float32)
+        return None
+
+
 class AdamW(_Optim):
     """与 torch.optim.AdamW 语义一致（含 decoupled weight decay）。"""
 
@@ -3909,6 +4028,7 @@ class Muon(_Optim):
 
 class _OptimModule:
     AdamW = AdamW
+    LAMB = LAMB
     Muon = Muon
 
 

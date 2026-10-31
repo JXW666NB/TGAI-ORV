@@ -18,6 +18,8 @@
 | 微调 Qwen2.5-0.5B | 留出集降 ≥5% | **−50.0%**（3.1148→1.5576，60 步） | FINETUNE_RESULTS R11 |
 | 微调 Qwen3-0.6B | 同上 | **−53.2%**（3.2036→1.5000，60 步） | FINETUNE_RESULTS R10 |
 | **RoPE 缩放（Llama-3 / Mistral）** | 与官方 `LlamaForCausalLM` 对拍 logits | llama3 / linear 均 **rel < 1e-5**；yarn/longrope 明确报错 | `tests/test_rope_scaling.py` |
+| **梯度检查点**（activation recompute） | 数值/梯度与不检查点**逐位一致**；保留中间张量 1041 → 41（**−96.1%**） | `tests/test_checkpoint.py` |
+| **LAMB 优化器** | 与独立参考实现 5 步一致；trust ratio 满足 ‖Δp‖=lr·‖p‖ | `tests/test_optimizers_extra.py` |
 | **模型级反向对齐** | 每个参数梯度 vs torch autograd | 全部参数相对误差 **≤1e-4**（含 q_norm / RoPE / GQA / tie 两路合并） | `tests/test_backward_parity.py` |
 | **优化器对齐** | AdamW 逐步 vs `torch.optim.AdamW` | wd ∈ {0, 0.01, 0.1} 各 6 步 **≤1e-5** | `tests/test_adamw_parity.py` |
 | 长跑可续训 | 断点续训轨迹不变 | 「3 步+存档+续 3 步」== 「连续 6 步」末 3 步 | `tests/test_resume.py` |

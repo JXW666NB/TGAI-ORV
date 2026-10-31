@@ -1,5 +1,13 @@
 ## [未发布]
 
+### 新增 · 梯度检查点 + LAMB（对齐 PyTorch 的两项能力）
+- `T.checkpoint(fn, *inputs)` / `T.checkpoint_sequential(fns, x)`：
+  前向不建图、反向重算。实测梯度与不检查点**逐位一致**，保留的中间张量
+  **1041 → 41（−96.1%）**。限制写清：单输出、fn 必须确定性。
+- `T.optim.LAMB`：逐层 trust ratio（`‖p‖/‖u‖`），大 batch 训练用。
+  与测试内独立参考实现 5 步一致；满足 `‖Δp‖ = lr·‖p‖` 不变量。**目前仅 CPU**
+  （CUDA 上明确报错而不是静默退化）。
+
 ### 新增 · RoPE 缩放（Llama-3 / Mistral-v0.3 类模型）
 - 读 `config.json` 的 `rope_scaling`，支持 `linear` 与 `llama3`（分段缩放）；
   **yarn / longrope / dynamic / mrope 明确报错并给修法**，不再静默忽略。
