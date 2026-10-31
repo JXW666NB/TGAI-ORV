@@ -108,6 +108,26 @@ class Qwen25:
             self.ln2.append(m2)
         DH = int(cfg.get("DH") or cfg["D"] // cfg["NH"])
         self.DH = DH
+        # ★ 两处形状自洽性必须显式检查，否则错得**不响**：
+        #   1) GQA 要求 NH % KV == 0。不整除时 repeat_interleave(NH//KV) 会少头，
+        #      之后 reshape 才炸（甚至可能恰好不炸，静默算错）。
+        #   2) q_proj 的行数必须是 NH*DH；DH 取错（比如用 D//NH）时能跑到 reshape 才崩。
+        if int(cfg["KV"]) <= 0 or int(cfg["NH"]) % int(cfg["KV"]) != 0:
+            raise ValueError(
+                "GQA: num_attention_heads(%d) 必须能被 num_key_value_heads(%d) 整除。"
+                "修法：检查权重目录里的 config.json（num_key_value_heads）是否与这份权重匹配"
+                % (int(cfg["NH"]), int(cfg["KV"])))
+        if DH <= 0 or DH % 2 != 0:
+            raise ValueError(
+                "head_dim=%d 非法（必须是正偶数，RoPE 要两两配对）。"
+                "修法：从 config.json 的 head_dim 或 q_proj.shape[0]//n_heads 取" % (DH,))
+        wq = self.p.get("blocks.0.attn.q_proj.weight")
+        if wq is not None and int(wq.shape[0]) != int(cfg["NH"]) * DH:
+            raise ValueError(
+                "形状不自洽：blocks.0.attn.q_proj.weight 有 %d 行，但 n_heads*head_dim=%d"
+                "（n_heads=%d, head_dim=%d）。修法：head_dim 取错了 —— "
+                "Qwen3-0.6B 是 128（不是 1024/16=64）"
+                % (int(wq.shape[0]), int(cfg["NH"]) * DH, int(cfg["NH"]), DH))
         self.qn, self.kn = [], []
         if cfg.get("QK_NORM"):
             for i in range(cfg["L"]):

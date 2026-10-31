@@ -587,6 +587,20 @@ def cross_entropy(logits, target, reduction="mean"):
             % (int(tg.min()), int(tg.max()), lg.shape[1]))
 
     n, v = lg.shape
+    if n == 0:
+        # 空 batch（或整批都被 loss mask 掉）是**真实场景**：
+        # 之前这里直接算 picked.mean()，对空数组返回 NaN，然后 NaN 会顺着
+        # 梯度污染整个模型 —— 而日志上只看到 "loss=nan"。
+        out0 = Tensor(np.asarray(0.0, np.float32),
+                      requires_grad=logits.requires_grad, _parents=(logits,))
+
+        def bw0(g, grads):
+            if not logits.requires_grad:
+                return
+            _acc(grads, logits, np.zeros(tuple(logits.shape), np.float32))
+
+        out0._backward = bw0
+        return out0
     m = lg.max(axis=1, keepdims=True)
     z = lg - m
     lse = np.log(np.exp(z).sum(axis=1, keepdims=True))
