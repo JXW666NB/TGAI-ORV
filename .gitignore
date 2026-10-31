@@ -20,3 +20,6 @@ _a10_*.py
 _v100_*.py
 _diag_ptx222.py
 _chk.py
+_a10_*.sh
+_*.csv
+_sweep_*.csv
