@@ -443,3 +443,101 @@ def load_npz(path):
             continue
         weights[k] = np.asarray(z[k], dtype=np.float32)
     return Checkpoint(weights, cfg, source=path)
+
+
+# ---------------------------------------------------------------------------
+# .TG（我们自己转换出来的格式）
+# ---------------------------------------------------------------------------
+
+def _tg_perm(nh, dh):
+    """.TG 的交错 RoPE 布局：perm[2k]=k, perm[2k+1]=k+dh/2（与 gguf_to_tg.maybe_permute_rope 对齐）。"""
+    perm = np.empty(dh, dtype=np.int64)
+    for k in range(dh // 2):
+        perm[2 * k] = k
+        perm[2 * k + 1] = k + dh // 2
+    return perm
+
+
+def _tg_depermute(a, nh, dh):
+    """把 .TG 的**交错**通道顺序还原成 HF 的 half 布局。
+
+    为什么必须还原：`.TG` 里 q_proj/k_proj/q_norm/k_norm 的通道被转换器按交错 RoPE
+    预置换过；用 half-rope 去算就会错到 rel≈0.44（实测），而且**不会报错**。
+    实测反置换后与官方 HF 对齐到 1e-6。
+    """
+    inv = np.argsort(_tg_perm(nh, dh))
+    if a.ndim == 1:
+        return np.ascontiguousarray(a.reshape(nh, dh)[:, inv].reshape(-1))
+    return np.ascontiguousarray(a.reshape(nh, dh, -1)[:, inv, :].reshape(a.shape))
+
+
+def load_tg(path, max_layers=None, vocab_limit=None):
+    """读 .TG → Checkpoint。max_layers / vocab_limit 用于"切片对拍"（省内存）。"""
+    from ..read_tg import read_tg, load_tensor
+    if not os.path.isfile(path):
+        raise CheckpointError("找不到 .TG 文件：%s。修法：检查路径" % (path,))
+    info = read_tg(path)
+    h = info["header"]
+    n_layers, D, NH = int(h["n_layers"]), int(h["d_model"]), int(h["n_heads"])
+    NKV = int(h.get("num_kv_heads") or NH)
+    q0 = load_tensor(info, "blocks.0.attn.q_proj.weight")
+    if q0 is None:
+        raise CheckpointError(
+            ".TG 里没有 blocks.0.attn.q_proj.weight。修法：确认这是完整模型而不是部分权重")
+    DH = int(q0.shape[0]) // NH          # .TG 头里没有 head_dim，只能从 q_proj 行数推
+    has_qk_norm = load_tensor(info, "blocks.0.attn.q_norm.weight") is not None
+
+    def get(name, nh=None):
+        a = load_tensor(info, name)
+        if a is None:
+            return None
+        if nh is not None:
+            a = _tg_depermute(a, nh, DH)
+        return a
+
+    weights = {}
+    emb = get("token_embedding.weight")
+    if emb is None:
+        raise CheckpointError(".TG 缺少 token_embedding.weight")
+    weights["token_embedding.weight"] = (
+        emb[:vocab_limit] if vocab_limit else emb)
+    fn = get("final_norm.weight")
+    if fn is not None:
+        weights["final_norm.weight"] = fn
+    lm = get("lm_head.weight")
+    tie = lm is None
+    if lm is not None:
+        weights["lm_head.weight"] = lm[:vocab_limit] if vocab_limit else lm
+
+    n = n_layers if max_layers is None else min(max_layers, n_layers)
+    for i in range(n):
+        b = "blocks.%d." % i
+        for key, nh in (("ln1.weight", None), ("ln2.weight", None),
+                        ("attn.q_proj.weight", NH), ("attn.k_proj.weight", NKV),
+                        ("attn.v_proj.weight", None),
+                        ("attn.out_proj.weight", None),
+                        ("attn.q_norm.weight", 1), ("attn.k_norm.weight", 1),
+                        ("ffn.w1.weight", None), ("ffn.w2.weight", None),
+                        ("ffn.w3.weight", None)):
+            a = get(b + key, nh)
+            if a is None:
+                continue
+            if vocab_limit and key == "attn.out_proj.weight":
+                pass
+            weights[b + key] = a
+        for bias in ("q_proj", "k_proj", "v_proj"):
+            a = get(b + "attn.%s.bias" % bias)
+            if a is not None:
+                weights[b + "attn.%s.bias" % bias] = a
+
+    cfg = {"arch": {1: "llama", 2: "mistral", 3: "qwen2"}.get(int(h["arch"]), "qwen2"),
+           "n_layer": n, "n_embd": D, "n_head": NH, "n_head_kv": NKV,
+           "head_dim": DH, "n_ff": int(h["d_ff"]),
+           "vocab_size": int(vocab_limit or h["vocab"]),
+           "rope_theta": float(h["rope_theta"] or 10000.0), "eps": 1e-6,
+           "tie_embeddings": tie, "DH": DH, "QK_NORM": has_qk_norm,
+           "QKV_BIAS": any(k.endswith("q_proj.bias") for k in weights),
+           "TIE": tie}
+    if has_qk_norm:
+        cfg["arch"] = "qwen3"
+    return Checkpoint(weights, cfg, source=path)

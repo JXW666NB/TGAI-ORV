@@ -5,19 +5,42 @@
 
 ## [未发布]
 
-### 新增
-- `examples/qwen25_sft.py`：真实 Qwen2.5 前向 + SFT（GGUF / safetensors 两种权重、权重绑定、
-  bf16 权重兜底、`--tiny` 迷你模式、`--holdout` 留出集、固定探针评估）。
-- `tools/qwen25_gpu_parity.py`：现场用 transformers 算参考 logits，与我们的引擎逐位比对。
-- `tests/test_qwen25_forward.py` / `tests/test_qwen_sft_smoke.py`：Qwen2.5 前向与 SFT 链路的 CPU CI 用例。
+### 修复 · CUDA 地基（重要，影响所有用户）
+- **ptx 加载失败 `rc=222` 的根因**：pip 的 NVRTC（12.8）产出的 PTX ISA **8.7** 高于驱动
+  （CUDA 12.4）支持的 **8.4**，任何**新模块**都会被驱动 JIT 拒绝。
+  此前基线"能跑"只是因为驱动 JIT 缓存里有旧 SASS —— **清缓存后引擎完全不可用**。
+- **修复**：改为**优先加载 cubin**（`--gpu-architecture=sm_86` + `nvrtcGetCUBIN`，SASS 不过 JIT），
+  PTX 作为兜底；两条都失败时报错给出修法（钉 `nvidia-cuda-nvrtc-cu12<12.5` 或升级驱动），
+  并注明"降 arch 到 compute_75 修不了"（已实测）。
+- `doctor` 现在打印**模块形态（cubin/ptx）+ NVRTC/驱动版本**，不匹配时主动警告。
 
-### 修复
-- 转换器：`tie_word_embeddings` 缺失时改为**比对权重数据**判断是否绑定（元数据里常常没有这个键）。
-- `nn_ops.embedding` 补反向（numpy scatter-add），训练时词嵌入才拿得到梯度。
+### 新增 · 检查点（GGUF 直接拿去训练）
+- `tgai_go.train.checkpoints`：`load_gguf` / `load_safetensors_dir` / `save_npz` / `load_npz`
+  → 统一的 `Checkpoint(weights, config)`。
+  - 未知架构 / 量化类型 / 缺必需权重一律**明确报错并给修法**（静默丢权重比崩溃更危险）；
+  - 读 `config.json` 取 `head_dim` / `tie_word_embeddings` / `rope_theta` / `rms_norm_eps`；
+  - `tie=true` 时**丢弃重复的 `lm_head`**（官方 Qwen3 safetensors 带它；Qwen2.5 GGUF 的
+    `output.weight` 与词嵌入逐位相同），并在数据不一致时报错。
 
-### 实测
-- 官方 Qwen2.5-0.5B 权重前向对齐：CUDA 上相对误差 **4.816e-06**。
-- 真实 SFT：A10 单卡 30 步，**留出集 loss 0.965 → 0.452（−53.2%）**，0.3 s/step。
+### 新增 · Qwen3 微调支持
+- `Qwen25` 增加 `DH` / `QK_NORM` / `QKV_BIAS` / `TIE` 四个开关（默认值保持 Qwen2.5 行为）：
+  - **`head_dim` 解耦**：Qwen3-0.6B 是 128 而 `hidden/heads`=64，硬编码必错；
+  - **`q_norm`/`k_norm`**：每个 head 对 `head_dim` 做 RMSNorm，且必须在 **RoPE 之前**；
+  - **无 qkv bias**；`params()` 按 `id()` 去重（tie 参数曾被优化器更新两次）。
+- `tools/qwen3_gpu_parity.py`：与 transformers 现场对拍（**先关 TF32**，失败时用 fp64 归因，
+  并做 `q_norm` 梯度冒烟）。
+
+### 新增 · 性能
+- **并行平方和内核**（两段归约）：1.36 亿元素 **2.665 ms**，原单线程 `sumsq_sequential`
+  需 **7595 ms（2850×）**；且单线程版在 float32 下累积误差达 **63%**，并行版 5e-9。
+  梯度裁剪因此恢复可用（`--clip` 默认 1.0）。
+
+### 工程
+- **CI 安装 CPU 版 torch**：此前 `ci.yml` 只装 numpy/pytest，导致 **117 项里 71 项
+  （所有 torch 对拍）在 CI 里根本没被收集** —— 数值对齐等于没有门禁。
+- 新增 `docs/FINETUNE_RESULTS.md`：微调实测的**唯一事实来源**（R1~R8 全部实验的命令、
+  超参、probe 起止、判定、日志原文、8 个坑）。
+- 测试 129 项（新增 checkpoints 18 项 / Qwen3 6 项 / SFT 冒烟 3 项）。
 
 ## [0.2.0] - 2026-10-30
 

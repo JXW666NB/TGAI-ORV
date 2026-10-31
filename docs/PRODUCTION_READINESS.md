@@ -2101,3 +2101,54 @@ step 20 | train 0.0000      ← 4 条样本被完全过拟合
 ⇒ **梯度、loss mask、优化器、数据链路全部正确**。
 "没学到"是超参/步数问题（2000 样本只跑了 0.05~0.15 个 epoch），不是引擎缺陷。
 这条经验值得记住：**loss 不降先过拟合一个 batch**，能立刻分清"引擎坏了"和"训得不够"。
+
+
+---
+
+## Qwen3 微调支持：真权重前向对拍通过（2026-10-31，CPU）
+
+### 结论
+
+用本机真实 Qwen3 权重（`Qwen3-fix.TG`，前 2 层 + 词表前 1024 行切片）与**官方**
+`transformers.Qwen3ForCausalLM` 对拍：
+
+```
+参考 [0,-1,:3] = [-1.853651, -2.162861, -5.602243]
+我们 [0,-1,:3] = [-1.853652, -2.162865, -5.602244]
+max|Δ| = 1.383e-05     相对误差 = 6.693e-07     判据 ≤1e-5   PASS
+```
+
+这次对拍的三个关键点全部生效：
+`head_dim=128`（而 `hidden/heads = 1024/16 = 64`）、`q_norm/k_norm`（每 head、按 head_dim、
+**在 RoPE 之前**）、`tie_word_embeddings=true`。
+
+> 为什么用切片：完整 28 层在 CPU 上太慢，而 2 层已足以暴露所有**结构性**错误
+> （reshape 维度、q_norm 位置、RoPE 布局、tie）。
+> 为什么用官方 HF 类而不是自己的 torch 孪生：孪生只能验证"两边写法一致"，
+> 验证不了"我们对 Qwen3 的理解是否正确"。
+
+### Qwen3 与 Qwen2.5 的三处硬差异（缺一个就全错）
+
+| # | 差异 | 错了我多少 | 证据 |
+| --- | --- | --- | --- |
+| 1 | `head_dim != hidden/heads`（0.6B/4B 才暴露） | 直接崩或静默错位 | 本机 `.TG` 的 `q_proj` 是 `[2048,1024]` ⇒ DH=128 |
+| 2 | `q_norm/k_norm`：每 head、head_dim、**RoPE 之前** | 不跑 **1.056**；放 rope 后 **0.3025** | 消融实测 |
+| 3 | 无 qkv bias（Qwen2.5 有） | KeyError | GGUF 无任何 `attn_*.bias` |
+
+### `.TG` 的通道置换：必须反置换
+
+`.TG` 里 `q_proj/k_proj/q_norm/k_norm` 的通道被转换器按**交错 RoPE** 预置换过。
+拿 `.TG` 原样配 half-rope 去算，误差 **0.44 且不报错**（最危险的那种错）。
+现在 `checkpoints.load_tg()` 会反置换（`argsort(perm)`）：
+
+- 反置换**不是对合**（`perm` 应用两次 ≠ 恒等），测试按"转换器做 `tg = hf[:, perm]`、
+  还原用 `argsort`"的语义写，而不是想当然的 round-trip；
+- 等价替代方案：保留 `.TG` 布局 + 用交错式 RoPE（实测与 half-rope 等价 1.12e-6），
+  但**两条路只能选一条**，混用 0.44。
+
+### 顺带补的两个能力
+
+- `checkpoints.load_tg()`：`.TG` 也能直接当训练检查点（含切片参数 `max_layers` / `vocab_limit`）；
+- `examples/qwen25_sft.py: cfg_from_checkpoint()`：`checkpoints` 的 HF 风格键
+  （`n_embd/n_layer/vocab_size`）↔ 模型类的 `D/L/V` 的**唯一**转换点
+  （两套命名并存是历史原因，散着写必然漂移）。

@@ -115,6 +115,7 @@ def main(argv=None):
                QKV_BIAS=any(k.endswith("q_proj.bias") for k in ck.weights),
                TIE=bool(ck.config.get("tie_embeddings", True)))
     w = dict(ck.weights)
+    cfg = q.cfg_from_checkpoint(ck)
     print("   权重 %d 个；tie=%s；有 lm_head: %s；QK_NORM=%s"
           % (len(w), cfg["TIE"], "lm_head.weight" in w, cfg["QK_NORM"]))
     model = q.Qwen25(cfg, w)

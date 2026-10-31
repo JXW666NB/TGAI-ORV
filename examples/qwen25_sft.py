@@ -431,6 +431,25 @@ def load_params(model, path):
     return n
 
 
+def cfg_from_checkpoint(ck):
+    """把 `checkpoints.Checkpoint` 的结构配置转换成模型类要的 cfg。
+
+    两套命名并存是历史原因（checkpoints 用 HF 风格 n_embd/n_layer，模型类用 D/L），
+    这里做**唯一**的转换点，避免每个脚本各写一遍（写错就静默出错）。
+    """
+    c = ck.config
+    return dict(V=int(c["vocab_size"] or 0), D=int(c["n_embd"]), L=int(c["n_layer"]),
+                NH=int(c["n_head"]), KV=int(c.get("n_head_kv") or c["n_head"]),
+                FF=int(c.get("n_ff") or 0),
+                THETA=float(c.get("rope_theta", 1e6)),
+                EPS=float(c.get("eps", 1e-6)),
+                DH=int(c.get("head_dim") or (int(c["n_embd"]) // int(c["n_head"]))),
+                QK_NORM=bool(c.get("QK_NORM") or any("q_norm" in k for k in ck.weights)),
+                QKV_BIAS=bool(c.get("QKV_BIAS",
+                                    any(k.endswith("q_proj.bias") for k in ck.weights))),
+                TIE=bool(c.get("tie_embeddings", True)))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--safetensors", default="", help="HF 权重目录（含 model.safetensors）")

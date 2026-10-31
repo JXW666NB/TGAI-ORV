@@ -287,3 +287,33 @@ def test_gguf_untied_keeps_lm_head(tmp_path):
     ck = C.load_gguf(p)
     assert ck.config["tie_embeddings"] is False
     assert "lm_head.weight" in ck.weights
+
+
+# ---------------------------------------------------------------------------
+# .TG 交错布局的反置换
+# ---------------------------------------------------------------------------
+
+def test_tg_depermute_inverts_converter_permutation():
+    """`.TG` 的通道被转换器按交错 RoPE 置换过：`tg = hf[:, perm]`。
+
+    反置换要用 `argsort(perm)`（**不是对合**，perm 应用两次不等于恒等 —— 我第一版
+    测试就错设了这个前提）。语义验证方式：造一个 HF 布局的张量，按转换器的方式置换成
+    .TG 布局，再反置换，必须回到原样。
+    """
+    dh, nh = 8, 2
+    perm = C._tg_perm(nh, dh)
+    hf = np.arange(nh * dh, dtype=np.float32).reshape(nh, dh)
+
+    tg = hf[:, perm]                          # 转换器做的事
+    back = C._tg_depermute(tg.reshape(-1), nh, dh).reshape(nh, dh)
+    assert np.allclose(back, hf), (back, hf)
+    assert not np.allclose(tg, hf)             # 置换确实改变了顺序
+
+
+def test_tg_depermute_2d_inverts_converter_permutation():
+    dh, nh, cols = 4, 2, 3
+    perm = C._tg_perm(nh, dh)
+    hf = np.arange(nh * dh * cols, dtype=np.float32).reshape(nh, dh, cols)
+    tg = hf[:, perm, :]
+    back = C._tg_depermute(tg.reshape(nh * dh, cols), nh, dh).reshape(nh, dh, cols)
+    assert np.allclose(back, hf)
