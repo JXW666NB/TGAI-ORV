@@ -61,9 +61,52 @@ def load_gguf_weights(path, cfg=None):
     return C.load_gguf(path).weights
 
 
-def rope_tables(seq, dh, theta):
-    """标准 rotate_half 的 cos/sin：[S, dh]（前半与后半相同）。"""
+def rope_inv_freq(dh, theta, scaling=None):
+    """RoPE 的逆频率。支持 config.json 里的 `rope_scaling`。
+
+    已实现：
+      * `None` —— 标准 RoPE；
+      * `{"rope_type"|"type": "linear", "factor": f}` —— inv_freq / f（线性插值）；
+      * `{"rope_type"|"type": "llama3", "factor": f, "low_freq_factor": lo,
+         "high_freq_factor": hi, "original_max_position_embeddings": L}` ——
+         Llama-3 的**分段**缩放：低频整体除以 factor、高频不动、中间平滑过渡。
+
+    没实现的类型（yarn / longrope / dynamic / mrope）**明确报错**，不静默忽略 ——
+    静默忽略会让长上下文输出错且没有任何提示。
+    """
     inv = 1.0 / (theta ** (np.arange(0, dh, 2, dtype=np.float64) / dh))
+    if not scaling:
+        return inv
+    stype = str(scaling.get("rope_type") or scaling.get("type") or "").lower()
+    factor = float(scaling.get("factor") or 1.0)
+    if stype in ("", "default", "none"):
+        return inv
+    if stype == "linear":
+        return inv / factor
+    if stype == "llama3":
+        lo = float(scaling.get("low_freq_factor") or 1.0)
+        hi = float(scaling.get("high_freq_factor") or 4.0)
+        old_len = float(scaling.get("original_max_position_embeddings") or 8192)
+        low_wavelen = old_len / lo
+        high_wavelen = old_len / hi
+        wavelen = 2.0 * np.pi / inv
+        # 波长比 low_wavelen 还长（=低频）⇒ 整体除以 factor
+        scaled = np.where(wavelen > low_wavelen, inv / factor, inv)
+        # 中间带做平滑过渡，避免频率出现跳变
+        smooth = (old_len / wavelen - lo) / max(hi - lo, 1e-12)
+        mid = (1.0 - smooth) * inv / factor + smooth * inv
+        is_mid = (wavelen <= low_wavelen) & (wavelen >= high_wavelen)
+        return np.where(is_mid, mid, scaled)
+    raise ValueError(
+        "rope_scaling 类型 %r 尚未实现（已支持: linear / llama3）。"
+        "修法：① 用不带 scaling 的同族模型验证；② 或在本文件 rope_inv_freq 里补上该类型"
+        "（参考 transformers 的 _compute_default_rope_parameters）；"
+        "③ 千万不要直接忽略 —— 长上下文会静默算错" % (stype,))
+
+
+def rope_tables(seq, dh, theta, scaling=None):
+    """rotate_half 布局的 cos/sin：[S, dh]（前半与后半相同）。"""
+    inv = rope_inv_freq(dh, theta, scaling)
     ang = np.outer(np.arange(seq, dtype=np.float64), inv)
     c = np.cos(ang).astype(np.float32)
     s = np.sin(ang).astype(np.float32)
@@ -156,7 +199,8 @@ class Qwen25:
         key = (S, DH)
         cs = self._rope.get(key)
         if cs is None:
-            cos, sin = rope_tables(S, DH, self.cfg["THETA"])
+            cos, sin = rope_tables(S, DH, self.cfg["THETA"],
+                                   self.cfg.get("ROPE_SCALING"))
             cs = (T.tensor(cos[None, :, :]), T.tensor(sin[None, :, :]))
             self._rope[key] = cs
         return cs
@@ -533,7 +577,8 @@ def cfg_from_checkpoint(ck):
                 QK_NORM=bool(c.get("QK_NORM") or any("q_norm" in k for k in ck.weights)),
                 QKV_BIAS=bool(c.get("QKV_BIAS",
                                     any(k.endswith("q_proj.bias") for k in ck.weights))),
-                TIE=bool(c.get("tie_embeddings", True)))
+                TIE=bool(c.get("tie_embeddings", True)),
+                ROPE_SCALING=c.get("rope_scaling") or None)
 
 
 def main(argv=None):

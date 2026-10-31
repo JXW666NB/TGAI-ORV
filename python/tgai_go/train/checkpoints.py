@@ -383,6 +383,9 @@ def load_safetensors_dir(dirpath):
             "n_ff": int(hf.get("intermediate_size") or 0),
             "vocab_size": int(hf.get("vocab_size") or 0),
             "rope_theta": float(hf.get("rope_theta", 10000.0)),
+            # rope_scaling 必须读：Llama-3 / Mistral-v0.3 等靠它把频率分段缩放。
+            # 不读 = 静默忽略 = 长上下文算错且不报错。
+            "rope_scaling": hf.get("rope_scaling") or None,
             "eps": float(hf.get("rms_norm_eps", 1e-6)),
             "tie_embeddings": bool(hf.get("tie_word_embeddings", True)),
         })

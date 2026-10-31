@@ -1,5 +1,11 @@
 ## [未发布]
 
+### 新增 · RoPE 缩放（Llama-3 / Mistral-v0.3 类模型）
+- 读 `config.json` 的 `rope_scaling`，支持 `linear` 与 `llama3`（分段缩放）；
+  **yarn / longrope / dynamic / mrope 明确报错并给修法**，不再静默忽略。
+- 与官方 `transformers.LlamaForCausalLM` 完整 logits 对拍：llama3 / linear 均 **rel < 1e-5**。
+- 为什么重要：忽略 scaling 时短上下文"看着差不多"、长上下文**静默算错**且不报错。
+
 ### 工程 · 错误信息质量（算子 / 形状 / 修法）
 - CPU 路径此前直接抛 numpy 裸异常，用户看到的是
   `operands could not be broadcast together with shapes (3,4) (7,)`、
