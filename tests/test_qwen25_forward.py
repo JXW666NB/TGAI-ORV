@@ -17,7 +17,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CFG = dict(V=128, D=64, L=2, NH=4, KV=2, FF=160, THETA=1e6, EPS=1e-6)
+CFG = dict(V=128, D=64, L=2, NH=4, KV=2, FF=160, THETA=1e6, EPS=1e-6,
+           TIE=False)   # 夹具造的是独立随机 lm_head
 
 
 def _load():

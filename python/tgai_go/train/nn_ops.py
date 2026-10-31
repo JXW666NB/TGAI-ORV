@@ -176,11 +176,12 @@ def clip_grad_norm_(params, max_norm):
     现在 CUDA 张量走 `sumsq_sequential` 在**设备端**累加平方和，最后只读一个标量；
     缩放用 `scale_inplace` 原地做。CPU 张量（numpy 梯度）走原来的路径。
 
-    ⚠ 已知限制：`sumsq_sequential` 是**单线程**内核，对大张量（1.36 亿元素的嵌入梯度）
-    实测把一步拖到 36 s。我尝试加并行归约内核（两段 block 归约）时，
-    在 A10 的 NVRTC/驱动组合上 `cuModuleLoadData` 报 rc=222（PTX toolchain 不支持），
-    已回滚。**因此训练默认不做全局裁剪（--clip 0）**，改用 warmup + mini-batch 求稳。
-    要恢复便宜裁剪，需要单独排查该 toolchain 问题（保留 NVRTC 日志 + 试不同 arch）。
+    走 `sumsq_parallel`（两段并行归约）：1.36 亿元素的嵌入梯度实测 **2.7 ms**，
+    而单线程版要 **7.6 s**（2850×），且单线程版在 float32 下累积误差高达 60%。
+
+    背景：加这个内核时曾在 A10 上 `cuModuleLoadData` 报 rc=222 —— 根因不是内核本身，
+    而是 **NVRTC(12.8) 产 PTX 8.7、驱动(12.4) 只支持 8.4**；基线能跑只因驱动 JIT 缓存。
+    引擎已改为**优先加载 cubin**（SASS 不经 JIT），该问题一并消失。
     """
     rt = None
     try:
@@ -200,7 +201,7 @@ def clip_grad_norm_(params, max_norm):
             gpu = getattr(g, "_gpu", None)
             if gpu is None:
                 return _clip_grad_norm_host(params, max_norm)
-            ss = rt.sumsq_sequential(gpu)
+            ss = rt.sumsq_parallel(gpu)
             acc = ss if acc is None else rt.add(acc, ss)
         if acc is not None:
             total = float(rt.read_scalar(acc))

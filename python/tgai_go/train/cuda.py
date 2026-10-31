@@ -1213,6 +1213,39 @@ extern "C" __global__ void sumsq_sequential(const float* a, float* out, int n) {
     out[0] = s;
 }
 
+/* 并行平方和（两段归约）。大张量必须用这条：
+   sumsq_sequential 是单线程，对 1.36 亿元素的嵌入梯度实测 36 s/step。 */
+extern "C" __global__ void sumsq_partial(const float* a, float* part, int n) {
+    float s = 0.f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+        float v = a[i];
+        s = __fadd_rn(s, __fmul_rn(v, v));
+    }
+    __shared__ float sm[256];
+    sm[threadIdx.x] = s;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (threadIdx.x < off)
+            sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + off]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) part[blockIdx.x] = sm[0];
+}
+
+extern "C" __global__ void sumsq_final(const float* part, float* out, int nb) {
+    float s = 0.f;
+    for (int i = threadIdx.x; i < nb; i += blockDim.x) s = __fadd_rn(s, part[i]);
+    __shared__ float sm[256];
+    sm[threadIdx.x] = s;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (threadIdx.x < off)
+            sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + off]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[0] = sm[0];
+}
+
 /* 基础切片 / repeat_interleave 的前向。
    输出下标按行主序拆开，源下标 = base + sum (coord/div)*stride。
    div 恒 >= 1。切片的 div 是 1，stride 已经乘过 step（可以为负）。
@@ -2467,15 +2500,42 @@ class CudaRuntime:
         except OSError as ex:
             raise CudaError("加载 %s 失败: %s" % (path, ex)) from ex
         self._bind_nvrtc()
-        arch = self._cc_arch()
+        arch = self._cc_arch()                        # compute_86
+        sm = arch.replace("compute_", "sm_")           # sm_86（cubin 要物理架构）
+        # ★ 优先 cubin：驱动只对 PTX 做 JIT，而新版 NVRTC 的 PTX ISA 可能比驱动新
+        #   （实测 NVRTC 12.8 -> .version 8.7，CUDA 12.4 驱动上限 8.4），
+        #   于是任何**新模块** rc=222。基线能跑只因驱动 JIT 缓存里有旧 SASS。
+        cubin_err = None
+        try:
+            cubin = self._compile(sm, want_cubin=True)
+        except Exception as ex:                       # noqa: BLE001
+            cubin, cubin_err = None, ex
+        if cubin:
+            mod = ctypes.c_void_p()
+            buf = ctypes.create_string_buffer(cubin)
+            rc = int(self.cu.cuModuleLoadData(
+                ctypes.byref(mod), ctypes.cast(buf, ctypes.c_void_p)))
+            if rc == 0:
+                self._ptx_keep = buf
+                self.mod = mod
+                self.module_kind = "cubin"
+                return
+            cubin_err = CudaError("cubin 加载失败 rc=%d" % rc)
         ptx = self._compile(arch)
         mod = ctypes.c_void_p()
         buf = ctypes.create_string_buffer(ptx)
-        self._chk(self.cu.cuModuleLoadData(
-            ctypes.byref(mod), ctypes.cast(buf, ctypes.c_void_p)), "cuModuleLoadData")
-        # PTX 缓冲必须活过 load；cuModuleLoadData 会拷贝，但保留引用更稳。
+        try:
+            self._chk(self.cu.cuModuleLoadData(
+                ctypes.byref(mod), ctypes.cast(buf, ctypes.c_void_p)), "cuModuleLoadData")
+        except CudaError as ex:
+            raise CudaError(
+                "%s\n（cubin 也没成功：%s）\n修法：① pip install "
+                "'nvidia-cuda-nvrtc-cu12<12.5' 让 NVRTC 与驱动匹配；② 或升级驱动。"
+                "PTX ISA 版本由 NVRTC 决定，**降 arch 到 compute_75 修不了**（已实测）。"
+                % (ex, cubin_err)) from ex
         self._ptx_keep = buf
         self.mod = mod
+        self.module_kind = "ptx"
 
     def _bind_nvrtc(self):
         n = self.nvrtc
@@ -2497,7 +2557,7 @@ class CudaRuntime:
         n.nvrtcDestroyProgram.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
         n.nvrtcDestroyProgram.restype = ctypes.c_int
 
-    def _compile(self, arch, source=None, cu_name=b"tgai_train.cu"):
+    def _compile(self, arch, source=None, cu_name=b"tgai_train.cu", want_cubin=False):
         # 源码没有 #include。不要把带空格的 CUDA include 塞进 -I，NVRTC 会把空格再拆开。
         if source is None:
             source = _device_source()
@@ -2519,6 +2579,29 @@ class CudaRuntime:
         if rc != 0:
             self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
             raise CudaError("NVRTC 编译失败 arch=%s\n%s" % (arch, log))
+        if want_cubin:
+            # SASS 直接产物：驱动不需要 JIT，不受 PTX ISA 版本闸门约束。
+            # 实测：NVRTC 12.8 产 PTX .version 8.7，CUDA 12.4 驱动上限 8.4 -> rc=222。
+            try:
+                self.nvrtc.nvrtcGetCUBINSize.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+                self.nvrtc.nvrtcGetCUBINSize.restype = ctypes.c_int
+                self.nvrtc.nvrtcGetCUBIN.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                self.nvrtc.nvrtcGetCUBIN.restype = ctypes.c_int
+            except AttributeError as ex:
+                self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+                raise CudaError("这个 NVRTC 不支持 nvrtcGetCUBIN：%s" % (ex,)) from ex
+            sz = ctypes.c_size_t()
+            rc = int(self.nvrtc.nvrtcGetCUBINSize(prog, ctypes.byref(sz)))
+            if rc != 0 or sz.value == 0:
+                self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+                raise CudaError("nvrtcGetCUBINSize 失败 rc=%d（arch=%s）。"
+                                "arch 必须是 sm_XX 物理架构，compute_XX 没有 cubin"
+                                % (rc, arch))
+            buf = ctypes.create_string_buffer(sz.value)
+            self._chk_nvrtc(self.nvrtc.nvrtcGetCUBIN(prog, buf), "nvrtcGetCUBIN", prog)
+            self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+            return buf.raw
         sz = ctypes.c_size_t()
         self._chk_nvrtc(self.nvrtc.nvrtcGetPTXSize(prog, ctypes.byref(sz)), "nvrtcGetPTXSize", prog)
         buf = ctypes.create_string_buffer(sz.value)
@@ -5222,6 +5305,30 @@ class CudaRuntime:
             (1 if do_wd else 0, ctypes.c_int),
             (1 if nesterov else 0, ctypes.c_int),
         ])
+
+    def sumsq_parallel(self, buf):
+        """并行平方和（两段归约），大张量用它。
+
+        `sumsq_sequential` 是单线程，136M 元素梯度实测 36 s/step；
+        这条按 256 线程 × 最多 1024 block 切分。
+        归约顺序与 numpy 左折叠不同，有 ~1e-6 相对差（裁剪用足够）。
+        """
+        n = int(buf.n)
+        if n <= 0:
+            out = self.empty((), dtype=np.float32)
+            self._memset32(out, 0)
+            return out
+        nb = max(1, min(1024, (n + 255) // 256))
+        part = self.empty((nb,), dtype=np.float32)
+        self.launch("sumsq_partial", (nb, 1, 1), (256, 1, 1), [
+            self._ptr(buf), self._ptr(part), (n, ctypes.c_int),
+        ])
+        out = self.empty((), dtype=np.float32)
+        self.launch("sumsq_final", (1, 1, 1), (256, 1, 1), [
+            self._ptr(part), self._ptr(out), (nb, ctypes.c_int),
+        ])
+        out.keepalive = part
+        return out
 
     def sumsq_sequential(self, buf):
         """一个标量：按地址顺序的 sum(x*x)。调用方只把这个标量降回主机。"""

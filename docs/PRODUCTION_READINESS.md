@@ -2028,3 +2028,76 @@ ck.config["n_layer"], ck.config["rope_theta"], ck.tied
 `tests/test_checkpoints.py`：12 项，纯 CPU、**不需要外部模型文件**
 （用 `gguf.GGUFWriter` 现场造迷你 GGUF）。覆盖：映射（含 qwen3 的 q/k_norm）、
 往返读取、未绑定权重、缺权重报错、未知架构报错、量化类型报错、npz 往返。
+
+
+---
+
+## CUDA 地基加固：ptx 222 根因与 cubin 修复（2026-10-31）
+
+### 根因（一次测量定论，不是猜）
+
+在 A10 上跑判别脚本，拿到驱动 JIT 的原话：
+
+```
+[env] nvrtcVersion: 12.8     driverVersion: 12.4     device CC: compute_86
+V0 基线(79 内核)  .version 8.7  -> cuModuleLoadData rc=0
+V1 基线+1 个空内核 .version 8.7  -> rc=222
+     JIT 日志: ptxas: fatal: Unsupported .version 8.7; current version is '8.4'
+V3 基线+等长注释   .version 8.7  -> rc=0        （证明与源码体积无关）
+V6 compute_75     .version 8.7  -> rc=222       （证明降 arch 修不了）
+[cubin sm_86]                   -> rc=0         ★ 修复方向
+```
+
+**结论**：pip 的 NVRTC 12.8 产出 PTX ISA **8.7**，而 CUDA **12.4** 驱动的上限是 **8.4**。
+基线之所以还能跑，**只是因为驱动 JIT 缓存里存着旧 SASS** —— 缓存一清，整个引擎就废。
+这不是"内核写错了"：同一个内核在 NVRTC 阶段完全正常，失败发生在加载期的版本闸门。
+
+### 修复（与 PyTorch 的做法一致）
+
+PyTorch 发布的是**按架构预编译的 cubin**，PTX 只作为兜底；我们改成同样的策略：
+
+1. `_init_kernels()` **优先编译并加载 cubin**（`--gpu-architecture=sm_86` + `nvrtcGetCUBIN`），
+   失败才退回 PTX；
+2. 两条路都失败时，报错里直接给修法（钉 `nvidia-cuda-nvrtc-cu12<12.5` 或升级驱动），
+   并说明"降 arch 修不了"（已实测）；
+3. `engine.module_kind` 记录实际形态（`cubin` / `ptx`）；
+4. `doctor` 打印**模块形态 + NVRTC/驱动版本**，不匹配时主动警告。
+
+### 验证（清缓存后的冷启动，排除侥幸）
+
+```
+rm -rf ~/.nv/ComputeCache
+cold module_kind = cubin
+sgemm ok (冷启动)
+doctor: 引擎模块形态：cubin / NVRTC 12.8 / 驱动 CUDA 12.4 / 12/12 PASS
+```
+
+### 顺带恢复的优化：并行平方和
+
+cubin 修好后，之前"一加就崩"的并行归约内核重新加回并通过：
+
+| 张量 | `sumsq_parallel` | `sumsq_sequential` | 加速 |
+| --- | --- | --- | --- |
+| 136,134,656（嵌入梯度） | **2.665 ms** | 7595.5 ms | **2850×** |
+| 4,358,144 | 2.420 ms | 242.4 ms | 100× |
+| 802,816 | 2.351 ms | 45.1 ms | 19× |
+
+> 附带发现：单线程版在 1.36 亿元素上 **float32 累积误差高达 63%**（rel 6.3e-01），
+> 并行版只有 5e-9。所以这不只是快慢问题，还是正确性问题。
+
+梯度裁剪因此重新可用（`--clip 1.0` 默认开启），实测 `gnorm 15~60` 说明裁剪确实在起作用，
+而开销可忽略（2.4 s/step 与不裁剪同量级）。
+
+### 训练侧的决定性诊断：过拟合一个 batch
+
+之前"2000 样本训不出东西"，按 PyTorch 调试的标准做法先做**过拟合单 batch**：
+
+```
+step  1 | train 1.1433
+step 10 | train 0.0010
+step 20 | train 0.0000      ← 4 条样本被完全过拟合
+```
+
+⇒ **梯度、loss mask、优化器、数据链路全部正确**。
+"没学到"是超参/步数问题（2000 样本只跑了 0.05~0.15 个 epoch），不是引擎缺陷。
+这条经验值得记住：**loss 不降先过拟合一个 batch**，能立刻分清"引擎坏了"和"训得不够"。

@@ -31,6 +31,7 @@ def _report(results):
     print("")
     bad = [r for r in results if not r[1]]
     print("=" * 62)
+    _engine_info()
     if not bad:
         print("自检通过：%d/%d 项 PASS" % (len(results), len(results)))
         print("=" * 62)
@@ -42,6 +43,51 @@ def _report(results):
             print("    怎么办: %s" % hint)
     print("=" * 62)
     return 1
+
+
+def _engine_info():
+    """打印引擎底层状态：模块形态（cubin/ptx）+ NVRTC/驱动版本。
+
+    为什么要有：NVRTC 比驱动新时，PTX 会带更高的 ISA 版本，驱动 JIT 直接拒绝
+    （实测 rc=222 ``Unsupported .version 8.7; current version is '8.4'``）。
+    以前这种情况只会表现为"加个内核就崩"，很难定位。把版本摆在自检里，
+    一眼就能看出环境是否匹配。
+    """
+    try:
+        import ctypes
+        from . import _cuda
+        rt = _cuda()
+        kind = getattr(rt, "module_kind", "?")
+        nvrtc_major = nvrtc_minor = None
+        try:
+            # nvrtcVersion(int *major, int *minor) —— 两个独立输出参数，不是打包值
+            maj, mnr = ctypes.c_int(), ctypes.c_int()
+            rt.nvrtc.nvrtcVersion.argtypes = [
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+            rt.nvrtc.nvrtcVersion.restype = ctypes.c_int
+            if int(rt.nvrtc.nvrtcVersion(ctypes.byref(maj), ctypes.byref(mnr))) == 0:
+                nvrtc_major, nvrtc_minor = int(maj.value), int(mnr.value)
+        except Exception:                          # noqa: BLE001
+            pass
+        drv = None
+        try:
+            d = ctypes.c_int()
+            rt.cu.cuDriverGetVersion(ctypes.byref(d))
+            drv = d.value
+        except Exception:                          # noqa: BLE001
+            pass
+        print("引擎模块形态：%s（cubin=预编译 SASS，不经 JIT；ptx=驱动现场 JIT）" % kind)
+        if nvrtc_major is not None and drv:
+            print("NVRTC %d.%d  /  驱动 CUDA %d.%d"
+                  % (nvrtc_major, nvrtc_minor, drv // 1000, drv % 1000 // 10))
+            # 用 major*100+minor 比较：12.8 vs 12.4 只比主版本会漏判
+            if nvrtc_major * 100 + nvrtc_minor > drv // 1000 * 100 + drv % 1000 // 10:
+                print("  ⚠ NVRTC 主版本高于驱动（危险）：若模块形态是 ptx，"
+                      "新内核会因 PTX ISA 版本过新被拒（rc=222）。"
+                      "修法：pip install 'nvidia-cuda-nvrtc-cu12<12.5' 或升级驱动；"
+                      "cubin 形态不受此影响。")
+    except Exception as ex:                        # noqa: BLE001
+        print("引擎底层信息不可用：%s" % (ex,))
 
 
 def main(argv=None):

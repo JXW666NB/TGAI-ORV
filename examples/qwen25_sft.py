@@ -43,7 +43,8 @@ from tgai_go.train import nn_ops as O  # noqa: E402
 from tgai_go.train import checkpoints as C  # noqa: E402
 
 # Qwen2.5-0.5B-instruct 结构（来自 GGUF 元数据实测）
-CFG = dict(V=151936, D=896, L=24, NH=14, KV=2, FF=4864, THETA=1e6, EPS=1e-6)
+CFG = dict(V=151936, D=896, L=24, NH=14, KV=2, FF=4864, THETA=1e6, EPS=1e-6,
+           DH=64, QK_NORM=False, QKV_BIAS=True, TIE=True)
 
 
 def load_converter():
@@ -75,13 +76,22 @@ class Qwen25:
     def __init__(self, cfg, w, tie=None):
         self.cfg = cfg
         P = T.nn.Parameter
+        w = dict(w)
+        # Qwen3 官方 safetensors **带 lm_head.weight**（tie 模型里它与词嵌入相同）。
+        # 仅凭"有没有 lm_head"判 tie 会把它当成不绑定 ⇒ 微调后两份分家。
+        if cfg.get("TIE", True) and "lm_head.weight" in w:
+            if not np.array_equal(w["lm_head.weight"], w["token_embedding.weight"]):
+                raise ValueError(
+                    "cfg 说 TIE=True，但 lm_head 与词嵌入不一致。"
+                    "修法：检查加载器是否把独立 lm_head 混进来了")
+            w.pop("lm_head.weight")
         self.p = {k: P(T.tensor(np.ascontiguousarray(v.astype(np.float32))))
                   for k, v in w.items()}
         # Qwen2.5-0.5B/1.5B 官方是**权重绑定**的（没有独立 lm_head）：
         # 这时必须让 lm_head 与词嵌入**共享同一个 Parameter 对象**，
         # 复制一份会让两条梯度各走各的，训练后两者就分家了。
         if tie is None:
-            tie = "lm_head.weight" not in self.p
+            tie = bool(cfg.get("TIE", "lm_head.weight" not in self.p))
         self.tie = bool(tie)
         if self.tie:
             self.p["lm_head.weight"] = self.p["token_embedding.weight"]
@@ -96,12 +106,31 @@ class Qwen25:
             m2.weight = self.p[b + "ln2.weight"]
             self.ln1.append(m1)
             self.ln2.append(m2)
+        DH = int(cfg.get("DH") or cfg["D"] // cfg["NH"])
+        self.DH = DH
+        self.qn, self.kn = [], []
+        if cfg.get("QK_NORM"):
+            for i in range(cfg["L"]):
+                b = "blocks.%d." % i
+                for mods, key in ((self.qn, b + "attn.q_norm.weight"),
+                                  (self.kn, b + "attn.k_norm.weight")):
+                    m = T.nn.RMSNorm(DH, eps=cfg["EPS"])     # 只归一化 head_dim
+                    m.weight = self.p[key]
+                    mods.append(m)
         self.final = T.nn.RMSNorm(cfg["D"], eps=cfg["EPS"])
         self.final.weight = self.p["final_norm.weight"]
         self._rope = {}
 
     def params(self):
-        return list(self.p.values())
+        # tie 时 lm_head 与词嵌入是**同一个 Parameter**；重复传给 AdamW 会被更新两次
+        # （实测 lr=1e-2 一步 0.98 而非 0.99；裁剪范数 6.928 vs 5.657）。
+        seen, out = set(), []
+        for prm in self.p.values():
+            if id(prm) in seen:
+                continue
+            seen.add(id(prm))
+            out.append(prm)
+        return out
 
     def _cos_sin(self, S, DH):
         key = (S, DH)
@@ -123,7 +152,7 @@ class Qwen25:
         """ids: numpy int64 [B, S] → logits [B, S, V]"""
         cfg = self.cfg
         D, L, NH, KV, FF = cfg["D"], cfg["L"], cfg["NH"], cfg["KV"], cfg["FF"]
-        DH = D // NH
+        DH = int(cfg.get("DH") or D // NH)      # Qwen3-0.6B: 128 != 1024/16
         B, S = int(ids.shape[0]), int(ids.shape[1])
         p = self.p
         cos_t, sin_t = self._cos_sin(S, DH)
@@ -133,19 +162,26 @@ class Qwen25:
         for i in range(L):
             b = "blocks.%d." % i
             h = self.ln1[i](x).reshape(B * S, D)
-            q = (h @ p[b + "attn.q_proj.weight"].T + p[b + "attn.q_proj.bias"])
-            k = (h @ p[b + "attn.k_proj.weight"].T + p[b + "attn.k_proj.bias"])
-            v = (h @ p[b + "attn.v_proj.weight"].T + p[b + "attn.v_proj.bias"])
+            q = h @ p[b + "attn.q_proj.weight"].T
+            k = h @ p[b + "attn.k_proj.weight"].T
+            v = h @ p[b + "attn.v_proj.weight"].T
+            if cfg.get("QKV_BIAS", True):        # Qwen3 无 qkv bias
+                q = q + p[b + "attn.q_proj.bias"]
+                k = k + p[b + "attn.k_proj.bias"]
+                v = v + p[b + "attn.v_proj.bias"]
             q = q.reshape(B, S, NH, DH).permute(0, 2, 1, 3).reshape(B * NH, S, DH)
             k = k.reshape(B, S, KV, DH).permute(0, 2, 1, 3).reshape(B * KV, S, DH)
             v = v.reshape(B, S, KV, DH).permute(0, 2, 1, 3).reshape(B * KV, S, DH)
+            if cfg.get("QK_NORM"):               # per-head RMSNorm，必须在 RoPE **之前**
+                q = self.qn[i](q)
+                k = self.kn[i](k)
             q = self._rope_apply(q, cos_t, sin_t)
             k = self._rope_apply(k, cos_t, sin_t)
             # GQA：KV 头复制到 Q 头数（在 [B,KV,S,DH] 上按第 1 维展开，避免跨 batch 打乱）
             k = k.reshape(B, KV, S, DH).repeat_interleave(NH // KV, dim=1).reshape(B * NH, S, DH)
             v = v.reshape(B, KV, S, DH).repeat_interleave(NH // KV, dim=1).reshape(B * NH, S, DH)
             o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            o = o.reshape(B, NH, S, DH).permute(0, 2, 1, 3).reshape(B * S, D)
+            o = o.reshape(B, NH, S, DH).permute(0, 2, 1, 3).reshape(B * S, NH * DH)
             x = x + (o @ p[b + "attn.out_proj.weight"].T).reshape(B, S, D)
 
             h2 = self.ln2[i](x).reshape(B * S, D)
@@ -330,10 +366,13 @@ def make_tiny_weights(cfg, seed=0):
     """随机初始化同结构权重（形状与 Qwen2.5 完全一致，只是小很多）。"""
     rng = np.random.default_rng(seed)
     D, L, NH, KV, FF, V = cfg["D"], cfg["L"], cfg["NH"], cfg["KV"], cfg["FF"], cfg["V"]
-    DH = D // NH
+    DH = int(cfg.get("DH") or D // NH)
+    qk_norm = bool(cfg.get("QK_NORM"))
+    qkv_bias = bool(cfg.get("QKV_BIAS", True))
+    tied = bool(cfg.get("TIE", True))
     k = 1.0 / np.sqrt(D)
     w = {"token_embedding.weight": (rng.normal(0, 0.02, (V, D))).astype(np.float32),
-         "lm_head.weight": (rng.normal(0, 0.02, (V, D))).astype(np.float32),
+         **({} if tied else {"lm_head.weight": (rng.normal(0, 0.02, (V, D))).astype(np.float32)}),
          "final_norm.weight": np.ones(D, np.float32)}
     for i in range(L):
         b = "blocks.%d." % i
@@ -343,9 +382,15 @@ def make_tiny_weights(cfg, seed=0):
         w[b + "attn.k_proj.weight"] = (rng.normal(0, k, (KV * DH, D))).astype(np.float32)
         w[b + "attn.v_proj.weight"] = (rng.normal(0, k, (KV * DH, D))).astype(np.float32)
         w[b + "attn.out_proj.weight"] = (rng.normal(0, k, (D, NH * DH))).astype(np.float32)
-        w[b + "attn.q_proj.bias"] = np.zeros(NH * DH, np.float32)
-        w[b + "attn.k_proj.bias"] = np.zeros(KV * DH, np.float32)
-        w[b + "attn.v_proj.bias"] = np.zeros(KV * DH, np.float32)
+        if qkv_bias:
+            w[b + "attn.q_proj.bias"] = np.zeros(NH * DH, np.float32)
+            w[b + "attn.k_proj.bias"] = np.zeros(KV * DH, np.float32)
+            w[b + "attn.v_proj.bias"] = np.zeros(KV * DH, np.float32)
+        if qk_norm:
+            # 真实 Qwen3 的 q_norm/k_norm 不是全 1（实测 mean 1.96 / 3.57），
+            # 这里也用非平凡值，避免"不接线也能过"
+            w[b + "attn.q_norm.weight"] = (1.0 + 0.1 * rng.normal(size=DH)).astype(np.float32)
+            w[b + "attn.k_norm.weight"] = (1.0 + 0.1 * rng.normal(size=DH)).astype(np.float32)
         w[b + "ffn.w1.weight"] = (rng.normal(0, k, (FF, D))).astype(np.float32)
         w[b + "ffn.w2.weight"] = (rng.normal(0, k, (FF, D))).astype(np.float32)
         w[b + "ffn.w3.weight"] = (rng.normal(0, k, (D, FF)) / np.sqrt(FF)).astype(np.float32)
@@ -404,7 +449,7 @@ def main(argv=None):
     ap.add_argument("--holdout", type=int, default=0,
                     help="最后 N 条留作留出集（不参与训练），探针用其中第一条")
     ap.add_argument("--lr", type=float, default=2e-5)
-    ap.add_argument("--clip", type=float, default=0.0,
+    ap.add_argument("--clip", type=float, default=1.0,
                     help="梯度 L2 裁剪阈值（0=不裁；注意引擎的 sumsq_sequential 是单线程，"
                          "大张量上很慢，实测 0.3→36 s/step）")
     ap.add_argument("--warmup", type=int, default=0, help="线性 warmup 步数")

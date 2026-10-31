@@ -30,7 +30,7 @@ def test_tiny_sft_probe_loss_decreases():
     T.set_default_device("cpu")
 
     cfg = dict(q.TINY_CFG)
-    cfg.update(D=32, L=1, NH=2, KV=1, FF=64, V=128)
+    cfg.update(D=32, L=1, NH=2, KV=1, FF=64, V=128, TIE=False)
     model = q.Qwen25(cfg, q.make_tiny_weights(cfg))
     seqs = q.tiny_sequences(cfg, n=3, seq_len=24)
 
