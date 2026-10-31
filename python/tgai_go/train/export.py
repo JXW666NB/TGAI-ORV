@@ -61,7 +61,7 @@ def _engine_name(name, n_experts):
 
 
 def collect(params, n_experts, n_layers, d_model, n_heads, d_ff, vocab, max_seq,
-            rope_theta=10000.0, n_activated=2, n_kv_heads=0):
+            rope_theta=10000.0, n_activated=2, n_kv_heads=0, head_dim=None):
     """把训练侧 dict 变成引擎可写的 (cfg, weights)。"""
     out = {}
     for k, v in params.items():
@@ -72,7 +72,27 @@ def collect(params, n_experts, n_layers, d_model, n_heads, d_ff, vocab, max_seq,
     # ★ 引擎会**直接按指针读** RoPE 的 cos/sin buffer，文件里缺了就是空指针：
     #   实测症状 = generate 时 `access violation reading 0x...`（加载能过，生成才崩）。
     #   这里按与 build_dummy_tg 完全相同的公式补齐。
-    DH = d_model // n_heads
+    # ★ head_dim 必须能单独指定：Qwen3-0.6B 是 128，而 d_model/n_heads = 1024/16 = 64。
+    #   用 d_model//n_heads 硬算会把 RoPE 表和 q_proj 的行数一起弄错，
+    #   且**不会报错** —— 导出的模型加载正常、生成全错。
+    DH = int(head_dim or (d_model // n_heads))
+    if DH <= 0 or DH % 2 != 0:
+        raise ValueError("head_dim=%r 非法（必须是正偶数）。"
+                         "修法：从 config.json 的 head_dim 或 q_proj.shape[0]//n_heads 取"
+                         % (head_dim,))
+    # 权重形状与 head_dim 必须自洽，否则宁可现在报错
+    want = {"attn.q_proj.weight": n_heads * DH,
+            "attn.k_proj.weight": (n_kv_heads or n_heads) * DH,
+            "attn.v_proj.weight": (n_kv_heads or n_heads) * DH}
+    for name, arr in out.items():
+        for suffix, rows in want.items():
+            if name.endswith(suffix) and int(np.shape(arr)[0]) != rows:
+                raise ValueError(
+                    "导出形状不符：%s 的行数是 %d，但 n_heads*head_dim=%d"
+                    "（head_dim=%d, n_heads=%d, n_kv_heads=%d）。"
+                    "修法：确认 head_dim 取自该模型的 config.json，"
+                    "或检查权重是否来自另一个模型"
+                    % (name, int(np.shape(arr)[0]), rows, DH, n_heads, n_kv_heads or n_heads))
     half = DH // 2
     pos = np.arange(max_seq, dtype=np.float64)[:, None]
     inv = float(rope_theta) ** (-2.0 * np.arange(half, dtype=np.float64) / DH)
@@ -99,10 +119,24 @@ def collect(params, n_experts, n_layers, d_model, n_heads, d_ff, vocab, max_seq,
 
 def save_tg(path, params, *, n_layers, d_model, n_heads, d_ff, vocab_tokens, merges=None,
             max_seq=512, n_experts=1, n_activated=1, rope_theta=10000.0,
-            special_ids=None, weight_dtype=DT_FP32, n_kv_heads=0, arch=None):
+            special_ids=None, weight_dtype=DT_FP32, n_kv_heads=0, arch=None,
+            head_dim=None):
     """写 `.TG`。vocab_tokens 是词表（list[str]），merges 是 BPE 合并表。"""
+    # ★ .TG 头字段是 `n_layers/d_model/n_heads/...`，**没有 head_dim**。
+    #   所以只要 head_dim != d_model//n_heads，这个格式就表达不了，
+    #   现有 C 引擎会按 d_model//n_heads 去解析 —— 导出必错、且不报错。
+    #   与其产出一个"能加载、生成全错"的模型，不如在这里停下。
+    natural = d_model // n_heads
+    if head_dim is not None and int(head_dim) != natural:
+        raise ValueError(
+            "无法导出：head_dim=%d，而 .TG 头里只有一个 d_model/n_heads=%d 的隐含值"
+            "（Qwen3-0.6B 这类模型 head_dim=128 而 1024/16=64）。"
+            "修法：① 在 .TG 扩展区写入 head_dim 并同步修改 C 引擎读取逻辑（需两边配合）；"
+            "② 或先不导出该类模型，训练侧继续用 npz 存档；"
+            "③ 若只是本地推理验证，可用 head_dim 与原模型一致的模型（如 Qwen2.5）"
+            % (int(head_dim), natural))
     w = collect(params, n_experts, n_layers, d_model, n_heads, d_ff,
-                len(vocab_tokens), max_seq, rope_theta, n_activated, n_kv_heads)
+                len(vocab_tokens), max_seq, rope_theta, n_activated, n_kv_heads, head_dim)
     kw = {}
     if arch is not None:
         kw["arch"] = arch
