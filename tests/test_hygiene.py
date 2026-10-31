@@ -69,3 +69,36 @@ def test_package_files_are_utf8():
                 b.decode("utf-8")
             except UnicodeDecodeError as ex:        # noqa: PERF203
                 pytest.fail("%s 不是合法 UTF-8：%s" % (os.path.relpath(p, REPO), ex))
+
+
+def test_all_test_files_are_tracked():
+    """tests/ 下的每个文件都必须被 git 跟踪 —— 否则 CI 上**根本不存在**。
+
+    踩过的坑：`tests/_dp_runner.py` 被 `.gitignore` 里的 `_*.py` 忽略，
+    本地跑得好好的（文件在磁盘上），CI 上子进程直接 FileNotFoundError。
+    这类"本地绿、CI 红"最难查，所以用测试钉住：
+    磁盘上有、但 git 没跟踪的测试文件，一律失败。
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("git"):
+        pytest.skip("没有 git，无法检查跟踪状态")
+    r = subprocess.run(["git", "ls-files", "tests"], cwd=REPO,
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        pytest.skip("不是 git 仓库（或 git 不可用）：%s" % (r.stderr or "").strip()[:120])
+    tracked = {p.replace("\\", "/") for p in r.stdout.split()}
+
+    on_disk = set()
+    for root, dirs, files in os.walk(os.path.join(REPO, "tests")):
+        dirs[:] = [d for d in dirs if d not in {"__pycache__", ".pytest_cache"}]
+        for fn in files:
+            if fn.endswith(".pyc"):
+                continue
+            on_disk.add(os.path.relpath(os.path.join(root, fn), REPO).replace("\\", "/"))
+
+    missing = sorted(on_disk - tracked)
+    assert not missing, (
+        "这些测试文件没被 git 跟踪，CI 上不存在（检查 .gitignore 是不是命中它们了）：%s"
+        % missing)

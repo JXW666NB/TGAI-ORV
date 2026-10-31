@@ -22,7 +22,7 @@ import pytest
 pytest.importorskip("multiprocessing.shared_memory")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RUNNER = os.path.join(REPO, "tests", "_dp_runner.py")
+RUNNER = os.path.join(REPO, "tests", "dp_worker.py")   # 别用下划线开头：.gitignore 有 _*.py
 
 
 def _run_two_ranks(tmp_path, job):
