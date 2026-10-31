@@ -31,7 +31,17 @@
 import logging as _logging
 import os as _os
 
-__version__ = '1.4.1'
+# 版本**单一来源**：安装后从发行版元数据取（与 pyproject.toml 保持一致）；
+# 直接在源码目录里跑（没装）时退回下面的字面量。两者由 tests/test_version.py 守着。
+try:
+    from importlib.metadata import PackageNotFoundError as _PNF
+    from importlib.metadata import version as _pkg_version
+    try:
+        __version__ = _pkg_version("tgai-orv")
+    except _PNF:
+        __version__ = "0.3.0"
+except Exception:  # noqa: BLE001  极端老的 Python / 精简环境
+    __version__ = "0.3.0"
 
 # 库默认不往 stdout 输出（脚本版会打印，库不该）
 _logging.getLogger('tgai_go').addHandler(_logging.NullHandler())
