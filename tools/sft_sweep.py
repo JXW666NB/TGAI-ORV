@@ -83,7 +83,9 @@ def main(argv=None):
     ap.add_argument("--data", default=None)
     ap.add_argument("--tokenizer", default=None)
     ap.add_argument("--model", default=None, help="safetensors 目录")
-    ap.add_argument("--seq-len", type=int, default=128)
+    # 默认 256：实测 sft_big 总长 p90=197 / p99=278，seq_len=128 会截断 **27.6%**
+    # 的样本（回答被从中间切断），256 降到 2.1%。截断率是"学不动"的常见隐形原因。
+    ap.add_argument("--seq-len", type=int, default=256)
     ap.add_argument("--limit", type=int, default=2000)
     ap.add_argument("--holdout", type=int, default=8)
     ap.add_argument("--device", default="cuda")
