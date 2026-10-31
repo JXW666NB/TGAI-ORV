@@ -71,7 +71,7 @@ def test_package_files_are_utf8():
                 pytest.fail("%s 不是合法 UTF-8：%s" % (os.path.relpath(p, REPO), ex))
 
 
-def test_all_test_files_are_tracked():
+def test_all_ci_relevant_files_are_tracked():
     """tests/ 下的每个文件都必须被 git 跟踪 —— 否则 CI 上**根本不存在**。
 
     踩过的坑：`tests/_dp_runner.py` 被 `.gitignore` 里的 `_*.py` 忽略，
@@ -84,19 +84,23 @@ def test_all_test_files_are_tracked():
 
     if not shutil.which("git"):
         pytest.skip("没有 git，无法检查跟踪状态")
-    r = subprocess.run(["git", "ls-files", "tests"], cwd=REPO,
+    r = subprocess.run(["git", "ls-files"], cwd=REPO,
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         pytest.skip("不是 git 仓库（或 git 不可用）：%s" % (r.stderr or "").strip()[:120])
     tracked = {p.replace("\\", "/") for p in r.stdout.split()}
 
+    # tests/ 与 tools/ 都必须被跟踪：
+    #   tests/ —— CI 会跑它们；tools/ —— verify_all.py 与文档引用它们。
+    # 磁盘上有、git 没有 => 别人 clone 下来就缺文件（踩过一次：tests/_dp_runner.py）。
     on_disk = set()
-    for root, dirs, files in os.walk(os.path.join(REPO, "tests")):
-        dirs[:] = [d for d in dirs if d not in {"__pycache__", ".pytest_cache"}]
-        for fn in files:
-            if fn.endswith(".pyc"):
-                continue
-            on_disk.add(os.path.relpath(os.path.join(root, fn), REPO).replace("\\", "/"))
+    for top in ("tests", "tools"):
+        for root, dirs, files in os.walk(os.path.join(REPO, top)):
+            dirs[:] = [d for d in dirs if d not in {"__pycache__", ".pytest_cache"}]
+            for fn in files:
+                if fn.endswith(".pyc"):
+                    continue
+                on_disk.add(os.path.relpath(os.path.join(root, fn), REPO).replace("\\", "/"))
 
     missing = sorted(on_disk - tracked)
     assert not missing, (
