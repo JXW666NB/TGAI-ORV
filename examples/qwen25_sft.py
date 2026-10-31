@@ -40,6 +40,7 @@ for cand in (os.path.join(REPO, "python"), REPO):
 import tgai_go.train as T  # noqa: E402
 from tgai_go.train import functional as F  # noqa: E402
 from tgai_go.train import nn_ops as O  # noqa: E402
+from tgai_go.train import checkpoints as C  # noqa: E402
 
 # Qwen2.5-0.5B-instruct 结构（来自 GGUF 元数据实测）
 CFG = dict(V=151936, D=896, L=24, NH=14, KV=2, FF=4864, THETA=1e6, EPS=1e-6)
@@ -54,23 +55,9 @@ def load_converter():
     return mod
 
 
-def load_gguf_weights(path, cfg):
-    """读 GGUF → {转换器命名: np.float32}。名字映射与 .TG 转换完全一致。"""
-    import gguf
-    conv = load_converter()
-    arch = conv.ARCH_CONFIG["qwen2"]
-    rd = gguf.GGUFReader(path)
-    out = {}
-    for t in rd.tensors:
-        nm = conv.map_weight_name(t.name, arch)
-        if nm is None:
-            continue
-        out[nm] = np.asarray(t.data, dtype=np.float32)
-    # 转换器会跳过 output.weight（.TG 里靠权重绑定），但 Qwen2.5 的 lm_head 是独立的
-    for t in rd.tensors:
-        if t.name == "output.weight":
-            out["lm_head.weight"] = np.asarray(t.data, dtype=np.float32)
-    return out
+def load_gguf_weights(path, cfg=None):
+    """薄封装：真正的名字映射与校验在 `tgai_go.train.checkpoints`（单一事实来源）。"""
+    return C.load_gguf(path).weights
 
 
 def rope_tables(seq, dh, theta):
@@ -326,72 +313,15 @@ def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None, clip=0.0,
 # safetensors 加载（HF 官方权重目录）
 # ---------------------------------------------------------------------------
 
-_HF_PATTERNS = [
-    (r"^model\.embed_tokens\.weight$", "token_embedding.weight"),
-    (r"^lm_head\.weight$", "lm_head.weight"),
-    (r"^model\.norm\.weight$", "final_norm.weight"),
-    (r"^model\.layers\.(\d+)\.input_layernorm\.weight$", r"blocks.\1.ln1.weight"),
-    (r"^model\.layers\.(\d+)\.post_attention_layernorm\.weight$", r"blocks.\1.ln2.weight"),
-    (r"^model\.layers\.(\d+)\.self_attn\.q_proj\.(weight|bias)$", r"blocks.\1.attn.q_proj.\2"),
-    (r"^model\.layers\.(\d+)\.self_attn\.k_proj\.(weight|bias)$", r"blocks.\1.attn.k_proj.\2"),
-    (r"^model\.layers\.(\d+)\.self_attn\.v_proj\.(weight|bias)$", r"blocks.\1.attn.v_proj.\2"),
-    (r"^model\.layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$", r"blocks.\1.attn.out_proj.\2"),
-    (r"^model\.layers\.(\d+)\.mlp\.gate_proj\.weight$", r"blocks.\1.ffn.w1.weight"),
-    (r"^model\.layers\.(\d+)\.mlp\.up_proj\.weight$", r"blocks.\1.ffn.w2.weight"),
-    (r"^model\.layers\.(\d+)\.mlp\.down_proj\.weight$", r"blocks.\1.ffn.w3.weight"),
-]
-
-
 def hf_name_to_ours(name):
-    """HF 参数名 → 我们脚本里的命名（与 GGUF 转换器的命名一致）。"""
-    import re as _re
-    for pat, rep in _HF_PATTERNS:
-        if _re.match(pat, name):
-            return _re.sub(pat, rep, name)
-    return None
+    """薄封装：HF 名 → 我方名（与工具共用 checkpoints 里的同一张表）。"""
+    return C.hf_name_to_ours(name)
 
 
-def load_safetensors_weights(dirpath, cfg):
-    """读 HF safetensors 目录 → {我们的名字: np.float32}。"""
-    from safetensors.numpy import load_file
-    path = os.path.join(dirpath, "model.safetensors")
-    if not os.path.isfile(path):
-        raise FileNotFoundError(
-            "找不到 %s。修法：确认 --safetensors 指向含 model.safetensors 的目录" % (path,))
-    try:
-        raw = load_file(path)
-    except TypeError as exc:
-        # 官方权重常是 bfloat16，numpy 没有 bf16 类型 ⇒ 用 torch 转 fp32；
-        # 没有 torch 就明确告知修法，而不是抛一个看不懂的 TypeError。
-        if "bfloat16" not in str(exc):
-            raise
-        try:
-            from safetensors.torch import load_file as tload
-        except ImportError:
-            raise RuntimeError(
-                "权重是 bfloat16，numpy 无法直接读取。修法：pip install torch（用它转 fp32），"
-                "或先把 safetensors 转成 fp16/fp32 再加载") from exc
-        raw = {k: v.float().numpy() for k, v in tload(path).items()}
-    out, unknown = {}, []
-    for k, v in raw.items():
-        ours = hf_name_to_ours(k)
-        if ours is None:
-            unknown.append(k)
-            continue
-        out[ours] = np.asarray(v, dtype=np.float32)
-    if unknown:
-        print("  注意：%d 个 HF 参数未映射（前 3 个：%s）" % (len(unknown), unknown[:3]))
-    need = ["token_embedding.weight", "final_norm.weight"]
-    lack = [k for k in need if k not in out]
-    if lack:
-        raise RuntimeError(
-            "缺少关键权重 %s。修法：检查 safetensors 是否为完整 Qwen2 结构" % (lack,))
-    return out
+def load_safetensors_weights(dirpath, cfg=None):
+    """薄封装：读 HF safetensors 目录，实现在 checkpoints。"""
+    return C.load_safetensors_dir(dirpath).weights
 
-
-# ---------------------------------------------------------------------------
-# tiny 模式：随机权重的迷你 Qwen（用于 CPU/CI 验证 SFT 链路，不需要真权重）
-# ---------------------------------------------------------------------------
 
 TINY_CFG = dict(V=256, D=64, L=2, NH=4, KV=2, FF=128, THETA=1e6, EPS=1e-6)
 

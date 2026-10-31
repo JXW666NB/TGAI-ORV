@@ -1981,3 +1981,50 @@ CudaError: cuModuleLoadData 失败 rc=222 the provided PTX was compiled with an 
 - 要恢复便宜裁剪，必须先解决上述 toolchain 问题，或换一种不新增内核的算法
   （例如用现有 `mul` + `sum_all`，但单 block 归约在大张量上仍然慢）；
 - 这是**引擎侧的待办优化项**，不影响"能训练"的结论。
+
+
+---
+
+## GGUF 直接作为训练检查点（2026-10-31）
+
+新增 `python/tgai_go/train/checkpoints.py`：**GGUF / safetensors / npz 三种来源统一入口**，
+不用先转 .TG 或 .pt 就能拿别人的模型训练。
+
+```python
+from tgai_go.train import checkpoints as C
+ck = C.load_gguf(r"D:\models\qwen2.5-0.5b-fp16.gguf")
+ck.weights["token_embedding.weight"]     # np.float32
+ck.config["n_layer"], ck.config["rope_theta"], ck.tied
+```
+
+实测（本机 CPU，真实文件）：
+
+| 文件 | 结果 |
+| --- | --- |
+| `qwen2.5-0.5b-fp16.gguf` | ✅ 291 张量、`L=24 D=896 NH=14/KV=2 FF=4864 V=151936`、`tie=True`（20.7 s） |
+| `Qwen3-0.6B-Q8_0.gguf` | ✅ **明确报错并给修法**：`量化类型 Q8_0，训练需要浮点权重。修法：用 *-fp16.gguf，或 llama.cpp 的 llama-quantize ... F16` |
+
+### 设计上的三条硬约束（都来自踩过的坑）
+
+1. **不认识的东西要吵**：未知架构 → 列出已支持清单 + 修法；量化类型 → 给出转 F16 的命令；
+   缺必需权重 → 列出缺哪几个（`blk.0.ffn_down.weight` 这种）。
+   —— 因为**静默丢权重**比崩溃更危险：模型能加载、能跑、输出全错。
+2. **名字映射只有一处**：`checkpoints.py` 是唯一事实来源，`examples/qwen25_sft.py` 与
+   转换工具都从这取，避免两套映射漂移（之前转换器与校验脚本各写一份，结果校验脚本
+   把 291 个张量全判成"取不到"）。
+3. **兼容 gguf 包的版本差异**：实测本机版本的 `reader.tensors` 是 **list** 而不是 dict，
+   且 `ReaderTensor.shape` 是 **GGUF 存储反序**（直接用会把 vocab 与 hidden 弄反）。
+   已加 `_as_dict()` / `_meta_value()` 兼容层，并用 `.data` 的实际形状取维度。
+
+### 顺带发现（重要，影响 Qwen3）
+
+`ARCH_CONFIG` 里虽然有 `qwen3`，但 Qwen3 的 GGUF 多了
+`blk.N.attn_q_norm.weight` / `blk.N.attn_k_norm.weight`（每个 head 的 RMSNorm）。
+转换器此前**没有映射这两项** ⇒ 转出来的 .TG 会**静默丢掉**它们，模型输出全错。
+`checkpoints.py` 已补映射，并把它们列入 `REQUIRED_LAYER_KEYS["qwen3"]`（缺了就报错）。
+
+### 测试
+
+`tests/test_checkpoints.py`：12 项，纯 CPU、**不需要外部模型文件**
+（用 `gguf.GGUFWriter` 现场造迷你 GGUF）。覆盖：映射（含 qwen3 的 q/k_norm）、
+往返读取、未绑定权重、缺权重报错、未知架构报错、量化类型报错、npz 往返。
