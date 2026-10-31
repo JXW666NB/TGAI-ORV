@@ -139,3 +139,122 @@ def _():
 
 这样核心永远是「一个精简、可自检、每台机器都能绿」的 LLM 训练引擎，
 而生态由插件自由长出来。
+
+---
+
+# 写一个"别人能用"的插件（生态规范）
+
+上面的最小示例够你自己用。但如果要**发给别人**，还差三样：契约、自检、来源可追溯。
+这三样都已实现，下面给出照抄步骤。
+
+## 1. 加 `PLUGIN` 契约块
+
+在插件文件**末尾**加一个模块级 `PLUGIN` dict：
+
+```python
+PLUGIN = {
+    "name": "my_ops",              # 插件名（小写，建议与文件名一致）
+    "version": "0.1.0",            # 插件自己的版本（semver）
+    "api_version": ops_plugin.API_VERSION,   # 你按哪一版接口写的
+    "author": "你的名字",
+    "description": "一句话说明",
+    "ops": {
+        "my_act": {
+            # 每个位置参数一条：形状 / 取值范围 / 是否需要梯度
+            "test_inputs": [
+                {"shape": [2, 4], "low": -2.0, "high": 2.0,
+                 "requires_grad": True, "seed": 1},
+            ],
+        },
+    },
+}
+```
+
+`test_inputs` 是给**自动数值自检**用的：工具会照这个规格造输入，跑前向，
+再用**中心差分**核对你的反向。没有它，工具只能确认"算子注册上了"，无法验证数学。
+
+## 2. 跑自检
+
+```bash
+python tools/check_plugin.py examples/plugins/squared_relu.py
+```
+
+输出形如：
+
+```
+插件：squared_relu.py
+  加载：OK
+  API：1（引擎 1）  版本：0.1.0  指纹：bcae5f3f4ac7efab…
+  [OK ] squared_relu       前向+梯度 OK（最大相对误差 3.06e-05）
+结论：PASS
+```
+
+反向写错时（比如漏乘系数 2）：
+
+```
+  [FAIL] bad_act            输入 0 的梯度和中心差分差 5.00e-01（阈值 2e-02）。
+                            常见原因：反向的转置方向、sum 的维度、少了/多了系数
+结论：FAIL
+```
+
+> 阈值取 2e-2 是因为引擎跑 float32、中心差分本身有 ~1e-3 误差；
+> 结构性错误（转置反了、符号错了）是 O(1) 量级，一定抓得住。
+
+## 3. 团队/CI 里开严格模式
+
+```bash
+TGAI_OPS_STRICT=1 python your_train_script.py
+```
+
+严格模式（`TGAI_OPS_STRICT=1`）下：
+* 插件没有 `PLUGIN` 契约 → **拒绝加载**；
+* 契约不合规（缺字段、api_version 不匹配、声明了却没注册）→ **拒绝加载**；
+* 被拒绝时会把该插件已注册的算子**回滚**，不留半截状态。
+
+## 4. 看清"现在到底加载了什么"
+
+```python
+from tgai_go.train import ops_plugin
+for r in ops_plugin.manifest():
+    print(r["name"], r["version"], r["sha256"][:16], r["ops"])
+```
+
+每条记录含 **sha256**（插件文件的指纹）与它新注册的算子。
+出问题时把这段贴出来，别人就能确认是不是同一份代码。
+
+## 5. 打包成可安装的插件（可选）
+
+让别人 `pip install` 就能用，靠 entry point：
+
+```toml
+# 你的插件包 pyproject.toml
+[project.entry-points."tgai_go.ops"]
+my_ops = "my_ops_pkg.plugin"
+```
+
+```python
+# 用户侧
+from tgai_go.train import ops_plugin
+ops_plugin.load_entry_points()        # 扫描并加载所有 tgai_go.ops 入口
+```
+
+## 6. 插件作者检查清单
+
+发出去之前逐条对一遍：
+
+- [ ] `PLUGIN` 四项齐全：`name` / `version` / `api_version` / `ops`
+- [ ] 每个算子都有 `test_inputs`，且 `python tools/check_plugin.py` **PASS**
+- [ ] 没有和核心算子重名（要覆盖核心必须显式 `replace=True`，且说明理由）
+- [ ] `register_numpy` 的 `backward` 返回**与输入同顺序**的列表
+- [ ] 边界输入不炸：全零、负数、极大值（`test_inputs` 里可加一组极值）
+- [ ] 文档字符串写清：输入形状、输出形状、是否可导
+- [ ] 说明性能预期（组合式 ≈ 拼出来的算子之和；自带反向绕过融合核，可能更慢）
+
+## 7. 信任模型（先说清楚，别误会）
+
+* 插件是**用户代码**，加载时会被**直接执行**；引擎**不做沙箱**。
+  所以只加载你信任的插件 —— 这点和 pytest 插件、Jupyter 扩展一样。
+* `sha256` 只用于**溯源与复现**，不是签名验证，不能证明"这份代码是安全的"。
+* `TGAI_OPS_STRICT=1` 管的是**契约合规**，不是安全。
+* 想让插件跑在 GPU 上：组合式插件自动跟随后端；`register_numpy` 的插件走 numpy，
+  对 CUDA 也能用，但**绕过了融合核**，性能要自己评估。

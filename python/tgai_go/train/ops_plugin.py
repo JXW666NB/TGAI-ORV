@@ -71,14 +71,21 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
+import time
 
 import numpy as np
 
 from . import Tensor, _acc
 from . import functional as F
 
+#: 插件接口版本。**破坏性改动**（比如 backward 签名变了）必须 +1，
+#: 这样老插件能明确报"接口不兼容"，而不是在某次训练里算出个错数。
+API_VERSION = 1
+
 #: name -> dict(kind, fn, backward, doc, source, replaced_core)
 _REGISTRY = {}
+#: 已加载的插件记录：file / sha256 / ops / api_version / loaded_at
+_LOADED = []
 #: 记录被插件替换掉的核心名字（透明化）
 _REPLACED_CORE = set()
 
@@ -192,17 +199,120 @@ def registered_names():
 
 # ---------------- 发现机制 -------------------------------------------------
 
+def _strict():
+    v = os.environ.get("TGAI_OPS_STRICT", "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+def _rollback(added):
+    """把被拒绝的插件注册过的算子撤掉。
+
+    不撤销的话，严格模式下"拒绝了插件"但注册表已经被污染 ——
+    后续代码仍然能调到它，等于拒绝了个寂寞。
+    """
+    for name in added:
+        try:
+            unregister(name)
+        except Exception:                        # noqa: BLE001  覆盖过核心的没法自动撤
+            pass
+
+
 def load_plugin_file(path):
-    """加载单个 .py 插件文件（模块内调用 register 即可生效）。"""
+    """加载单个 .py 插件文件（模块内调用 register 即可生效）。
+
+    加载后会记录：文件路径、**sha256**、新增了哪些算子、插件声明的 api_version。
+    `TGAI_OPS_STRICT=1` 时，没有 `PLUGIN` 契约的插件会被拒绝 —— 给 CI/团队用。
+    """
+    import hashlib
+
     path = os.path.abspath(path)
     if not os.path.isfile(path):
         raise FileNotFoundError("插件文件不存在：%s" % (path,))
+    raw = open(path, "rb").read()
+    digest = hashlib.sha256(raw).hexdigest()
+
+    before = set(_REGISTRY)
     mod_name = "tgai_plugin_" + os.path.splitext(os.path.basename(path))[0]
     spec = importlib.util.spec_from_file_location(mod_name, path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)
+    added = sorted(set(_REGISTRY) - before)
+
+    info = getattr(mod, "PLUGIN", None)
+    rec = dict(file=path, sha256=digest, ops=added,
+               api_version=(info or {}).get("api_version") if isinstance(info, dict) else None,
+               root=os.path.dirname(path), loaded_at=time.time())
+    if isinstance(info, dict):
+        rec.update({k: info.get(k) for k in ("name", "version", "author", "description")
+                    if info.get(k) is not None})
+        problems = check_contract(info, added)
+        rec["contract_problems"] = problems
+        if problems and _strict():
+            _rollback(added)
+            raise ValueError(
+                "插件 %s 的 PLUGIN 契约不合规（TGAI_OPS_STRICT=1）：\n  %s\n"
+                "修法：按 docs/PLUGINS.md 的契约补齐；或用 python tools/check_plugin.py 逐条修"
+                % (os.path.basename(path), "\n  ".join(problems)))
+    elif _strict():
+        _rollback(added)
+        raise ValueError(
+            "插件 %s 没有 PLUGIN 元数据块（TGAI_OPS_STRICT=1）。\n"
+            "修法：在插件末尾加 PLUGIN = {\"name\": ..., \"version\": ..., "
+            "\"api_version\": %d, \"ops\": {...}}；详见 docs/PLUGINS.md"
+            % (os.path.basename(path), API_VERSION))
+    else:
+        rec["contract_problems"] = ["没有 PLUGIN 元数据块（无法校验接口版本与自检输入）"]
+
+    _LOADED.append(rec)
     return mod
+
+
+def check_contract(info, added_ops=()):
+    """校验插件声明的 PLUGIN 契约，返回问题列表（空 = 合规）。
+
+    契约（都可被工具检查）：
+      * `name` / `version` / `api_version` 必填；
+      * `api_version` 必须与引擎的 `API_VERSION` 主版本一致；
+      * `ops` 里声明的算子在本次加载中必须**真的注册了**；
+      * 每个算子若声明 `test_inputs`，必须是 list[dict]（供 tools/check_plugin.py 做数值自检）。
+    """
+    problems = []
+    if not isinstance(info, dict):
+        return ["PLUGIN 必须是 dict"]
+    for key in ("name", "version", "api_version"):
+        if info.get(key) in (None, ""):
+            problems.append("缺少 %s" % key)
+    api = info.get("api_version")
+    if isinstance(api, int) and api != API_VERSION:
+        problems.append("api_version=%s 与引擎 API_VERSION=%s 不一致" % (api, API_VERSION))
+    ops = info.get("ops")
+    if ops is not None:
+        if not isinstance(ops, dict):
+            problems.append("ops 必须是 dict：{算子名: {...}}")
+        else:
+            added = set(added_ops or ())
+            for name, spec in ops.items():
+                if added and name not in added:
+                    problems.append("ops 里声明了 %r，但本次加载没有注册它" % (name,))
+                if spec is not None and not isinstance(spec, dict):
+                    problems.append("%s 的规格必须是 dict（可含 test_inputs）" % (name,))
+                elif isinstance(spec, dict):
+                    ti = spec.get("test_inputs")
+                    if ti is not None and not (isinstance(ti, list)
+                                               and all(isinstance(x, dict) for x in ti)):
+                        problems.append("%s.test_inputs 必须是 list[dict]" % (name,))
+    return problems
+
+
+def manifest():
+    """当前进程加载过的插件清单（含 sha256，可复现）。"""
+    out = []
+    for r in _LOADED:
+        out.append({k: r.get(k) for k in
+                    ("name", "version", "api_version", "file", "sha256", "ops",
+                     "contract_problems")})
+    return out
 
 
 def load_from_env():
