@@ -51,7 +51,7 @@ def test_hf_name_to_ours():
 # ---------------------------------------------------------------------------
 
 def _write_tiny_gguf(path, arch="llama", n_layer=1, D=8, NH=2, KV=1, FF=16, V=32,
-                     tie=True, drop=()):
+                     tie=True, drop=(), equal_head=False):
     w = gguf.GGUFWriter(path, arch)
     w.add_uint32("%s.block_count" % arch, n_layer)
     w.add_uint32("%s.embedding_length" % arch, D)
@@ -67,10 +67,12 @@ def _write_tiny_gguf(path, arch="llama", n_layer=1, D=8, NH=2, KV=1, FF=16, V=32
         w.add_tensor(name, np.asarray(arr, dtype=np.float32),
                      raw_dtype=gguf.GGMLQuantizationType.F32)
 
-    add("token_embd.weight", np.random.rand(V, D))
+    emb = np.random.rand(V, D).astype(np.float32)
+    add("token_embd.weight", emb)
     add("output_norm.weight", np.ones(D))
     if not tie:
-        add("output.weight", np.random.rand(V, D))
+        # equal_head=True：写出与词嵌入**逐位相同**的 output（模拟 Qwen2.5 GGUF 的真实情况）
+        add("output.weight", emb if equal_head else np.random.rand(V, D))
     DH = D // NH
     for i in range(n_layer):
         add("blk.%d.attn_norm.weight" % i, np.ones(D))
@@ -193,3 +195,95 @@ def test_npz_missing_file_errors():
     with pytest.raises(C.CheckpointError) as ei:
         C.load_npz("D:/nope/ck.npz")
     assert "修法" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# config.json 语义（Qwen3 的 head_dim / tie 只能从这里读）
+# ---------------------------------------------------------------------------
+
+def _write_hf_dir(dirpath, D=96, NH=4, KV=2, DH=32, L=1, V=128, tie=True,
+                  lm_head_equal=True, FF=160):
+    """造一个迷你 HF 权重目录（config.json + model.safetensors）。"""
+    from safetensors.numpy import save_file
+    rng = np.random.default_rng(0)
+    w = {"model.embed_tokens.weight": rng.normal(0, 0.02, (V, D)).astype(np.float32),
+         "model.norm.weight": np.ones(D, np.float32)}
+    if tie:
+        head = (w["model.embed_tokens.weight"] if lm_head_equal
+                else rng.normal(0, 0.02, (V, D)).astype(np.float32))
+        w["lm_head.weight"] = head.astype(np.float32)
+    else:
+        w["lm_head.weight"] = rng.normal(0, 0.02, (V, D)).astype(np.float32)
+    for i in range(L):
+        b = "model.layers.%d." % i
+        w[b + "input_layernorm.weight"] = np.ones(D, np.float32)
+        w[b + "post_attention_layernorm.weight"] = np.ones(D, np.float32)
+        w[b + "self_attn.q_proj.weight"] = rng.normal(0, 0.02, (NH * DH, D)).astype(np.float32)
+        w[b + "self_attn.k_proj.weight"] = rng.normal(0, 0.02, (KV * DH, D)).astype(np.float32)
+        w[b + "self_attn.v_proj.weight"] = rng.normal(0, 0.02, (KV * DH, D)).astype(np.float32)
+        w[b + "self_attn.o_proj.weight"] = rng.normal(0, 0.02, (D, NH * DH)).astype(np.float32)
+        w[b + "mlp.gate_proj.weight"] = rng.normal(0, 0.02, (FF, D)).astype(np.float32)
+        w[b + "mlp.up_proj.weight"] = rng.normal(0, 0.02, (FF, D)).astype(np.float32)
+        w[b + "mlp.down_proj.weight"] = rng.normal(0, 0.02, (D, FF)).astype(np.float32)
+        if DH != D // NH:                      # Qwen3 特征：per-head RMSNorm
+            w[b + "self_attn.q_norm.weight"] = np.ones(DH, np.float32)
+            w[b + "self_attn.k_norm.weight"] = np.ones(DH, np.float32)
+    save_file(w, str(dirpath / "model.safetensors"))
+    import json
+    cfg = {"hidden_size": D, "num_attention_heads": NH, "num_key_value_heads": KV,
+           "num_hidden_layers": L, "vocab_size": V, "intermediate_size": FF,
+           "rope_theta": 1e6, "rms_norm_eps": 1e-6,
+           "tie_word_embeddings": tie}
+    if DH != D // NH:
+        cfg["head_dim"] = DH
+    (dirpath / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+    return dirpath
+
+
+def test_safetensors_reads_head_dim_from_config(tmp_path):
+    """Qwen3-0.6B 的 head_dim=128 而 hidden/heads=64：只猜形状会算错。"""
+    d = _write_hf_dir(tmp_path, D=96, NH=4, DH=32)
+    ck = C.load_safetensors_dir(str(d))
+    assert ck.config["head_dim"] == 32
+    assert ck.config["head_dim"] != ck.config["n_embd"] // ck.config["n_head"]
+    assert "blocks.0.attn.q_norm.weight" in ck.weights
+    assert ck.config["arch"] == "qwen3"
+
+
+def test_safetensors_tie_drops_lm_head(tmp_path):
+    """官方 Qwen3 safetensors 带 lm_head，但 tie=true ⇒ 必须共享而不是两份。"""
+    d = _write_hf_dir(tmp_path, tie=True, lm_head_equal=True)
+    ck = C.load_safetensors_dir(str(d))
+    assert ck.config["tie_embeddings"] is True
+    assert "lm_head.weight" not in ck.weights
+
+
+def test_safetensors_tie_mismatch_raises(tmp_path):
+    d = _write_hf_dir(tmp_path, tie=True, lm_head_equal=False)
+    with pytest.raises(C.CheckpointError) as ei:
+        C.load_safetensors_dir(str(d))
+    assert "tie" in str(ei.value) and "修法" in str(ei.value)
+
+
+def test_safetensors_untied_keeps_lm_head(tmp_path):
+    d = _write_hf_dir(tmp_path, tie=False)
+    ck = C.load_safetensors_dir(str(d))
+    assert ck.config["tie_embeddings"] is False
+    assert "lm_head.weight" in ck.weights
+
+
+def test_gguf_tied_equal_output_is_dropped(tmp_path):
+    """Qwen2.5 的 GGUF：output 与 token_embd 逐位相同 ⇒ 应判 tie 并丢掉 lm_head。"""
+    p = str(tmp_path / "tied.gguf")
+    _write_tiny_gguf(p, arch="qwen2", tie=False, equal_head=True)
+    ck = C.load_gguf(p)
+    assert ck.config["tie_embeddings"] is True
+    assert "lm_head.weight" not in ck.weights
+
+
+def test_gguf_untied_keeps_lm_head(tmp_path):
+    p = str(tmp_path / "untied2.gguf")
+    _write_tiny_gguf(p, arch="qwen2", tie=False, equal_head=False)
+    ck = C.load_gguf(p)
+    assert ck.config["tie_embeddings"] is False
+    assert "lm_head.weight" in ck.weights

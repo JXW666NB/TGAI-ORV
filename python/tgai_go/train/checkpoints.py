@@ -284,6 +284,11 @@ def load_gguf(path):
             "GGUF 缺少必需权重（前几个）：%s。修法：确认文件完整；"
             "若这是 LoRA/部分权重，请先用基座模型合并" % (", ".join(missing[:8]),))
 
+    # tie 时丢掉 output.weight：Qwen2.5 的 GGUF 里 output 与 token_embd 逐位相同，
+    # 留着会被当成独立 lm_head，等于悄悄把 tie 模型训成不 tie。
+    if cfg.get("tie_embeddings", True) and "lm_head.weight" in weights:
+        weights.pop("lm_head.weight", None)
+
     # 没映射上的张量：可能是新架构的新增权重 —— 必须说出来，不能静默丢
     if dropped:
         cfg["dropped_tensors"] = dropped
@@ -356,13 +361,51 @@ def load_safetensors_dir(dirpath):
     if "token_embedding.weight" not in weights:
         raise CheckpointError(
             "缺少 model.embed_tokens.weight。修法：确认是 Qwen2/Qwen3/LLaMA 结构")
-    cfg = {"arch": "qwen3" if "blocks.0.attn.q_norm.weight" in weights else "qwen2",
-           "tie_embeddings": "lm_head.weight" not in weights}
-    n_layer = max((int(k.split(".")[1]) for k in weights if k.startswith("blocks.")),
-                  default=-1) + 1
+    # ★ 结构参数**必须**读 config.json：Qwen3-0.6B 的 head_dim=128 而 hidden/heads=64，
+    #   只靠权重形状猜会退化、直接算错（reshape 就崩）。tie 也要以 config 为准：
+    #   官方 safetensors 里**带 lm_head.weight**，用"有没有"判 tie 会把 tie 模型训成不 tie。
+    cfg = {"arch": "qwen3" if "blocks.0.attn.q_norm.weight" in weights else "qwen2"}
+    jpath = os.path.join(dirpath, "config.json")
+    hf = {}
+    if os.path.isfile(jpath):
+        import json
+        with open(jpath, encoding="utf-8") as f:
+            hf = json.load(f)
+    if hf:
+        D = int(hf["hidden_size"])
+        NH = int(hf["num_attention_heads"])
+        cfg.update({
+            "n_layer": int(hf["num_hidden_layers"]),
+            "n_embd": D,
+            "n_head": NH,
+            "n_head_kv": int(hf.get("num_key_value_heads", NH)),
+            "head_dim": int(hf.get("head_dim") or D // NH),
+            "n_ff": int(hf.get("intermediate_size") or 0),
+            "vocab_size": int(hf.get("vocab_size") or 0),
+            "rope_theta": float(hf.get("rope_theta", 10000.0)),
+            "eps": float(hf.get("rms_norm_eps", 1e-6)),
+            "tie_embeddings": bool(hf.get("tie_word_embeddings", True)),
+        })
+    else:
+        cfg["tie_embeddings"] = "lm_head.weight" not in weights
+    n_layer = cfg.get("n_layer")
+    if n_layer is None:
+        n_layer = max((int(k.split(".")[1]) for k in weights if k.startswith("blocks.")),
+                      default=-1) + 1
+        cfg["n_layer"] = n_layer
     emb = weights["token_embedding.weight"]
-    cfg.update({"n_layer": n_layer, "vocab_size": int(emb.shape[0]),
-                "n_embd": int(emb.shape[1])})
+    cfg.setdefault("vocab_size", int(emb.shape[0]) or 0)
+    if not cfg.get("vocab_size"):
+        cfg["vocab_size"] = int(emb.shape[0])
+    cfg.setdefault("n_embd", int(emb.shape[1]))
+
+    # tie 时丢掉重复的 lm_head（先校验相等，避免把"其实不 tie"的模型强行绑定）
+    if cfg["tie_embeddings"] and "lm_head.weight" in weights:
+        if not np.array_equal(weights["lm_head.weight"], weights["token_embedding.weight"]):
+            raise CheckpointError(
+                "config.json 说 tie_word_embeddings=true，但 lm_head 与词嵌入不一致。"
+                "修法：确认权重目录完整（可能混入了别的模型的 lm_head）")
+        weights.pop("lm_head.weight")
     if dropped:
         print("  注意：%d 个 HF 参数未映射（前 3 个：%s）" % (len(dropped), dropped[:3]))
     return Checkpoint(weights, cfg, source=dirpath)
