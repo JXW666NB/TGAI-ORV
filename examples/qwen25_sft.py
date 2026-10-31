@@ -294,7 +294,8 @@ def _probe_loss(model, ids, seq_len):
 
 
 def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None, clip=0.0,
-        warmup=0, probe_every=25, batch=1, shuffle=True, seed=0):
+        warmup=0, probe_every=25, batch=1, shuffle=True, seed=0,
+        start_step=0, opt=None):
     """最小可用 SFT 循环：AdamW + 交叉熵（全 token）。
 
     注意：训练样本轮转 ⇒ **每步 loss 不可比**（不同样本难度不同）。
@@ -302,19 +303,30 @@ def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None, clip=0.0,
     """
     import time
     cfg = model.cfg
-    opt = T.optim.AdamW(model.params(), lr=lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0)
+    if opt is None:
+        opt = T.optim.AdamW(model.params(), lr=lr, betas=(0.9, 0.95),
+                            eps=1e-8, weight_decay=0.0)
     losses, probes, gnorms = [], [], []
     t0 = time.time()
     base_lr = float(lr)
     rng_s = np.random.default_rng(seed)
-    order = list(range(len(seqs)))
+    # ★ 预先按 seed 生成整条取样计划：第 s 步固定用 plan[s*batch:(s+1)*batch]。
+    #   之前是"跑到 pos==0 才 shuffle"，续训从 step 0 重排 ⇒ 顺序错位、loss 不可比。
+    need = (start_step + steps) * batch
+    plan = []
+    while len(plan) < need:
+        idx = list(range(len(seqs)))
+        if shuffle:
+            rng_s.shuffle(idx)
+        plan.extend(idx)
     # 探针很贵（8 条 × 完整前向 ≈ 0.4 s），不能每步都跑
     if probe is not None:
         base = _probe_multi(model, probe, seq_len)
         probes.append(base)
         print("探针基线（训练前，留出集平均）= %.6f" % (base,))
-    for step in range(steps):
+    for step in range(start_step, start_step + steps):
         # 线性 warmup：真实大模型上 lr 一步到位会炸（实测 probe 0.42 -> 17.2）
+        # 注意用**真实步号** step（续训时 start_step>0，不能重跑 warmup）
         if warmup and step < warmup:
             opt.lr = base_lr * float(step + 1) / float(warmup)
         else:
@@ -326,12 +338,7 @@ def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None, clip=0.0,
                 prm.zero_grad()
 
         # mini-batch：逐条前向/反向，梯度自动累加（batch=1 时噪声大到留出集反而变差）
-        idxs = []
-        for k in range(batch):
-            pos = (step * batch + k) % len(order)
-            if pos == 0 and shuffle:
-                rng_s.shuffle(order)
-            idxs.append(order[pos])
+        idxs = plan[step * batch:(step + 1) * batch]
         for k, si in enumerate(idxs):
             xb, yb = _make_xy(seqs[si], seq_len)
             logits = model.forward(xb)
@@ -347,13 +354,15 @@ def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None, clip=0.0,
 
         losses.append(train_loss)
         pl = None
-        if probe is not None and ((step + 1) % probe_every == 0 or step + 1 == steps):
+        if probe is not None and ((step + 1) % probe_every == 0
+                                  or step + 1 == start_step + steps):
             pl = _probe_multi(model, probe, seq_len)
             probes.append(pl)
         if (step + 1) % log_every == 0:
             extra = ("| probe %.6f " % probes[-1]) if pl is not None else ""
             print("step %3d | train %6.4f %s| gnorm %7.2f | %.1f s/step"
-                  % (step + 1, train_loss, extra, gnorm, (time.time() - t0) / (step + 1)))
+                  % (step + 1, train_loss, extra, gnorm,
+                     (time.time() - t0) / (step + 1 - start_step)))
     # gnorm 中位数是判断"学习率是否合适"最直接的指标，比看 loss 曲线快得多：
     # 中位数远大于 clip 阈值 ⇒ 每步都被裁、有效步长被压扁，方向也被大梯度主导。
     if gnorms:
@@ -421,14 +430,32 @@ def tiny_sequences(cfg, n=4, seq_len=32, seed=1):
     return [rng.integers(0, cfg["V"], size=seq_len).astype(np.int64).tolist() for _ in range(n)]
 
 
-def save_params(model, path):
-    """把当前参数存成 npz（fp32），供后续生成/续训。"""
-    arrays = {k: np.asarray(v.to_numpy(), dtype=np.float32) for k, v in model.p.items()}
+def _to_np(x):
+    """numpy 数组 / Tensor / GpuBuf 统一转成 np.float32。"""
+    if isinstance(x, np.ndarray):
+        return np.asarray(x, dtype=np.float32)
+    if hasattr(x, "to_numpy"):
+        return np.asarray(x.to_numpy(), dtype=np.float32)
+    return np.asarray(T._cuda().d2h(x), dtype=np.float32)
+
+
+def save_params(model, path, opt=None, step=0):
+    """存参数（+ 优化器状态）成 npz，供生成 / **续训**。
+
+    只存参数不够：AdamW 的 m/v/t 丢了，续训等于重启动量，轨迹不连续。
+    """
+    arrays = {k: _to_np(v) for k, v in model.p.items()}
+    arrays["__step"] = np.asarray([int(step)], np.int64)
+    if opt is not None:
+        arrays["__opt_t"] = np.asarray([int(getattr(opt, "t", 0))], np.int64)
+        for i, (m, v) in enumerate(zip(opt.m, opt.v)):
+            arrays["__opt_m_%d" % i] = _to_np(m)
+            arrays["__opt_v_%d" % i] = _to_np(v)
     np.savez(path, **arrays)
     return path
 
 
-def load_params(model, path):
+def load_params(model, path, opt=None):
     """把 npz 里的权重灌回模型（原地覆盖，保持 Parameter 对象不变）。
 
     注意：CUDA 张量的数据在 `_gpu`（GpuBuf）里，`.data` 是 None ——
@@ -447,7 +474,27 @@ def load_params(model, path):
             p.data[...] = arr
         seen.add(id(p))
         n += 1
-    return n
+    # 优化器状态（有就恢复；老存档没这些键 ⇒ 保持"只恢复参数"的旧行为）
+    state = {"params": n, "step": int(z["__step"][0]) if "__step" in z.files else 0,
+             "opt": False}
+    if opt is not None and "__opt_t" in z.files:
+        opt.t = int(z["__opt_t"][0])
+        rt = None
+        for i in range(len(opt.m)):
+            km, kv = "__opt_m_%d" % i, "__opt_v_%d" % i
+            if km not in z.files or kv not in z.files:
+                continue
+            am = np.ascontiguousarray(np.asarray(z[km], dtype=np.float32))
+            av = np.ascontiguousarray(np.asarray(z[kv], dtype=np.float32))
+            if isinstance(opt.m[i], np.ndarray):
+                opt.m[i][...] = am
+                opt.v[i][...] = av
+            else:                                  # GpuBuf：换缓冲
+                rt = rt or T._cuda()
+                opt.m[i] = rt.h2d(am)
+                opt.v[i] = rt.h2d(av)
+        state["opt"] = True
+    return state
 
 
 def cfg_from_checkpoint(ck):
@@ -484,6 +531,8 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, default=8, help="最多取多少条样本")
     ap.add_argument("--save", default="", help="训练后保存权重的 npz 路径")
     ap.add_argument("--load", default="", help="从 npz 加载权重（生成/续训前）")
+    ap.add_argument("--resume", default="",
+                    help="从 npz **续训**：恢复参数 + AdamW 动量 + 步号（与 --load 的区别是后者只恢复参数）")
     ap.add_argument("--holdout", type=int, default=0,
                     help="最后 N 条留作留出集（不参与训练），探针用其中第一条")
     ap.add_argument("--lr", type=float, default=2e-5)
@@ -572,14 +621,23 @@ def main(argv=None):
         else:
             train_seqs = seqs
             probe = seqs[0]
+        opt = T.optim.AdamW(model.params(), lr=a.lr, betas=(0.9, 0.95), eps=1e-8,
+                            weight_decay=0.0)
+        start_step = 0
+        if a.resume:
+            st = load_params(model, a.resume, opt)
+            start_step = int(st["step"])
+            print("续训：从 step %d 继续（参数 %d 个；优化器动量%s）"
+                  % (start_step, st["params"],
+                     "已恢复" if st["opt"] else "未恢复（老存档只含参数）"))
         losses, probes = sft(model, train_seqs, a.steps, a.lr, a.seq_len,
                              probe=probe, clip=a.clip, warmup=a.warmup,
-                             batch=a.batch)
+                             batch=a.batch, start_step=start_step, opt=opt)
         drop = (probes[0] - probes[-1]) / max(abs(probes[0]), 1e-9)
         print("")
         print("探针 loss：%.6f → %.6f（变化 %.1f%%）" % (probes[0], probes[-1], 100 * drop))
         if a.save:
-            save_params(model, a.save)
+            save_params(model, a.save, opt=opt, step=start_step + a.steps)
             print("权重已保存：%s" % a.save)
         gain = (probes[0] - probes[-1]) / max(abs(probes[0]), 1e-9)
         if gain >= 0.05:

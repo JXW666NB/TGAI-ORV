@@ -1,5 +1,15 @@
 ## [未发布]
 
+### 训练 · 真正可续训（存档带优化器状态）
+- `save_params(model, path, opt=None, step=0)`：除参数外还存 `__step` / `__opt_t` /
+  `__opt_m_*` / `__opt_v_*`。此前只存参数，AdamW 的动量一丢，**续训等于重启动量**，
+  轨迹不连续（表现为续训后 loss 先跳一下）。
+- `load_params(model, path, opt=None)`：恢复参数 + 动量 + 步号；**老存档（只有参数）仍可加载**。
+- `sft(..., start_step=0, opt=None)`：取样改为**按 seed 预生成计划**（第 s 步固定用
+  `plan[s*batch:(s+1)*batch]`），warmup 用真实步号 ⇒ 续训与连续跑对齐。
+- `examples/qwen25_sft.py --resume <npz>`：一条命令接着训。
+- 测试 `tests/test_resume.py`：**"3 步 + 存档 + 续 3 步" 的 loss 与 "一口气 6 步" 的末 3 步一致**。
+
 ### 工程 · 行尾与 BOM 规则自动化
 - 全仓文本文件统一为 **UTF-8 无 BOM + LF**：`python/ tools/ tests/ docs/ .github/` 共 259 个文件
   （其中包树里 16 个 `.py`/`.c` 之前带着 CRLF 被打进了 wheel）。

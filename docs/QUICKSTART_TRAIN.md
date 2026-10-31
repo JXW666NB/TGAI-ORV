@@ -233,3 +233,31 @@ python examples/qwen25_sft.py   --safetensors /path/Qwen3-0.6B   --data sft.json
 `.TG` 头里**没有 `head_dim`** 字段。Qwen3-0.6B 的 `head_dim=128 ≠ 1024/16`，
 所以 `export.save_tg` 会**明确拒绝**导出（而不是产出一个能加载、生成全错的模型）。
 训练产物先用 `.npz`；要部署 Qwen3 需要扩展 `.TG` 格式并同步改 C 引擎。
+
+### 10.7 长跑要能续（`--resume`）
+
+训练大模型可能几小时，机器重启/被抢占是常态。存档会自动带上**优化器动量**：
+
+```bash
+# 第一次：训 600 步后存档
+python examples/qwen25_sft.py --safetensors /path/Qwen3-0.6B --data sft.jsonl \
+  --tokenizer /path/Qwen3-0.6B/tokenizer.json --seq-len 256 --steps 600 --batch 4 \
+  --lr 2e-5 --clip 1.0 --device cuda --save ck600.npz
+
+# 接着训：参数 + AdamW 动量 + 步号一起恢复
+python examples/qwen25_sft.py --safetensors /path/Qwen3-0.6B --data sft.jsonl \
+  --tokenizer /path/Qwen3-0.6B/tokenizer.json --seq-len 256 --steps 600 --batch 4 \
+  --lr 2e-5 --clip 1.0 --device cuda --resume ck600.npz --save ck1200.npz
+```
+
+会打印一行确认：
+
+```
+续训：从 step 600 继续（参数 310 个；优化器动量已恢复）
+```
+
+> 为什么不能只存参数：AdamW 的 `m/v/t` 丢了就是重启动量，续训后的头几步 loss 会跳。
+> 这一点有测试守着：`tests/test_resume.py` 断言"3 步 + 存档 + 续 3 步"与
+> "一口气 6 步"的末 3 步**损失一致**。
+>
+> 老存档（只有参数）仍然能加载，只是会提示"未恢复（老存档只含参数）"。
