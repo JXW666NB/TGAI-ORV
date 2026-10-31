@@ -302,7 +302,9 @@ def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None, clip=0.0,
     order = list(range(len(seqs)))
     # 探针很贵（8 条 × 完整前向 ≈ 0.4 s），不能每步都跑
     if probe is not None:
-        probes.append(_probe_multi(model, probe, seq_len))
+        base = _probe_multi(model, probe, seq_len)
+        probes.append(base)
+        print("探针基线（训练前，留出集平均）= %.6f" % (base,))
     for step in range(steps):
         # 线性 warmup：真实大模型上 lr 一步到位会炸（实测 probe 0.42 -> 17.2）
         if warmup and step < warmup:
