@@ -162,3 +162,30 @@ def test_qwen3_tie_mismatch_raises():
     with pytest.raises(ValueError) as ei:
         q.Qwen25(dict(CFG3, TIE=True), w)
     assert "TIE" in str(ei.value) and "修法" in str(ei.value)
+
+
+def test_pad_targets_are_masked():
+    """补位 token 不能进 loss。
+
+    踩过的坑：`_make_xy` 用 ids[-1] 补齐却没掩掉，36 个真实 token 的样本补齐到 128 后
+    有 127 个非掩码目标 —— 模型大部分 loss 在学"重复最后一个 token"，
+    表现为 loss 掉得飞快但不会说话，加数据也没用。
+    """
+    q = _load()
+    ids = [5, 6, 7, 8, 9]                    # 5 个真实 token
+    item = {"ids": ids, "mask_from": 0}
+    xb, yb = q._make_xy(item, 16)
+    assert xb.shape == (1, 15) and yb.shape == (1, 15)
+    n_targets = int((yb != -100).sum())
+    assert n_targets == len(ids) - 1, n_targets      # 只有真实目标
+    # 最后一列一定是补位 -> 必须被掩
+    assert int(yb[0, -1]) == -100
+
+
+def test_pad_masking_preserves_prompt_mask():
+    """提示段掩码 + 补位掩码要能共存。"""
+    q = _load()
+    item = {"ids": [5, 6, 7, 8, 9, 10, 11], "mask_from": 4}
+    xb, yb = q._make_xy(item, 12)
+    live = [i for i, v in enumerate(yb[0]) if v != -100]
+    assert live == [3, 4, 5], live                    # 回答从 mask_from=4 起 -> 目标索引 3..5

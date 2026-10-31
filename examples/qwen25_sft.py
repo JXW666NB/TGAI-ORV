@@ -252,6 +252,7 @@ def _make_xy(item, seq_len):
         ids, mask_from = list(item["ids"]), int(item.get("mask_from", 0))
     else:
         ids, mask_from = list(item), 0
+    n = len(ids)                          # 真实 token 数（补齐前）
     pad = ids[-1]
     ids = (ids + [pad] * seq_len)[:seq_len]
     xb = np.asarray([ids[:-1]], dtype=np.int64)
@@ -259,6 +260,13 @@ def _make_xy(item, seq_len):
     cut = max(0, mask_from - 1)          # 预测 ids[i+1]，回答从 mask_from 开始
     if cut:
         yb[:, :cut] = -100
+    # ★ 补位必须掩掉（-100），否则模型有大量 loss 花在"重复输出最后一个 token"上。
+    #   实测症状：36 个真实 token 的样本补齐到 128 后，非掩码目标有 127 个 ——
+    #   等于 92 个补位 token 都在参与训练，真正的回答信号被淹没；
+    #   表现为 loss 掉得飞快（补位太好猜）但模型不会说话、加数据也没用。
+    #   yb[i] = ids[i+1]，真实目标只到 i = n-2，所以从 n-1 开始都是补位。
+    if n - 1 < seq_len - 1:
+        yb[:, max(0, n - 1):] = -100
     return xb, yb
 
 
