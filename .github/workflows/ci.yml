@@ -20,7 +20,11 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install -U pip
-          python -m pip install numpy pytest build
+          # safetensors: 检查点用例要现场造一个迷你 HF 权重目录
+          # transformers: rope_scaling 对拍要用官方 LlamaForCausalLM 当参照物
+          python -m pip install numpy pytest build safetensors transformers
+          # gguf 是选装的：装不上就跳过那一 个用例（不要因为它整文件跳过）
+          python -m pip install gguf || echo "gguf 未安装，对应用例会跳过"
           # CPU 版 torch：让 7 个 importorskip("torch") 的模块真正运行。
           # 之前 CI 里 117 项中有 71 项根本没被收集 —— 数值对齐等于没有门禁。
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu

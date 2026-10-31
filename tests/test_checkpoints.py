@@ -10,7 +10,10 @@ import pytest
 
 from tgai_go.train import checkpoints as C
 
-gguf = pytest.importorskip("gguf")
+# 注意：这里**不能**做模块级 importorskip("gguf")。
+#   CI 不装 gguf，那样会让整个文件 20 个用例全被跳过（本地却全跑）——
+#   "本地绿、CI 少跑" 和 "CI 红" 一样危险：覆盖率悄悄掉了没人发现。
+#   只有真正用到 gguf 的那个用例才跳过。
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +57,9 @@ def test_hf_name_to_ours():
 
 def _write_tiny_gguf(path, arch="llama", n_layer=1, D=8, NH=2, KV=1, FF=16, V=32,
                      tie=True, drop=(), equal_head=False):
+    # 只有"造 GGUF"这条路需要 gguf 包：把跳过放在这里，
+    # 而不是模块级 —— 模块级会让同文件里 13 个与 gguf 无关的用例在 CI 里一起消失。
+    gguf = pytest.importorskip("gguf")
     w = gguf.GGUFWriter(path, arch)
     w.add_uint32("%s.block_count" % arch, n_layer)
     w.add_uint32("%s.embedding_length" % arch, D)

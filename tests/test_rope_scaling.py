@@ -16,6 +16,9 @@ import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
+# 本文件用 transformers 的 LlamaForCausalLM 当参照物；
+# 没装就跳过（CI 现在装了，所以这条路是真跑的）
+pytest.importorskip("transformers")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "python"))
