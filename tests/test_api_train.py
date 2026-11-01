@@ -34,7 +34,8 @@ def test_parse_marks_fail_when_no_pass():
 
 
 def test_unsupported_methods_raise_with_plan():
-    for m in ("dpo", "grpo", "pretrain"):
+    # pretrain 现在已支持（见 test_api_pretrain.py）；dpo/grpo 仍是"计划中"
+    for m in ("dpo", "grpo"):
         with pytest.raises(NotImplementedError) as ei:
             api.method_supported(m)
         assert "修法" in str(ei.value)

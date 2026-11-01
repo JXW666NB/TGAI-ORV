@@ -20,9 +20,8 @@ import numpy as np
 
 __all__ = ["train", "TrainingResult", "method_supported"]
 
-SUPPORTED = ("sft",)
+SUPPORTED = ("sft", "pretrain")
 PLANNED = {
-    "pretrain": "预训练入口（同一套循环，换语料格式）—— 计划中",
     "dpo": "需要参考模型 + 偏好对，计划中",
     "grpo": "需要 rollout 采样 + 奖励函数，计划中",
 }
@@ -80,7 +79,8 @@ def _check_data(data):
     return data
 
 
-def train(weights=None, data=None, method="sft", *, tokenizer=None,
+def train(weights=None, data=None, method="sft", *, corpus=None, cfg=None,
+          tokenizer=None,
           seq_len=256, steps=300, lr=5e-6, batch=1, limit=2000, holdout=64,
           lr_warmup=40, clip=1.0, out=None, device="cuda", tiny=False,
           quiet=True, timeout=7200, extra_args=None, engine="inproc"):
@@ -102,12 +102,23 @@ def train(weights=None, data=None, method="sft", *, tokenizer=None,
     method_supported(method)
     # ★ 参数校验必须在**分派之前**：否则进程内路径会先尝试建 CUDA 上下文，
     #   在没卡的机器上抛出"找不到 nvcuda.dll"，把真正的问题（路径写错）盖掉。
-    if not tiny:
+    if str(method).lower() == "pretrain":
+        if not corpus:
+            raise ValueError("api.train: method='pretrain' 需要 corpus（.txt 或每行 {\"text\"}）。"
+                             "修法：传 corpus='my_corpus.txt'")
+        tokenizer = _resolve_tokenizer(None, tokenizer)
+    elif not tiny:
         if not weights:
             raise ValueError("api.train: 需要 weights（safetensors 目录）。"
                              "没有权重时先用 tiny=True 跑通流程")
         data = _check_data(data)
         tokenizer = _resolve_tokenizer(weights, tokenizer)
+
+    if method_supported(method) and str(method).lower() == "pretrain":
+        return _train_pretrain_inproc(corpus, cfg, tokenizer=tokenizer, seq_len=seq_len,
+                                      steps=steps, lr=lr, batch=batch, limit=limit,
+                                      holdout=holdout, warmup=lr_warmup, clip=clip,
+                                      out=out, device=device, quiet=quiet, tiny=tiny)
 
     if engine != "subprocess":
         return _train_inproc(weights, data, tokenizer, seq_len=seq_len, steps=steps,
@@ -141,6 +152,56 @@ def train(weights=None, data=None, method="sft", *, tokenizer=None,
     if extra_args:
         cmd += list(extra_args)
     return _run(cmd, quiet=quiet, timeout=timeout)
+
+
+def _train_pretrain_inproc(corpus, cfg, *, tokenizer, seq_len, steps, lr, batch,
+                           limit, holdout, warmup, clip, out, device, quiet=True,
+                           tiny=False):
+    """从零预训练：随机初始化 -> 纯文本定长分块 -> 全 token LM loss。"""
+    import contextlib
+
+    from .train import qwen as Q
+
+    T = __import__("tgai_go.train", fromlist=["train"])
+    T.set_default_device("cpu" if tiny else device)
+
+    if not cfg:
+        raise ValueError("api.train: method='pretrain' 需要 cfg（如 V/D/L/NH/KV/FF/DH）。"
+                         "修法：传 cfg=dict(V=32000, D=256, L=4, NH=8, KV=2, FF=688, DH=32)")
+
+    model = Q.Qwen25(cfg, Q.make_random_weights(cfg))
+    seqs = Q.build_lm_sequences(Q.load_tokenizer(tokenizer), corpus, int(seq_len),
+                                int(limit) if limit else None)
+    if len(seqs) < 2:
+        raise ValueError(
+            "api.train: 语料太小，切不出足够的训练块（只有 %d 块，每块 %d token）。"
+            "修法：加长语料或减小 seq_len" % (len(seqs), int(seq_len)))
+
+    rng = np.random.default_rng(0)
+    idx = list(range(len(seqs)))
+    rng.shuffle(idx)
+    h = max(1, min(int(holdout), len(seqs) // 4))
+    hold = set(idx[:h])
+    probes = [seqs[i] for i in sorted(hold)][:8]
+    train_seqs = [s for i, s in enumerate(seqs) if i not in hold]
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf if quiet else contextlib.nullcontext()):
+        base = Q._probe_multi(model, probes, int(seq_len))
+        Q.sft(model, train_seqs, int(steps), float(lr), int(seq_len), probe=probes,
+              clip=float(clip), warmup=int(warmup), batch=int(batch))
+        final = Q._probe_multi(model, probes, int(seq_len))
+
+    ckpt = None
+    if out:
+        Q.save_params(model, out)
+        ckpt = out
+    drop = round((base - final) / base * 100.0, 1) if base else None
+    return TrainingResult(command="in-process(pretrain)", returncode=0,
+                          log=buf.getvalue(), probe_base=base, probe_final=final,
+                          drop_pct=drop,
+                          verdict="PASS" if (drop is not None and drop >= 5.0) else "FAIL",
+                          ckpt=ckpt, engine="in-process", n_seqs=len(seqs))
 
 
 def _train_inproc(weights, data, tok_path, *, seq_len, steps, lr, batch, limit,

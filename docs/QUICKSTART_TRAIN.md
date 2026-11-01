@@ -348,3 +348,37 @@ r = api.train(weights="qwen25", data="examples/_alpaca_zh.jsonl",
 
 ⇒ 两条都 PASS，但**基线不同**（不同留出集），所以降幅不可直接相减比较。
 要横向比较超参时，**必须固定同一个 engine**。
+
+---
+
+## 12. 从零预训练（`method="pretrain"`）
+
+```python
+from tgai_go import api
+
+cfg = dict(V=151936, D=256, L=4, NH=8, KV=2, FF=688, DH=32, THETA=1e6, EPS=1e-6,
+           TIE=True, QKV_BIAS=True, QK_NORM=False)
+r = api.train(method="pretrain", corpus="my_corpus.txt", cfg=cfg,
+              tokenizer="tokenizer.json", seq_len=256, steps=1200,
+              batch=2, lr=1e-3, out="pre.npz")
+print(r.probe_base, "->", r.probe_final, r.drop_pct, r.verdict)
+```
+
+- **语料**：`.txt`（整篇）或 `.jsonl`（每行 `{"text": ...}`）；按 `seq_len` 切定长块，
+  末尾残块丢弃。**全 token 参与 loss**（与 SFT 的"只学答案"不同）。
+- **结构**：`cfg` 给 `V/D/L/NH/KV/FF/DH`；随机初始化后开始训。
+- **判据**：留出块上的 probe loss 降幅 ≥5% 记 PASS。
+
+V100 实测（151936 词表 / D=256 / L=4，854 KB 中文语料 → 400 块）：
+**probe 12.0112 → 7.4026（−38.4%）**，120 步。
+
+### 12.1 梯度检查点（用显存换时间）
+
+```python
+cfg["GRAD_CKPT"] = True        # 或 model.use_ckpt = True
+```
+
+逐层前向不建图、反向时重算该层。实测：
+- 梯度与不检查点**逐位一致**（`tests/test_qwen_grad_ckpt.py`，max|diff| = 0.0）
+- 单测里保留的中间张量 **1041 → 41（−96.1%）**
+- 代价：反向多一次前向计算（约 +30% 时间，视模型深度）

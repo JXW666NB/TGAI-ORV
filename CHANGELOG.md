@@ -1,3 +1,19 @@
+## [未发布]
+
+### 新增 · `api.train` 支持 `pretrain`（从零预训练）
+- 纯文本语料切定长块（`build_lm_sequences`，支持 `.txt` / 每行 `{"text"}`），
+  **全 token 参与 loss**（不做对话模板、不遮 prompt）。
+- `cfg` 给结构即可随机初始化（`make_random_weights`），CPU 上也可跑。
+- V100 实测（V=151936, D=256, L=4, 400 块 × seq 256，120 步）：
+  probe **12.0112 → 7.4026（−38.4%）** PASS。
+- `dpo`/`grpo` 仍明确抛 `NotImplementedError`（不假装支持）。
+
+### 修复 · 梯度检查点**真正接进训练路径**
+- 之前 `T.checkpoint` 只有实现与单测（梯度逐位一致、中间张量 −96.1%），
+  但 `Qwen25.forward` 里**没有调用** —— 即"有实现 ≠ 训练省显存"。
+- 现在逐层前向抽成 `_layer()`，用 `cfg["GRAD_CKPT"]=True`（或 `model.use_ckpt`）包一层
+  `T.checkpoint`；新增 3 项测试断言**前向与梯度逐位一致**（max|diff| = 0.0）。
+
 ## [0.4.0] - 2026-11-01
 
 ### 新增 · 十行代码训练 API（`tgai_go.api.train`）

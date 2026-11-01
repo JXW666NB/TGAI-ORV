@@ -103,6 +103,8 @@ class Qwen25:
         if tie is None:
             tie = bool(cfg.get("TIE", "lm_head.weight" not in self.p))
         self.tie = bool(tie)
+        # 梯度检查点开关（显存换时间；用 cfg 传更方便做 A/B）
+        self.use_ckpt = bool(cfg.get("GRAD_CKPT", False))
         if self.tie:
             self.p["lm_head.weight"] = self.p["token_embedding.weight"]
         # 直接挂共享 Parameter：不要先随机初始化一张 V*D 的表再扔掉
@@ -180,6 +182,47 @@ class Qwen25:
         rot = T.cat([-x[:, :, h:], x[:, :, :h]], dim=-1)
         return x * cos_t + rot * sin_t
 
+    def _layer(self, x, i):
+        """单层前向（抽出来是为了能用 `T.checkpoint` 包住：反向时重算这一层）。"""
+        cfg = self.cfg
+        # 这些量原来在 forward 里算好、闭包共享；抽成方法后必须自己算一遍
+        D, NH, KV = cfg["D"], cfg["NH"], cfg["KV"]
+        DH = int(cfg.get("DH") or D // NH)
+        B, S = int(x.shape[0]), int(x.shape[1])
+        p = self.p
+        cos_t, sin_t = self._cos_sin(S, DH)   # 已按 (S, DH) 缓存，重算无成本
+        b = "blocks.%d." % i
+        h = self.ln1[i](x).reshape(B * S, D)
+        q = h @ p[b + "attn.q_proj.weight"].T
+        k = h @ p[b + "attn.k_proj.weight"].T
+        v = h @ p[b + "attn.v_proj.weight"].T
+        if cfg.get("QKV_BIAS", True):        # Qwen3 无 qkv bias
+            q = q + p[b + "attn.q_proj.bias"]
+            k = k + p[b + "attn.k_proj.bias"]
+            v = v + p[b + "attn.v_proj.bias"]
+        q = q.reshape(B, S, NH, DH).permute(0, 2, 1, 3).reshape(B * NH, S, DH)
+        k = k.reshape(B, S, KV, DH).permute(0, 2, 1, 3).reshape(B * KV, S, DH)
+        v = v.reshape(B, S, KV, DH).permute(0, 2, 1, 3).reshape(B * KV, S, DH)
+        if cfg.get("QK_NORM"):               # per-head RMSNorm，必须在 RoPE **之前**
+            q = self.qn[i](q)
+            k = self.kn[i](k)
+        q = self._rope_apply(q, cos_t, sin_t)
+        k = self._rope_apply(k, cos_t, sin_t)
+        # GQA：KV 头复制到 Q 头数（在 [B,KV,S,DH] 上按第 1 维展开，避免跨 batch 打乱）
+        k = k.reshape(B, KV, S, DH).repeat_interleave(NH // KV, dim=1).reshape(B * NH, S, DH)
+        v = v.reshape(B, KV, S, DH).repeat_interleave(NH // KV, dim=1).reshape(B * NH, S, DH)
+        o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        o = o.reshape(B, NH, S, DH).permute(0, 2, 1, 3).reshape(B * S, NH * DH)
+        x = x + (o @ p[b + "attn.out_proj.weight"].T).reshape(B, S, D)
+
+        h2 = self.ln2[i](x).reshape(B * S, D)
+        g = h2 @ p[b + "ffn.w1.weight"].T
+        u = h2 @ p[b + "ffn.w2.weight"].T
+        act = F.silu(g) * u
+        x = x + (act @ p[b + "ffn.w3.weight"].T).reshape(B, S, D)
+        return x
+
+
     def forward(self, ids):
         """ids: numpy int64 [B, S] → logits [B, S, V]"""
         cfg = self.cfg
@@ -192,35 +235,13 @@ class Qwen25:
         x = self.emb(T.tensor(ids) if T.__name__ == "torch" else ids).reshape(B, S, D)
 
         for i in range(L):
-            b = "blocks.%d." % i
-            h = self.ln1[i](x).reshape(B * S, D)
-            q = h @ p[b + "attn.q_proj.weight"].T
-            k = h @ p[b + "attn.k_proj.weight"].T
-            v = h @ p[b + "attn.v_proj.weight"].T
-            if cfg.get("QKV_BIAS", True):        # Qwen3 无 qkv bias
-                q = q + p[b + "attn.q_proj.bias"]
-                k = k + p[b + "attn.k_proj.bias"]
-                v = v + p[b + "attn.v_proj.bias"]
-            q = q.reshape(B, S, NH, DH).permute(0, 2, 1, 3).reshape(B * NH, S, DH)
-            k = k.reshape(B, S, KV, DH).permute(0, 2, 1, 3).reshape(B * KV, S, DH)
-            v = v.reshape(B, S, KV, DH).permute(0, 2, 1, 3).reshape(B * KV, S, DH)
-            if cfg.get("QK_NORM"):               # per-head RMSNorm，必须在 RoPE **之前**
-                q = self.qn[i](q)
-                k = self.kn[i](k)
-            q = self._rope_apply(q, cos_t, sin_t)
-            k = self._rope_apply(k, cos_t, sin_t)
-            # GQA：KV 头复制到 Q 头数（在 [B,KV,S,DH] 上按第 1 维展开，避免跨 batch 打乱）
-            k = k.reshape(B, KV, S, DH).repeat_interleave(NH // KV, dim=1).reshape(B * NH, S, DH)
-            v = v.reshape(B, KV, S, DH).repeat_interleave(NH // KV, dim=1).reshape(B * NH, S, DH)
-            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            o = o.reshape(B, NH, S, DH).permute(0, 2, 1, 3).reshape(B * S, NH * DH)
-            x = x + (o @ p[b + "attn.out_proj.weight"].T).reshape(B, S, D)
-
-            h2 = self.ln2[i](x).reshape(B * S, D)
-            g = h2 @ p[b + "ffn.w1.weight"].T
-            u = h2 @ p[b + "ffn.w2.weight"].T
-            act = F.silu(g) * u
-            x = x + (act @ p[b + "ffn.w3.weight"].T).reshape(B, S, D)
+            # 梯度检查点：前向不建图（激活用完即弃），反向时重算这一层。
+            # 实测（tests/test_checkpoint.py）：梯度与不检查点**逐位一致**，
+            # 保留的中间张量 1041 -> 41（-96.1%）。
+            if self.use_ckpt:
+                x = T.checkpoint(self._layer, x, i)
+            else:
+                x = self._layer(x, i)
 
         z = self.final(x).reshape(B * S, D)
         return (z @ p["lm_head.weight"].T).reshape(B, S, cfg["V"])
@@ -527,6 +548,56 @@ def load_params(model, path, opt=None):
                 opt.v[i] = rt.h2d(av)
         state["opt"] = True
     return state
+
+
+def build_lm_sequences(tok, path, seq_len, limit=None):
+    """把**纯文本**切成定长 token 块，用于预训练（全 token 参与 loss）。
+
+    与 `build_sequences` 的区别：那个走 Qwen 的对话模板并只用答案算 loss（SFT），
+    这个不做任何模板、不遮 prompt —— 每个 token 都是训练目标。
+
+    支持 `.txt`（整篇）与 `.jsonl`（每行的 `text` 字段），空行/空文本跳过。
+    末尾不足 seq_len 的残块**丢弃**（拼半个序列当一条样本会引入伪边界）。
+    """
+    import json
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            "build_lm_sequences: 找不到语料文件 %s。修法：传 .txt 或 .jsonl 路径" % (path,))
+    chunks = []
+    cur = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if path.endswith(".jsonl"):
+                try:
+                    line = json.loads(line).get("text") or ""
+                except json.JSONDecodeError:
+                    raise ValueError(
+                        "build_lm_sequences: %s 有一行不是合法 JSON。"
+                        "修法：预训练语料可以是 .txt（整篇）或每行 {\"text\": ...}" % (path,))
+                if not line:
+                    continue
+            ids = tok.encode(line).ids
+            cur.extend(ids)
+            cur.append(int(tok.token_to_id("<|endoftext|>")) if
+                       tok.token_to_id("<|endoftext|>") is not None else 0)
+            while len(cur) >= int(seq_len):
+                chunks.append(cur[:int(seq_len)])
+                cur = cur[int(seq_len):]
+                if limit and len(chunks) >= int(limit):
+                    return chunks
+    return chunks
+
+
+def make_random_weights(cfg, seed=0):
+    """按 cfg 随机初始化一套权重（预训练起点）。
+
+    就是 `make_tiny_weights` 的别名 —— 那个函数本来就按 cfg 通用生成，
+    名字里的 "tiny" 只是当初的用处。这里单独导出，避免读代码的人误会。
+    """
+    return make_tiny_weights(cfg, seed=seed)
 
 
 def cfg_from_checkpoint(ck):
