@@ -312,3 +312,16 @@ print(r.probe_base, r.probe_final, r.drop_pct, r.verdict)
 
 API 只是入口；要改训练细节（融合核、梯度裁剪策略、掩码方式）请直接看
 `examples/qwen25_sft.py`，那里的每一步都有中文注释与实测判据。
+
+### 11.5 实测（V100，2026-11-01）
+
+```python
+r = api.train(weights="qwen25", data="examples/_alpaca_zh.jsonl",
+              lr=5e-6, batch=1, seq_len=256, steps=120, holdout=64,
+              out="ck_api.npz")
+```
+
+实测输出：`probe 1.9695 → 1.7601（−10.6%）verdict=PASS`，1.2 s/step，检查点 6.5 GB。
+
+> **坑（实测）**：同一配置 `batch=2` 在 V100 上 **OOM** —— 因为产线推理服务常驻占用
+> 14.8 GB，batch2/seq256 需要约 16.5 GB，正好卡线。显存紧张时先 `batch=1`。
