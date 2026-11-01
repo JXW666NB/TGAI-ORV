@@ -585,6 +585,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--safetensors", default="", help="HF 权重目录（含 model.safetensors）")
     ap.add_argument("--gguf", default=r"D:\DSH-Workspace\_gguf_test\qwen2.5-0.5b-fp16.gguf")
+    ap.add_argument("--tg", default="", help="我们自己的 .TG 权重（训练产物/MoE 转换件）；"
+                                            "与 --safetensors/--gguf 三选一，优先 --safetensors")
     ap.add_argument("--ref", default=os.path.join(REPO, "tools", "_qwen_ref.npz"))
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--forward-only", action="store_true")
@@ -636,6 +638,9 @@ def main(argv=None):
     if a.safetensors:
         print("读取 safetensors 目录：%s" % a.safetensors)
         ck = C.load_safetensors_dir(a.safetensors)
+    elif a.tg:
+        print("读取 .TG：%s" % a.tg)
+        ck = C.load_tg(a.tg)
     else:
         print("读取 GGUF：%s" % a.gguf)
         ck = C.load_gguf(a.gguf)

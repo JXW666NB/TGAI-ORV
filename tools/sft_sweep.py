@@ -83,6 +83,7 @@ def main(argv=None):
     ap.add_argument("--data", default=None)
     ap.add_argument("--tokenizer", default=None)
     ap.add_argument("--model", default=None, help="safetensors 目录")
+    ap.add_argument("--tg", default=None, help=".TG 权重（与 --model 二选一）")
     # 别名：与 examples/qwen25_sft.py 的参数名一致。
     # 实测踩过：守护脚本按示例的写法传 --safetensors，这里只有 --model，
     # 于是 argparse 直接报 unrecognized arguments —— 白等 5 小时。
@@ -105,14 +106,18 @@ def main(argv=None):
 
     if a.safetensors and not a.model:
         a.model = a.safetensors
+    if not a.model and not a.tg and not a.tiny:
+        print("非 --tiny 模式必须给 --model（safetensors 目录）或 --tg（.TG 文件）")
+        return 2
     base = []
     if a.tiny:
         base = ["--tiny", "--device", a.device]
     else:
-        if not (a.data and a.tokenizer and a.model):
-            print("非 --tiny 模式必须给 --data/--tokenizer/--model")
+        if not (a.data and a.tokenizer and (a.model or a.tg)):
+            print("非 --tiny 模式必须给 --data/--tokenizer/（--model 或 --tg）")
             return 2
-        base = ["--safetensors", a.model, "--data", a.data, "--tokenizer", a.tokenizer,
+        model_args = ["--tg", a.tg] if a.tg else ["--safetensors", a.model]
+        base = model_args + ["--data", a.data, "--tokenizer", a.tokenizer,
                 "--seq-len", str(a.seq_len), "--limit", str(a.limit),
                 "--holdout", str(a.holdout), "--device", a.device,
                 "--warmup", str(a.warmup), "--clip", repr(a.clip)]
