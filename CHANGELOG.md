@@ -1,4 +1,41 @@
-## [未发布]
+## [0.4.0] - 2026-11-01
+
+### 新增 · 十行代码训练 API（`tgai_go.api.train`）
+- **进程内**训练：模型与 SFT 循环搬进 `tgai_go/train/qwen.py`（与示例共用同一份代码），
+  `pip install` 之后不再需要仓库目录。
+- `api.train(weights=…, data=…, method="sft", lr=…, batch=…, steps=…, out=…)`
+  返回 `TrainingResult`（`probe_base/probe_final/drop_pct/verdict/ckpt/log`）。
+- `method` 只支持 `sft`；`pretrain/dpo/grpo` **明确抛错并说明计划**，不假装支持。
+- `tiny=True` 走 CPU 迷你权重，几秒跑通（CI 与首次上手用）。
+- 实测（V100，Qwen2.5-0.5B × alpaca-zh，120 步）：`probe 2.5825 → 2.3771（−8.0%）`，
+  0.5 s/step；同一配置走 CLI 为 −10.6%（**留出集划分不同，数字不可直接相减**，见文档 §11.7）。
+
+### 新增 · `.TG` 加载体检与护栏
+- `tools/tg_audit.py`：同一模型用 `.TG` 与 safetensors 各加载一遍比 CE，
+  差 > 0.5 判 FAIL 并给出三个最可能原因。
+- `load_tg` 加两道体检：线性层布局（`[in,out]` 自动转置或报错）、
+  归一化权重是否像 gamma（**单点离谱即报错**并给修法，留 `allow_suspicious_norms`）。
+  实测某份 `.TG`：2-D 权重正常，但 6/49 个归一化张量读错（`final_norm` 均值 7.14、
+  `ln1` 0.033）⇒ CE 8.30 vs safetensors 3.66。
+
+### 新增 · 数据层（`tgai_go.train.data`）
+- `read_jsonl` 流式读（坏行报行号+修法）、`normalize`（原生/`text`/ShareGPT/Alpaca 四形态）、
+  `from_hf`（鸭子类型接 datasets，不 import datasets）、`train_eval_split`（确定性划分）。
+
+### 新增 · 对齐 PyTorch 的能力
+- 梯度检查点：梯度逐位一致，保留中间张量 **1041 → 41（−96.1%）**。
+- `LAMB` 优化器（仅 CPU；CUDA 上明确报错）。
+- `Embedding(weight=)`：直接挂已有参数，省掉一张白分配的随机词表。
+
+### 修复 · 会静默出错的三个问题
+1. `api` 解析日志时取「训练 loss（不可比）」而非「探针 loss（可比）」⇒ 报出错误数字。
+2. `load_tg` 对布局/归一化异常**静默放行** ⇒ 能训但训坏（现已响亮报错）。
+3. `sweep_report` 的 gnorm 阈值按实测重新校准（旧规则会误杀最优配置），并修正排序。
+
+### 度量 · V100 显存构成（Qwen2.5-0.5B / b2 / seq256 / fp32）
+权重 2.56 + 优化器 3.46 + 一步激活 **6.85** = 峰值 **16.5 GiB**；
+⇒ 激活改 bf16 存储理论省 ≈3.4 GiB。**V100 = sm_70，硬件无 bf16**，加速比必须等 sm_80+。
+
 
 ### 新增 · 梯度检查点 + LAMB（对齐 PyTorch 的两项能力）
 - `T.checkpoint(fn, *inputs)` / `T.checkpoint_sequential(fns, x)`：
