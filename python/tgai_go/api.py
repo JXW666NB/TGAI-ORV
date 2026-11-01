@@ -3,20 +3,20 @@
 
 设计取舍（如实说明）
 --------------------
-v1 是**编排层**：它校验参数、拼出命令、启动仓库里**已验证**的训练脚本
-（`examples/qwen25_sft.py`），再把结果解析成 dict 返回。
-这样做的好处是：API 不可能与"被验证过的那条路"产生行为差异 ——
-数值、日志、检查点格式都是同一套。
+模型与训练循环住在 `tgai_go.train.qwen` 里（**与 examples/qwen25_sft.py 共用同一份代码**，
+不是复制）。所以这里是**进程内**调用：不需要仓库目录，pip 装完即可用。
 
-还没做（会在文档里标注）：把模型定义与训练循环搬进包内、改成进程内调用。
-那时 API 才能摆脱"需要仓库目录"的限制。
+`engine="subprocess"` 仍保留，用于"想复现 CLI 行为的对照"场景。
 """
 from __future__ import annotations
 
+import io
 import os
 import re
 import subprocess
 import sys
+
+import numpy as np
 
 __all__ = ["train", "TrainingResult", "method_supported"]
 
@@ -83,7 +83,7 @@ def _check_data(data):
 def train(weights=None, data=None, method="sft", *, tokenizer=None,
           seq_len=256, steps=300, lr=5e-6, batch=1, limit=2000, holdout=64,
           lr_warmup=40, clip=1.0, out=None, device="cuda", tiny=False,
-          quiet=True, timeout=7200, extra_args=None):
+          quiet=True, timeout=7200, extra_args=None, engine="inproc"):
     """训练/微调一个模型，返回 `TrainingResult`。
 
     最小用法（三行）::
@@ -100,6 +100,21 @@ def train(weights=None, data=None, method="sft", *, tokenizer=None,
     tiny    : True 时用随机迷你权重跑（CPU 冒烟/CI 用，不需要 GPU 与真权重）
     """
     method_supported(method)
+    # ★ 参数校验必须在**分派之前**：否则进程内路径会先尝试建 CUDA 上下文，
+    #   在没卡的机器上抛出"找不到 nvcuda.dll"，把真正的问题（路径写错）盖掉。
+    if not tiny:
+        if not weights:
+            raise ValueError("api.train: 需要 weights（safetensors 目录）。"
+                             "没有权重时先用 tiny=True 跑通流程")
+        data = _check_data(data)
+        tokenizer = _resolve_tokenizer(weights, tokenizer)
+
+    if engine != "subprocess":
+        return _train_inproc(weights, data, tokenizer, seq_len=seq_len, steps=steps,
+                             lr=lr, batch=batch, limit=limit, holdout=holdout,
+                             warmup=lr_warmup, clip=clip, out=out, device=device,
+                             tiny=tiny, quiet=quiet)
+
     if tiny:
         cmd = [sys.executable, "-X", "utf8", "examples/qwen25_sft.py",
                "--tiny", "--device", "cpu", "--steps", str(steps),
@@ -128,7 +143,62 @@ def train(weights=None, data=None, method="sft", *, tokenizer=None,
     return _run(cmd, quiet=quiet, timeout=timeout)
 
 
-_PROBE = re.compile(r"([0-9]+\.[0-9]+)\s*[→>-]+\s*([0-9]+\.[0-9]+)")
+def _train_inproc(weights, data, tok_path, *, seq_len, steps, lr, batch, limit,
+                  holdout, warmup, clip, out, device, tiny, quiet=True):
+    """进程内训练：建模型 -> 造序列 -> 切留出集 -> 跑 sft()。"""
+    from .train import qwen as Q
+
+    T = __import__("tgai_go.train", fromlist=["train"])
+    T.set_default_device("cpu" if tiny else device)
+
+    if tiny:
+        cfg = dict(Q.TINY_CFG)
+        model = Q.Qwen25(cfg, Q.make_tiny_weights(cfg))
+        seqs = Q.tiny_sequences(cfg, n=8, seq_len=min(int(seq_len), 32))
+        probes = [s[:min(len(s), 24)] for s in seqs[:4]]
+        steps = max(1, int(steps))
+        warmup = min(int(warmup), steps)
+    else:
+        ck = Q.load_safetensors_weights and None          # 仅为可读性占位
+        from tgai_go.train import checkpoints as C
+        ck = C.load_safetensors_dir(weights)
+        cfg = Q.cfg_from_checkpoint(ck)
+        model = Q.Qwen25(cfg, dict(ck.weights))
+        del ck
+        tok = Q.load_tokenizer(tok_path)
+        seqs = Q.build_sequences(tok, data, int(seq_len), int(limit))
+        rng = np.random.default_rng(0)
+        idx = list(range(len(seqs)))
+        rng.shuffle(idx)
+        hold = set(idx[:max(1, int(holdout))])
+        probes = [seqs[i] for i in sorted(hold)][:8]
+        seqs = [s for i, s in enumerate(seqs) if i not in hold]
+
+    import contextlib
+    buf = io.StringIO()
+    sink = buf if quiet else contextlib.nullcontext()
+    with contextlib.redirect_stdout(sink):
+        base = Q._probe_multi(model, probes, int(seq_len))
+        Q.sft(model, seqs, int(steps), float(lr), int(seq_len), probe=probes,
+              clip=float(clip), warmup=int(warmup), batch=int(batch))
+        final = Q._probe_multi(model, probes, int(seq_len))
+    ckpt = None
+    if out:
+        Q.save_params(model, out)
+        ckpt = out
+    drop = round((base - final) / base * 100.0, 1) if base else None
+    return TrainingResult(command="in-process", returncode=0, log=buf.getvalue(),
+                          probe_base=base, probe_final=final, drop_pct=drop,
+                          verdict="PASS" if (drop is not None and drop >= 5.0) else "FAIL",
+                          ckpt=ckpt, engine="in-process")
+
+
+_PAIR = re.compile(r"([0-9]+\.[0-9]+)\s*[→>-]+\s*([0-9]+\.[0-9]+)")
+# ★ 只认"探针/probe"那一行：示例里同时会打印
+#   「训练 loss（轮转样本，不可比）：A → B」和「探针 loss（固定序列，可比）：C → D」，
+#   取第一个匹配会拿到**不可比**的那个数（实测踩过：API 报 5.5995→5.541，
+#   而真正可比的探针是 5.5789→5.2458）。
+_PROBE_LINE = re.compile(r"(探针|probe)", re.I)
 
 
 def _run(cmd, quiet=True, timeout=7200):
@@ -148,7 +218,14 @@ def _parse(text, rc, cmd):
     res = TrainingResult(command=" ".join(cmd), returncode=rc, log=text,
                          probe_base=None, probe_final=None, drop_pct=None,
                          verdict="FAIL", ckpt=None)
-    m = _PROBE.search(text)
+    m = None
+    for line in text.splitlines():
+        if _PROBE_LINE.search(line):
+            m = _PAIR.search(line)
+            if m:
+                break
+    if m is None:                      # 兜底：没有任何"探针"标记时才用第一对
+        m = _PAIR.search(text)
     if m:
         base, final = float(m.group(1)), float(m.group(2))
         res["probe_base"], res["probe_final"] = base, final

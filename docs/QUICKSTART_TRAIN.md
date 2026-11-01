@@ -303,8 +303,9 @@ print(r.probe_base, r.probe_final, r.drop_pct, r.verdict)
 
 ### 11.3 现在**不是**什么
 
-- **不是进程内训练**：v1 通过子进程驱动 `examples/qwen25_sft.py`（已全面验证的那条路），
-  所以要求本机有这个仓库目录；
+- **是进程内训练**：模型与训练循环住在 `tgai_go/train/qwen.py`，
+  与 `examples/qwen25_sft.py` **共用同一份代码**（不是复制），所以 pip 装完即可用；
+  想对照 CLI 行为时传 `engine="subprocess"`；
 - **不支持 DPO / GRPO / 预训练**：会明确抛错，不假装支持；
 - **不做自动调参**：`lr` 等要自己给（推荐值来自实测扫参，不是猜的）。
 
@@ -325,3 +326,13 @@ r = api.train(weights="qwen25", data="examples/_alpaca_zh.jsonl",
 
 > **坑（实测）**：同一配置 `batch=2` 在 V100 上 **OOM** —— 因为产线推理服务常驻占用
 > 14.8 GB，batch2/seq256 需要约 16.5 GB，正好卡线。显存紧张时先 `batch=1`。
+
+### 11.6 两种引擎
+
+| engine | 说明 | 什么时候用 |
+| --- | --- | --- |
+| `"inproc"`（默认） | 进程内建模型 + 跑循环 | 正常使用；返回的 `drop_pct/verdict` 由 API 自己算 |
+| `"subprocess"` | 驱动 `examples/qwen25_sft.py` | 想逐字复现 CLI 日志时 |
+
+两者用的是**同一份模型与训练代码**（`tgai_go/train/qwen.py`），
+区别只是"谁来算探针与判定"。

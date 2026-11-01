@@ -68,3 +68,14 @@ def test_tiny_end_to_end_returns_numbers():
     assert r.probe_base and r.probe_final, "tiny 跑完必须能解析出探针数字"
     assert r.verdict in ("PASS", "FAIL")
     assert isinstance(r.drop_pct, float)
+
+def test_parse_prefers_probe_line_over_training_loss():
+    """回归：示例同时打印「训练 loss（不可比）」与「探针 loss（可比）」，
+    取第一个匹配会报出不可比的数字（实测踩过：5.5995→5.541 vs 真值 5.5789→5.2458）。"""
+    text = ("训练 loss（轮转样本，不可比）：5.5995 → 5.5410\n"
+            "探针 loss（固定序列，可比）：  5.578872 → 5.245787\n"
+            "结论：PASS\n")
+    r = api._parse(text, 0, ["python", "x.py"])
+    assert r["probe_base"] == pytest.approx(5.578872)
+    assert r["probe_final"] == pytest.approx(5.245787)
+    assert r["drop_pct"] == pytest.approx(6.0, abs=0.2)

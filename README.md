@@ -234,9 +234,9 @@ print(r.probe_base, "->", r.probe_final, r.drop_pct, "%", r.verdict)
 
 没有 GPU、没有权重也能先跑通流程：`api.train(tiny=True, steps=3)`（CPU，几秒）。
 
-> **这一层现在是什么（如实说）**：它是**编排层** —— 校验参数、驱动仓库里已验证的
-> `examples/qwen25_sft.py`，再把日志解析成 dict。好处是 API 与被验证的那条路
-> **不可能产生行为差异**；代价是它需要仓库目录。把模型与训练循环搬进包内是下一步。
+> **这一层现在是什么（如实说）**：**进程内**训练 —— 模型与循环住在
+> `tgai_go/train/qwen.py`，与 `examples/qwen25_sft.py` 共用同一份代码（不是复制）。
+> 所以 `pip install` 之后就能用，不再需要仓库目录。
 
 ## 装 / Install
 
