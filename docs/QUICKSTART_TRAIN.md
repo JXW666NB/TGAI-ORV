@@ -336,3 +336,15 @@ r = api.train(weights="qwen25", data="examples/_alpaca_zh.jsonl",
 
 两者用的是**同一份模型与训练代码**（`tgai_go/train/qwen.py`），
 区别只是"谁来算探针与判定"。
+
+### 11.7 进程内 vs 子进程：绝对数字**不可直接比**
+
+两者用的是同一份模型/训练代码，但**留出集划分不同**：
+
+| 引擎 | 留出集怎么来的 | V100 实测（Qwen2.5-0.5B / alpaca-zh / 120 步 / batch 1） |
+| --- | --- | --- |
+| `subprocess` | 由 `examples/qwen25_sft.py` 自己切（seed 固定） | probe 1.9695 → 1.7601（**−10.6%**），1.2 s/step |
+| `inproc`（默认） | API 用 `default_rng(0)` 洗牌后取 64 条 | probe 2.5825 → 2.3771（**−8.0%**），**0.5 s/step** |
+
+⇒ 两条都 PASS，但**基线不同**（不同留出集），所以降幅不可直接相减比较。
+要横向比较超参时，**必须固定同一个 engine**。
