@@ -532,6 +532,35 @@ def fix_linear_layout(weights, cfg, strict=True):
     return out, flipped
 
 
+def norm_sanity(weights, lo=0.2, hi=3.0):
+    """检查归一化权重是否"像"RMSNorm/LayerNorm 的 gamma（应≈1）。
+
+    返回 (好坏统计, 可疑名单)。判据：1-D 且名字含 norm 的张量，
+    均值应落在 [lo, hi]、且极值不应远离 1。
+
+    为什么需要：实测（2026-11-01）某份 `.TG` 的 2-D 权重统计完全正常，
+    但 `final_norm.weight` 的均值是 **7.14**、`blocks.0.ln1.weight` 是 **0.03** ——
+    加载不报错、训练不报错，只是模型永远训不好。这类"静默读错"必须被点名。
+    """
+    # ★ 命名要同时认 "norm" 和 "ln1/ln2"：实测出问题的正是 blocks.0.ln1.weight，
+    #   它不含 "norm" 字样 —— 只匹配 norm 会漏掉最该抓的那个张量。
+    import re as _re
+    pat = _re.compile(r"(^|\.)ln\d*(\.|$)")
+    good, bad = 0, []
+    for k, a in weights.items():
+        if a.ndim != 1:
+            continue
+        if "norm" not in k and not pat.search(k):
+            continue
+        m = float(np.mean(a))
+        lo_a, hi_a = float(np.min(a)), float(np.max(a))
+        if lo <= m <= hi and lo_a > -2.0 and hi_a < 10.0:
+            good += 1
+        else:
+            bad.append((k, m, lo_a, hi_a))
+    return good, bad
+
+
 def load_tg(path, max_layers=None, vocab_limit=None):
     """读 .TG → Checkpoint。max_layers / vocab_limit 用于"切片对拍"（省内存）。"""
     from ..read_tg import read_tg, load_tensor
@@ -607,4 +636,17 @@ def load_tg(path, max_layers=None, vocab_limit=None):
     weights, flipped = fix_linear_layout(weights, cfg_for_shape)
     if flipped:
         cfg["layout_transposed"] = flipped
+
+    # 归一化权重体检：多数不像 gamma 时，说明这份 .TG 读错了（实测踩过）
+    n_good, bad = norm_sanity(weights)
+    if bad and len(bad) * 2 >= (n_good + len(bad)):
+        raise CheckpointError(
+            ".TG 的归一化权重不像 RMSNorm/LayerNorm 的 gamma（%d/%d 个可疑，例如 %s 均值 %.2f）。"
+            "修法：① 用 tools/tg_audit.py 与 safetensors 对拍同一模型；"
+            "② 确认转换器版本与 .TG 版本一致（本文件 version=%s）；"
+            "③ 若是旧转换器写出的文件，请重新转换 —— 这种错误不会报错，只会让模型训不好"
+            % (len(bad), n_good + len(bad), bad[0][0], bad[0][1], h.get("version")))
+    if bad:
+        cfg["suspicious_norms"] = [b[0] for b in bad]
+
     return Checkpoint(weights, cfg, source=path)
