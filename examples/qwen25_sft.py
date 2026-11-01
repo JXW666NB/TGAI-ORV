@@ -138,8 +138,9 @@ class Qwen25:
         self.tie = bool(tie)
         if self.tie:
             self.p["lm_head.weight"] = self.p["token_embedding.weight"]
-        self.emb = T.nn.Embedding(cfg["V"], cfg["D"])
-        self.emb.weight = self.p["token_embedding.weight"]
+        # 直接挂共享 Parameter：不要先随机初始化一张 V*D 的表再扔掉
+        # （0.5B 模型那是 545 MB，实测会留在分配器缓存里）
+        self.emb = T.nn.Embedding(cfg["V"], cfg["D"], weight=self.p["token_embedding.weight"])
         self.ln1, self.ln2 = [], []
         for i in range(cfg["L"]):
             b = "blocks.%d." % i

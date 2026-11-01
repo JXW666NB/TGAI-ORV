@@ -2915,8 +2915,23 @@ class Linear(Module):
 
 
 class Embedding(Module):
-    def __init__(self, num_embeddings, dim):
+    def __init__(self, num_embeddings, dim, weight=None):
+        """weight 给定时**直接挂上**，不再随机初始化一张新表。
+
+        为什么要有这个参数：权重绑定（tie）的模型会把词嵌入同时当作 lm_head，
+        典型写法是"建 Embedding，再把 weight 换成共享 Parameter"——
+        那等于先白分配一张 V*D 的表（0.5B 模型 545 MB）再扔掉。
+        用 weight= 可以直接复用已有 Parameter，既省显存也不会多一次随机初始化。
+        """
         super().__init__()
+        if weight is not None:
+            if tuple(int(x) for x in weight.shape) != (int(num_embeddings), int(dim)):
+                raise ValueError(
+                    "Embedding: 传入的 weight 形状是 %s，与 (V=%d, D=%d) 不符。"
+                    "修法：确认 cfg 的 V/D 与权重一致"
+                    % (tuple(int(x) for x in weight.shape), num_embeddings, dim))
+            self.weight = weight
+            return
         self.weight = Parameter((np.random.randn(num_embeddings, dim) * 0.02).astype(np.float32))
 
     def forward(self, idx):
