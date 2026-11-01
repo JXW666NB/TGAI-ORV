@@ -474,6 +474,64 @@ def _tg_depermute(a, nh, dh):
     return np.ascontiguousarray(a.reshape(nh, dh, -1)[:, inv, :].reshape(a.shape))
 
 
+def _expect_linear_shapes(cfg):
+    """每个线性层**应该**是什么形状（.TG / HF 都是 [out, in] 约定）。"""
+    D = int(cfg["D"])
+    NH = int(cfg["NH"])
+    NKV = int(cfg["KV"])
+    DH = int(cfg["DH"])
+    FF = int(cfg["FF"])
+    return {
+        "attn.q_proj.weight": (NH * DH, D),
+        "attn.k_proj.weight": (NKV * DH, D),
+        "attn.v_proj.weight": (NKV * DH, D),
+        "attn.out_proj.weight": (D, NH * DH),
+        "ffn.w1.weight": (FF, D),
+        "ffn.w2.weight": (FF, D),
+        "ffn.w3.weight": (D, FF),
+        "lm_head.weight": (int(cfg["V"]), D),
+    }
+
+
+def fix_linear_layout(weights, cfg, strict=True):
+    """校正/校验线性层布局，返回 (weights, 转置了哪些名字)。
+
+    `.TG` 有两种可能的存储约定：
+      * 标准 [out, in]  —— 与我们的 `linear(x, w) = x @ w.T` 一致；
+      * 转置 [in, out]  —— 需要转置回来。
+    形状正好是转置的，就自动转；**两者都不是**就报错（绝不静默放过）。
+    """
+    exp = _expect_linear_shapes(cfg)
+    flipped = []
+    out = dict(weights)
+    # ★ 必须遍历**所有** key：一个 24 层模型有 24 个 blocks.N.ffn.w1，
+    #   只修"第一个匹配到的"会漏掉其余 23 层（实测踩过：单测里立刻暴露）。
+    for key in list(out):
+        want = None
+        for name, shape in exp.items():
+            if key.endswith(name):
+                want = shape
+                break
+        if want is None:
+            continue
+        a = out[key]
+        got = tuple(int(x) for x in a.shape)
+        if got == want:
+            continue
+        if got == want[::-1]:
+            out[key] = np.ascontiguousarray(a.T)
+            flipped.append(key)
+            continue
+        if strict:
+            raise CheckpointError(
+                "线性层形状对不上：%s 是 %s，期望 %s（或转置 %s）。"
+                "修法：① 这是别的模型结构的权重吗？核对 config/头里的 "
+                "d_model/n_heads/n_head_kv/n_ff；② 若是转置存储的 .TG，"
+                "请确认转换器写的是 [out,in] 还是 [in,out]（本函数只接受这两种）"
+                % (key, got, want, want[::-1]))
+    return out, flipped
+
+
 def load_tg(path, max_layers=None, vocab_limit=None):
     """读 .TG → Checkpoint。max_layers / vocab_limit 用于"切片对拍"（省内存）。"""
     from ..read_tg import read_tg, load_tensor
@@ -543,4 +601,10 @@ def load_tg(path, max_layers=None, vocab_limit=None):
            "TIE": tie}
     if has_qk_norm:
         cfg["arch"] = "qwen3"
+    # ★ 布局自洽检查：形状不对就转置或报错，绝不让"能加载但训出错模型"发生
+    cfg_for_shape = {"D": D, "NH": NH, "KV": NKV, "DH": DH,
+                     "FF": int(h["d_ff"]), "V": int(cfg["vocab_size"])}
+    weights, flipped = fix_linear_layout(weights, cfg_for_shape)
+    if flipped:
+        cfg["layout_transposed"] = flipped
     return Checkpoint(weights, cfg, source=path)
