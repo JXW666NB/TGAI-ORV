@@ -561,7 +561,7 @@ def norm_sanity(weights, lo=0.2, hi=3.0):
     return good, bad
 
 
-def load_tg(path, max_layers=None, vocab_limit=None):
+def load_tg(path, max_layers=None, vocab_limit=None, allow_suspicious_norms=False):
     """读 .TG → Checkpoint。max_layers / vocab_limit 用于"切片对拍"（省内存）。"""
     from ..read_tg import read_tg, load_tensor
     if not os.path.isfile(path):
@@ -638,14 +638,21 @@ def load_tg(path, max_layers=None, vocab_limit=None):
         cfg["layout_transposed"] = flipped
 
     # 归一化权重体检：多数不像 gamma 时，说明这份 .TG 读错了（实测踩过）
+    # ★ 判据不是"比例"，而是"有没有离谱的单点"：实测量过 —— 49 个归一化张量里
+    #   只有 4 个可疑（8%），但 final_norm 均值 7.14 会把 logits 放大 7 倍、
+    #   blocks.0.ln1 均值 0.03 直接把第 0 层废掉，CE 就从 3.66 变成 8.30。
+    #   真实训练出来的模型里，归一化权重几乎不可能出现这种值。
     n_good, bad = norm_sanity(weights)
-    if bad and len(bad) * 2 >= (n_good + len(bad)):
+    if bad and not allow_suspicious_norms:
         raise CheckpointError(
-            ".TG 的归一化权重不像 RMSNorm/LayerNorm 的 gamma（%d/%d 个可疑，例如 %s 均值 %.2f）。"
+            ".TG 的归一化权重不像 RMSNorm/LayerNorm 的 gamma（%d/%d 个可疑：%s）。"
             "修法：① 用 tools/tg_audit.py 与 safetensors 对拍同一模型；"
             "② 确认转换器版本与 .TG 版本一致（本文件 version=%s）；"
-            "③ 若是旧转换器写出的文件，请重新转换 —— 这种错误不会报错，只会让模型训不好"
-            % (len(bad), n_good + len(bad), bad[0][0], bad[0][1], h.get("version")))
+            "③ 确认无误时可用 allow_suspicious_norms=True 放行 —— "
+            "否则这种错误不会报错，只会让模型训不好"
+            % (len(bad), n_good + len(bad),
+               "；".join("%s 均值 %.3f" % (b[0], b[1]) for b in bad[:3]),
+               h.get("version")))
     if bad:
         cfg["suspicious_norms"] = [b[0] for b in bad]
 
