@@ -261,3 +261,54 @@ python examples/qwen25_sft.py --safetensors /path/Qwen3-0.6B --data sft.jsonl \
 > "一口气 6 步"的末 3 步**损失一致**。
 >
 > 老存档（只有参数）仍然能加载，只是会提示"未恢复（老存档只含参数）"。
+
+---
+
+## 11. 十行代码训练（`tgai_go.api.train`）
+
+### 11.1 最小用法
+
+```python
+from tgai_go import api
+
+r = api.train(weights="Qwen2.5-0.5B", data="my_sft.jsonl",
+              lr=5e-6, batch=2, seq_len=256, steps=300, out="ckpt.npz")
+print(r.probe_base, r.probe_final, r.drop_pct, r.verdict)
+```
+
+返回的 `TrainingResult` 既是 dict 也能按属性取：
+
+| 字段 | 含义 |
+| --- | --- |
+| `probe_base` / `probe_final` | 留出集探针 loss（开始 / 结束） |
+| `drop_pct` | 降幅（%，正数表示下降） |
+| `verdict` | `PASS` / `FAIL`（脚本判定：降幅 >=5% 才算学到） |
+| `ckpt` | 检查点路径（传了 `out` 才有） |
+| `log` | 完整日志（`quiet=False` 时也打到屏幕） |
+| `command` / `returncode` | 实际执行的命令与返回码（便于复现） |
+
+### 11.2 参数
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `weights` | — | safetensors 目录（`tokenizer.json` 可自动找） |
+| `data` | — | jsonl 路径，每行 `{"prompt","completion"}`（也支持 `{"text"}` 等，见 `tgai_go.train.data`） |
+| `method` | `"sft"` | 只支持 `sft`；`pretrain`/`dpo`/`grpo` 抛 `NotImplementedError` 并说明计划 |
+| `seq_len` / `batch` / `steps` | 256 / 1 / 300 | 训练形状 |
+| `lr` | 5e-6 | V100 实测推荐值（1e-5~2e-5 之间开始发散，见 FINETUNE_RESULTS §10） |
+| `holdout` | 64 | 探针留出集。**别低于 64** —— 8 条的结论会被噪声反转（实测） |
+| `out` | None | 检查点路径 |
+| `tiny` | False | True 时用随机迷你权重（CPU、几秒），先跑通流程 |
+| `quiet` | True | False 时把训练日志实时打出来 |
+
+### 11.3 现在**不是**什么
+
+- **不是进程内训练**：v1 通过子进程驱动 `examples/qwen25_sft.py`（已全面验证的那条路），
+  所以要求本机有这个仓库目录；
+- **不支持 DPO / GRPO / 预训练**：会明确抛错，不假装支持；
+- **不做自动调参**：`lr` 等要自己给（推荐值来自实测扫参，不是猜的）。
+
+### 11.4 想直接改内部行为时
+
+API 只是入口；要改训练细节（融合核、梯度裁剪策略、掩码方式）请直接看
+`examples/qwen25_sft.py`，那里的每一步都有中文注释与实测判据。

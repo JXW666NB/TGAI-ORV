@@ -217,6 +217,27 @@ ops_plugin.register_numpy("gelu_exact", fwd, bwd, kind="tensor")
 
 ---
 
+## 十行代码训练 / Ten Lines
+
+```python
+from tgai_go import api
+
+r = api.train(
+    weights="Qwen2.5-0.5B",        # safetensors 目录（含 tokenizer.json）
+    data="my_sft.jsonl",           # 每行 {"prompt": "...", "completion": "..."}
+    method="sft",                  # 目前支持 sft；pretrain/dpo/grpo 会明确报"计划中"
+    lr=5e-6, batch=2, seq_len=256, steps=300,
+    out="ckpt.npz",                # 可选：落检查点
+)
+print(r.probe_base, "->", r.probe_final, r.drop_pct, "%", r.verdict)
+```
+
+没有 GPU、没有权重也能先跑通流程：`api.train(tiny=True, steps=3)`（CPU，几秒）。
+
+> **这一层现在是什么（如实说）**：它是**编排层** —— 校验参数、驱动仓库里已验证的
+> `examples/qwen25_sft.py`，再把日志解析成 dict。好处是 API 与被验证的那条路
+> **不可能产生行为差异**；代价是它需要仓库目录。把模型与训练循环搬进包内是下一步。
+
 ## 装 / Install
 
 ```bash
