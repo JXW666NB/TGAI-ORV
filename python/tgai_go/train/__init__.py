@@ -2523,9 +2523,11 @@ def checkpoint(fn, *inputs):
       * 只有"需要梯度"的输入才会被追踪，纯 numpy 输入原样透传。
     """
     ts = [x for x in inputs if isinstance(x, Tensor)]
-    need = [x for x in ts if x.requires_grad and getattr(x, "device", "cpu") == "cpu"]
+    # ★ 不要按 device 过滤：CUDA 张量也必须走"不建图 + 反向重算"，
+    #   否则这个函数在 GPU 上等于 `fn(*inputs)`（静默不省显存）。
+    need = [x for x in ts if x.requires_grad]
     if not need:
-        return fn(*inputs)              # 无可求导输入（或在设备上）：直接算，不折腾
+        return fn(*inputs)              # 没有需要梯度的输入：没必要折腾
 
     prev = _GRAD_ENABLED[0]
     _GRAD_ENABLED[0] = False
@@ -2541,9 +2543,13 @@ def checkpoint(fn, *inputs):
             "修法：多输出请包成 lambda，返回一个 Tensor（例如把 tuple 拼起来），"
             "或对每个输出分别调用 checkpoint" % type(out).__name__)
 
-    # 关键：不连 _parents —— 中间激活因此可以在前向结束后被释放
-    res = Tensor(np.array(out.data, copy=True),
-                 requires_grad=any(x.requires_grad for x in need))
+    # 关键：不连 _parents —— 中间激活因此可以在前向结束后被释放。
+    # 输出要**分离拷贝**一份（脱离计算图）；CUDA 上必须在设备侧复制，
+    # 走 detach() 会把它拉回主机（那是错的，也慢）。
+    if getattr(out, "device", "cpu") == "cuda":
+        res = Tensor._from_gpu(_cuda().clone(out._gpu), requires_grad=True)
+    else:
+        res = Tensor(np.array(out.data, copy=True), requires_grad=True)
 
     def bw(g, grads):
         # 反向时重跑前向（必须重新打开 grad，否则重算出来的图没有 _backward）

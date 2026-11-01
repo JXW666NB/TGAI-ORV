@@ -4,8 +4,10 @@
 - `chunked_ce()`：lm_head 投影与 CE 按 token 分块，用 `T.checkpoint` 保证反向时重算，
   图里只保留块大小的 logits（不落地 `[N,V]`）。
 - `cfg["CHUNK_CE"] = True`（可选 `CHUNK_TOKENS`，默认 8192）即在 `sft()` 生效。
-- 实测（V100，Qwen2.5-0.5B，B=4/S=512）：整块 **29.92 GiB 峰值 → OOM**；
-  分块 **17.72 GiB → 跑通**，**−12.2 GiB（−41%）**。
+- ⚠ **测量作废（2026-11-01 晚复核）**：先前记的"整块 29.92 GiB OOM / 分块 17.72 GiB"
+  不可用 —— 当时 `T.checkpoint` 在 CUDA 上是**空操作**，且 `CHUNK_TOKENS` 默认 8192
+  大于 N=2048（实际只有 1 块），因此两条路径的差异**不能归因于分块**。
+  待用修好的 checkpoint 重测后再填数字。
 - 数值等价：loss 差 4.8e-07、梯度差 <1e-5（`tests/test_chunked_ce.py` 4 项）。
 
 

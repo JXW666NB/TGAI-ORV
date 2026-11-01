@@ -40,6 +40,9 @@ def scan():
     out = []
     for name, args in sigs:
         a = " ".join(args.split())
+        # 只认**类型名**：本引擎的 bf16 内核形参写成 `unsigned short`（位运算实现），
+        # 按类型名扫不到是**正确**的 —— 因为它们确实没接进引擎。
+        # "源码里有"由下面的 src_bf16 单独统计，两个数字别混。
         has_bf16 = ("bfloat16" in a) or ("__nv_bfloat16" in a)
         out.append({"name": name, "bf16": has_bf16, "args": a[:120]})
     return out

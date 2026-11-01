@@ -39,8 +39,14 @@ def test_counts_are_self_consistent():
     assert n_bf16 <= len(ks)
     # 目前（未实现 bf16 内核变体）应当全是 float-only；
     # 将来做了 S1 之后这条会变，届时**主动改测试**并更新 docs/AMP_PLAN.md
-    assert n_bf16 == 0, ("已有 %d 个内核支持 bf16 —— 说明 AMP 计划推进了，"
-                         "请更新 docs/AMP_PLAN.md 与 README 的状态表" % n_bf16)
+    # bf16 内核源码存在（amp.py 里 3 个），但**没有接进引擎**（_device_source 里为 0）。
+    # 这两件事必须分开断言：源码里有 ≠ 训练时在用（实测踩过这个误解）。
+    from tgai_go.train import amp as _amp
+    n_src = len(getattr(_amp, "BF16_KERNELS", {}))
+    # 两个数字必须分开看：源码里有（amp.py）≠ 引擎里接线了（cuda.py 设备源码）
+    assert n_bf16 == 0, ("引擎里有 %d 个内核支持 bf16 —— 说明 AMP 真的推进了，"
+                         "请更新 docs/AMP_PLAN.md 与 README 状态表" % n_bf16)
+    assert n_src >= 3, "amp.py 里应至少有 3 个 bf16 内核源码（当前 %d）" % n_src
 
 
 def test_plan_doc_exists():
