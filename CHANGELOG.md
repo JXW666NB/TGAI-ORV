@@ -1,5 +1,14 @@
 ## [未发布]
 
+### 新增 · 分块交叉熵（`CHUNK_CE`）—— 把 32 GB 卡跑不动的形状变成能跑
+- `chunked_ce()`：lm_head 投影与 CE 按 token 分块，用 `T.checkpoint` 保证反向时重算，
+  图里只保留块大小的 logits（不落地 `[N,V]`）。
+- `cfg["CHUNK_CE"] = True`（可选 `CHUNK_TOKENS`，默认 8192）即在 `sft()` 生效。
+- 实测（V100，Qwen2.5-0.5B，B=4/S=512）：整块 **29.92 GiB 峰值 → OOM**；
+  分块 **17.72 GiB → 跑通**，**−12.2 GiB（−41%）**。
+- 数值等价：loss 差 4.8e-07、梯度差 <1e-5（`tests/test_chunked_ce.py` 4 项）。
+
+
 ### 新增 · `api.train` 支持 `pretrain`（从零预训练）
 - 纯文本语料切定长块（`build_lm_sequences`，支持 `.txt` / 每行 `{"text"}`），
   **全 token 参与 loss**（不做对话模板、不遮 prompt）。

@@ -223,8 +223,12 @@ class Qwen25:
         return x
 
 
-    def forward(self, ids):
-        """ids: numpy int64 [B, S] → logits [B, S, V]"""
+    def forward(self, ids, hidden=False):
+        """ids: numpy int64 [B, S] → logits [B, S, V]（hidden=True 时只到 final norm 的 z）。
+
+        `hidden=True` 是给**分块 CE** 用的：先拿 z [B*S, D]，再按 token 分块投影，
+        避免一次materialize [B*S, V] 这个大张量（B=4/S=512 时它是 1.24 GB）。
+        """
         cfg = self.cfg
         D, L, NH, KV, FF = cfg["D"], cfg["L"], cfg["NH"], cfg["KV"], cfg["FF"]
         DH = int(cfg.get("DH") or D // NH)      # Qwen3-0.6B: 128 != 1024/16
@@ -244,6 +248,8 @@ class Qwen25:
                 x = self._layer(x, i)
 
         z = self.final(x).reshape(B * S, D)
+        if hidden:
+            return z
         return (z @ p["lm_head.weight"].T).reshape(B, S, cfg["V"])
 
 
@@ -394,8 +400,14 @@ def sft(model, seqs, steps, lr, seq_len, log_every=1, probe=None, clip=0.0,
         idxs = plan[step * batch:(step + 1) * batch]
         for k, si in enumerate(idxs):
             xb, yb = _make_xy(seqs[si], seq_len)
-            logits = model.forward(xb)
-            loss = F.cross_entropy(logits.reshape(xb.size, cfg["V"]), yb.reshape(-1))
+            if cfg.get("CHUNK_CE"):
+                # 分块 CE：不落地 [B*S, V]，省 3 份词表大小的张量
+                zc = model.forward(xb, hidden=True)
+                loss = chunked_ce(zc, model.p["lm_head.weight"], yb.reshape(-1),
+                                  chunk=int(cfg.get("CHUNK_TOKENS") or 8192))
+            else:
+                logits = model.forward(xb)
+                loss = F.cross_entropy(logits.reshape(xb.size, cfg["V"]), yb.reshape(-1))
             (loss * (1.0 / batch)).backward()
         train_loss = float(loss.to_numpy())
         # 梯度裁剪：真实大模型上 lr 稍大就会炸（实测 probe 从 0.42 冲到 17.2），
@@ -598,6 +610,36 @@ def make_random_weights(cfg, seed=0):
     名字里的 "tiny" 只是当初的用处。这里单独导出，避免读代码的人误会。
     """
     return make_tiny_weights(cfg, seed=seed)
+
+
+def chunked_ce(z, W, target, chunk=8192, ignore_index=-100):
+    """分块交叉熵：`z` [N,D]（final norm 之后的隐状态）、`W` [V,D]、`target` [N]。
+
+    与"先算整块 logits 再 cross_entropy"在数值上等价（测试逐位对比），
+    但**不落地** [N,V]：每块只算 chunk×V 的 logits，包在 `T.checkpoint` 里，
+    反向时按块重算。
+    """
+    N = int(z.shape[0])
+    tgt = np.asarray(target.to_numpy() if hasattr(target, "to_numpy") else target,
+                     dtype=np.int64).reshape(-1)
+    valid = tgt != int(ignore_index)
+    total = int(valid.sum())
+    if total == 0:
+        return z.sum() * 0.0                     # 全掩码：零 loss，保持可反传
+
+    acc = None
+    step = max(1, int(chunk))
+    for s0 in range(0, N, step):
+        s1 = min(s0 + step, N)
+        m = int(valid[s0:s1].sum())
+        if m == 0:
+            continue
+        hc = z[s0:s1]                      # 引擎 Tensor 支持切片；别把整块传进去
+        lg = T.checkpoint(lambda hh: hh @ W.T, hc)
+        ce = T.functional.cross_entropy(lg, tgt[s0:s1], ignore_index)
+        ce = ce * float(m) / float(total)        # 换算成全局均值
+        acc = ce if acc is None else acc + ce
+    return acc
 
 
 def cfg_from_checkpoint(ck):
