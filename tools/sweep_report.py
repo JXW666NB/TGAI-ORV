@@ -48,7 +48,7 @@ def _f(v):
         return None
 
 
-def judge(rows, clip=1.0, min_delta=5.0, max_gnorm_ratio=5.0):
+def judge(rows, clip=1.0, min_delta=5.0, max_gnorm_ratio=200.0):
     """给每一组打判定，再挑推荐。返回 (verdicts, best, second)。"""
     out = []
     for r in rows:
@@ -57,8 +57,11 @@ def judge(rows, clip=1.0, min_delta=5.0, max_gnorm_ratio=5.0):
         steps = _f(r.get("steps"))
         reasons = []
         ok = True
-        if delta is None:
-            ok, _ = False, reasons.append("没有探针结果（运行可能失败）")
+        verdict = str(r.get("verdict") or "")
+        if delta is None or "FAIL" in verdict.upper():
+            ok = False
+            # 实测：lr=2e-5 两组直接发散（没有探针终值），这是最硬的信号
+            reasons.append("运行失败/发散（无探针终值，verdict=%s）" % (verdict or "-"))
         elif delta > -min_delta:
             ok = False
             reasons.append("降幅 %.1f%% < %.1f%%（未学到）" % (delta, min_delta))
@@ -74,7 +77,8 @@ def judge(rows, clip=1.0, min_delta=5.0, max_gnorm_ratio=5.0):
 
     cand = [v for v in out if v["ok"]]
     # 并列时更保守：lr 小优先，再 batch 小优先
-    cand.sort(key=lambda v: (-v["delta"], v["lr"] or 0, v["batch"] or 0))
+    # delta 是**负值**（-8.5 表示降了 8.5%），所以直接升序 = 降幅最大优先
+    cand.sort(key=lambda v: (v["delta"], v["lr"] or 0, v["batch"] or 0))
     best = cand[0] if cand else None
     second = cand[1] if len(cand) > 1 else None
     return out, best, second
@@ -104,9 +108,11 @@ def render(out, best, second, clip, min_delta):
             lines.append("**次佳**：lr=%g，batch=%d（降幅 %.1f%%）"
                          % (second["lr"], second["batch"], -second["delta"]))
         lines.append("")
-        lines.append("> 判据：留出集降幅 ≥%.0f%% 且 gnorm 中位数 ≤%.0f×clip(=%g)。"
+        lines.append("> 判据：留出集降幅 ≥%.0f%%，且运行未失败（无发散）。"
+                     "gnorm 仅作异常值警告（>%.0f×clip）：实测 0.5B 在 clip=%g 下 "
+                     "gnorm 中位数 29~37 属正常，不能拿它当筛选门槛。"
                      "单 seed 结果，只说明「这组能达到」，**不构成收敛性承诺**。"
-                     % (min_delta, 5.0, clip))
+                     % (min_delta, 200.0, clip))
     else:
         lines.append("**没有一组达标** —— 不要放宽判据。下一步该查数据（"
                      "`tools/dataset_report.py` 的截断率/监督密度）而不是继续调超参。")
