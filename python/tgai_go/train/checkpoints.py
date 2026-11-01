@@ -637,22 +637,14 @@ def load_tg(path, max_layers=None, vocab_limit=None, allow_suspicious_norms=Fals
     if flipped:
         cfg["layout_transposed"] = flipped
 
-    # 归一化权重体检：多数不像 gamma 时，说明这份 .TG 读错了（实测踩过）
-    # ★ 判据不是"比例"，而是"有没有离谱的单点"：实测量过 —— 49 个归一化张量里
-    #   只有 4 个可疑（8%），但 final_norm 均值 7.14 会把 logits 放大 7 倍、
-    #   blocks.0.ln1 均值 0.03 直接把第 0 层废掉，CE 就从 3.66 变成 8.30。
-    #   真实训练出来的模型里，归一化权重几乎不可能出现这种值。
+    # 归一化权重体检：**只记录，不抛错**。
+    # ★ 教训（2026-11-01，我踩的坑）：原先按"均值应≈1"的常识设阈值并抛错，
+    #   随后用官方 safetensors 对拍发现 —— **官方 Qwen2.5-0.5B 的
+    #   blocks.0.ln1.weight 均值就是 0.032、final_norm 约 7.1**（它的 mean/std
+    #   与 .TG 完全一致），也就是说这个护栏会**拒绝合法权重**。
+    #   能判对错的只有"对比"：tools/tg_audit.py 让同一模型两路加载比 CE；
+    #   容器本身的自洽性（hash 唯一/区间不重叠/不越界）由 tools/tg_check 检查。
     n_good, bad = norm_sanity(weights)
-    if bad and not allow_suspicious_norms:
-        raise CheckpointError(
-            ".TG 的归一化权重不像 RMSNorm/LayerNorm 的 gamma（%d/%d 个可疑：%s）。"
-            "修法：① 用 tools/tg_audit.py 与 safetensors 对拍同一模型；"
-            "② 确认转换器版本与 .TG 版本一致（本文件 version=%s）；"
-            "③ 确认无误时可用 allow_suspicious_norms=True 放行 —— "
-            "否则这种错误不会报错，只会让模型训不好"
-            % (len(bad), n_good + len(bad),
-               "；".join("%s 均值 %.3f" % (b[0], b[1]) for b in bad[:3]),
-               h.get("version")))
     if bad:
         cfg["suspicious_norms"] = [b[0] for b in bad]
 
