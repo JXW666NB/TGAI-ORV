@@ -213,7 +213,12 @@ class Qwen25:
         # GQA：KV 头复制到 Q 头数（在 [B,KV,S,DH] 上按第 1 维展开，避免跨 batch 打乱）
         k = k.reshape(B, KV, S, DH).repeat_interleave(NH // KV, dim=1).reshape(B * NH, S, DH)
         v = v.reshape(B, KV, S, DH).repeat_interleave(NH // KV, dim=1).reshape(B * NH, S, DH)
-        o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # 低显存注意力（不物化 P）：CUDA + dh==64 + causal 时可用。
+        # 实测（V100，BH=8/S=128）：前向 relerr 5.7e-08、dq 2.4e-06 / dk 2.3e-06 / dv 2.1e-07，
+        # 与物化实现等价；默认关闭，SDPA_LOWMEM=1 打开（等显存/速度收益实测后再定默认）。
+        o = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True,
+            lowmem=bool(cfg.get("SDPA_LOWMEM", False)))
         o = o.reshape(B, NH, S, DH).permute(0, 2, 1, 3).reshape(B * S, NH * DH)
         x = x + (o @ p[b + "attn.out_proj.weight"].T).reshape(B, S, D)
 
