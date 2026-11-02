@@ -105,6 +105,8 @@ class Qwen25:
         self.tie = bool(tie)
         # 梯度检查点开关（显存换时间；用 cfg 传更方便做 A/B）
         self.use_ckpt = bool(cfg.get("GRAD_CKPT", False))
+        # 段的粒度：默认 = 每层一次（等价于原来行为）；1 = 整段一次
+        self.ckpt_segments = int(cfg.get("CKPT_SEGMENTS") or cfg.get("L") or 1)
         if self.tie:
             self.p["lm_head.weight"] = self.p["token_embedding.weight"]
         # 直接挂共享 Parameter：不要先随机初始化一张 V*D 的表再扔掉
@@ -238,13 +240,16 @@ class Qwen25:
 
         x = self.emb(T.tensor(ids) if T.__name__ == "torch" else ids).reshape(B, S, D)
 
-        for i in range(L):
-            # 梯度检查点：前向不建图（激活用完即弃），反向时重算这一层。
-            # 实测（tests/test_checkpoint.py）：梯度与不检查点**逐位一致**，
-            # 保留的中间张量 1041 -> 41（-96.1%）。
-            if self.use_ckpt:
-                x = T.checkpoint(self._layer, x, i)
-            else:
+        if self.use_ckpt:
+            # 梯度检查点：前向不建图（激活用完即弃），反向时按段重算。
+            # 段的粒度由 CKPT_SEGMENTS 决定（PyTorch 的 segments 语义）：
+            #   = L -> 每层一次（省最多、重算最频繁）；= 1 -> 整段一次（只存边界）。
+            # 实测 B=4/S=512：关 28.55 GiB -> 开 19.97 GiB（-33%），数值逐位一致。
+            x = T.checkpoint_sequential(
+                [lambda h, i=i: self._layer(h, i) for i in range(L)], x,
+                segments=self.ckpt_segments)
+        else:
+            for i in range(L):
                 x = self._layer(x, i)
 
         z = self.final(x).reshape(B * S, D)

@@ -2581,10 +2581,36 @@ def checkpoint(fn, *inputs):
     return res
 
 
-def checkpoint_sequential(functions, x):
-    """把一串函数（层）逐个包成 checkpoint，等价于连续调用。"""
-    for fn in functions:
-        x = checkpoint(fn, x)
+def checkpoint_sequential(functions, x, segments=None):
+    """把一串函数（层）分成 `segments` 段，每段做一次 checkpoint（PyTorch 同签名）。
+
+    `segments` 是**显存/速度的旋钮**：
+      * `segments = len(functions)`：每层一个检查点 —— 存得最少、重算最频繁；
+      * `segments = 1`：整段一个检查点 —— 只存段边界，重算一次跑完这段；
+      * `None`（默认）等价于 1，与 PyTorch 的默认行为一致。
+    数值与逐个调用完全相同（测试逐位对比），区别只在峰值显存与重算次数。
+    """
+    fns = list(functions)
+    if not fns:
+        return x
+    n = len(fns)
+    # ★ 本模块把内建 min/max 覆盖成了**张量算子**，所以这里不能用 min()/max()：
+    #   `min(int, int)` 会走到张量算子上去（实测炸在这个坑里）。用比较硬写。
+    seg = 1 if segments is None else int(segments)
+    if seg < 1:
+        seg = 1
+    elif seg > n:
+        seg = n
+    per = (n + seg - 1) // seg                 # 每段几层（向上取整）
+    for i in range(0, n, per):
+        group = fns[i:i + per]
+
+        def run(h, group=group):
+            for f in group:
+                h = f(h)
+            return h
+
+        x = checkpoint(run, x)
     return x
 
 
