@@ -899,7 +899,14 @@ class Tensor:
             if K != K2:
                 raise ValueError("matmul K 不匹配: %s @ %s^T" % (self.shape, src.shape) + HINT_MATMUL)
             if not rt._numpy_exact_gemm(M, N, K):
-                buf = rt.gemm_nt(self._gpu, src._gpu)
+                # ★ fp16 前向 GEMM（V100 Tensor Core）：只在 rt.fp16_gemm 打开时走。
+                #   前向用 fp16 计算（fp32 累加），**反向仍用 fp32 的 sgemm/gemm_tn**，
+                #   所以梯度路径一个字节都没变，只有前向的输入被舍入到 fp16。
+                #   实测（V100）：mlp 4.33x、lm_head 5.21x，relerr ~3e-04（fp16 舍入）。
+                if getattr(rt, "fp16_gemm", False):
+                    buf = rt.sgemm_fp16_nt(self._gpu, src._gpu)
+                else:
+                    buf = rt.gemm_nt(self._gpu, src._gpu)
                 rg = self.requires_grad or src.requires_grad
                 out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, src) if rg else ())
                 a, w = self._gpu, src._gpu

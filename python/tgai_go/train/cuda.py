@@ -2881,13 +2881,17 @@ class CudaRuntime:
         # ★ 原来这里是**硬编码 12.2 GiB**：工作集一到 13 GiB 就每步狂 trim
         #   （实测 1190 次/步），而 trim 对裸指针要先 cuCtxSynchronize（整设备同步）。
         #   改成看设备**真实空闲显存**：只有真不够（< 2 GiB）才丢缓存。
+        # limit 必须在所有分支都有定义（下面循环里要用）——之前漏了，实测 UnboundLocalError
+        limit = (12 * 1024 + 204) * 1024 * 1024
         free_b = self.free_device_bytes()
         if free_b is None:
-            limit = (12 * 1024 + 204) * 1024 * 1024
             if self._pool_live_bytes + self._pool_cached_bytes <= limit:
                 return
         elif free_b >= (2 << 30):
             return
+        else:
+            # 真不够了：把阈值压到 0，逼它每个尺寸只留 2 块、其余还给驱动
+            limit = 0
         self._activate()
         self._pool_trimming = True
         synced = False
