@@ -225,7 +225,12 @@ class Qwen25:
         h2 = self.ln2[i](x).reshape(B * S, D)
         g = h2 @ p[b + "ffn.w1.weight"].T
         u = h2 @ p[b + "ffn.w2.weight"].T
-        act = F.silu(g) * u
+        # 融合 silu(g)*u：CUDA 上 fwd/bwd 各 1 个 kernel（组合实现要 5 个）。
+        # 内核异常会自动回退组合实现（T.silu_mul 内部保证），FUSED_OPS=0 可关。
+        if cfg.get("FUSED_OPS", True):
+            act = T.silu_mul(g, u)
+        else:
+            act = F.silu(g) * u
         x = x + (act @ p[b + "ffn.w3.weight"].T).reshape(B, S, D)
         return x
 
