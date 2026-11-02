@@ -1378,6 +1378,23 @@ extern "C" __global__ void index_gather8(
 
 /* 反向：调用方先把 full memset 成 0，再把梯度加回源位置。
    切片各位置不重叠，atomicAdd 只执行一次；repeat 的同一源位置会被加 repeats 次。 */
+/* 确定性 repeat_interleave 反向：out[o,k,inn] = sum_{j=0..r-1} g[o, k*r+j, inn]。
+   一个线程一个输出元素，j 升序累加 —— 顺序固定，无原子，运行间逐位可复现。 */
+extern "C" __global__ void repeat_reduce(const float* g, float* out, long long n_out,
+                                          int repeats, long long kinner, long long inner) {
+    long long i = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+    if (i >= n_out) return;
+    long long inn = i % inner;
+    long long k = (i / inner) % (kinner / inner);
+    long long o = i / kinner;
+    float acc = 0.f;
+    const long long gbase = (o * kinner) * (long long)repeats + k * (long long)repeats * inner + inn;
+    for (int j = 0; j < repeats; ++j) {
+        acc = __fadd_rn(acc, g[gbase + (long long)j * inner]);
+    }
+    out[i] = acc;
+}
+
 extern "C" __global__ void index_scatter_add8(
     const float* g, float* full, int n, int base,
     int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
@@ -2321,6 +2338,8 @@ class CudaRuntime:
         self._blas_stream_set = False
         self._dto_async_ready = False
         self._capturing = False
+        # 确定性模式：TG_DETERMINISTIC=1 时反向走无原子内核（慢约 1%，可逐位复现）
+        self.deterministic = str(os.environ.get("TG_DETERMINISTIC", "")).strip().lower() in ("1", "true", "on", "yes")
         # CUDA Graph 捕获期的预留 arena（bump 分配）
         self._arena_base = 0
         self._arena_size = 0
@@ -3810,6 +3829,32 @@ class CudaRuntime:
         grid, block = self._ewise_grid(n)
         self.launch("index_gather8", grid, block, self._index_launch_args(
             buf, out, n, base, out_shape, divs, strides))
+        return out
+
+    def repeat_reduce(self, g, repeats, out_shape, axis):
+        """确定性重复归约（replace index_scatter_add 的原子版）。"""
+        rt_shape = tuple(int(x) for x in out_shape)
+        axis = int(axis)
+        if axis < 0:
+            axis += len(rt_shape)
+        outer = 1
+        for v in rt_shape[:axis]:
+            outer *= v
+        inner = 1
+        for v in rt_shape[axis + 1:]:
+            inner *= v
+        k = int(rt_shape[axis])
+        out = self.empty(rt_shape, dtype=np.float32)
+        n_out = int(outer * k * inner)
+        if n_out and int(repeats) > 0:
+            grid, block = self._ewise_grid(n_out)
+            self.launch("repeat_reduce", grid, block, [
+                self._ptr(g), self._ptr(out),
+                (ctypes.c_longlong(n_out), ctypes.c_longlong),
+                (int(repeats), ctypes.c_int),
+                (ctypes.c_longlong(k * inner), ctypes.c_longlong),
+                (ctypes.c_longlong(inner), ctypes.c_longlong),
+            ])
         return out
 
     def index_scatter_add(self, grad, in_shape, base, divs, strides):
@@ -5616,6 +5661,14 @@ class CudaRuntime:
         #   A10：我们 kernel 的 GPU 合计 20.07 → 15.77 ms；V100：整步 53.3 → 46.0 ms。
         # 所以把阈值抬到 8192：常规序列一律走原子版；
         # 独占版只留给"超长序列 + 小词表"（原来那条注释针对的 8192 场景）。
+        # 确定性模式：强制走"按 id 独占一行、块内按 token 顺序累加"的 emb_bwd_owned，
+        # 它没有 atomicAdd，所以同一输入两次运行结果逐位相同（代价是每块扫全部 seq）。
+        if getattr(self, "deterministic", False) and vocab >= 2 and d >= 128:
+            self.launch("emb_bwd_owned", (256, 1, 1), (256, 1, 1), [
+                self._ptr(grad), self._ptr(ids), self._ptr(dw),
+                (seq, ctypes.c_int), (d, ctypes.c_int), (vocab, ctypes.c_int),
+            ])
+            return dw
         if seq < 8192 or d < 128 or vocab < 2:
             self.launch("emb_gather_bwd", (seq, 1, 1), (256, 1, 1), [
                 self._ptr(grad), self._ptr(ids), self._ptr(dw),

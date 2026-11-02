@@ -2205,3 +2205,14 @@ max|Δ| = 1.383e-05     相对误差 = 6.693e-07     判据 ≤1e-5   PASS
 - `examples/qwen25_sft.py: cfg_from_checkpoint()`：`checkpoints` 的 HF 风格键
   （`n_embd/n_layer/vocab_size`）↔ 模型类的 `D/L/V` 的**唯一**转换点
   （两套命名并存是历史原因，散着写必然漂移）。
+
+### 2026-11-03 追加：可复现性判据
+
+| 判据 | 结果 |
+| --- | --- |
+| 默认模式：同配置两次训练 | 参数差 7.63e-06（**非确定**，与 PyTorch 默认行为一致） |
+| `TG_DETERMINISTIC=1`：同配置两次训练 | **参数差 0.000e+00（逐位一致）** |
+| 确定性模式的代价 | 717.3 → 724.3 ms/step（**约 1%**） |
+| 确定性覆盖范围 | rmsnorm dw / 词嵌入反向 / repeat_interleave 反向（三处 atomic 全部替换） |
+
+用法：`rt.deterministic = True` 或环境变量 `TG_DETERMINISTIC=1`。

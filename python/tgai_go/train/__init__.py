@@ -1524,7 +1524,13 @@ class Tensor:
         def bw(g, grads):
             if self.requires_grad:
                 # 连续重复的那几份梯度加回同一个源位置。
-                _acc(grads, self, rt.index_scatter_add(g, in_shape, base, divs, strides))
+                # rt.deterministic=True 时走 repeat_reduce（按 j 升序归约、无原子），
+                # 保证同一输入两次运行梯度逐位相同。
+                if getattr(rt, "deterministic", False):
+                    _acc(grads, self, rt.repeat_reduce(g, int(repeats), in_shape, dim))
+                else:
+                    _acc(grads, self,
+                         rt.index_scatter_add(g, in_shape, base, divs, strides))
         out._backward = bw
         return out
 

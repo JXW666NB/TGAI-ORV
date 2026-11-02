@@ -610,3 +610,41 @@ run B: 10.1822243  9.5593433  9.1486282  8.9099903  8.7375994
 - **前向已逐位可复现**；反向还有 ~1e-6 级抖动。
 - `rt.deterministic` 目前只覆盖 rmsnorm；**默认关闭**（快路径仍是原子版）。
 - 要做到"同配置两次训练逐位一致"，还需要上面两处的确定性变体。
+
+---
+
+## 21. 2026-11-03：**可复现模式打通** —— 两次训练逐位一致，代价 1%
+
+### 21.1 三处 atomic 全部改成确定性归约
+
+| 位置 | 原实现 | 确定性替代 |
+| --- | --- | --- |
+| rmsnorm 的 `dw` | `atomicAdd(dw+i)`，2048 block 竞争同一列 | `rms_rstd` + `rmsnorm_bwd_dx` + `rms_dw_det`（每线程独占一列、按行号升序） |
+| 词嵌入反向 | `emb_gather_bwd` 的 `atomicAdd(erow+j)` | `emb_bwd_owned`（按 id 独占一行、块内按 token 顺序） |
+| repeat_interleave 反向（GQA） | `index_scatter_add8` 的 7 路 `atomicAdd` | `repeat_reduce`（每线程一个输出、按 j 升序累加） |
+
+### 21.2 实测（V100，Qwen2.5-0.5B 形状，B=4/S=512）
+
+| 模式 | ms/step | 两次训练 loss 完全一致 | 参数最大绝对差 |
+| --- | --- | --- | --- |
+| 默认（关） | 717.3 | ❌ | 7.63e-06 |
+| **`deterministic=True`** | **724.3** | ✅ | **0.000e+00** |
+
+反向单测：9.537e-07 → **0.000e+00**。**代价 7 ms/步（约 1%）。**
+
+### 21.3 用法
+
+```python
+import tgai_go.train as T
+rt = T._cuda()
+rt.deterministic = True        # 或环境变量 TG_DETERMINISTIC=1
+```
+
+- 默认**关闭**（快路径仍是 atomic 版，行为与之前逐位一致）。
+- 打开后：同一份数据、同一个初始权重、同样的步数 ⇒ **参数逐位相同**。
+- 这是"能替别人训练"的关键工程属性（别人能复现你的结果）。
+
+### 21.4 顺带
+
+新增 `tests/test_deterministic.py`（GPU-gated）：直接断言"反向两次最大差 == 0"。
+写这个文件时被仓库自带的 `tests/test_hygiene.py` 抓到 BOM + CRLF —— 守卫有效，已修正。
