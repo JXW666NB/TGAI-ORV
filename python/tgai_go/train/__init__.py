@@ -4103,6 +4103,35 @@ class AdamW(_Optim):
         bc1s = _f32(bc1)
         bc2s = _f32(bc2)
         do_wd = bool(self.wd)
+        # ★ fused 路径：把所有 CUDA 参数收进一个 kernel（290 -> 1）。
+        #   逐元素算术与单张量内核逐条相同，所以数值逐位一致。
+        #   只要有一个参数不是 CUDA/梯度类型不对，就整体退回逐参数循环（行为不变）。
+        # 只有确实存在 CUDA 参数时才去取运行时（纯 CPU 环境不能碰 _cuda()）
+        _has_cuda = any(getattr(p, "device", "cpu") == "cuda" for p in self.params)
+        _rt = None
+        if _has_cuda:
+            try:
+                _rt = _cuda()
+            except Exception:
+                _rt = None
+        if _rt is not None and getattr(_rt, "fused_adamw", True):
+            ents = []
+            fused_ok = True
+            for i, p in enumerate(self.params):
+                if p.grad is None:
+                    continue
+                if getattr(p, "device", "cpu") != "cuda":
+                    fused_ok = False
+                    break
+                g = p.grad
+                if not isinstance(g, Tensor) or getattr(g, "device", "cpu") != "cuda":
+                    fused_ok = False
+                    break
+                ents.append((p._gpu, g._gpu, self.m[i], self.v[i]))
+            if fused_ok and ents:
+                _rt.adamw_multi(ents, b1, omb1, b2, omb2, lr, wd_lr, eps,
+                                bc1s, bc2s, do_wd)
+                return
         for i, p in enumerate(self.params):
             if p.grad is None:
                 continue

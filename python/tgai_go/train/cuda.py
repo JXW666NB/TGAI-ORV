@@ -986,6 +986,43 @@ extern "C" __global__ void adamw_update(
     p[i] = __fsub_rn(pi, step);
 }
 
+/* 多张量 AdamW：一次发射更新全部参数。
+   ps/gs/ms/vs 是设备上的指针数组，offs 是长度前缀和（offs[t]..offs[t+1) 属于第 t 个张量）。
+   每个元素的算术与单张量版 adamw_update **逐条相同**（同样的舍入内建函数），因此逐位一致。 */
+extern "C" __global__ void adamw_update_multi(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* ms, const unsigned long long* vs,
+    const int* offs, int ntensors, int total,
+    float b1, float omb1, float b2, float omb2,
+    float lr, float wd_lr, float eps, float bc1, float bc2, int do_wd) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= total) return;
+    int lo = 0;
+    int hi = ntensors - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (offs[mid] <= i) lo = mid; else hi = mid - 1;
+    }
+    int j = i - offs[lo];
+    float* p = (float*)(unsigned long long)ps[lo];
+    const float* g = (const float*)(unsigned long long)gs[lo];
+    float* m = (float*)(unsigned long long)ms[lo];
+    float* v = (float*)(unsigned long long)vs[lo];
+    float gi = g[j];
+    float pi = p[j];
+    if (do_wd) pi = __fsub_rn(pi, __fmul_rn(wd_lr, pi));
+    float mi = __fadd_rn(__fmul_rn(b1, m[j]), __fmul_rn(omb1, gi));
+    float g2 = __fmul_rn(gi, gi);
+    float vi = __fadd_rn(__fmul_rn(b2, v[j]), __fmul_rn(omb2, g2));
+    m[j] = mi;
+    v[j] = vi;
+    float mh = __fdiv_rn(mi, bc1);
+    float vh = __fdiv_rn(vi, bc2);
+    float denom = __fadd_rn(sqrtf(vh), eps);
+    float step = __fdiv_rn(__fmul_rn(lr, mh), denom);
+    p[j] = __fsub_rn(pi, step);
+}
+
 /* Muon 的动量。先 decoupled weight decay，再 buf = mom*buf + g，
    Nesterov 时 u = g + mom*buf（用刚写完的 buf）。 */
 extern "C" __global__ void muon_momentum(
@@ -5509,6 +5546,51 @@ class CudaRuntime:
             (seq, ctypes.c_int), (d, ctypes.c_int), (vocab, ctypes.c_int),
         ])
         return dw
+
+    def adamw_multi(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):
+        """一次发射更新全部参数。entries = [(p, g, m, v), ...]，全是 GpuBuf。
+
+        指针表按 id 缓存（训练中地址不变），只在第一次或换模型时重建。
+        """
+        if not entries:
+            return
+        for p, g, m, v in entries:
+            self._split_forget_ptr(p)
+            self._split_forget_ptr(m)
+            self._split_forget_ptr(v)
+        key = tuple(id(x) for ent in entries for x in ent)
+        tb = getattr(self, "_adamw_table", None)
+        if tb is None or tb[0] != key:
+            sizes = [int(ent[0].n) for ent in entries]
+            offs = [0]
+            for n in sizes:
+                offs.append(offs[-1] + n)
+            total = offs[-1]
+            if total > 2147483647:
+                raise CudaError("fused AdamW 元素总数 %d 超过 int32" % total)
+            ps = self.h2d(np.array([int(ent[0].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            gs = self.h2d(np.array([int(ent[1].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            ms = self.h2d(np.array([int(ent[2].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            vs = self.h2d(np.array([int(ent[3].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            of = self.h2d(np.array(offs[:-1], np.int32), dtype=np.int32)
+            tb = (key, ps, gs, ms, vs, of, len(entries), total)
+            self._adamw_table = tb
+        _, ps, gs, ms, vs, of, ntensors, total = tb
+        grid, block = self._ewise_grid(total)
+        self.launch("adamw_update_multi", grid, block, [
+            self._ptr(ps), self._ptr(gs), self._ptr(ms), self._ptr(vs), self._ptr(of),
+            (int(ntensors), ctypes.c_int), (int(total), ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (float(eps), ctypes.c_float),
+            (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+            (1 if do_wd else 0, ctypes.c_int),
+        ])
 
     def adamw(self, p, g, m, v, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):
         """原地更新参数和两份动量。标量必须已经按 numpy 的 float32 规则收好。"""
