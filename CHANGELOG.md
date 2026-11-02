@@ -3,6 +3,16 @@
 这一版几乎全是**性能与可复现性**，每条都有实测数字。判据与证据见
 `docs/GAP_VS_PYTORCH.md` §10~§22 与 `docs/PRODUCTION_READINESS.md`。
 
+### 新增 · 存储精度 float32 / float16 / bfloat16（新模块 	rain/dtypes.py）
+- save_weights(path, weights, dtype="bfloat16") / load_weights(path)：
+  检查点可按 fp16 或 bf16 存储（体积减半），文件内**逐张量记 dtype**，允许混合精度。
+- bf16 用 uint16 存高位截断（round-to-nearest-even），**指数范围与 fp32 相同**：
+  1e30 / 1e-30 都不溢出（fp16 会）。实测 bf16 相对误差 < 2^-8，且只有 8 位尾数。
+- cast_weights() / 	o_storage() / rom_storage() 供训练侧按需 upcast。
+- 注意：这是**检查点存储**精度；Tensor 的运行时存储仍是 float32
+  （fp16/bf16 只用于 GEMM 内部计算）。真 AMP（激活存 fp16/bf16）仍未做。
+- 新增 	ests/test_dtypes.py（7 项，纯 CPU）。
+
 ### 新增 · 可复现模式（`TG_DETERMINISTIC=1` 或 `rt.deterministic = True`）
 - 三处 `atomicAdd` 全部换成确定性归约：rmsnorm 的 dw（按列升序）、
   词嵌入反向（按 id 独占一行）、`repeat_interleave` 反向（按 j 升序，新内核 `repeat_reduce`）。
