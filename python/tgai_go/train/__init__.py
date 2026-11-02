@@ -903,8 +903,15 @@ class Tensor:
                 #   前向用 fp16 计算（fp32 累加），**反向仍用 fp32 的 sgemm/gemm_tn**，
                 #   所以梯度路径一个字节都没变，只有前向的输入被舍入到 fp16。
                 #   实测（V100）：mlp 4.33x、lm_head 5.21x，relerr ~3e-04（fp16 舍入）。
-                if getattr(rt, "fp16_gemm", False):
+                # 只对"赚"的形状开：K>=512 且 N>=512。实测 attn_kv(N=128) fp16 反而慢 0.64x。
+                if (getattr(rt, "fp16_gemm", False) and K >= 512 and N >= 512):
+                    # 注意：_sgemm_f16 内部会把 A/B 当 fp32 **再转一次** fp16，
+                    # 所以这里必须传 fp32 缓冲（传 fp16 缓冲会得到全零/非法访问，实测过）。
                     buf = rt.sgemm_fp16_nt(self._gpu, src._gpu)
+                    try:
+                        _FP16_HITS[0] += 1
+                    except Exception:
+                        pass
                 else:
                     buf = rt.gemm_nt(self._gpu, src._gpu)
                 rg = self.requires_grad or src.requires_grad
@@ -2529,6 +2536,36 @@ functional = _Functional()
 
 # ─────────────────── 梯度检查点（activation recompute） ───────────────────
 
+# ---- fp16 权重影子（按"代"缓存，step() 后失效）----
+_FP16_HITS = [0]
+_FP16_SHADOW_GEN = [0]
+_FP16_SHADOWS = {}
+
+
+def fp16_shadow_gen():
+    return _FP16_SHADOW_GEN[0]
+
+
+def fp16_shadows_invalidate():
+    """优化器 step() 之后调用：所有权重影子作废。"""
+    _FP16_SHADOW_GEN[0] += 1
+
+
+def _fp16_shadow(buf):
+    """取/建权重的 fp16 影子。键用 id(buf)+元素数，代不匹配就重建。"""
+    key = (id(buf), int(buf.n))
+    gen = _FP16_SHADOW_GEN[0]
+    ent = _FP16_SHADOWS.get(key)
+    if ent is not None and ent[0] == gen:
+        return ent[1]
+    rt = _cuda()
+    sh = rt.cast_f32_to_f16(buf)
+    if len(_FP16_SHADOWS) > 512:            # 上限，防止换模型时无限增长
+        _FP16_SHADOWS.clear()
+    _FP16_SHADOWS[key] = (gen, sh)
+    return sh
+
+
 def checkpoint(fn, *inputs):
     """用"重算"换显存：`out = checkpoint(fn, x)` 的数值与 `fn(x)` 完全一致，
     但前向不保留中间激活，反向时重跑一次 fn。
@@ -3908,6 +3945,18 @@ class _Optim:
         raise NotImplementedError
 
 
+def _invalidate_fp16_after_step(fn):
+    """装饰器：step() 执行后让 fp16 权重影子失效。"""
+    def wrapped(self, *a, **kw):
+        out = fn(self, *a, **kw)
+        try:
+            fp16_shadows_invalidate()
+        except Exception:
+            pass
+        return out
+    return wrapped
+
+
 class LAMB(_Optim):
     """LAMB：Adam 的逐层自适应更新 + trust ratio（`||p|| / ||u||`）。
 
@@ -3938,6 +3987,7 @@ class LAMB(_Optim):
             self.m.append(np.zeros_like(p.data))
             self.v.append(np.zeros_like(p.data))
 
+    @_invalidate_fp16_after_step
     def step(self):
         self.t += 1
         bc1 = 1.0 - self.b1 ** self.t
@@ -3985,6 +4035,7 @@ class AdamW(_Optim):
                 self.m.append(np.zeros_like(p.data))
                 self.v.append(np.zeros_like(p.data))
 
+    @_invalidate_fp16_after_step
     def step(self):
         _bf16_step_boundary()
         self.t += 1
@@ -4152,6 +4203,7 @@ class Muon(_Optim):
         scale = float(np.sqrt(_builtin_max(1.0, rows / cols)))
         rt.sub_scale_(p._gpu, o, _f32(self.lr * scale))
 
+    @_invalidate_fp16_after_step
     def step(self):
         _bf16_step_boundary()
         self.t += 1
