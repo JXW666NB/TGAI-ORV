@@ -3130,6 +3130,40 @@ def _rope_rotate_np(g, cos, sin):
     return out
 
 
+def rope_half(x, cos, sin, seq):
+    """half-split RoPE（rotate_half：配对 d / d+dh/2）。CUDA 上前后向各 1 个 kernel。
+
+    组合实现要 1 个 cat + 2 次乘 + 1 次加（反向 14 个 kernel），这里各 1 个。
+    cos/sin 是 [seq, dh] 的常量表（模型里 reshape 成 [1,seq,dh] 也等价，元素数一致）。
+    非 CUDA 或异常 → 回退组合实现，数值一致。
+    """
+    if (getattr(x, "device", "cpu") != "cuda"
+            or getattr(cos, "device", "cpu") != "cuda"
+            or getattr(sin, "device", "cpu") != "cuda"):
+        return _rope_half_composed(x, cos, sin)
+    try:
+        rt = _cuda()
+        y = rt.rope_half_ip(rt.clone(x._gpu), cos._gpu, sin._gpu, int(seq))
+        rt._fn("rope_half_bwd")              # 先把反向符号解析出来，别等反向才炸
+    except Exception as exc:
+        _fused_warn_once("rope_half", exc)
+        return _rope_half_composed(x, cos, sin)
+    out = Tensor._from_gpu(y, requires_grad=x.requires_grad, _parents=(x,))
+    if x.requires_grad:
+        def bw(g, grads):
+            _acc(grads, x, rt.rope_half_bwd(g, cos._gpu, sin._gpu, int(seq)))
+        out._backward = bw
+    return out
+
+
+def _rope_half_composed(x, cos, sin):
+    """half-split 的组合实现（CPU / 回退路径）。与 `rope_half` 数值一致。"""
+    dh = int(x.shape[-1])
+    h = dh // 2
+    rot = cat([-x[..., h:], x[..., :h]], dim=-1)
+    return x * cos + rot * sin
+
+
 def fused_rope(x, cos, sin):
     """交错式 RoPE：out[2k]=x[2k]*cos-x[2k+1]*sin，out[2k+1]=x[2k]*sin+x[2k+1]*cos。
 

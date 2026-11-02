@@ -1576,6 +1576,47 @@ extern "C" __global__ void cast_bf16_to_f32(const unsigned short* __restrict__ s
 # 全部显式用 __fmul_rn / __fadd_rn / __fsub_rn，禁止编译器缩成 FMA：
 # Python 侧的 `x*cos + (x@P)*sin` 是两次独立取整，这里也要两次，才能做到逐位可比。
 _FUSED_KERNELS = r"""
+/* ---- half-split RoPE（rotate_half：配对 d / d+dh/2）----
+   与交错式无关；cos/sin 表是 [seq, dh]，前后半相同，按 (row % seq, d) 取值。 */
+extern "C" __global__ void rope_half_ip(float* x, const float* cs, const float* sn,
+                                        int dh, int seq, long npair) {
+    long p = (long)blockIdx.x * (long)blockDim.x + (long)threadIdx.x;
+    if (p >= npair) return;
+    int h = dh >> 1;
+    int d = (int)(p % h);
+    long rp = p / h;                       /* 行号 = ((b*H + hh)*S + s) */
+    int s = (int)(rp % seq);
+    long base = rp * dh;
+    long i0 = base + d;
+    long i1 = i0 + h;
+    float x0 = x[i0];
+    float x1 = x[i1];
+    float c = cs[(long)s * dh + d];
+    float sv = sn[(long)s * dh + d];
+    x[i0] = __fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, sv));
+    x[i1] = __fadd_rn(__fmul_rn(x1, c), __fmul_rn(x0, sv));
+}
+
+extern "C" __global__ void rope_half_bwd(const float* g, const float* cs, const float* sn,
+                                          float* dx, int dh, int seq, long npair) {
+    long p = (long)blockIdx.x * (long)blockDim.x + (long)threadIdx.x;
+    if (p >= npair) return;
+    int h = dh >> 1;
+    int d = (int)(p % h);
+    long rp = p / h;
+    int s = (int)(rp % seq);
+    long base = rp * dh;
+    long i0 = base + d;
+    long i1 = i0 + h;
+    float g0 = g[i0];
+    float g1 = g[i1];
+    float c = cs[(long)s * dh + d];
+    float sv = sn[(long)s * dh + d];
+    dx[i0] = __fadd_rn(__fmul_rn(g0, c), __fmul_rn(g1, sv));
+    dx[i1] = __fsub_rn(__fmul_rn(g1, c), __fmul_rn(g0, sv));
+}
+
+
 /* ---- 交错式（GPT-2 interleaved）RoPE，原地 ----
  * 参考实现：y = x*cos + (x@P)*sin，P 是置换矩阵：
  *   (x@P)[2k]   = -x[2k+1]
@@ -5158,6 +5199,40 @@ class CudaRuntime:
                     self._ptr(g), self._ptr(cos), self._ptr(sin), self._ptr(dx),
                     (npair, ctypes.c_int),
                 ])
+        return dx
+
+    def rope_half_ip(self, x, cos, sin, seq):
+        """原地 half-split RoPE（rotate_half）。调用方先 clone。"""
+        dh = int(x.shape[-1])
+        rows = int(x.n) // dh
+        npair = rows * (dh >> 1)
+        if int(cos.n) != int(seq) * dh or int(sin.n) != int(seq) * dh:
+            raise CudaError(
+                "rope_half: cos/sin 形状不对（要 [seq,dh] = %d 个元素），"
+                "收到 cos=%d sin=%d" % (int(seq) * dh, int(cos.n), int(sin.n)))
+        if npair:
+            self._split_forget_ptr(x)
+            grid, block = self._ewise_grid(npair)
+            self.launch("rope_half_ip", grid, block, [
+                self._ptr(x), self._ptr(cos), self._ptr(sin),
+                (dh, ctypes.c_int), (int(seq), ctypes.c_int),
+                (ctypes.c_longlong(npair), ctypes.c_longlong),
+            ])
+        return x
+
+    def rope_half_bwd(self, g, cos, sin, seq):
+        """half-split RoPE 反向：dx 是新缓冲（旋转正交，用转置）。"""
+        dh = int(g.shape[-1])
+        rows = int(g.n) // dh
+        npair = rows * (dh >> 1)
+        dx = self.empty(g.shape, dtype=np.float32)
+        if npair:
+            grid, block = self._ewise_grid(npair)
+            self.launch("rope_half_bwd", grid, block, [
+                self._ptr(g), self._ptr(cos), self._ptr(sin), self._ptr(dx),
+                (dh, ctypes.c_int), (int(seq), ctypes.c_int),
+                (ctypes.c_longlong(npair), ctypes.c_longlong),
+            ])
         return dx
 
     def add_(self, x, y):

@@ -107,6 +107,8 @@ class Qwen25:
         self.use_ckpt = bool(cfg.get("GRAD_CKPT", False))
         # 段的粒度：默认 = 每层一次（等价于原来行为）；1 = 整段一次
         self.ckpt_segments = int(cfg.get("CKPT_SEGMENTS") or cfg.get("L") or 1)
+        # half-split RoPE 融合内核开关（FUSED_ROPE=0 回退组合实现；数值逐位一致）
+        self.use_fused_rope = bool(cfg.get("FUSED_ROPE", True))
         if self.tie:
             self.p["lm_head.weight"] = self.p["token_embedding.weight"]
         # 直接挂共享 Parameter：不要先随机初始化一张 V*D 的表再扔掉
@@ -184,6 +186,12 @@ class Qwen25:
         rot = T.cat([-x[:, :, h:], x[:, :, :h]], dim=-1)
         return x * cos_t + rot * sin_t
 
+    def _rope_half_apply(self, x, cos_t, sin_t, seq):
+        """half-split RoPE：融合内核（默认）或组合实现（FUSED_ROPE=0 / 非 CUDA）。"""
+        if self.use_fused_rope:
+            return T.rope_half(x, cos_t, sin_t, seq)
+        return self._rope_apply(x, cos_t, sin_t)
+
     def _layer(self, x, i):
         """单层前向（抽出来是为了能用 `T.checkpoint` 包住：反向时重算这一层）。"""
         cfg = self.cfg
@@ -208,8 +216,8 @@ class Qwen25:
         if cfg.get("QK_NORM"):               # per-head RMSNorm，必须在 RoPE **之前**
             q = self.qn[i](q)
             k = self.kn[i](k)
-        q = self._rope_apply(q, cos_t, sin_t)
-        k = self._rope_apply(k, cos_t, sin_t)
+        q = self._rope_half_apply(q, cos_t, sin_t, S)
+        k = self._rope_half_apply(k, cos_t, sin_t, S)
         # GQA：KV 头复制到 Q 头数（在 [B,KV,S,DH] 上按第 1 维展开，避免跨 batch 打乱）
         k = k.reshape(B, KV, S, DH).repeat_interleave(NH // KV, dim=1).reshape(B * NH, S, DH)
         v = v.reshape(B, KV, S, DH).repeat_interleave(NH // KV, dim=1).reshape(B * NH, S, DH)
