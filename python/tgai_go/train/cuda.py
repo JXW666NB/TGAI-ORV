@@ -620,6 +620,59 @@ extern "C" __global__ void rmsnorm_bwd(const float* dy, const float* x, const fl
     }
 }
 
+/* ---- 确定性 rmsnorm 反向（替代 atomicAdd 版本）----
+   1) rms_rstd: 每行算 rstd（block per row，与 fwd 同一归约）
+   2) rmsnorm_bwd_dx: 只写 dx，不碰 dw
+   3) rms_dw_det: 每线程独占一列、按行号升序串行累加 —— 顺序固定，运行间可复现
+*/
+extern "C" __global__ void rms_rstd(const float* x, float* rstd, int rows, int d, float eps) {
+    __shared__ float smem[256];
+    const int r = (int)blockIdx.x;
+    if (r >= rows) return;
+    const float* xrow = x + (long long)r * d;
+    float sumsq = 0.f;
+    for (int i = (int)threadIdx.x; i < d; i += (int)blockDim.x) {
+        const float v = xrow[i];
+        sumsq += v * v;
+    }
+    sumsq = blk_sum(sumsq, smem);
+    if (threadIdx.x == 0) rstd[r] = rsqrtf(sumsq / (float)d + eps);
+}
+
+extern "C" __global__ void rmsnorm_bwd_dx(const float* dy, const float* x, const float* w,
+                                          const float* rstd, float* dx, int rows, int d) {
+    __shared__ float smem[256];
+    const int r = (int)blockIdx.x;
+    if (r >= rows) return;
+    const float* xrow = x + (long long)r * d;
+    const float* dyrow = dy + (long long)r * d;
+    float* dxrow = dx + (long long)r * d;
+    const int stride = (int)blockDim.x;
+    float dot = 0.f;
+    for (int i = (int)threadIdx.x; i < d; i += stride) dot += dyrow[i] * xrow[i] * w[i];
+    dot = blk_sum(dot, smem);
+    const float inv_d = 1.f / (float)d;
+    const float rs = rstd[r];
+    const float scale = rs * rs * rs * inv_d;
+    for (int i = (int)threadIdx.x; i < d; i += stride) {
+        const float xi = xrow[i];
+        const float dyi = dyrow[i];
+        dxrow[i] = __fsub_rn(__fmul_rn(__fmul_rn(rs, dyi), w[i]), __fmul_rn(__fmul_rn(scale, xi), dot));
+    }
+}
+
+extern "C" __global__ void rms_dw_det(const float* dy, const float* x, const float* rstd,
+                                      float* dw, int rows, int d) {
+    const int j = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (j >= d) return;
+    float acc = 0.f;
+    for (int r = 0; r < rows; ++r) {
+        const long long off = (long long)r * d + j;
+        acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(dy[off], x[off]), rstd[r]));
+    }
+    dw[j] = acc;
+}
+
 extern "C" __global__ void silu_mul_bwd(const float* g, const float* a, const float* b,
                                         float* da, float* db, int n) {
     const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
@@ -5302,6 +5355,34 @@ class CudaRuntime:
                 (float(eps), ctypes.c_float),
             ], shared=256 * 4)
         return out
+
+    def rmsnorm_bwd_det(self, dy, x, w, seq, d, eps, dw_out):
+        """确定性 rmsnorm 反向：返回 dx，把 dw 写进 dw_out（按列升序累加，可复现）。"""
+        seq, d = int(seq), int(d)
+        dx = self.empty((seq, d), dtype=np.float32)
+        if seq and d:
+            rstd = self._rms_rstd_scratch(seq)
+            self.launch("rms_rstd", (seq, 1, 1), (256, 1, 1), [
+                self._ptr(x), self._ptr(rstd), (seq, ctypes.c_int), (d, ctypes.c_int),
+                (float(eps), ctypes.c_float),
+            ])
+            self.launch("rmsnorm_bwd_dx", (seq, 1, 1), (256, 1, 1), [
+                self._ptr(dy), self._ptr(x), self._ptr(w), self._ptr(rstd), self._ptr(dx),
+                (seq, ctypes.c_int), (d, ctypes.c_int),
+            ])
+            grid, block = self._ewise_grid(d)
+            self.launch("rms_dw_det", grid, block, [
+                self._ptr(dy), self._ptr(x), self._ptr(rstd), self._ptr(dw_out),
+                (seq, ctypes.c_int), (d, ctypes.c_int),
+            ])
+        return dx
+
+    def _rms_rstd_scratch(self, seq):
+        buf = getattr(self, "_rstd_scratch", None)
+        if buf is None or int(buf.n) < int(seq):
+            buf = self.empty((int(seq),), dtype=np.float32)
+            self._rstd_scratch = buf
+        return buf
 
     def rmsnorm_bwd(self, dy, x, w, seq, d, eps):
         dx = self.empty(x.shape, dtype=np.float32)

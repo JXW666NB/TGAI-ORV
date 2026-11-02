@@ -3452,7 +3452,13 @@ class RMSNorm(Module):
             y, requires_grad=(x.requires_grad or w.requires_grad), _parents=(x, w))
 
         def bw(g, grads):
-            dx, dw = rt.rmsnorm_bwd(g, x._gpu, w._gpu, seq, d, eps)
+            # rt.deterministic=True 时走"无 atomic"版本：dw 按列升序串行累加，
+            # 保证同一输入两次运行得到逐位相同的梯度（默认关闭，快路径仍是原子版）。
+            if getattr(rt, "deterministic", False) and w.requires_grad:
+                dw = rt.empty((d,), dtype=__import__("numpy").float32)
+                dx = rt.rmsnorm_bwd_det(g, x._gpu, w._gpu, seq, d, eps, dw)
+            else:
+                dx, dw = rt.rmsnorm_bwd(g, x._gpu, w._gpu, seq, d, eps)
             if x.requires_grad:
                 _acc(grads, x, dx)
             if w.requires_grad:
