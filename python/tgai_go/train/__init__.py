@@ -921,12 +921,41 @@ class Tensor:
                 out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, src) if rg else ())
                 a, w = self._gpu, src._gpu
 
-                def bw(g, grads, _a=a, _w=w, _self=self, _src=src):
+                def bw(g, grads, _a=a, _w=w, _self=self, _src=src,
+                       _M=M, _N=N, _K=K):
                     # dA = g @ W，dW = g^T @ A。不再经过物化的 W^T。
+                    # fp16 版：g/a 转进复用 scratch，W 用按代缓存的影子；
+                    # 形状不划算（结果维度 <512）或出错则回退 fp32。
+                    use16 = (getattr(rt, "fp16_gemm", False)
+                             and _N >= 512 and _K >= 512)
+                    g16 = None
+                    if use16:
+                        try:
+                            g16 = _fp16_scratch(g)
+                            rt.cast_f32_to_f16_into(g, g16)
+                        except Exception:
+                            g16 = None
                     if _self.requires_grad:
-                        _acc(grads, _self, rt.sgemm(g, _w))
+                        if g16 is not None and _K >= 512:
+                            try:
+                                _acc(grads, _self,
+                                     rt.gemm_f16_nn_raw(g16, _fp16_shadow(_w),
+                                                        _M, _N, _K))
+                            except Exception:
+                                _acc(grads, _self, rt.sgemm(g, _w))
+                        else:
+                            _acc(grads, _self, rt.sgemm(g, _w))
                     if _src.requires_grad:
-                        _acc(grads, _src, rt.gemm_tn(g, _a))
+                        if g16 is not None:
+                            try:
+                                a16 = _fp16_scratch(_a)
+                                rt.cast_f32_to_f16_into(_a, a16)
+                                _acc(grads, _src,
+                                     rt.gemm_f16_tn_raw(g16, a16, _M, _N, _K))
+                            except Exception:
+                                _acc(grads, _src, rt.gemm_tn(g, _a))
+                        else:
+                            _acc(grads, _src, rt.gemm_tn(g, _a))
                 out._backward = bw
                 return out
             buf_t = rt.transpose2d(src._gpu)

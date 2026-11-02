@@ -4291,6 +4291,39 @@ class CudaRuntime:
         ), "cublasGemmEx(fp16 raw)")
         return C
 
+    def _gemm_f16_raw(self, opA, opB, m, n, k, A16, lda, B16, ldb, C, ldc):
+        """零转换 fp16 GEMM 的公共实现（fp16 输入 + fp32 输出 + fp32 累加）。"""
+        self._bind_gemm_ex()
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._activate()
+        self._chk_blas(self.cublas.cublasGemmEx(
+            self.handle, opA, opB, int(m), int(n), int(k),
+            ctypes.byref(alpha),
+            ctypes.c_uint64(int(A16.ptr)), CUDA_R_16F, int(lda),
+            ctypes.c_uint64(int(B16.ptr)), CUDA_R_16F, int(ldb),
+            ctypes.byref(beta),
+            ctypes.c_uint64(int(C.ptr)), CUDA_R_32F, int(ldc),
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT,
+        ), "cublasGemmEx(fp16 raw)")
+
+    def gemm_f16_nn_raw(self, A16, B16, M, N, K):
+        """C[M,K] = A16[M,N] @ B16[N,K]（反向的 dA 就是这个形状）。"""
+        C = self.empty((int(M), int(K)), dtype=np.float32)
+        if int(M) and int(K) and int(N):
+            self._gemm_f16_raw(CUDA_OP_N, CUDA_OP_N, int(K), int(M), int(N),
+                               B16, int(K), A16, int(N), C, int(K))
+        return C
+
+    def gemm_f16_tn_raw(self, A16, B16, M, N, K):
+        """C[N,K] = A16[M,N]^T @ B16[M,K]（反向的 dW 就是这个形状）。"""
+        C = self.empty((int(N), int(K)), dtype=np.float32)
+        if int(N) and int(K) and int(M):
+            self._gemm_f16_raw(CUDA_OP_N, CUDA_OP_T, int(K), int(N), int(M),
+                               B16, int(K), A16, int(N), C, int(K))
+        return C
+
     def _bind_gemm_ex(self):
         st = self._fp16_state()
         if st["inited"]:
