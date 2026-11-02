@@ -1,3 +1,62 @@
+## [0.5.0] - 2026-11-03
+
+这一版几乎全是**性能与可复现性**，每条都有实测数字。判据与证据见
+`docs/GAP_VS_PYTORCH.md` §10~§22 与 `docs/PRODUCTION_READINESS.md`。
+
+### 新增 · 可复现模式（`TG_DETERMINISTIC=1` 或 `rt.deterministic = True`）
+- 三处 `atomicAdd` 全部换成确定性归约：rmsnorm 的 dw（按列升序）、
+  词嵌入反向（按 id 独占一行）、`repeat_interleave` 反向（按 j 升序，新内核 `repeat_reduce`）。
+- **实测：同一配置两次训练，参数最大绝对差 0.000e+00（逐位一致）**；默认模式 7.63e-06。
+- 代价约 1%（717.3 → 724.3 ms/step，V100 / Qwen2.5-0.5B 形状 / B=4·S=512）。
+- 与 fp16 加速**可同时开启**：492.9 ms/step 且参数逐位一致。
+
+### 新增 · fp16 Tensor Core GEMM（`rt.fp16_gemm = True`，默认关）
+- 零转换入口 `gemm_f16_nt_raw` / `gemm_f16_tn_raw` / `gemm_f16_nn_raw`
+  （fp16 输入 + **fp32 输出** + **fp32 累加**），配权重影子与激活 scratch。
+- 前向 GEMM 156.3 → **28.4 ms（5.5×）**；整步 754 → **489 ms（1.54×）**。
+- 已知代价：**精度地板** —— 1000 步记忆任务 fp32 能到 2e-6，fp16 停在 1.2e-02。
+  因此默认关闭，只适合常规训练。
+
+### 新增 · fused AdamW（默认开）
+- `adamw_update_multi`：290 个 kernel → **1 个**（设备指针表 + 前缀和 + 二分查找）。
+- 隔离对拍 **0.000e+00**（与逐参数版逐位一致）；整步 **1.04×**。
+
+### 新增 · CUDA Graph 捕获 arena
+- `reserve_capture_arena()`：捕获期 bump 分配，绕开"捕获中禁止 cuMemAlloc"。
+- 捕获成功（2441 节点），重放 **748.5 → 605.5 ms（1.23×）**。
+
+### 修复 · 三处"看起来没问题但很致命"的实现
+- `ce_row_stats` 是**非合并访问**（每线程连续分块，步长 V/256，仅 37 GB/s）：
+  改跨步后 CE 前向 **67.5 → 3.6 ms（18.7×）**。
+- `log_softmax_lastdim` 前向/反向是**线程-per-row 串行扫 k**：改 warp-per-row。
+- 分配器两处**硬编码 12.2 GiB** 判据（工作集本就 13 GiB）导致每次未命中都整设备同步：
+  改为看真实空闲显存 + 节流，步时 **1.125 → 0.898 s（-20%）**。
+
+### 新增 · 算子
+- `rope_half`（half-split RoPE 融合内核，前向/反向各 1 个 kernel）：步时 **-14%**。
+  注意：现有 `fused_rope` 是**交错式**，与 Qwen/LLaMA 的 rotate_half 不等价（实测差 2.478）。
+- `checkpoint_sequential(..., segments=)`（对齐 PyTorch 同名签名）。
+- causal softmax 接线（含 n-D 支持）—— 但**实测更慢**（内核每行单线程串行），
+  已改为 opt-in（`TG_SOFTMAX_CAUSAL=1`）。
+
+### 工具
+- `tools/profile_kernel.py`：CUDA event 级内核剖析（曾用它发现"只 instrument launch
+  会漏掉 cuBLAS"的测量错误）。
+- `tools/bench_gemm_fp16.py`：fp16 vs fp32 逐形状对照。
+- `tools/tg_check.py`：`.TG` 表结构自检（哈希唯一、区间不重叠、越界、空洞）。
+
+### 测试
+- 新增 `tests/test_deterministic.py`（GPU-gated，断言"确定性模式下反向两次差 == 0"）、
+  `tests/test_rope_half.py`、`tests/test_ckpt_segments.py` 等。
+- 合计 **292 passed / 6 skipped**，`tools/check_package.py` PASS。
+
+### 诚实结论
+- 对 **PyTorch fp32**（610 ms）：我们 489 ms，**快 1.25×**。
+- 对 **PyTorch AMP**（219.5 ms）：我们仍慢 **2.2×** —— torch 的 AMP 把激活也存 fp16，
+  我们只换了 GEMM。真 AMP（激活 fp16 存储）尚未做。
+- L3 三项仍未全过（24h 长稳 21.8h、2 卡缺硬件、真 AMP 未做），
+  因此对外标签保持 **「可用（自用/小团队）」**。
+
 ## [未发布]
 
 ### 新增 · 分块交叉熵（`CHUNK_CE`）—— 把 32 GB 卡跑不动的形状变成能跑
