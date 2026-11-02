@@ -4370,6 +4370,29 @@ class CudaRuntime:
             self._sgemm_f16(CUDA_OP_N, CUDA_OP_N, N, M, K, B.ptr, N, A.ptr, K, C.ptr, N)
         return C
 
+    def sgemm_fp16_nt(self, A, B):
+        """C[M,N] = A[M,K] @ B[N,K]^T，fp16 计算 + fp32 累加，返回 fp32 GpuBuf。
+
+        A/B 都是 fp32 GpuBuf（内部转 fp16）。模型里的线性层正是这个形状
+        （`x @ W.T`，W 是 [N,K]），所以不需要预先转置权重。
+        """
+        if len(A.shape) != 2 or len(B.shape) != 2:
+            raise CudaError("sgemm_fp16_nt 需要 2D，收到 %s @ %s" % (A.shape, B.shape))
+        M, K = int(A.shape[0]), int(A.shape[1])
+        N, K2 = int(B.shape[0]), int(B.shape[1])
+        if K != K2:
+            raise CudaError("sgemm_fp16_nt K 不匹配：A%s @ B%s 的 K 是 %d vs %d"
+                            % (A.shape, B.shape, K, K2))
+        C = self.empty((M, N), dtype=np.float32)
+        if M and N and K:
+            # 行主序 C[M,N]=A[M,K]@B[N,K]^T  <=>  列主序 C^T[N,M] = B_cm^T @ A_cm
+            #   B_cm 是 [K,N]（行主序 [N,K] 的原样），取 T 得 [N,K]
+            #   A_cm 是 [K,M]（行主序 [M,K] 的原样），取 N
+            #   => opA=T(W), opB=N(A)，lda=K, ldb=K, ldc=N
+            self._sgemm_f16(CUDA_OP_T, CUDA_OP_N, N, M, K,
+                            B.ptr, K, A.ptr, K, C.ptr, N)
+        return C
+
     def _split16_state(self):
         """惰性读 TG_FP16_SPLIT。没打开时不建缓存，fp32 热路径只多一次属性查找。"""
         st = getattr(self, "_split16", None)
