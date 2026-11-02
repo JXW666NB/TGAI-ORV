@@ -168,13 +168,17 @@ __device__ void ce_chunk_range(int V, int* begin_out, int* end_out) {
 }
 
 __device__ void ce_row_stats(const float* row, int V, float* sm, float* m_out, float* sum_out) {
-    int begin, end;
-    ce_chunk_range(V, &begin, &end);
+    /* ★ 改成**跨步**访问：原来 ce_chunk_range 给每个线程分连续一段（步长 V/256 ≈ 594），
+       相邻线程地址相隔 594 个 float —— 完全非合并，实测只有 37 GB/s
+       （[2048,151936] 的 CE 前向要 67.5 ms，torch 只要 6.8 ms）。
+       跨步后相邻线程读相邻地址，合并访问。数学不变（max 精确；sum 只是求和顺序变了）。 */
+    const int tid = (int)threadIdx.x;
+    const int step = (int)blockDim.x;
     float m = __int_as_float(0xff800000u);
-    for (int j = begin; j < end; ++j) m = fmaxf(m, row[j]);
+    for (int j = tid; j < V; j += step) m = fmaxf(m, row[j]);
     m = ce_red_max(m, sm);
     float s = 0.0f;
-    for (int j = begin; j < end; ++j) {
+    for (int j = tid; j < V; j += step) {
         float e = exp32_bits(__fsub_rn(row[j], m));
         s = __fadd_rn(s, e);
     }
@@ -924,28 +928,38 @@ extern "C" __global__ void sum_axis8(
 }
 
 extern "C" __global__ void log_softmax_lastdim(const float* x, float* y, int rows, int k) {
-    int r = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-    if (r >= rows || k <= 0) return;
-    const float* row = x + (long long)r * k;
-    float* orow = y + (long long)r * k;
-    float m = row[0];
-    for (int j = 1; j < k; ++j) m = fmaxf(m, row[j]);
+    /* warp-per-row：一行由 32 个 lane 并行归约。
+       原来是一条线程串行扫 k —— k=151936 时比 warp 版慢 20 倍以上（实测 144ms vs 6ms）。 */
+    int warp = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    int lane = (int)(threadIdx.x & 31u);
+    if (warp >= rows || k <= 0) return;
+    const float* row = x + (long long)warp * k;
+    float* orow = y + (long long)warp * k;
+    float m = -3.402823466e+38f;
+    for (int j = lane; j < k; j += 32) m = fmaxf(m, row[j]);
+    m = tg_warp_max(m);
     float sum = 0.f;
-    for (int j = 0; j < k; ++j) sum += expf(row[j] - m);
-    float lse = m + logf(sum);
-    for (int j = 0; j < k; ++j) orow[j] = row[j] - lse;
+    for (int j = lane; j < k; j += 32) sum = __fadd_rn(sum, expf(__fsub_rn(row[j], m)));
+    sum = tg_warp_sum(sum);
+    float lse = __fadd_rn(m, logf(sum));
+    for (int j = lane; j < k; j += 32) orow[j] = __fsub_rn(row[j], lse);
 }
 
 extern "C" __global__ void log_softmax_lastdim_bwd(const float* g, const float* y, float* dx,
                                                   int rows, int k) {
-    int r = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-    if (r >= rows || k <= 0) return;
-    const float* grow = g + (long long)r * k;
-    const float* yrow = y + (long long)r * k;
-    float* drow = dx + (long long)r * k;
+    /* 同样改成 warp-per-row（反向也是串行扫 k，实测同样慢）。 */
+    int warp = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    int lane = (int)(threadIdx.x & 31u);
+    if (warp >= rows || k <= 0) return;
+    const float* grow = g + (long long)warp * k;
+    const float* yrow = y + (long long)warp * k;
+    float* drow = dx + (long long)warp * k;
     float sg = 0.f;
-    for (int j = 0; j < k; ++j) sg += grow[j];
-    for (int j = 0; j < k; ++j) drow[j] = grow[j] - expf(yrow[j]) * sg;
+    for (int j = lane; j < k; j += 32) sg = __fadd_rn(sg, grow[j]);
+    sg = tg_warp_sum(sg);
+    for (int j = lane; j < k; j += 32) {
+        drow[j] = __fsub_rn(grow[j], __fmul_rn(expf(yrow[j]), sg));
+    }
 }
 
 /* 与 CPU AdamW.step 同一顺序，且每步都是 IEEE 舍入（禁止 FMA 收缩）。
@@ -4002,7 +4016,7 @@ class CudaRuntime:
         rows = int(x.n) // k
         out = self.empty(x.shape, dtype=np.float32)
         if rows:
-            grid, block = self._ewise_grid(rows)
+            grid, block = self._warp_row_grid(rows)
             self.launch("log_softmax_lastdim", grid, block, [
                 self._ptr(x), self._ptr(out),
                 (rows, ctypes.c_int), (k, ctypes.c_int),
@@ -4014,7 +4028,7 @@ class CudaRuntime:
         rows = int(y.n) // k if k else 0
         out = self.empty(y.shape, dtype=np.float32)
         if rows and k:
-            grid, block = self._ewise_grid(rows)
+            grid, block = self._warp_row_grid(rows)
             self.launch("log_softmax_lastdim_bwd", grid, block, [
                 self._ptr(g), self._ptr(y), self._ptr(out),
                 (rows, ctypes.c_int), (k, ctypes.c_int),
