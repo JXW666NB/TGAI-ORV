@@ -494,3 +494,40 @@ fp16 前期收敛慢一些，100 步后追上到同一量级（0.126 vs 0.095）
 - **attention 的 bmm / strided_batched**（约 40 ms）仍是 fp32。
 - 长训练（1k+ 步）的收敛等价性还没验证，只有 100 步数据。
 - `accept` 与所有默认路径仍是 fp32 —— **不打开开关时行为与之前逐位一致**。
+
+---
+
+## 18. 2026-11-03：**纠正** —— 我们快过 torch fp32，但比 torch AMP 慢 2.2×
+
+### 18.1 同机同形状四种配置（全部实测，独立进程避免显存干扰）
+
+| 实现 | ms/step | 说明 |
+| --- | --- | --- |
+| PyTorch fp32 | 609.8 | 基线 |
+| **PyTorch AMP（fp16 autocast + GradScaler）** | **219.5** | torch 自己快 **2.78×** |
+| 本引擎 fp32 | 754.2 | |
+| **本引擎 fp16（GEMM-only）** | **489.5** | 比自家 fp32 快 1.54× |
+
+⇒ 对 torch fp32：**1.25× 更快**；
+⇒ 对 **torch AMP：2.2× 更慢**。
+
+### 18.2 为什么差这么多
+
+torch AMP 把**整个前向都放进 fp16**：权重副本、激活、elementwise、softmax、attention、CE
+全在 fp16 上跑，所有带宽类操作直接减半。
+本引擎目前**只把 GEMM 换成 fp16**，激活/逐元素/softmax/CE/AdamW 仍是 fp32。
+
+按 489.5 ms 反推：fp16 GEMM 之后 GEMM 总计约 140 ms，**剩余约 350 ms 是 fp32 的非 GEMM 工作** ——
+这正是 torch AMP 靠"全 fp16"拿走的那块。
+
+### 18.3 结论（对外表述必须改）
+
+> 之前说"首次快过 PyTorch"是**对着 torch fp32** 说的；对 torch AMP 我们仍慢 2.2×。
+> 真正的 AMP（激活也 fp16 存储）还没做，这正好是目标 L3 里那一项。
+
+### 18.4 下一步（真 AMP）
+
+1. 激活缓冲改 fp16 存储（`Tensor.dtype` 现在恒为 float32，这是最大障碍）
+2. 逐元素/rmsnorm/softmax/CE 内核加 fp16 变体
+3. 梯度仍 fp32 累加，配 loss scaling（fp16 会下溢）
+4. 验收：与 torch AMP 比 s/step + 100 步收敛曲线
