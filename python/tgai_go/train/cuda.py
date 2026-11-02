@@ -2816,8 +2816,15 @@ class CudaRuntime:
             return
         if self.cu is None or getattr(self, "_pool_trimming", False):
             return
-        limit = (12 * 1024 + 204) * 1024 * 1024
-        if self._pool_live_bytes + self._pool_cached_bytes <= limit:
+        # ★ 原来这里是**硬编码 12.2 GiB**：工作集一到 13 GiB 就每步狂 trim
+        #   （实测 1190 次/步），而 trim 对裸指针要先 cuCtxSynchronize（整设备同步）。
+        #   改成看设备**真实空闲显存**：只有真不够（< 2 GiB）才丢缓存。
+        free_b = self.free_device_bytes()
+        if free_b is None:
+            limit = (12 * 1024 + 204) * 1024 * 1024
+            if self._pool_live_bytes + self._pool_cached_bytes <= limit:
+                return
+        elif free_b >= (2 << 30):
             return
         self._activate()
         self._pool_trimming = True
@@ -2938,6 +2945,19 @@ class CudaRuntime:
             return
         self._pool_trim_to(_POOL_IDLE_KEEP, sync=False)
 
+    def free_device_bytes(self):
+        """设备当前可用字节；查不到返回 None。"""
+        info = getattr(self.cu, "cuMemGetInfo_v2", None) or getattr(self.cu, "cuMemGetInfo", None)
+        if info is None:
+            return None
+        try:
+            free_b, _total = ctypes.c_size_t(), ctypes.c_size_t()
+            if info(ctypes.byref(free_b), ctypes.byref(_total)) == 0:
+                return int(free_b.value)
+        except Exception:
+            return None
+        return None
+
     def _alloc(self, nbytes):
         nbytes = int(nbytes)
         if nbytes <= 0:
@@ -2950,13 +2970,18 @@ class CudaRuntime:
             self._bucket[nbytes] = bucket
         ptr = self._pool_take(bucket)
         if not ptr and not getattr(self, "_alloc_retry", False) and not self._capturing:
-            # 空闲块还没跑完就再分配，占用会冲过 13 GiB。等默认流结束再回收一次。
-            limit = (12 * 1024 + 204) * 1024 * 1024
-            if self._pool_live_bytes + self._pool_cached_bytes + bucket > limit and self._pool_cached_bytes:
+            # ★ 这里原来的判据是**硬编码 12.2 GiB**：一旦 live+cached 超过它就
+            #   cuCtxSynchronize() + 释放缓存。工作集本来就 13 GiB 左右，于是**每次未命中
+            #   都整设备同步一次**（实测 1190 次/步，1.1 s 里很大一块）。
+            #   改成看**设备真实空闲显存**：真不够（< 本次申请 + 1 GiB 余量）才同步回收。
+            #   正常情况直接 cuMemAlloc；失败路径下面仍有 empty_cache + 重试兜底。
+            need = int(bucket) + (1 << 30)
+            free_b = self.free_device_bytes()
+            if free_b is not None and free_b < need and self._pool_cached_bytes:
                 self._alloc_retry = True
                 try:
                     self._activate()
-                    self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize(alloc-cap)")
+                    self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize(alloc-low)")
                     self._pool_shed_ready()
                     ptr = self._pool_take(bucket)
                 finally:
