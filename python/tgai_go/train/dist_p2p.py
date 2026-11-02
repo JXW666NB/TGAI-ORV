@@ -115,7 +115,8 @@ class P2PAllReduce:
             raise P2PError("没有可归约的参数。修法：传入至少一个非空参数")
         self.sizes = sizes
         n = len(sizes)
-        self.slots = [rt.empty((s,), dtype=T.float32 if hasattr(T, "float32") else None)
+        import numpy as _np
+        self.slots = [rt.empty((s,), dtype=_np.float32)
                       for s in sizes for _ in range(self.world)]
         handles = []
         for b in self.slots:
