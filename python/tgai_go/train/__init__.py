@@ -2644,6 +2644,25 @@ def _attn_scores(q, k, scale):
     return out
 
 
+# 因果掩码缓存：S=512 时一个 mask 是 59 MB。
+# ★ 原来每层每步都 `Tensor(mask)` 重建一次 —— 在 cuda 默认设备下那是**每层一次 59 MB H2D**，
+#   24 层就是 1.4 GB/前向（实测：forward 0.419 s 里很大一块是这个）。掩码是常量，缓存即可。
+_CAUSAL_MASK_CACHE = {}
+
+
+def _causal_mask(S, device):
+    """返回缓存的上三角 -1e30 掩码（常量，不需要梯度）。"""
+    key = (int(S), str(device))
+    t = _CAUSAL_MASK_CACHE.get(key)
+    if t is None:
+        m = np.triu(np.full((int(S), int(S)), -1e30, dtype=np.float32), k=1)
+        t = Tensor(m, requires_grad=False, device=device)
+        if len(_CAUSAL_MASK_CACHE) > 8:      # 内存上限：最多缓存 8 种长度
+            _CAUSAL_MASK_CACHE.clear()
+        _CAUSAL_MASK_CACHE[key] = t
+    return t
+
+
 def _sdpa_materialized(q, k, v, causal, scale):
     """物化 scores/P 的 SDPA。默认路径，也是 lowmem 不合格时的回退。"""
     # ★ 转置乘走 cuBLAS 的 op=T，省掉 k 的一次真拷贝（旧写法 q @ k.swap_last2()）
@@ -2653,9 +2672,7 @@ def _sdpa_materialized(q, k, v, causal, scale):
     else:
         scores = (q @ k.swap_last2()) * scale
     if causal:
-        S = scores.shape[-1]
-        mask = np.triu(np.full((S, S), -1e30, dtype=np.float32), k=1)
-        scores = scores + Tensor(mask)                     # 常数，不回传梯度
+        scores = scores + _causal_mask(scores.shape[-1], scores.device)
     p = _Functional.softmax(scores, axis=-1)
     return p @ v
 
