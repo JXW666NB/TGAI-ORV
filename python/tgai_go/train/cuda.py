@@ -2883,6 +2883,11 @@ class CudaRuntime:
         #   改成看设备**真实空闲显存**：只有真不够（< 2 GiB）才丢缓存。
         # limit 必须在所有分支都有定义（下面循环里要用）——之前漏了，实测 UnboundLocalError
         limit = (12 * 1024 + 204) * 1024 * 1024
+        # ★ 节流：free() 每次都会调到这里，而 cuMemGetInfo 是一次驱动调用（约 2000 次/步）。
+        #   每 64 次释放才真查一次；真不够时下面会立刻连续触发，不会漏掉。
+        self._shed_probe = int(getattr(self, "_shed_probe", 0)) + 1
+        if (self._shed_probe & 63) != 0:
+            return
         free_b = self.free_device_bytes()
         if free_b is None:
             if self._pool_live_bytes + self._pool_cached_bytes <= limit:
@@ -4244,6 +4249,47 @@ class CudaRuntime:
                 "[tgai] fp16 GEMM 不可用，已回退 fp32（只警告一次）：%s: %s\n"
                 % (type(ex).__name__, str(ex)[:300]))
             sys.stderr.flush()
+
+    def cast_f32_to_f16_into(self, src, dst):
+        """把 fp32 缓冲 cast 进**已有的** fp16 缓冲（不分配）。两者元素数必须相等。"""
+        n = int(src.n)
+        if int(dst.n) != n:
+            raise CudaError("cast_f32_to_f16_into 元素数不一致：%d vs %d" % (n, int(dst.n)))
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("cast_f32_to_f16", grid, block, [
+                self._ptr(src), self._ptr(dst), (n, ctypes.c_int),
+            ])
+        return dst
+
+    def gemm_f16_nt_raw(self, A16, B16, M, N, K):
+        """C[M,N] = A16[M,K] @ B16[N,K]^T；A16/B16 已是 fp16，C 是 fp32。
+
+        与 `_sgemm_f16` 相同的列主序换算（行主序 C=A@B^T <=> 列主序 C^T=B_cm^T @ A_cm），
+        但**跳过内部 cast**：直接 cublasGemmEx，输入 CUDA_R_16F、输出 CUDA_R_32F、
+        computeType 用 fp32 累加。
+        """
+        self._bind_gemm_ex()
+        M, N, K = int(M), int(N), int(K)
+        C = self.empty((M, N), dtype=np.float32)
+        if not (M and N and K):
+            return C
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._activate()
+        self._chk_blas(self.cublas.cublasGemmEx(
+            self.handle,
+            CUDA_OP_T, CUDA_OP_N,          # op(A)=W^T, op(B)=A
+            N, M, K,
+            ctypes.byref(alpha),
+            ctypes.c_uint64(int(B16.ptr)), CUDA_R_16F, K,
+            ctypes.c_uint64(int(A16.ptr)), CUDA_R_16F, K,
+            ctypes.byref(beta),
+            ctypes.c_uint64(int(C.ptr)), CUDA_R_32F, N,
+            CUBLAS_COMPUTE_32F,             # computeType: fp32 累加（68，不是 CUDA_R_32F=0！）
+            CUBLAS_GEMM_DEFAULT,       # 与 _sgemm_f16 一致（fp16 输入自动走 Tensor Core）
+        ), "cublasGemmEx(fp16 raw)")
+        return C
 
     def _bind_gemm_ex(self):
         st = self._fp16_state()

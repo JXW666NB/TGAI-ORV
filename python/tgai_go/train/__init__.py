@@ -905,9 +905,12 @@ class Tensor:
                 #   实测（V100）：mlp 4.33x、lm_head 5.21x，relerr ~3e-04（fp16 舍入）。
                 # 只对"赚"的形状开：K>=512 且 N>=512。实测 attn_kv(N=128) fp16 反而慢 0.64x。
                 if (getattr(rt, "fp16_gemm", False) and K >= 512 and N >= 512):
-                    # 注意：_sgemm_f16 内部会把 A/B 当 fp32 **再转一次** fp16，
-                    # 所以这里必须传 fp32 缓冲（传 fp16 缓冲会得到全零/非法访问，实测过）。
-                    buf = rt.sgemm_fp16_nt(self._gpu, src._gpu)
+                    # 零转换路径：权重影子只建一次（step 后失效）、激活 cast 进复用 scratch、
+                    # 直接 cublasGemmEx（fp16 输入 + fp32 输出），跳过 _sgemm_f16 内部那两次转换。
+                    w16 = _fp16_shadow(src._gpu)
+                    a16 = _fp16_scratch(self._gpu)
+                    rt.cast_f32_to_f16_into(self._gpu, a16)
+                    buf = rt.gemm_f16_nt_raw(a16, w16, M, N, K)
                     try:
                         _FP16_HITS[0] += 1
                     except Exception:
@@ -2549,6 +2552,25 @@ def fp16_shadow_gen():
 def fp16_shadows_invalidate():
     """优化器 step() 之后调用：所有权重影子作废。"""
     _FP16_SHADOW_GEN[0] += 1
+
+
+_FP16_SCRATCH = {}
+
+
+def _fp16_scratch(src_buf):
+    """按元素数复用一块 fp16 scratch（避免每次 GEMM 前都分配）。
+
+    同一条流上 kernel 有序，所以下一行的 cast 一定在上一个 GEMM 之后执行 —— 复用安全。
+    """
+    n = int(src_buf.n)
+    buf = _FP16_SCRATCH.get(n)
+    if buf is None:
+        rt = _cuda()
+        buf = rt.empty((n,), dtype=__import__("numpy").float16)
+        if len(_FP16_SCRATCH) > 64:
+            _FP16_SCRATCH.clear()
+        _FP16_SCRATCH[n] = buf
+    return buf
 
 
 def _fp16_shadow(buf):
