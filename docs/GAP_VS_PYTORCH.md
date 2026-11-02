@@ -210,3 +210,48 @@ V100，B=4/S=512，Qwen2.5-0.5B 形状，每段都 `sync` 后计时、跑完释�
 
 - causal softmax（掩码内联）：0.802 → **0.893 s**。内核每行一个线程串行扫 k，
   并行度不足；已改为 opt-in（`TG_SOFTMAX_CAUSAL=1`），要收益需先改成 warp 归约。
+
+---
+
+## 11. 2026-11-02 夜：**真正的瓶颈是 CPU 发射，不是 kernel**
+
+### 11.1 实测（新增 `tools/profile_kernel.py`，CUDA event 计时）
+
+```
+wall = 744 ms    kernels = 1330    GPU 实际忙 = 111.6 ms
+=> GPU 利用率仅 15%，85% 的时间 CPU 在发射/建图/等
+```
+
+Top kernel（占 GPU 时间）：
+
+| kernel | 次数 | ms | 占比 |
+| --- | --- | --- | --- |
+| `adamw_update` | 290 | 18.8 | 16.8% |
+| `sum_axis8` | 72 | 14.5 | 13.0% |
+| `softmax_lastdim_bwd` | 24 | 8.8 | 7.9% |
+| `bcast_add4_v4` | 96 | 4.9 | 4.4% |
+| `ewise_scale_v4` | 72 | 4.8 | 4.3% |
+
+⇒ 即使把 GPU kernel 全优化到 0，整步也只能降到 ~630 ms。
+**优化方向必须换成"减少发射次数 / 降 CPU 开销"**。
+
+### 11.2 已有的杠杆：CUDA Graph
+
+运行时已有 `graph_begin/graph_end/graph_launch`（含 AdamW 偏差校正节点改写）。
+捕获能把 1330 次发射压成 1 次。
+
+但当前**捕获会失败**：
+
+```
+CudaError: CUDA Graph 捕获中内存池未命中 7340032 字节，拒绝 cuMemAlloc
+```
+
+这是**设计使然**（捕获中不允许分配），说明进捕获前必须把所有需要的块预先放进池子。
+下一步：给捕获加"预留 arena"（bump 分配）或按尺寸预热到池内，再捕获。
+预计收益：1330 → 1 次发射，wall 有望从 744 ms 降到 ~150-200 ms。
+
+### 11.3 顺带修好的（本轮已提交）
+
+`ce_row_stats` 的**非合并访问**（每线程连续分块，步长 V/256）：
+CE 前向 67.5 → **3.6 ms（18.7×）**，整步 0.811 → **0.748 s**。
+`log_softmax_lastdim` 前向/反向也从"线程-per-row 串行扫 k"改成 warp-per-row。

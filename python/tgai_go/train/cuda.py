@@ -2376,6 +2376,9 @@ class CudaRuntime:
         cu.cuEventCreate.restype = ctypes.c_int
         cu.cuEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
         cu.cuEventRecord.restype = ctypes.c_int
+        cu.cuEventElapsedTime.argtypes = [ctypes.POINTER(ctypes.c_float),
+                                          ctypes.c_void_p, ctypes.c_void_p]
+        cu.cuEventElapsedTime.restype = ctypes.c_int
         cu.cuEventQuery.argtypes = [ctypes.c_void_p]
         cu.cuEventQuery.restype = ctypes.c_int
         cu.cuEventDestroy.argtypes = [ctypes.c_void_p]
