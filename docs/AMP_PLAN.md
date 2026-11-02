@@ -201,3 +201,42 @@ cuBLAS 的 `CUDA_R_16BF` 需要 **sm_80+**（A100/A10/4090）。
 > bf16（AMP）是在"已经很省"的基础上再省一半；
 > 而我们现在的问题是**先多花了一倍**。所以顺序应该是：
 > **① 分块 CE + ② 大形状下打开检查点 + ③ 池子回收** → 再谈 bf16。
+
+---
+
+## 11. 2026-11-02：两个真 bug 修完，B=4/S=512 从 OOM 变 19.97 GiB（实测）
+
+### 11.1 修了什么
+
+1. **`T.checkpoint` 在 CUDA 上是空操作**（`device=="cpu"` 过滤 + `np.array(out.data)` 在 CUDA 造不出来）
+   → 改为设备侧 `clone` 造输出；补 `GpuBuf` 直传分支（反向重算传的是设备缓冲，
+   原来会落到 `np.asarray(GpuBuf)` 报 `float(GpuBuf)`）。
+2. **中间梯度从不释放**：`grads` 字典从反向开始带到结束，所有中间梯度常驻
+   → 消费完立即 `pop`，且**只给叶子留 `.grad`**（PyTorch 语义，对应 `release_variables`）。
+
+### 11.2 实测（V100-32GB，Qwen2.5-0.5B，B=4/S=512，采样线程 20 ms 取峰值）
+
+| 模式 | 修复前 | 修复后 |
+| --- | --- | --- |
+| `GRAD_CKPT=False` | **29.92 GiB → OOM** | **28.55 GiB ✅ 能跑** |
+| `GRAD_CKPT=True` | 29.76 GiB（检查点无效，等于没开） | **19.97 GiB**（−9.79 GiB，−33%） |
+| 步时 | — | 1.22 / 1.34 s/step |
+
+**前向保留的激活**（B=1/S=256 单测式对比）：`ckpt=False` **1.26 GiB** → `ckpt=True` **0.17 GiB**
+（**−86%**）—— 这条证明检查点本身是真生效的；之前"看不出差别"是因为被中间梯度掩盖。
+
+### 11.3 数值回归
+
+`tools/accept.py --quick` 在 V100 上 **PASS（0 FAIL）**，且关键数字与改动前**完全一致**：
+`cross_entropy` relerr 1.01e-06、`train_step` loss 4.3208 → 4.2742、120 步末 loss 0.091211。
+⇒ 省显存没有牺牲正确性。
+
+### 11.4 仍然没解决的大头（下一阶段）
+
+按子智能体台账（`docs/analysis/mem.md`），剩余峰值 ≈ 激活 11.26 + 权重/梯度/优化器 7.37
++ 词表张量多份 ≈ 3.5。要继续压：
+
+1. 词表张量 4 份 → 1 份（`CHUNK_TOKENS` 传小值；CE 的 ignore 路径少开中间缓冲）≈ −3.5 GiB
+2. `permute`/`__getitem__`/`repeat_interleave` 在 CUDA 上是真拷贝（PyTorch 是视图）
+3. SDPA `lowmem=True`（`dh=64` 条件满足）≈ −6.6 GiB
+4. 跨步释放旧图（`sft()` 里 loss/zc/logits 活到下一次前向结束）

@@ -683,11 +683,18 @@ class Tensor:
             g = grads.get(id(node))
             if g is None:
                 continue
-            if node.grad is None:
-                node.grad = np.zeros_like(node.data)
-            node.grad = node.grad + g
-            if node._backward is not None and _GRAD_ENABLED[0]:
+            is_leaf = node._backward is None
+            if is_leaf:
+                # 只有叶子对外保留 .grad（PyTorch 语义）；中间节点不再建一份全尺寸梯度
+                if node.grad is None:
+                    node.grad = np.array(g, copy=True)
+                else:
+                    node.grad = node.grad + g
+            elif _GRAD_ENABLED[0]:
                 node._backward(g, grads)
+            # ★ 消费完立刻释放：否则所有中间梯度在反向期间常驻，峰值≈2 倍
+            if not is_leaf:
+                grads.pop(id(node), None)
 
     def zero_grad(self):
         self.grad = None
@@ -1008,8 +1015,12 @@ class Tensor:
                 g0 = rt.h2d(np.asarray(grad.to_numpy(), dtype=np.float32).reshape(self.shape))
             else:
                 g0 = grad._gpu
-        else:
+        elif isinstance(grad, np.ndarray) or isinstance(grad, (list, tuple, int, float)):
             g0 = rt.h2d(np.asarray(grad, dtype=np.float32).reshape(self.shape))
+        else:
+            # 设备缓冲（GpuBuf）：直接用，不要 np.asarray —— 那会去调 float(GpuBuf)。
+            # `T.checkpoint` 的反向重算就是这条路（它手里只有缓冲）。
+            g0 = grad
         topo, seen, stack = [], set(), [(self, False)]
         while stack:
             node, done = stack.pop()
@@ -1040,8 +1051,13 @@ class Tensor:
                     if not isinstance(node.grad, Tensor) or getattr(node.grad, "device", "cpu") != "cuda":
                         raise RuntimeError("CUDA 张量的 .grad 必须是 CUDA Tensor")
                     node.grad = Tensor._from_gpu(rt.add(node.grad._gpu, g), requires_grad=False)
-            if node._backward is not None and _GRAD_ENABLED[0]:
-                node._backward(g, grads)
+            if node._backward is not None:
+                if _GRAD_ENABLED[0]:
+                    node._backward(g, grads)
+                # ★ 消费完立刻释放该节点的输出梯度：否则所有中间梯度在反向期间常驻，
+                #   峰值 ≈ 激活 + 同尺寸梯度 = 2 倍（子智能体台账：中间梯度 11.23 GiB）。
+                #   PyTorch 对应 node.h::release_variables。叶子已在上面挂进 .grad，不删。
+                grads.pop(id(node), None)
         rt.sync()
 
     def swap_last2(self):
