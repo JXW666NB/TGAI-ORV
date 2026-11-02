@@ -5258,9 +5258,11 @@ class CudaRuntime:
 
     def attn_mask_softmax_(self, s, causal=True, want_lse=False):
         """原地 causal-mask + softmax。s 是 [rows, k] 行主序；返回 (s, lse|None)。"""
-        if len(s.shape) != 2:
-            raise CudaError("attn_mask_softmax 需要 2D，收到 %s" % (s.shape,))
-        rows, k = int(s.shape[0]), int(s.shape[1])
+        if len(s.shape) < 2:
+            raise CudaError("attn_mask_softmax 需要至少 2 维，收到 %s" % (s.shape,))
+        # n-D：末维是 k，其余维展平成 rows（行内连续，causal 的 pos=r%k 仍然正确）
+        k = int(s.shape[-1])
+        rows = int(s.n) // k if k else 0
         lse = None
         if rows <= 0 or k <= 0:
             return s, lse
@@ -5278,10 +5280,11 @@ class CudaRuntime:
 
     def attn_mask_softmax_bwd(self, dp, p):
         """dS = P * (dP - sum(dP*P))，就地写到新缓冲。"""
-        if len(dp.shape) != 2 or tuple(dp.shape) != tuple(p.shape):
+        if len(dp.shape) < 2 or tuple(dp.shape) != tuple(p.shape):
             raise CudaError("attn_mask_softmax_bwd 形状不一致: %s vs %s"
                             % (dp.shape, p.shape))
-        rows, k = int(dp.shape[0]), int(dp.shape[1])
+        k = int(dp.shape[-1])
+        rows = int(dp.n) // k if k else 0
         ds = self.empty(dp.shape, dtype=np.float32)
         if rows <= 0 or k <= 0:
             return ds

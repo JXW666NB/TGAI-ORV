@@ -2663,6 +2663,30 @@ def _causal_mask(S, device):
     return t
 
 
+def _softmax_causal_enabled():
+    """TG_SOFTMAX_CAUSAL=1 时启用掩码内联 softmax（默认关：现版内核比通用路径慢）。"""
+    import os
+    return os.environ.get("TG_SOFTMAX_CAUSAL", "").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _softmax_causal_cuda(x):
+    """causal softmax（掩码内联）：一行只看 j<=pos，省掉 mask 张量与一次加法。
+
+    内核原地写，所以先 clone；反向用 attn_mask_softmax_bwd（被掩掉的列 P=0，
+    dS 自动为 0，不需要再乘掩码）。
+    """
+    rt = _cuda()
+    y = rt.clone(x._gpu)
+    rt.attn_mask_softmax_(y, causal=True)
+    out = Tensor._from_gpu(y, requires_grad=x.requires_grad, _parents=(x,))
+
+    def bw(g, grads):
+        if x.requires_grad:
+            _acc(grads, x, rt.attn_mask_softmax_bwd(g, y))
+    out._backward = bw
+    return out
+
+
 def _sdpa_materialized(q, k, v, causal, scale):
     """物化 scores/P 的 SDPA。默认路径，也是 lowmem 不合格时的回退。"""
     # ★ 转置乘走 cuBLAS 的 op=T，省掉 k 的一次真拷贝（旧写法 q @ k.swap_last2()）
@@ -2671,9 +2695,17 @@ def _sdpa_materialized(q, k, v, causal, scale):
         scores = _attn_scores(q, k, scale)
     else:
         scores = (q @ k.swap_last2()) * scale
-    if causal:
-        scores = scores + _causal_mask(scores.shape[-1], scores.device)
-    p = _Functional.softmax(scores, axis=-1)
+    # 掩码内联的 causal softmax：**默认关闭**。
+    # 实测（V100，B=4/S=512）：开它整步 0.800 -> 0.893 s（反而更慢）。
+    # 原因：内核是"每行一个线程、串行扫 k"（k=512 时每线程 512 次串行），
+    # 并行度远不如通用 softmax 的分块归约。要收益得先把内核改成 warp/块内归约。
+    # 数值是对的（dq/dk/dv relerr ~2e-07），所以留着开关，改好内核再打开。
+    if causal and _softmax_causal_enabled() and getattr(scores, "device", "cpu") == "cuda":
+        p = _softmax_causal_cuda(scores)
+    else:
+        if causal:
+            scores = scores + _causal_mask(scores.shape[-1], scores.device)
+        p = _Functional.softmax(scores, axis=-1)
     return p @ v
 
 
