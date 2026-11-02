@@ -648,3 +648,20 @@ rt.deterministic = True        # 或环境变量 TG_DETERMINISTIC=1
 
 新增 `tests/test_deterministic.py`（GPU-gated）：直接断言"反向两次最大差 == 0"。
 写这个文件时被仓库自带的 `tests/test_hygiene.py` 抓到 BOM + CRLF —— 守卫有效，已修正。
+
+---
+
+## 22. 2026-11-03：fp16 与确定性**可以同时开启**
+
+| 配置 | ms/step | 两次训练 loss 完全一致 | 参数最大绝对差 |
+| --- | --- | --- | --- |
+| `deterministic=True` + `fp16_gemm=True` | **492.9** | ✅ | **0.000e+00** |
+| `deterministic=True`（fp32 GEMM） | 724.3 | ✅ | 0.000e+00 |
+| 默认 | 717.3 | ❌ | 7.63e-06 |
+
+⇒ 对外可以宣称：
+- **fp32 快路径**：最快，但运行间有 ~1e-6 抖动（与 PyTorch 默认一致）
+- **确定性模式**（`TG_DETERMINISTIC=1`）：逐位可复现，代价约 1%
+- **fp16 加速**（`rt.fp16_gemm=True`）：约 1.5×，且**在确定性模式下依然逐位可复现**
+
+三种组合互不冲突，可任意搭配。
