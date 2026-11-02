@@ -2231,6 +2231,10 @@ class CudaRuntime:
         self._blas_stream_set = False
         self._dto_async_ready = False
         self._capturing = False
+        # CUDA Graph 捕获期的预留 arena（bump 分配）
+        self._arena_base = 0
+        self._arena_size = 0
+        self._arena_off = 0
         self._graph = None
         self._graph_exec = None
         self._graph_dead = False
@@ -3016,6 +3020,48 @@ class CudaRuntime:
             return None
         return None
 
+    def reserve_capture_arena(self, nbytes):
+        """捕获前预留一块显存，供 `_capturing` 期间 bump 分配（不调 cuMemAlloc）。"""
+        nbytes = int(nbytes)
+        if nbytes <= 0 or self._arena_base:
+            return
+        self._activate()
+        raw = ctypes.c_uint64()
+        rc = self.cu.cuMemAlloc(ctypes.byref(raw), ctypes.c_size_t(nbytes))
+        if rc != 0 or not raw.value:
+            raise CudaError(
+                "预留捕获 arena 失败：申请 %.2f GiB（rc=%d）。修法：减小 arena，"
+                "或先 empty_cache() 再试" % (nbytes / float(1 << 30), rc))
+        self._arena_base = int(raw.value)
+        self._arena_size = nbytes
+        self._arena_off = 0
+
+    def _arena_alloc(self, nbytes):
+        """从 arena 切一块（16B 对齐）。不够就抛错并说明差多少。"""
+        if not self._arena_base:
+            return 0
+        n = (int(nbytes) + 15) & ~15
+        if self._arena_off + n > self._arena_size:
+            raise CudaError(
+                "捕获 arena 用尽：已用 %.2f / %.2f GiB，本次要 %d 字节。"
+                "修法：调大 reserve_capture_arena 的字节数"
+                % (self._arena_off / float(1 << 30), self._arena_size / float(1 << 30), n))
+        ptr = self._arena_base + self._arena_off
+        self._arena_off += n
+        return ptr
+
+    def release_capture_arena(self):
+        """归还 arena（图销毁后调用；arena 里的地址此时已不再被引用）。"""
+        base = int(getattr(self, "_arena_base", 0) or 0)
+        self._arena_base = 0
+        self._arena_size = 0
+        self._arena_off = 0
+        if base and self.cu is not None:
+            try:
+                self.cu.cuMemFree(ctypes.c_uint64(base))
+            except Exception:
+                pass
+
     def _alloc(self, nbytes):
         nbytes = int(nbytes)
         if nbytes <= 0:
@@ -3054,8 +3100,17 @@ class CudaRuntime:
             self._pool_checkout(ptr, got)
             return ptr
         if self._capturing:
+            # 捕获期不允许 cuMemAlloc：先从预留 arena 切，切不出来才报错（说清差多少）
+            aptr = self._arena_alloc(bucket)
+            if aptr:
+                got = bucket
+                self._pool_checkout(aptr, got)
+                self._arena_ptrs = getattr(self, "_arena_ptrs", 0) + 1
+                return aptr
             raise CudaError(
-                "CUDA Graph 捕获中内存池未命中 %d 字节，拒绝 cuMemAlloc" % int(bucket))
+                "CUDA Graph 捕获中内存池未命中 %d 字节，且没有预留 arena。"
+                "修法：捕获前调用 rt.reserve_capture_arena(<字节数>)"
+                % int(bucket))
         # 只有真正要向驱动要内存时才需要设上下文；池命中那条路一个 CUDA API 都不调。
         self._activate()
         raw = ctypes.c_uint64()
@@ -5883,6 +5938,7 @@ class CudaRuntime:
         return "rc=%d%s" % (int(rc), extra)
 
     def _graph_destroy(self):
+        self.release_capture_arena()
         cu = self.cu
         nodes = self._adamw_nodes
         self._adamw_nodes = []

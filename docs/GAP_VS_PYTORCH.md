@@ -255,3 +255,41 @@ CudaError: CUDA Graph 捕获中内存池未命中 7340032 字节，拒绝 cuMemA
 `ce_row_stats` 的**非合并访问**（每线程连续分块，步长 V/256）：
 CE 前向 67.5 → **3.6 ms（18.7×）**，整步 0.811 → **0.748 s**。
 `log_softmax_lastdim` 前向/反向也从"线程-per-row 串行扫 k"改成 warp-per-row。
+
+---
+
+## 12. 2026-11-03：**更正**——之前"GPU 只忙 15%"是我的测量错误；CUDA Graph 让我们追平 torch
+
+### 12.1 我错在哪
+
+`tools/profile_kernel.py` 只 instrument 了 `CudaRuntime.launch()`（NVRTC 内核），
+**完全没算 cuBLAS 的 385 次 GEMM 调用**，也没算走 fast-path 的内核
+（图里有 2441 个节点，而当时只统计到 1330+385）。
+
+用**两个 event 包住整步**的干净测法：
+
+```
+wall=734 ms   gpu=734 ms   gpu_util=100%
+```
+
+⇒ **GPU 一直是满的**，不是 CPU 空转。原结论作废。
+
+### 12.2 正确的时间构成（把 cuBLAS 也纳入 event）
+
+| 项 | 次数 | GPU 时间 | 占 wall |
+| --- | --- | --- | --- |
+| cuBLAS GEMM（`sgemm` 156.6 + batched 19.4 + `bmm` 14.8 + …） | 385 | **200.7 ms** | 27% |
+| NVRTC 内核（`adamw_update` 18.8 / `sum_axis8` 14.5 / `softmax_bwd` 8.8 / …） | ≥1330 | ≥111.6 ms | ≥15% |
+| 其余（memcpy / 发射间隙 / 未 instrument 的 fast-path 内核） | — | ≈430 ms | ≈58% |
+
+### 12.3 CUDA Graph：**743 ms → 605 ms（1.23×）**
+
+- 捕获曾失败：`捕获中内存池未命中 7340032 字节`（设计使然：捕获期禁止 cuMemAlloc）
+- 已实现 `reserve_capture_arena(nbytes)`：捕获前预留一块，捕获期从 arena **bump 分配**
+- 实测：`graph_end=True, nodes=2441`，重放 **605.5 ms/step**
+- **对照 PyTorch 同形状 610 ms ⇒ 0.99×（追平）**
+
+### 12.4 下一步
+
+图重放要求输入静态：真实训练每步 `ids/tgt` 会变，需要
+「固定 staging buffer + `cuMemcpyHtoDAsync` → 重放」的数据通路（方案见子智能体产出）。
