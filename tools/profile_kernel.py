@@ -27,6 +27,7 @@ def main(argv=None):
     ap.add_argument("--checkpoint", required=True, help="safetensors 目录（含 model.safetensors）")
     ap.add_argument("--shape", default="4x512", help="BxS，例如 4x512")
     ap.add_argument("--top", type=int, default=14)
+    ap.add_argument("--fp16", action="store_true", help="打开 rt.fp16_gemm 再剖析")
     a = ap.parse_args(argv)
     b, s = (int(x) for x in a.shape.lower().split("x"))
 
@@ -69,6 +70,8 @@ def main(argv=None):
     ids = rng.integers(0, 1000, (b, s)).astype(np.int64)
     tgt = rng.integers(0, 1000, (b * s,)).astype(np.int64)
     rt = T._cuda()
+    if a.fp16:
+        rt.fp16_gemm = True
 
     def step():
         lg = model.forward(ids)

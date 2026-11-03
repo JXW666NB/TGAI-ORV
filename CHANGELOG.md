@@ -60,10 +60,17 @@
   `tests/test_rope_half.py`、`tests/test_ckpt_segments.py` 等。
 - 合计 **292 passed / 6 skipped**，`tools/check_package.py` PASS。
 
-### 诚实结论
-- 对 **PyTorch fp32**（610 ms）：我们 489 ms，**快 1.25×**。
-- 对 **PyTorch AMP**（219.5 ms）：我们仍慢 **2.2×** —— torch 的 AMP 把激活也存 fp16，
-  我们只换了 GEMM。真 AMP（激活 fp16 存储）尚未做。
+### 诚实结论（**2026-11-03 已纠正口径**，见 docs/BENCHMARK_RIGOR.md）
+- ⚠ 更正：此前写的「对 PyTorch fp32 快 1.25×」**是错的** —— 我们的基准每步都读了一次
+  loss（D2H + 同步），虚增了 9~12% 步时，而 torch 那侧没有。
+- 同口径（循环内不读设备标量，只在末尾 sync）实测：
+  我们 fp32 **683.9 ms** vs torch fp32 **621.0 ms** ⇒ 我们**慢 1.10×**；
+  我们 fp16 **389.3 ms** vs torch AMP **219.5 ms** ⇒ 我们**慢 1.77×**。
+- 我们 fp16 对 torch fp32：**快 1.60×**（389.3 vs 621.0）。
+- torch AMP 的优势主要来自把**激活也存 fp16**；我们只把 GEMM 输入换成 fp16，
+  真 AMP（激活 fp16 存储）尚未做。
+- CUDA Graph 曾量到 1.23×/1.71×，但那是优化前；同口径重测**只有 1.01×**
+  （见 docs/CUDA_GRAPH_FINDINGS.md），已不作为优化方向。
 - L3 三项仍未全过（24h 长稳 21.8h、2 卡缺硬件、真 AMP 未做），
   因此对外标签保持 **「可用（自用/小团队）」**。
 
