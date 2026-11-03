@@ -122,7 +122,8 @@ def register(name, fn, *, kind="functional", doc="", replace=False):
     if not name.isidentifier():
         raise ValueError("算子名必须是合法标识符：%r。修法：用字母/下划线开头，如 'my_op'" % (name,))
     if not callable(fn):
-        raise TypeError("算子 %r 的实现必须可调用（Tensor -> Tensor）" % (name,))
+        raise TypeError("算子 %r 的实现必须可调用（Tensor -> Tensor）" % (name,)
+                        + "。修法：传一个函数，参数是 Tensor、返回 Tensor")
     if name in _REGISTRY and not replace:
         raise ValueError(
             "算子 %r 已注册（来源：%s）。修法：换一个名字，或显式 replace=True 覆盖"
@@ -149,7 +150,8 @@ def register_numpy(name, forward, backward, *, kind="functional", doc="", replac
     backward(g, out, xs) -> list[np.ndarray]（与 xs 一一对应；不需要梯度的位置给 None）
     """
     if not callable(forward) or not callable(backward):
-        raise TypeError("register_numpy: forward 与 backward 都必须可调用")
+        raise TypeError("register_numpy: forward 与 backward 都必须可调用"
+                        + "。修法：两个参数都传函数；不需要反向就改用 register()")
 
     def op(*args, **kwargs):
         tensors = [a for a in args if isinstance(a, Tensor)]
@@ -180,7 +182,8 @@ def unregister(name):
     """卸载插件算子（恢复核心原样，若它覆盖过核心则无法自动恢复 —— 会明确告知）。"""
     rec = _REGISTRY.pop(name, None)
     if rec is None:
-        raise KeyError("算子 %r 没有注册过。已注册：%s" % (name, ", ".join(sorted(_REGISTRY)) or "(空)"))
+        raise KeyError("算子 %r 没有注册过。已注册：%s" % (name, ", ".join(sorted(_REGISTRY)) or "(空)")
+                       + "。修法：先 ops_plugin.register() 再调用")
     if rec.get("replaced_core"):
         raise RuntimeError(
             "算子 %r 覆盖过核心实现，卸载无法自动恢复原实现。"
@@ -237,7 +240,8 @@ def load_plugin_file(path):
 
     path = os.path.abspath(path)
     if not os.path.isfile(path):
-        raise FileNotFoundError("插件文件不存在：%s" % (path,))
+        raise FileNotFoundError("插件文件不存在：%s" % (path,)
+                                + "。修法：检查路径；.tgop 请用 ops_bundle.load()")
     raw = open(path, "rb").read()
     digest = hashlib.sha256(raw).hexdigest()
 

@@ -77,7 +77,7 @@ class DataParallel:
         self.dir = os.path.join(base, "tgai_dp_%s" % self.job)
         self._shm = []
         if self.world > 1 and not _HAS_SHM:
-            raise RuntimeError("多卡需要 multiprocessing.shared_memory，当前环境不可用")
+            raise RuntimeError("多卡需要 multiprocessing.shared_memory，当前环境不可用" + "。修法：把 TGAI_DP_WORLD 设为 1 跑单卡，或换支持 shared_memory 的平台")
         if self.world > 1:
             os.makedirs(self.dir, exist_ok=True)
             self._slot = None
@@ -92,7 +92,7 @@ class DataParallel:
         t0 = time.time()
         while not os.path.exists(path):
             if time.time() - t0 > self.timeout:
-                raise TimeoutError("数据并行等待超时（%s）: %s" % (what, path))
+                raise TimeoutError("数据并行等待超时（%s）: %s" % (what, path) + "。修法：确认所有 rank 都已启动、TGAI_DP_JOB 一致、临时目录可写")
             time.sleep(0.002)
 
     def _barrier(self, tag):
@@ -132,7 +132,7 @@ class DataParallel:
                     break
                 except FileNotFoundError:
                     if time.time() - t0 > self.timeout:
-                        raise TimeoutError("共享内存 %s 未创建" % name)
+                        raise TimeoutError("共享内存 %s 未创建" % name + "。修法：确认 rank0 已完成共享内存创建（可能有 rank 提前退出）")
                     time.sleep(0.002)
             self._shm.append(self._slot)
         self._bytes = need

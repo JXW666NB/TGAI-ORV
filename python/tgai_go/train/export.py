@@ -144,7 +144,7 @@ def save_tg(path, params, *, n_layers, d_model, n_heads, d_ff, vocab_tokens, mer
     # 而 θ 通常是浮点（10000.0 / 500000.0）。这里要求它是整数值再取 int，避免静默截断。
     th = float(rope_theta)
     if abs(th - round(th)) > 1e-9:
-        raise ValueError("rope_theta 必须是整数值才能写进 .TG 头（收到 %r）" % (rope_theta,))
+        raise ValueError("rope_theta 必须是整数值才能写进 .TG 头（收到 %r）" % (rope_theta,) + "。修法：把 rope_theta 设成整数（例如 10000）；.TG 头只存整数")
     rope_theta = int(round(th))
     wr = TGWriter(n_layers=n_layers, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
                   vocab=len(vocab_tokens), max_seq=max_seq,

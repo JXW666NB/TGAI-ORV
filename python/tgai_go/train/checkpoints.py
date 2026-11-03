@@ -588,7 +588,7 @@ def load_tg(path, max_layers=None, vocab_limit=None, allow_suspicious_norms=Fals
     weights = {}
     emb = get("token_embedding.weight")
     if emb is None:
-        raise CheckpointError(".TG 缺少 token_embedding.weight")
+        raise CheckpointError(".TG 缺少 token_embedding.weight" + "。这份 .TG 可能不是标准导出（缺 embedding 表）。修法：用 tools/tg_audit.py 先体检，或改用 safetensors 目录加载")
     weights["token_embedding.weight"] = (
         emb[:vocab_limit] if vocab_limit else emb)
     fn = get("final_norm.weight")

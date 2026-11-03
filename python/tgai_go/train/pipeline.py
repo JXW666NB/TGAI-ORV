@@ -47,7 +47,7 @@ def _load_bpe_funcs_legacy():
     """
     path = os.path.join(_repo_root(), "training", "bpe_train.py")
     if not os.path.isfile(path):
-        raise FileNotFoundError("找不到 bpe_train.py: %s" % path)
+        raise FileNotFoundError("找不到 bpe_train.py: %s" % path + "。修法：确认仓库里存在该脚本，或用 --bpe-script 指定正确路径")
     with open(path, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
     cleaned = []
@@ -84,7 +84,7 @@ def _llama_ref():
 def _read_corpus(corpus_dir):
     """按文件名排序，把目录下每个 *.txt 用 UTF-8 读出来，拼成一段文本。"""
     if not os.path.isdir(corpus_dir):
-        raise FileNotFoundError("corpus_dir 不是目录: %s" % corpus_dir)
+        raise FileNotFoundError("corpus_dir 不是目录: %s" % corpus_dir + "。修法：传一个真实存在的目录（例如 data/corpus）")
     names = []
     for name in os.listdir(corpus_dir):
         if not name.endswith(".txt"):
@@ -94,7 +94,7 @@ def _read_corpus(corpus_dir):
             names.append(name)
     names.sort()
     if not names:
-        raise ValueError("corpus_dir 下没有 *.txt: %s" % corpus_dir)
+        raise ValueError("corpus_dir 下没有 *.txt: %s" % corpus_dir + "。修法：确认目录下有 .txt 语料；子目录不会递归扫描")
     parts = []
     for name in names:
         path = os.path.join(corpus_dir, name)
@@ -111,7 +111,7 @@ def _windows(ids, seq):
     """
     ids = np.asarray(ids, dtype=np.int64).reshape(-1)
     if int(ids.size) < 2:
-        raise ValueError("编码后 token 少于 2，无法做下一词预测")
+        raise ValueError("编码后 token 少于 2，无法做下一词预测" + "。修法：换更大的语料，或调小词表/降低最小频次")
     raw_n = int(ids.size)
     need = int(seq) + 1
     tiled = False
@@ -121,7 +121,7 @@ def _windows(ids, seq):
         tiled = True
     n = (int(ids.size) - 1) // int(seq)
     if n < 1:
-        raise ValueError("切不出长度为 %d 的样本（token=%d）" % (seq, int(ids.size)))
+        raise ValueError("切不出长度为 %d 的样本（token=%d）" % (seq, int(ids.size)) + "。修法：把 --seq 调小（不超过语料 token 总数），或加更多语料")
     if n > _MAX_WINDOWS:
         n = _MAX_WINDOWS
     x = np.stack([ids[i * seq:(i + 1) * seq] for i in range(n)]).astype(np.int64, copy=False)
@@ -160,11 +160,13 @@ def _check_arch(arch, d_model, n_layers, n_heads, n_kv, seq, steps):
     """只做校验，不再限制成 llama。三套预设共用同一份「读语料→自训 BPE→训练」的流程。"""
     if arch not in SUPPORTED_ARCHS:
         raise NotImplementedError("流水线支持的架构: %s（收到 %r）"
-                                  % (", ".join(SUPPORTED_ARCHS), arch))
+                                  % (", ".join(SUPPORTED_ARCHS), arch) + "。修法：用 --arch 选一个受支持的架构")
     if d_model % n_heads != 0:
-        raise ValueError("d_model(%d) 必须能被 n_heads(%d) 整除" % (d_model, n_heads))
+        raise ValueError("d_model(%d) 必须能被 n_heads(%d) 整除" % (d_model, n_heads)
+                             + "。修法：调 d_model 或 n_heads，使两者整除")
     if n_kv <= 0 or n_heads % n_kv != 0:
-        raise ValueError("n_heads(%d) 必须是 n_kv(%d) 的整数倍" % (n_heads, n_kv))
+        raise ValueError("n_heads(%d) 必须是 n_kv(%d) 的整数倍" % (n_heads, n_kv)
+                             + "。修法：把 n_heads 改成 n_kv 的整数倍")
 
 
 def _model_mod(arch):
@@ -224,20 +226,20 @@ def run(corpus_dir, out_dir, arch="llama", vocab_size=512, seq=128, steps=200,
     import tgai_go.train as T
     T.manual_seed(seed)
     if device_name not in ("cpu", "cuda"):
-        raise ValueError("device 只接受 'cpu' 或 'cuda'，收到 %r" % (device,))
+        raise ValueError("device 只接受 'cpu' 或 'cuda'，收到 %r" % (device,) + "。修法：传「cpu」或「cuda」（注意大小写）")
     T.set_device(device_name)
 
     text = _read_corpus(corpus_dir)
     if not text:
-        raise ValueError("语料是空的: %s" % corpus_dir)
+        raise ValueError("语料是空的: %s" % corpus_dir + "。修法：确认语料文件不是空文件")
     train_bpe, encode_ref = _bpe()
     vocab, merges = train_bpe(text, int(vocab_size))
     if not vocab:
-        raise ValueError("BPE 词表是空的")
+        raise ValueError("BPE 词表是空的" + "。修法：确认 BPE 词表文件非空、且是从同一份语料训练出来的")
     ids = encode_ref(text, vocab, merges)
     x, y, n_raw, n_train, tiled = _windows(ids, seq)
     if int(x.max()) >= len(vocab) or int(y.max()) >= len(vocab):
-        raise RuntimeError("编码出了词表以外的 id")
+        raise RuntimeError("编码出了词表以外的 id" + "。修法：词表与编码器的 id 空间不一致，重新训练 BPE 或换回配套词表")
 
     model, cfg = _build(arch, len(vocab), d_model, n_layers, n_heads, n_kv, d_ff, seq, seed)
     opt = T.optim.AdamW(model.parameters(), lr=float(lr))
@@ -281,10 +283,10 @@ def run(corpus_dir, out_dir, arch="llama", vocab_size=512, seq=128, steps=200,
         loaded = {}
         for name in saved:
             if name not in blob.files:
-                raise RuntimeError("ckpt.npz 缺参数 %s" % name)
+                raise RuntimeError("ckpt.npz 缺参数 %s" % name + "。修法：确认 ckpt.npz 与当前模型的参数名一致（np.load 后打印 keys 对照）")
             loaded[name] = np.ascontiguousarray(blob[name], dtype=np.float32).copy()
             if not np.array_equal(saved[name], loaded[name]):
-                raise RuntimeError("ckpt.npz 往返后权重变了: %s" % name)
+                raise RuntimeError("ckpt.npz 往返后权重变了: %s" % name + "。修法：检查是否有 dtype/BOM 转换，或改用 safetensors 往返")
     # ★ 必须把权重直接传进构造函数：这些"薄定义"模型不是 Module，没有 load_state_dict
     reloaded, _ = _build(arch, len(vocab), d_model, n_layers, n_heads, n_kv, d_ff, seq,
                          seed, weights=loaded)

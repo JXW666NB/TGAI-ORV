@@ -215,3 +215,16 @@ aise
 消息是变量（
 aise ValueError(msg)）时静态判不了，扫描器会**跳过并计数**，
 不假装通过、也不误杀。扫描器本身也有自测用例。
+
+### 覆盖进度（2026-11-03）
+
+| 模块 | 缺「修法」 | 状态 |
+| --- | --- | --- |
+| ops_* / dtypes / dist_p2p / graph_train（本会话新增） | 0 / 53 | ✅ 强制 |
+| checkpoints / data / 
+n_ops / export / pipeline / dist / ackend / ops_plugin / doctor / qwen | **0** | ✅ 强制（本轮补齐 30 条） |
+| cuda.py | 149 | 🟡 棘轮锁定基线（只减不增） |
+| __init__.py | 119 | 🟡 棘轮锁定基线（只减不增） |
+
+「棘轮」= 	ests/test_error_messages.py 里记了基线数字，**新增的 raise 不带「修法」就会红**，
+补完一批就把基线调低。这样大文件也能持续收敛，而不是一次性堵死。

@@ -187,9 +187,9 @@ def register(name, factory, replace=False):
     """登记一个后端工厂。factory 必须无参并返回实例（或抛异常表示不可用）。"""
     name = str(name).strip().lower()
     if not name:
-        raise ValueError("后端名不能为空")
+        raise ValueError("后端名不能为空" + "。修法：传非空字符串，例如「cuda」/「vulkan」")
     if name in _REGISTRY and not replace:
-        raise ValueError("后端 %r 已登记；要替换请传 replace=True" % name)
+        raise ValueError("后端 %r 已登记；要替换请传 replace=True" % name + "。修法：换一个名字，或显式传 replace=True")
     global _TOKEN
     _REGISTRY[name] = factory
     _TOKEN += 1
@@ -222,6 +222,7 @@ def get(name=None, *, check=True):
         else:
             raise NotImplementedError(
                 "后端 %r 尚未登记。已登记：%s。\n"
+                "修法："
                 "要接新后端：tgai_go.train.backend.register(%r, factory)，"
                 "接口清单见 backend.required_methods()。" % (
                     want, ", ".join(available()) or "(空)", want))
@@ -233,7 +234,7 @@ def get(name=None, *, check=True):
         if lack:
             raise RuntimeError(
                 "后端 %r 缺少 %d 个接口方法：%s\n"
-                "（MoE 相关可选，详见 tgai_go.train.backend.GROUPS）"
+                "修法：补上这些方法，或把可选组标进 GROUPS（MoE 相关可选，详见 tgai_go.train.backend.GROUPS）"
                 % (want, len(lack), ", ".join(lack[:10]) + ("..." if len(lack) > 10 else "")))
     return inst
 

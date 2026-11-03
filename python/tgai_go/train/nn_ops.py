@@ -54,7 +54,7 @@ def tanh(x):
 def gelu(x, approximate="tanh"):
     """GELU。目前只支持 tanh 近似（精确版需要 erf）。"""
     if approximate not in ("tanh", None, "none"):
-        raise ValueError("gelu: 只支持 approximate='tanh'（精确版需要 erf 算子，尚未实现）")
+        raise ValueError("gelu: 只支持 approximate='tanh'（精确版需要 erf 算子，尚未实现）" + "。修法：传 approximate=「tanh」；要精确版需先实现 erf 算子")
     c = float(np.sqrt(2.0 / np.pi))
     inner = (x + (x * x * x) * 0.044715) * c
     return x * 0.5 * (_ones_like(x) + tanh(inner))
@@ -133,7 +133,7 @@ def stack(xs, dim=0):
     """沿新维度拼接（与 torch.stack 一致）。"""
     xs = list(xs)
     if not xs:
-        raise ValueError("stack: 输入为空")
+        raise ValueError("stack: 输入为空" + "。修法：至少传入一个张量")
     shp = xs[0].shape
     for x in xs:
         if x.shape != shp:
@@ -398,7 +398,7 @@ def nll_loss(log_probs, target, reduction="mean"):
 def chunk(x, chunks, dim=0):
     """沿 dim 等分成 chunks 份（与 torch.chunk 一致：除不尽时最后一份更小）。"""
     if chunks <= 0:
-        raise ValueError("chunk: chunks 必须 > 0，收到 %r" % (chunks,))
+        raise ValueError("chunk: chunks 必须 > 0，收到 %r" % (chunks,) + "。修法：传正整数（例如 chunks=4）")
     n = x.shape[dim]
     size = int(np.ceil(n / chunks))
     return split(x, size, dim)
@@ -418,7 +418,7 @@ def arange(start, end=None, step=1, dtype=np.float32):
     if end is None:
         start, end = 0, start
     if step == 0:
-        raise ValueError("arange: step 不能为 0")
+        raise ValueError("arange: step 不能为 0" + "。修法：给一个非零 step（例如 1 或 -1）")
     return _tensor(np.arange(start, end, step, dtype=np.float32))
 
 
@@ -656,7 +656,7 @@ def _parse_einsum(subscripts):
     all_labels = "".join(ins)
     for c in outs:
         if c not in all_labels:
-            raise ValueError("einsum: 输出下标 %r 不在输入里：%r" % (c, subscripts))
+            raise ValueError("einsum: 输出下标 %r 不在输入里：%r" % (c, subscripts) + "。修法：把该字母写进某个输入的下标中，或从输出下标里删掉")
     return ins, outs
 
 
@@ -672,7 +672,7 @@ def einsum(subscripts, *operands):
     ins, outs = _parse_einsum(subscripts)
     if len(ins) != len(operands):
         raise ValueError("einsum: 下标组数 %d 与操作数个数 %d 不一致：%r"
-                         % (len(ins), len(operands), subscripts))
+                         % (len(ins), len(operands), subscripts) + "。修法：让逗号分隔的下标组数与操作数个数一致")
     arrs = [np.asarray(o.data if isinstance(o, Tensor) else o, dtype=np.float32)
             for o in operands]
     for t, arr in zip(ins, arrs):
