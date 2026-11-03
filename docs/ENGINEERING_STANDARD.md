@@ -113,6 +113,57 @@ CI（GitHub Actions）只跑**不需要 GPU** 的那部分 —— 它能拦住"�
 
 ---
 
+## 9. 基准口径（2026-11-03 起强制）
+
+**因为踩过坑**：我们的基准曾经每一步都读一次 loss（`float(loss.to_numpy())`），
+那是 D2H + 整设备同步，把异步流水线打断，**虚增 9~12% 步时**；
+而 PyTorch 那侧没这么写。于是得出"我们比 torch fp32 快 1.25×"的**错误结论**，
+后来同口径重测才发现是**慢 1.10×**。详见 `docs/BENCHMARK_RIGOR.md`。
+
+强制规则：
+
+1. **计时循环内不许读任何设备标量**（loss / 梯度范数 / 任何 `.to_numpy()`）。
+   需要监控 loss 时，另跑一份「带同步」的版本，并在结论里**标注它不代表吞吐**。
+2. **对手用同一段测量代码**：步数 N、是否 sync、是否含数据加载，两边必须一致。
+3. 结论里必须写清：`N 步 / 是否含同步 / 是否含数据加载 / 平均值还是中位数`。
+4. 单次测量一律加 `sync()` 再取时间；多次取平均，必要时给中位数与最大偏差。
+
+---
+
+## 10. 触碰驱动的测试必须子进程化
+
+**因为踩过坑**：AMD 驱动在同一进程里加载/卸载 `vulkan-1.dll`、或反复建销
+`VkInstance`，会让 **pytest 进程在退出时段错误**（表现为跑完一堆点后直接崩、
+没有失败报告）。NVIDIA 侧创建 `VkDevice` 也建议同样处理。
+
+规则：任何真实触碰 GPU / Vulkan / 驱动的用例，**主体逻辑放子进程**，
+父进程只解析子进程 stdout 并断言；子进程崩溃按失败处理，不吞掉。
+
+示例见 `tests/test_ops_vk.py`、`tests/test_ops_vk_ops.py`（`_child` / `_vk_ready`）。
+
+---
+
+## 11. 插件包（`.tgop`）的硬性契约
+
+| 契约 | 谁在管 | 违反会怎样 |
+| --- | --- | --- |
+| 必须有 `python` 兜底档 | `ops_bundle._load_manifest` + `tools/tgop_pack.py` | 打包直接失败；加载报错并给修法 |
+| 引用的文件必须真在包里 | `tools/tgop_pack.py`（打包时）+ `ops_bundle._pick`（加载时） | 打包失败 / 加载时**顺延**到下一个后端 |
+| 后端按 `cuda → hip → musa → ascend → bang → vulkan → cpu → python` 挑 | `ops_bundle._ORDER` | — |
+| 声明了后端但加载器未实现 | `ops_bundle.load` | 明确报错并列出本机可用后端，**绝不静默跑错** |
+
+**能力矩阵（当前真实状态）**：
+
+| 后端 | 加载器 | 实测 |
+| --- | --- | --- |
+| cuda | ✅ | GELU 前向 relerr **7.78e-08**（V100） |
+| cpu（C JIT） | ✅ | 前向/反向正确（自动发现 zig/gcc/clang/tcc，`pip install ziglang` 即可零配置） |
+| vulkan | ✅ | relu 前/反向 **0.000e+00**（AMD 核显）；但**比 numpy 慢 20~150×**，见 `docs/VULKAN_BACKEND.md` |
+| python | ✅ | 兜底，永远可用 |
+| hip / musa / ascend / bang | ❌ | 只有探测，加载器未实现；缺硬件**没法测**，不写假的 |
+
+---
+
 ## 一条命令跑完全部门禁
 
 ```bash
