@@ -2216,3 +2216,12 @@ max|Δ| = 1.383e-05     相对误差 = 6.693e-07     判据 ≤1e-5   PASS
 | 确定性覆盖范围 | rmsnorm dw / 词嵌入反向 / repeat_interleave 反向（三处 atomic 全部替换） |
 
 用法：`rt.deterministic = True` 或环境变量 `TG_DETERMINISTIC=1`。
+
+### 2026-11-03：24h 长稳（V100）已启动
+
+* 机器：Tesla V100-PCIE-32GB（单卡），任务名 	gai_soak24，日志 D:\\tgai_orv\\soak_24h.log，
+  采样 CSV D:\\tgai_orv\\soak_24h.csv。
+* 参数：--minutes 1440 --batch 64 --sample-steps 100。
+* 起步观测（前 90 秒）：**2600 步 / 88.6 s ≈ 29 步/秒**，loss 0.0880~0.0903（无 NaN），
+  peak 2.525 GiB、live 1.332 GiB、cached 1.192 GiB、free 28.97 GB、RSS 0.41 GB。
+* 判定：跑满 1440 分钟且末段 loss/显存无漂移、无 NaN ⇒ 长稳项通过。
