@@ -83,10 +83,22 @@ def _load_manifest(zf):
     return m
 
 
-def _pick(manifest, available):
+def _pick(manifest, available, names=None):
+    """挑第一个「本机可用 且 包里引用的文件确实存在」的后端。
+
+    只查可用性不查文件是不够的：包里写了 `vulkan` 却没带 `.spv` 时，
+    选到它会在加载阶段抛 KeyError。这里直接顺延到下一个后端。
+    """
+    names = set(names or ())
     for b in _ORDER:
-        if b in manifest["backends"] and b in available:
-            return b
+        if b not in manifest["backends"] or b not in available:
+            continue
+        spec = manifest["backends"][b] or {}
+        refs = [spec[k] for k in ("source", "c", "spirv", "bwd_spirv", "module")
+                if isinstance(spec, dict) and spec.get(k)]
+        if names and any(r not in names for r in refs):
+            continue
+        return b
     return None
 
 
@@ -116,10 +128,10 @@ def load(path, verbose=True):
         m = _load_manifest(zf)
         name, arity = m["name"], int(m.get("arity", 1))
         available = ops_native.supported()
-        chosen = _pick(m, available)
+        chosen = _pick(m, available, zf.namelist())
         if chosen is None:
             raise BundleError(
-                "插件 %r 里没有本机可用的后端（本机：%s，包里：%s）。"
+                "插件 %r 里没有本机可用且文件齐全的后端（本机：%s，包里：%s）。"
                 "修法：补一个 python 档，或换一台有对应加速卡的机器"
                 % (name, available, sorted(m["backends"])))
         spec = m["backends"][chosen]

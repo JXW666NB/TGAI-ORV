@@ -58,6 +58,20 @@ def _backend_chain():
             chain.append(name)
         except OSError:
             pass
+    # Vulkan：只查 loader 是否存在，**不建 instance**（AMD 驱动在进程内反复建销会崩退出）
+    try:
+        from tgai_go.train import ops_vk
+        if ops_vk.available():
+            chain.append("vulkan")
+    except Exception:                                  # noqa: BLE001
+        pass
+    # CPU：有 C 编译器才算可用（否则只能退回 python 组合）
+    try:
+        from tgai_go.train import ops_cpu
+        if ops_cpu.find_compiler()[0] is not None:
+            chain.append("cpu")
+    except Exception:                                  # noqa: BLE001
+        pass
     chain.append("python")
     return chain
 

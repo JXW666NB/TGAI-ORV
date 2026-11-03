@@ -53,7 +53,7 @@ def test_load_picks_python_on_cpu(tmp_path):
     assert name == "tgop_test_relu"
     if "cuda" in ops_bundle.os.environ.get("TGAI_TEST_BACKENDS", "python"):
         pass
-    assert chosen in ("cuda", "python")          # 有卡选 cuda，无卡选 python
+    assert chosen in ("cuda", "vulkan", "cpu", "python")
 
 
 def test_manifest_without_python_fallback_rejected(tmp_path):
@@ -95,7 +95,7 @@ def test_bom_tolerated(tmp_path):
         zf.write(str(d / "relu_py.py"), "relu_py.py")
     # 目标：不因 BOM 报错（后端选择无关紧要）
     name, chosen = ops_bundle.load(out, verbose=False)
-    assert name == "tgop_bom_test" and chosen in ("cuda", "python")
+    assert name == "tgop_bom_test" and chosen in ("cuda", "vulkan", "cpu", "python")
 
 
 def test_missing_file_message(tmp_path):
