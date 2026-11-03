@@ -131,6 +131,13 @@ def load(path, verbose=True):
             bwd = spec.get("bwd") or (name + "_bwd")
             bwd2 = spec.get("bwd2")
             ops_cuda.register_elementwise(name, mod, fwd, bwd, bwd2, arity=arity)
+        elif chosen == "cpu":
+            from tgai_go.train import ops_cpu
+            src = zf.read(spec["c"]).decode("utf-8-sig")
+            h = ops_cpu.load_source(src, name="tgop_" + name)
+            fwd = spec.get("fwd") or (name + "_fwd")
+            bwd = spec.get("bwd") or (name + "_bwd")
+            ops_cpu.register_elementwise(name, h, fwd, bwd, spec.get("bwd2"), arity=arity)
         elif chosen == "python":
             ops_plugin.register(name, _python_impl(zf, spec, name))
         else:
