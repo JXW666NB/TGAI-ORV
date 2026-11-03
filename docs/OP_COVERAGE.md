@@ -23,7 +23,7 @@
 | `torch.nn.functional.rms_norm` | `nn_ops.rms_norm` | 有 | 已验证（Qwen2 对齐用到） |
 | `torch.nn.functional.layer_norm` | `nn_ops.layer_norm` | 有 | 已验证 |
 | `torch.nn.functional.silu` | `F.silu` | 有 |  |
-| `torch.nn.functional.gelu` | `nn_ops.gelu / contrib.gelu_exact` | 有 | tanh 近似在核心，精确版在 contrib |
+| `torch.nn.functional.gelu` | `nn_ops.gelu / F.gelu_exact` | 有 | tanh 近似在核心，精确版在 contrib（`autoload()` 后可用） |
 | `torch.nn.functional.relu` | `nn_ops.relu` | 有 | 已验证 |
 | `torch.nn.functional.softmax` | `F.softmax` | 有 |  |
 | `torch.nn.functional.log_softmax` | `F.log_softmax` | 有 |  |
@@ -47,7 +47,7 @@
 | `torch.sqrt` | `Tensor.sqrt` | 有 |  |
 | `torch.rsqrt` | `nn_ops.rsqrt` | 有 | 已验证 |
 | `torch.tanh` | `nn_ops.tanh` | 有 | 已验证 |
-| `torch.erf` | `contrib.erf` | 有 | 官方 contrib 插件 |
+| `torch.erf` | `F.erf` | 有 | 官方 contrib 插件（`autoload()` 后可用） |
 | `torch.sigmoid` | `nn_ops.sigmoid` | 有 | 已验证 |
 | `torch.clamp` | `Tensor.clamp` | 有 |  |
 | `torch.abs` | `Tensor.abs` | 有 |  |

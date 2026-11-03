@@ -97,11 +97,16 @@ class GraphStep:
             del loss
         return None
 
+    def _clip_grad(self):
+        """梯度裁剪：nn_ops 是子模块，tgai_go.train 上没有这个属性，必须显式 import。"""
+        from tgai_go.train import nn_ops as _nn_ops
+        _nn_ops.clip_grad_norm_(self.model.params(), self.clip)
+
     def _one_step(self):
         """逐算子对照路径：前向+反向+优化器（语义与图外组合完全一致）。"""
         self._forward_backward()
         if self.clip:
-            self.T.nn_ops.clip_grad_norm_(self.model.params(), self.clip)
+            self._clip_grad()
         self.opt.step()
         self.opt.zero_grad()
 
@@ -160,7 +165,7 @@ class GraphStep:
         # 图只含前向+反向：重放把梯度写进固定缓冲，优化器在图外跑（偏差校正天然正确）
         self.rt.graph_launch()
         if self.clip:
-            self.T.nn_ops.clip_grad_norm_(self.model.params(), self.clip)
+            self._clip_grad()
         self.opt.step()
         self._t = int(getattr(self.opt, "t", self._t + 1))
 

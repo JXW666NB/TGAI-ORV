@@ -230,3 +230,23 @@ n_ops / export / pipeline / dist / ackend / ops_plugin / doctor / qwen | **0** 
 
 「棘轮」= 	ests/test_error_messages.py 里记了基线数字，**新增的 raise 不带「修法」就会红**，
 补完一批就把基线调低。这样大文件也能持续收敛，而不是一次性堵死。
+
+---
+
+## 13. 文档与代码的一致性也是门禁
+
+	ests/test_doc_op_coverage.py 解析 docs/OP_COVERAGE.md 的表格：
+**状态列写「有」的每一行，其「我们的对应」必须真能解析到**（getattr 一遍），
+否则测试红。标「缺」的行数锁定上界，**只减不增**。
+
+它已经抓到两个真问题：
+
+1. 	orch.erf → contrib.erf、gelu → contrib.gelu_exact —— 这两个算子在 contrib 里**已注册**
+   （list_ops() 可见），但**不在模块属性上**；真实路径是 F.erf / F.gelu_exact
+   （contrib.autoload() 之后）。文档写错了访问方式，已改。
+2. 顺带发现 graph_train.py 里 self.T.nn_ops.clip_grad_norm_ 会 AttributeError
+   （
+n_ops 是子模块，	gai_go.train 上没有这个属性）；改成方法内 rom tgai_go.train import nn_ops。
+
+> 经验：文档里的「符号路径」比「功能描述」更容易腐坏，而且腐坏后用户照着写就跑不通。
+> 所以门禁要校验**可解析性**，不只是文字。
