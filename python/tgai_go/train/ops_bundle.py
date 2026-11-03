@@ -171,7 +171,9 @@ def load(path, verbose=True):
 def inspect(path):
     """只看包里有什么（不加载、不编译）。"""
     if not os.path.isfile(path):
-        raise FileNotFoundError("找不到插件包：%s" % path)
+        raise FileNotFoundError(
+            "找不到插件包：%s。修法：检查路径（扩展名 .tgop），"
+            "或用 tools/tgop_pack.py 从目录生成" % path)
     with zipfile.ZipFile(path) as zf:
         m = _load_manifest(zf)
         files = [n for n in zf.namelist() if n != "manifest.json"]

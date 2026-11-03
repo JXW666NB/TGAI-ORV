@@ -83,7 +83,9 @@ def spv_of(x):
         return compile_glsl(p)
     if "\n" in p or p.lstrip().startswith("#version"):
         return compile_glsl(p)
-    raise FileNotFoundError("既不是 SPIR-V 字节、也不是存在的文件：%r" % (x,))
+    raise FileNotFoundError(
+        "既不是 SPIR-V 字节、也不是存在的文件：%r。修法：给 .spv 路径、GLSL 源码字符串，"
+        "或 .comp 文件路径；GLSL 需要 glslang（TGAI_GLSLANG）" % (x,))
 
 
 def device():
@@ -119,7 +121,9 @@ def register_elementwise(name, fwd, da, db=None, arity=1):
     def op(*args):
         ts = [T._as_tensor(a) for a in args]
         if len(ts) != arity:
-            raise ValueError("算子 %s 需要 %d 个输入，收到 %d" % (name, arity, len(ts)))
+            raise ValueError(
+                "算子 %s 需要 %d 个输入，收到 %d。修法：检查调用处传参个数；"
+                "Vulkan 内核约定 binding0..k-1 是输入、binding k 是输出" % (name, arity, len(ts)))
         shape = tuple(ts[0].shape)
         n = int(np.prod(shape)) if shape else 1
         ins = [np.ascontiguousarray(t.data, dtype=np.float32).tobytes() for t in ts]

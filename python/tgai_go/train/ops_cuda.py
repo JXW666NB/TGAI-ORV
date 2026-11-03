@@ -71,7 +71,9 @@ def load_cubin(path):
     with open(path, "rb") as f:
         blob = f.read()
     if not blob:
-        raise RuntimeError("cubin 是空文件：%s" % path)
+        raise RuntimeError(
+            "cubin 是空文件：%s。修法：重新用 `nvcc -cubin` 编译；"
+            "若只想给源码，用 load_source() 让引擎自己编" % path)
     rt = _rt()
     rt._activate()
     mod = ctypes.c_void_p()
@@ -117,7 +119,9 @@ def register_elementwise(name, module, fwd, da, db=None, arity=1):
     """
     import tgai_go.train as T
     if arity not in (1, 2):
-        raise ValueError("arity 只能是 1 或 2，收到 %r" % (arity,))
+        raise ValueError(
+            "arity 只能是 1 或 2，收到 %r。修法：一元算子填 1，二元填 2（对应内核的输入个数）"
+            % (arity,))
     _fn(module, fwd)
     for k in ([da] if db is None else [da, db]):
         if k:
@@ -126,7 +130,9 @@ def register_elementwise(name, module, fwd, da, db=None, arity=1):
     def op(*args):
         ts = [T._as_tensor(a) for a in args]
         if len(ts) != arity:
-            raise ValueError("算子 %s 需要 %d 个输入，收到 %d" % (name, arity, len(ts)))
+            raise ValueError(
+                "算子 %s 需要 %d 个输入，收到 %d。修法：检查调用处传参个数；"
+                "二元算子的内核签名是 fwd(a,b,out,n)" % (name, arity, len(ts)))
         rt = _rt()
         shape = tuple(ts[0].shape)
         n = int(np.prod(shape)) if shape else 1
