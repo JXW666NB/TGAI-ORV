@@ -2035,7 +2035,7 @@ def attn_nop_source_path():
         seen.append(ap)
         if os.path.isfile(ap):
             return ap
-    raise CudaError("找不到已验收的 tgai_attn_nop.cu。已查: %s" % seen)
+    raise CudaError("找不到已验收的 tgai_attn_nop.cu。已查: %s" % seen + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
 
 
 class GpuBuf:
@@ -2276,12 +2276,12 @@ def _alias_driver_symbol(cu, name, require_v2=True):
     if not require_v2:
         if getattr(cu, name, None) is not None:
             return
-        raise CudaError("驱动库没有 %s（该符号本无 _v2 变体）。" % name)
+        raise CudaError("驱动库没有 %s（该符号本无 _v2 变体）。" % name + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     if sys.platform != "win32" and getattr(cu, name, None) is not None:
         return
     raise CudaError(
         "驱动库没有 %s_v2。不能用旧入口：primary context 上会 rc=201。" % name
-    )
+     + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
 
 
 def _pool_bucket(nbytes):
@@ -2412,7 +2412,7 @@ class CudaRuntime:
                     "找不到 nvcuda.dll（NVIDIA 驱动没加载）。"
                     "当前进程建不了 CUDA 上下文。需要一台已装驱动的 NVIDIA GPU。"
                     " 原始错误: %s" % (ex,)
-                ) from ex
+                 + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）") from ex
         else:
             self._dirs = _linux_lib_dirs()
             path = _find_file(["libcuda.so.1", "libcuda.so"], self._dirs)
@@ -2425,13 +2425,13 @@ class CudaRuntime:
                 raise CudaError(
                     "找不到 libcuda.so.1（NVIDIA 驱动没加载）。已查目录: %s。"
                     " 原始错误: %s" % (self._dirs or ["<空>"], ex)
-                ) from ex
+                 + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）") from ex
         self._bind_driver()
         self._chk(self.cu.cuInit(0), "cuInit")
         dev = ctypes.c_int()
         rc = self.cu.cuDeviceGet(ctypes.byref(dev), 0)
         if rc != 0:
-            raise CudaError("cuDeviceGet(0) 失败 rc=%d。机器上没有可用的 CUDA 设备。" % rc)
+            raise CudaError("cuDeviceGet(0) 失败 rc=%d。机器上没有可用的 CUDA 设备。" % rc + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         self.dev = int(dev.value)
         ctx = ctypes.c_void_p()
         self._chk(self.cu.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), self.dev),
@@ -2527,7 +2527,7 @@ class CudaRuntime:
             msg = ctypes.c_char_p()
             if get(int(rc), ctypes.byref(msg)) == 0 and msg.value:
                 extra = " " + msg.value.decode("utf-8", "replace")
-        raise CudaError("%s 失败 rc=%d%s" % (what, int(rc), extra))
+        raise CudaError("%s 失败 rc=%d%s" % (what, int(rc), extra) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
 
     def _cublas_path(self):
         if sys.platform == "win32":
@@ -2568,7 +2568,7 @@ class CudaRuntime:
             else:
                 self.cublas = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
         except OSError as ex:
-            raise CudaError("加载 %s 失败: %s" % (path, ex)) from ex
+            raise CudaError("加载 %s 失败: %s" % (path, ex) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）") from ex
         self._cublas_path = path
         cb = self.cublas
         cb.cublasCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
@@ -2620,7 +2620,7 @@ class CudaRuntime:
                     extra = " " + s.decode("utf-8", "replace")
             except Exception:
                 pass
-        raise CudaError("%s 失败 rc=%d%s" % (what, int(rc), extra))
+        raise CudaError("%s 失败 rc=%d%s" % (what, int(rc), extra) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
 
     def _cc_arch(self):
         major = ctypes.c_int()
@@ -2639,13 +2639,13 @@ class CudaRuntime:
             if path is None:
                 raise CudaError(
                     "找不到 nvrtc64_*.dll（NVRTC）。已查目录: %s" % (self._dirs or ["<空>"])
-                )
+                 + "。修法：确认 NVRTC/cuBLAS 可用（驱动 >= CUDA 12）；把完整日志和 GPU 型号反馈")
             return path
         path = _find_file(["libnvrtc.so.12", "libnvrtc.so"], self._dirs)
         if path is None:
             raise CudaError(
                 "找不到 libnvrtc.so.12（NVRTC）。已查目录: %s" % (self._dirs or ["<空>"])
-            )
+             + "。修法：确认 NVRTC/cuBLAS 可用（驱动 >= CUDA 12）；把完整日志和 GPU 型号反馈")
         return path
 
     def _init_kernels(self):
@@ -2669,7 +2669,7 @@ class CudaRuntime:
             else:
                 self.nvrtc = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
         except OSError as ex:
-            raise CudaError("加载 %s 失败: %s" % (path, ex)) from ex
+            raise CudaError("加载 %s 失败: %s" % (path, ex) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）") from ex
         self._bind_nvrtc()
         arch = self._cc_arch()                        # compute_86
         sm = arch.replace("compute_", "sm_")           # sm_86（cubin 要物理架构）
@@ -2749,7 +2749,7 @@ class CudaRuntime:
         log = self._nvrtc_log(prog)
         if rc != 0:
             self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
-            raise CudaError("NVRTC 编译失败 arch=%s\n%s" % (arch, log))
+            raise CudaError("NVRTC 编译失败 arch=%s\n%s" % (arch, log) + "。修法：确认 NVRTC/cuBLAS 可用（驱动 >= CUDA 12）；把完整日志和 GPU 型号反馈")
         if want_cubin:
             # SASS 直接产物：驱动不需要 JIT，不受 PTX ISA 版本闸门约束。
             # 实测：NVRTC 12.8 产 PTX .version 8.7，CUDA 12.4 驱动上限 8.4 -> rc=222。
@@ -2761,14 +2761,14 @@ class CudaRuntime:
                 self.nvrtc.nvrtcGetCUBIN.restype = ctypes.c_int
             except AttributeError as ex:
                 self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
-                raise CudaError("这个 NVRTC 不支持 nvrtcGetCUBIN：%s" % (ex,)) from ex
+                raise CudaError("这个 NVRTC 不支持 nvrtcGetCUBIN：%s" % (ex,) + "。修法：确认 NVRTC/cuBLAS 可用（驱动 >= CUDA 12）；把完整日志和 GPU 型号反馈") from ex
             sz = ctypes.c_size_t()
             rc = int(self.nvrtc.nvrtcGetCUBINSize(prog, ctypes.byref(sz)))
             if rc != 0 or sz.value == 0:
                 self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
                 raise CudaError("nvrtcGetCUBINSize 失败 rc=%d（arch=%s）。"
                                 "arch 必须是 sm_XX 物理架构，compute_XX 没有 cubin"
-                                % (rc, arch))
+                                % (rc, arch) + "。修法：确认 NVRTC/cuBLAS 可用（驱动 >= CUDA 12）；把完整日志和 GPU 型号反馈")
             buf = ctypes.create_string_buffer(sz.value)
             self._chk_nvrtc(self.nvrtc.nvrtcGetCUBIN(prog, buf), "nvrtcGetCUBIN", prog)
             self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
@@ -2784,7 +2784,7 @@ class CudaRuntime:
         if rc == 0:
             return
         log = self._nvrtc_log(prog) if prog else ""
-        raise CudaError("%s 失败 rc=%d\n%s" % (what, int(rc), log))
+        raise CudaError("%s 失败 rc=%d\n%s" % (what, int(rc), log) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
 
     def _nvrtc_log(self, prog):
         if not prog:
@@ -2883,7 +2883,7 @@ class CudaRuntime:
 
     def _pool_checkout(self, ptr, size):
         if ptr in self._pool_live:
-            raise CudaError("分配器把仍在使用的块交了出去: 0x%x" % int(ptr))
+            raise CudaError("分配器把仍在使用的块交了出去: 0x%x" % int(ptr) + "。修法：调小 batch/seq，或开梯度检查点（cfg[GRAD_CKPT]=True）；也可设 TG_POOL_GB 限制池上限")
         self._pool_seq += 1
         self._pool_live[int(ptr)] = (int(size), self._pool_seq, self._submit_stamp)
         self._pool_live_bytes += int(size)
@@ -3183,12 +3183,12 @@ class CudaRuntime:
     def _alloc(self, nbytes):
         nbytes = int(nbytes)
         if nbytes <= 0:
-            raise CudaError("cuMemAlloc 拒绝 0 字节")
+            raise CudaError("cuMemAlloc 拒绝 0 字节" + "。修法：调小 batch/seq，或开梯度检查点（cfg[GRAD_CKPT]=True）；也可设 TG_POOL_GB 限制池上限")
         bucket = self._bucket.get(nbytes)
         if bucket is None:
             bucket = _pool_bucket(nbytes)
             if bucket < nbytes:
-                raise CudaError("内部分桶 %d 小于请求 %d" % (bucket, nbytes))
+                raise CudaError("内部分桶 %d 小于请求 %d" % (bucket, nbytes) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             self._bucket[nbytes] = bucket
         ptr = self._pool_take(bucket)
         if not ptr and not getattr(self, "_alloc_retry", False) and not self._capturing:
@@ -3213,7 +3213,7 @@ class CudaRuntime:
             if ptr in self._pool_live:
                 self._pool_free.setdefault(got, []).append(ptr)
                 self._pool_cached_bytes += int(got)
-                raise CudaError("空闲链上的块仍被活张量占用: 0x%x" % int(ptr))
+                raise CudaError("空闲链上的块仍被活张量占用: 0x%x" % int(ptr) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             self._pool_hits += 1
             self._pool_checkout(ptr, got)
             return ptr
@@ -3241,7 +3241,7 @@ class CudaRuntime:
         if rc != 0:
             self._raise_alloc_failed(int(bucket), int(rc))
         if not raw.value:
-            raise CudaError("cuMemAlloc 返回空指针")
+            raise CudaError("cuMemAlloc 返回空指针" + "。修法：调小 batch/seq，或开梯度检查点（cfg[GRAD_CKPT]=True）；也可设 TG_POOL_GB 限制池上限")
 
         ptr = int(raw.value)
         self._pool_misses += 1
@@ -3386,7 +3386,7 @@ class CudaRuntime:
 
     def read_scalar(self, buf):
         if int(buf.n) != 1:
-            raise CudaError("期望标量梯度，收到 shape=%s" % (buf.shape,))
+            raise CudaError("期望标量梯度，收到 shape=%s" % (buf.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if buf.known_scalar is not None:
             return float(buf.known_scalar)
         if self._capturing:
@@ -3546,7 +3546,7 @@ class CudaRuntime:
 
     def transpose2d(self, buf):
         if len(buf.shape) != 2:
-            raise CudaError("transpose2d 只支持 2D，收到 %s" % (buf.shape,))
+            raise CudaError("transpose2d 只支持 2D，收到 %s" % (buf.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         rows, cols = int(buf.shape[0]), int(buf.shape[1])
         out = self.empty((cols, rows), dtype=np.float32)
         n = rows * cols
@@ -3583,7 +3583,7 @@ class CudaRuntime:
         sb = tuple(int(s) for s in sb)
         ndim = max(len(sa), len(sb), 1)
         if ndim > 4:
-            raise CudaError("broadcast 最高 4 维，收到 %s 和 %s" % (sa, sb))
+            raise CudaError("broadcast 最高 4 维，收到 %s 和 %s" % (sa, sb) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         pa = (1,) * (ndim - len(sa)) + sa
         pb = (1,) * (ndim - len(sb)) + sb
         out = []
@@ -3595,13 +3595,13 @@ class CudaRuntime:
             elif y == 1:
                 out.append(x)
             else:
-                raise CudaError("形状不能广播: %s vs %s" % (sa, sb) + HINT_BCAST)
+                raise CudaError("形状不能广播: %s vs %s" % (sa, sb) + HINT_BCAST + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         return tuple(out), pa, pb
 
     def _pad4(self, shape):
         shape = tuple(int(s) for s in shape)
         if len(shape) > 4:
-            raise CudaError("内部 rank %d > 4" % len(shape))
+            raise CudaError("内部 rank %d > 4" % len(shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         return (1,) * (4 - len(shape)) + shape
 
     def _strides4(self, padded):
@@ -3620,7 +3620,7 @@ class CudaRuntime:
         if n == 0:
             return out
         if n > 2147483647:
-            raise CudaError("broadcast add 元素个数超过 int32")
+            raise CudaError("broadcast add 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         c = self._pad4(out_shape)
         sa = self._strides4(self._pad4(pa))
         sb = self._strides4(self._pad4(pb))
@@ -3653,7 +3653,7 @@ class CudaRuntime:
     def _left_pad8(self, values, fill):
         values = tuple(int(v) for v in values)
         if len(values) > 8:
-            raise CudaError("rank %d > 8" % len(values))
+            raise CudaError("rank %d > 8" % len(values) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         return (int(fill),) * (8 - len(values)) + values
 
     def _row_strides(self, shape):
@@ -3670,14 +3670,14 @@ class CudaRuntime:
         shape = tuple(int(s) for s in buf.shape)
         nd = len(shape)
         if nd == 0:
-            raise CudaError("sum_axis 不能用于标量")
+            raise CudaError("sum_axis 不能用于标量" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if nd > 8:
-            raise CudaError("sum_axis 最高 8 维，收到 %s" % (shape,))
+            raise CudaError("sum_axis 最高 8 维，收到 %s" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         axis = int(axis)
         if axis < 0:
             axis += nd
         if axis < 0 or axis >= nd:
-            raise CudaError("sum_axis 轴 %d 越界（ndim=%d）" % (axis, nd))
+            raise CudaError("sum_axis 轴 %d 越界（ndim=%d）" % (axis, nd) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         extent = int(shape[axis])
         out_keep = list(shape)
         out_keep[axis] = 1
@@ -3721,14 +3721,14 @@ class CudaRuntime:
         if src == shape:
             return buf
         if len(shape) > 8 or len(src) > len(shape):
-            raise CudaError("broadcast_to %s -> %s" % (src, shape))
+            raise CudaError("broadcast_to %s -> %s" % (src, shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if any(s < 0 for s in shape):
-            raise CudaError("broadcast_to 目标形状非法 %s" % (shape,))
+            raise CudaError("broadcast_to 目标形状非法 %s" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         ndim = len(shape)
         aligned = (1,) * (ndim - len(src)) + src
         for a, b in zip(aligned, shape):
             if a != b and a != 1:
-                raise CudaError("不能广播 %s -> %s" % (src, shape))
+                raise CudaError("不能广播 %s -> %s" % (src, shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         raw = self._row_strides(src)
         strides = []
         base = ndim - len(src)
@@ -3741,7 +3741,7 @@ class CudaRuntime:
         n = int(out.n)
         if n:
             if n > 2147483647:
-                raise CudaError("broadcast_to 元素个数超过 int32")
+                raise CudaError("broadcast_to 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             grid, block = self._ewise_grid(n)
             self.launch("broadcast_to8", grid, block, [
                 self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
@@ -3755,9 +3755,9 @@ class CudaRuntime:
         in_shape = tuple(int(s) for s in buf.shape)
         nd = len(in_shape)
         if nd > 8:
-            raise CudaError("permute 最高 8 维，收到 %s" % (in_shape,))
+            raise CudaError("permute 最高 8 维，收到 %s" % (in_shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if sorted(axes) != list(range(nd)):
-            raise CudaError("permute 不是排列: %s" % (axes,))
+            raise CudaError("permute 不是排列: %s" % (axes,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         out_shape = tuple(in_shape[a] for a in axes)
         in_stride = self._row_strides(in_shape)
         src_stride = [int(in_stride[a]) for a in axes]
@@ -3765,7 +3765,7 @@ class CudaRuntime:
         n = int(out.n)
         if n:
             if n > 2147483647:
-                raise CudaError("permute 元素个数超过 int32")
+                raise CudaError("permute 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             last = int(out_shape[-1]) if out_shape else 1
             if last % 4 == 0 and int(src_stride[-1]) == 1 and n % 4 == 0:
                 shp_v4 = list(self._left_pad8(out_shape, 1))
@@ -3787,7 +3787,7 @@ class CudaRuntime:
     def _index_i32(self, value, what):
         iv = int(value)
         if iv < -2147483648 or iv > 2147483647:
-            raise CudaError("%s 超出 int32: %d" % (what, iv))
+            raise CudaError("%s 超出 int32: %d" % (what, iv) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         return iv
 
     def _index_launch_args(self, src, dst, n, base, shape, divs, strides):
@@ -3796,9 +3796,9 @@ class CudaRuntime:
         div8 = self._left_pad8(divs, 1)
         st8 = self._left_pad8(strides, 0)
         if any(int(s) < 1 for s in shape8):
-            raise CudaError("index 发射时每一维都必须 >= 1，收到 %s" % (shape8,))
+            raise CudaError("index 发射时每一维都必须 >= 1，收到 %s" % (shape8,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if any(int(d) < 1 for d in div8):
-            raise CudaError("index div 必须 >= 1，收到 %s" % (div8,))
+            raise CudaError("index div 必须 >= 1，收到 %s" % (div8,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         args = [
             self._ptr(src), self._ptr(dst),
             (self._index_i32(n, "index n"), ctypes.c_int),
@@ -3815,17 +3815,17 @@ class CudaRuntime:
         divs = tuple(int(s) for s in divs)
         strides = tuple(int(s) for s in strides)
         if len(divs) != len(out_shape) or len(strides) != len(out_shape):
-            raise CudaError("index_gather 计划长度与输出形状不符: %s" % (out_shape,))
+            raise CudaError("index_gather 计划长度与输出形状不符: %s" % (out_shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if len(out_shape) > 8:
-            raise CudaError("index_gather 最高 8 维，收到 %s" % (out_shape,))
+            raise CudaError("index_gather 最高 8 维，收到 %s" % (out_shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if any(s < 0 for s in out_shape):
-            raise CudaError("index_gather 形状非法 %s" % (out_shape,))
+            raise CudaError("index_gather 形状非法 %s" % (out_shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         out = self.empty(out_shape, dtype=np.float32)
         n = int(out.n)
         if n == 0:
             return out
         if n > 2147483647:
-            raise CudaError("index_gather 元素个数超过 int32")
+            raise CudaError("index_gather 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         grid, block = self._ewise_grid(n)
         self.launch("index_gather8", grid, block, self._index_launch_args(
             buf, out, n, base, out_shape, divs, strides))
@@ -3864,15 +3864,15 @@ class CudaRuntime:
         strides = tuple(int(s) for s in strides)
         out_shape = tuple(int(s) for s in grad.shape)
         if len(divs) != len(out_shape) or len(strides) != len(out_shape):
-            raise CudaError("index_scatter 计划与梯度形状不符: %s" % (out_shape,))
+            raise CudaError("index_scatter 计划与梯度形状不符: %s" % (out_shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if len(in_shape) > 8 or len(out_shape) > 8:
-            raise CudaError("index_scatter 最高 8 维")
+            raise CudaError("index_scatter 最高 8 维" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         full = self.zeros(in_shape, dtype=np.float32)
         n = int(grad.n)
         if n == 0:
             return full
         if n > 2147483647:
-            raise CudaError("index_scatter 元素个数超过 int32")
+            raise CudaError("index_scatter 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         grid, block = self._ewise_grid(n)
         self.launch("index_scatter_add8", grid, block, self._index_launch_args(
             grad, full, n, base, out_shape, divs, strides))
@@ -3883,41 +3883,41 @@ class CudaRuntime:
         shape = tuple(int(s) for s in shape)
         axis = int(axis)
         if not shape or axis < 0 or axis >= len(shape):
-            raise CudaError("cat 轴 %d 越界（shape=%s）" % (axis, shape))
+            raise CudaError("cat 轴 %d 越界（shape=%s）" % (axis, shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         outer = 1
         for s in shape[:axis]:
             if s < 0:
-                raise CudaError("cat 形状非法 %s" % (shape,))
+                raise CudaError("cat 形状非法 %s" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             outer *= s
         inner = 1
         for s in shape[axis + 1:]:
             if s < 0:
-                raise CudaError("cat 形状非法 %s" % (shape,))
+                raise CudaError("cat 形状非法 %s" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             inner *= s
         span = int(shape[axis])
         if span < 0:
-            raise CudaError("cat 形状非法 %s" % (shape,))
+            raise CudaError("cat 形状非法 %s" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         n = outer * span * inner
         if (n > 2147483647 or outer > 2147483647 or inner > 2147483647
                 or span > 2147483647):
-            raise CudaError("cat 元素个数超过 int32（shape=%s）" % (shape,))
+            raise CudaError("cat 元素个数超过 int32（shape=%s）" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         return int(outer), int(span), int(inner), int(n)
 
     def cat_place(self, src, dst, axis, dst_off):
         """把连续 src 抄进 dst 沿 axis 的槽 [dst_off, dst_off+src_span)。纯拷贝。"""
         if src.dtype != np.float32 or dst.dtype != np.float32:
-            raise CudaError("cat_place 只支持 float32")
+            raise CudaError("cat_place 只支持 float32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         _s_outer, s_span, s_inner, s_n = self._cat_geom(src.shape, axis)
         _d_outer, d_span, d_inner, d_n = self._cat_geom(dst.shape, axis)
         if _s_outer != _d_outer or s_inner != d_inner:
             raise CudaError(
-                "cat_place 形状对不上: %s -> %s axis=%d" % (src.shape, dst.shape, axis))
+                "cat_place 形状对不上: %s -> %s axis=%d" % (src.shape, dst.shape, axis) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         if int(src.n) != s_n or int(dst.n) != d_n:
-            raise CudaError("cat_place 缓冲不是按形状打包的连续块")
+            raise CudaError("cat_place 缓冲不是按形状打包的连续块" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         off = int(dst_off)
         if off < 0 or s_span < 0 or off + s_span > d_span:
             raise CudaError(
-                "cat_place 槽越界 off=%d len=%d dst=%d" % (off, s_span, d_span))
+                "cat_place 槽越界 off=%d len=%d dst=%d" % (off, s_span, d_span) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if s_n == 0:
             return
         self._split_forget_ptr(dst)
@@ -3935,21 +3935,21 @@ class CudaRuntime:
         """从连续 src 沿 axis 切出 [src_off, src_off+span)，写成一块新的连续缓冲。"""
         dst_shape = tuple(int(s) for s in dst_shape)
         if src.dtype != np.float32:
-            raise CudaError("cat_extract 只支持 float32")
+            raise CudaError("cat_extract 只支持 float32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         _s_outer, s_span, s_inner, s_n = self._cat_geom(src.shape, axis)
         _d_outer, d_span, d_inner, d_n = self._cat_geom(dst_shape, axis)
         if d_span != int(span):
             raise CudaError(
-                "cat_extract 长度 %d 与目标形状 %s 不符" % (int(span), dst_shape))
+                "cat_extract 长度 %d 与目标形状 %s 不符" % (int(span), dst_shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         if _s_outer != _d_outer or s_inner != d_inner:
             raise CudaError(
-                "cat_extract 形状对不上: %s -> %s axis=%d" % (src.shape, dst_shape, axis))
+                "cat_extract 形状对不上: %s -> %s axis=%d" % (src.shape, dst_shape, axis) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         if int(src.n) != s_n:
-            raise CudaError("cat_extract 源缓冲不是按形状打包的连续块")
+            raise CudaError("cat_extract 源缓冲不是按形状打包的连续块" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         off = int(src_off)
         if off < 0 or d_span < 0 or off + d_span > s_span:
             raise CudaError(
-                "cat_extract 槽越界 off=%d len=%d src=%d" % (off, d_span, s_span))
+                "cat_extract 槽越界 off=%d len=%d src=%d" % (off, d_span, s_span) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         out = self.empty(dst_shape, dtype=np.float32)
         if d_n == 0:
             return out
@@ -3971,7 +3971,7 @@ class CudaRuntime:
         if ndim == 0:
             return ()
         if ndim > 6:
-            raise CudaError("matmul 前导维 %d 超过 6" % ndim)
+            raise CudaError("matmul 前导维 %d 超过 6" % ndim + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         pa = (1,) * (ndim - len(sa)) + sa
         pb = (1,) * (ndim - len(sb)) + sb
         out = []
@@ -3983,19 +3983,19 @@ class CudaRuntime:
             elif y == 1:
                 out.append(x)
             else:
-                raise CudaError("matmul 前导维不能广播: %s vs %s" % (sa, sb))
+                raise CudaError("matmul 前导维不能广播: %s vs %s" % (sa, sb) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         return tuple(out)
 
     def matmul_general(self, A, B):
         """最后两维做矩阵乘，前导维按 PyTorch 右对齐广播。没有前导维时就是 sgemm。"""
         if len(A.shape) < 2 or len(B.shape) < 2:
-            raise CudaError("matmul 至少 2D，收到 %s @ %s" % (A.shape, B.shape))
+            raise CudaError("matmul 至少 2D，收到 %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if len(A.shape) > 8 or len(B.shape) > 8:
-            raise CudaError("matmul 最高 8 维，收到 %s @ %s" % (A.shape, B.shape))
+            raise CudaError("matmul 最高 8 维，收到 %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         M, K = int(A.shape[-2]), int(A.shape[-1])
         K2, N = int(B.shape[-2]), int(B.shape[-1])
         if K != K2:
-            raise CudaError("matmul K 不匹配: %s @ %s" % (A.shape, B.shape) + HINT_MATMUL)
+            raise CudaError("matmul K 不匹配: %s @ %s" % (A.shape, B.shape) + HINT_MATMUL + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         a_lead = tuple(int(s) for s in A.shape[:-2])
         b_lead = tuple(int(s) for s in B.shape[:-2])
         if not a_lead and not b_lead:
@@ -4021,17 +4021,17 @@ class CudaRuntime:
         """
         shape = tuple(int(s) for s in shape)
         if any(s < 0 for s in shape):
-            raise CudaError("reshape 不支持负数维度 %s" % (shape,))
+            raise CudaError("reshape 不支持负数维度 %s" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         n = 1
         for s in shape:
             n *= int(s)
         if n != int(buf.n):
-            raise CudaError("reshape %s -> %s 元素个数 %d != %d" % (buf.shape, shape, buf.n, n))
+            raise CudaError("reshape %s -> %s 元素个数 %d != %d" % (buf.shape, shape, buf.n, n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         return GpuBuf(self, buf.ptr, buf.nbytes, shape, n, buf.dtype, view_of=buf)
 
     def swap_last2(self, buf):
         if len(buf.shape) < 2:
-            raise CudaError("swap_last2 至少要 2 维，收到 %s" % (buf.shape,))
+            raise CudaError("swap_last2 至少要 2 维，收到 %s" % (buf.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         dims = tuple(int(s) for s in buf.shape)
         m, n = dims[-2], dims[-1]
         batch = 1
@@ -4050,13 +4050,13 @@ class CudaRuntime:
     def bmm(self, A, B):
         """行优先 C[b,M,N] = A[b,M,K] @ B[b,K,N]。每个 batch 走一次已验收的 sgemm。"""
         if len(A.shape) != 3 or len(B.shape) != 3:
-            raise CudaError("bmm 需要 3D，收到 %s @ %s" % (A.shape, B.shape))
+            raise CudaError("bmm 需要 3D，收到 %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         batch, M, K = (int(s) for s in A.shape)
         batch2, K2, N = (int(s) for s in B.shape)
         if batch != batch2:
-            raise CudaError("bmm batch 不同: %s @ %s" % (A.shape, B.shape))
+            raise CudaError("bmm batch 不同: %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if K != K2:
-            raise CudaError("bmm K 不匹配: %s @ %s" % (A.shape, B.shape) + HINT_MATMUL)
+            raise CudaError("bmm K 不匹配: %s @ %s" % (A.shape, B.shape) + HINT_MATMUL + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if batch == 0 or M == 0 or N == 0:
             return self.empty((batch, M, N), dtype=np.float32)
         if K == 0:
@@ -4195,10 +4195,10 @@ class CudaRuntime:
 
     def softmax_lastdim(self, x):
         if len(x.shape) < 1:
-            raise CudaError("softmax 需要至少 1 维，收到 %s" % (x.shape,))
+            raise CudaError("softmax 需要至少 1 维，收到 %s" % (x.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         k = int(x.shape[-1])
         if k <= 0:
-            raise CudaError("softmax 最后一维是 %d" % k)
+            raise CudaError("softmax 最后一维是 %d" % k + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         rows = int(x.n) // k
         out = self.empty(x.shape, dtype=np.float32)
         if rows:
@@ -4211,10 +4211,10 @@ class CudaRuntime:
 
     def log_softmax_lastdim(self, x):
         if len(x.shape) < 1:
-            raise CudaError("log_softmax 需要至少 1 维，收到 %s" % (x.shape,))
+            raise CudaError("log_softmax 需要至少 1 维，收到 %s" % (x.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         k = int(x.shape[-1])
         if k <= 0:
-            raise CudaError("log_softmax 最后一维是 %d" % k)
+            raise CudaError("log_softmax 最后一维是 %d" % k + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         rows = int(x.n) // k
         out = self.empty(x.shape, dtype=np.float32)
         if rows:
@@ -4306,7 +4306,7 @@ class CudaRuntime:
         out = self.empty(a.shape, dtype=np.float32)
         if a.n:
             if int(a.n) > 2147483647:
-                raise CudaError("pow 元素个数超过 int32")
+                raise CudaError("pow 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             grid, block = self._ewise_grid(a.n)
             self.launch("ewise_pow", grid, block, [
                 self._ptr(a), (float(p), ctypes.c_float), self._ptr(out),
@@ -4389,7 +4389,7 @@ class CudaRuntime:
         """把 fp32 缓冲 cast 进**已有的** fp16 缓冲（不分配）。两者元素数必须相等。"""
         n = int(src.n)
         if int(dst.n) != n:
-            raise CudaError("cast_f32_to_f16_into 元素数不一致：%d vs %d" % (n, int(dst.n)))
+            raise CudaError("cast_f32_to_f16_into 元素数不一致：%d vs %d" % (n, int(dst.n)) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if n:
             grid, block = self._ewise_grid(n)
             self.launch("cast_f32_to_f16", grid, block, [
@@ -4541,7 +4541,7 @@ class CudaRuntime:
         nb = int(ldb) * (int(n) if int(transb) == CUDA_OP_N else int(k))
         nc = int(ldc) * int(n)
         if max(na, nb, nc) > 2147483647:
-            raise CudaError("fp16 GEMM 元素数超过 int32")
+            raise CudaError("fp16 GEMM 元素数超过 int32" + "。修法：确认 cuBLAS 版本与驱动匹配；可先用 TG_FP16=0 关掉 fp16 GEMM 排查")
         a16 = self._cast_flat_ptr(A, na, True)
         b16 = self._cast_flat_ptr(B, nb, True)
         if st["c32"]:
@@ -4577,11 +4577,11 @@ class CudaRuntime:
         A、B 是 fp32 GpuBuf；返回 fp32 GpuBuf。仅用于单点验证和特殊场景。
         """
         if len(A.shape) != 2 or len(B.shape) != 2:
-            raise CudaError("sgemm_fp16 需要 2D，收到 %s @ %s" % (A.shape, B.shape))
+            raise CudaError("sgemm_fp16 需要 2D，收到 %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         M, K = int(A.shape[0]), int(A.shape[1])
         K2, N = int(B.shape[0]), int(B.shape[1])
         if K != K2:
-            raise CudaError("sgemm_fp16 K 不匹配: %s @ %s" % (A.shape, B.shape))
+            raise CudaError("sgemm_fp16 K 不匹配: %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         C = self.empty((M, N), dtype=np.float32)
         if M and N and K:
             # 和 sgemm 一样：列主序视角 C^T(N,M) = B^T @ A^T
@@ -4595,12 +4595,12 @@ class CudaRuntime:
         （`x @ W.T`，W 是 [N,K]），所以不需要预先转置权重。
         """
         if len(A.shape) != 2 or len(B.shape) != 2:
-            raise CudaError("sgemm_fp16_nt 需要 2D，收到 %s @ %s" % (A.shape, B.shape))
+            raise CudaError("sgemm_fp16_nt 需要 2D，收到 %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         M, K = int(A.shape[0]), int(A.shape[1])
         N, K2 = int(B.shape[0]), int(B.shape[1])
         if K != K2:
             raise CudaError("sgemm_fp16_nt K 不匹配：A%s @ B%s 的 K 是 %d vs %d"
-                            % (A.shape, B.shape, K, K2))
+                            % (A.shape, B.shape, K, K2) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         C = self.empty((M, N), dtype=np.float32)
         if M and N and K:
             # 行主序 C[M,N]=A[M,K]@B[N,K]^T  <=>  列主序 C^T[N,M] = B_cm^T @ A_cm
@@ -4716,7 +4716,7 @@ class CudaRuntime:
             return (self.empty((0,), dtype=np.float16),
                     self.empty((0,), dtype=np.float16))
         if count > 2147483647:
-            raise CudaError("fp16 split 元素数超过 int32")
+            raise CudaError("fp16 split 元素数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         hi16 = self._cast_flat_ptr(src_ptr, count, True)
         hi32 = self._cast_flat_ptr(hi16.ptr, count, False)
         lo32 = self.empty((count,), dtype=np.float32)
@@ -4757,7 +4757,7 @@ class CudaRuntime:
         na = lda * (k if int(transa) == CUDA_OP_N else m)
         nb = ldb * (n if int(transb) == CUDA_OP_N else k)
         if na < 0 or nb < 0 or na > 2147483647 or nb > 2147483647:
-            raise CudaError("fp16 split GEMM 元素数非法: A=%s B=%s" % (na, nb))
+            raise CudaError("fp16 split GEMM 元素数非法: A=%s B=%s" % (na, nb) + "。修法：确认 cuBLAS 版本与驱动匹配；可先用 TG_FP16=0 关掉 fp16 GEMM 排查")
         ahi, alo = self._split16_pair(A, na)
         bhi, blo = self._split16_pair(B, nb)
         alpha = ctypes.c_float(1.0)
@@ -4837,7 +4837,7 @@ class CudaRuntime:
         out = self.empty((count,), dtype=np.uint16)
         if count:
             if count > 2147483647:
-                raise CudaError("bf16 cast 元素数超过 int32")
+                raise CudaError("bf16 cast 元素数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             grid, block = self._ewise_grid(count)
             self._activate()
             self.launch("cast_f32_to_bf16", grid, block, [
@@ -4860,7 +4860,7 @@ class CudaRuntime:
         nb = int(ldb) * (int(n) if int(transb) == CUDA_OP_N else int(k))
         nc = int(ldc) * int(n)
         if na < 0 or nb < 0 or nc < 0 or max(na, nb, nc) > 2147483647:
-            raise CudaError("bf16 GEMM 元素数超过 int32")
+            raise CudaError("bf16 GEMM 元素数超过 int32" + "。修法：确认 cuBLAS 版本与驱动匹配；可先用 TG_FP16=0 关掉 fp16 GEMM 排查")
         a16 = self._cast_flat_ptr_bf16(A, na)
         b16 = self._cast_flat_ptr_bf16(B, nb)
         alpha = ctypes.c_float(1.0)
@@ -4949,13 +4949,13 @@ class CudaRuntime:
     def sgemm_mode(self, A, B, mode):
         """对照用：同一种形状的多种累加。mode 见 sgemm_mode kernel。"""
         if len(A.shape) != 2 or len(B.shape) != 2:
-            raise CudaError("sgemm_mode 需要 2D")
+            raise CudaError("sgemm_mode 需要 2D" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         M, K = int(A.shape[0]), int(A.shape[1])
         K2, N = int(B.shape[0]), int(B.shape[1])
         if K != K2:
-            raise CudaError("sgemm_mode K 不匹配")
+            raise CudaError("sgemm_mode K 不匹配" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if K > 32 and int(mode) == 3:
-            raise CudaError("pairwise mode 只支持 K<=32")
+            raise CudaError("pairwise mode 只支持 K<=32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         C = self.empty((M, N), dtype=np.float32)
         total = M * N
         if total and K:
@@ -4981,11 +4981,11 @@ class CudaRuntime:
     def sgemm(self, A, B):
         """行优先 C[M,N] = A[M,K] @ B[K,N]。"""
         if len(A.shape) != 2 or len(B.shape) != 2:
-            raise CudaError("sgemm 需要 2D，收到 %s @ %s" % (A.shape, B.shape))
+            raise CudaError("sgemm 需要 2D，收到 %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         M, K = int(A.shape[0]), int(A.shape[1])
         K2, N = int(B.shape[0]), int(B.shape[1])
         if K != K2:
-            raise CudaError("sgemm K 不匹配: %s @ %s" % (A.shape, B.shape) + HINT_MATMUL)
+            raise CudaError("sgemm K 不匹配: %s @ %s" % (A.shape, B.shape) + HINT_MATMUL + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if M == 0 or N == 0 or K == 0:
             return self.full((M, N), 0.0)
         if self._numpy_exact_gemm(M, N, K):
@@ -5001,11 +5001,11 @@ class CudaRuntime:
     def gemm_nt(self, A, B):
         """行优先 C[M,N] = A[M,K] @ B[N,K]^T。"""
         if len(A.shape) != 2 or len(B.shape) != 2:
-            raise CudaError("gemm_nt 需要 2D，收到 %s @ %s^T" % (A.shape, B.shape))
+            raise CudaError("gemm_nt 需要 2D，收到 %s @ %s^T" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         M, K = int(A.shape[0]), int(A.shape[1])
         N, K2 = int(B.shape[0]), int(B.shape[1])
         if K != K2:
-            raise CudaError("gemm_nt K 不匹配: %s @ %s^T" % (A.shape, B.shape) + HINT_MATMUL)
+            raise CudaError("gemm_nt K 不匹配: %s @ %s^T" % (A.shape, B.shape) + HINT_MATMUL + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if M == 0 or N == 0 or K == 0:
             return self.full((M, N), 0.0)
         if self._numpy_exact_gemm(M, N, K):
@@ -5020,11 +5020,11 @@ class CudaRuntime:
     def gemm_tn(self, A, B):
         """行优先 C[M,N] = A[K,M]^T @ B[K,N]。"""
         if len(A.shape) != 2 or len(B.shape) != 2:
-            raise CudaError("gemm_tn 需要 2D，收到 %s^T @ %s" % (A.shape, B.shape))
+            raise CudaError("gemm_tn 需要 2D，收到 %s^T @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         K, M = int(A.shape[0]), int(A.shape[1])
         K2, N = int(B.shape[0]), int(B.shape[1])
         if K != K2:
-            raise CudaError("gemm_tn K 不匹配: %s^T @ %s" % (A.shape, B.shape))
+            raise CudaError("gemm_tn K 不匹配: %s^T @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if M == 0 or N == 0 or K == 0:
             return self.full((M, N), 0.0)
         if self._numpy_exact_gemm(M, N, K):
@@ -5123,16 +5123,16 @@ class CudaRuntime:
     def grouped_nt(self, As, Bs):
         """每个 C[M,N] = A[M,K] @ B[N,K]^T。M 可以各不相同，K/N 按各对自己的形状。"""
         if len(As) != len(Bs):
-            raise CudaError("grouped_nt 两边条数不同")
+            raise CudaError("grouped_nt 两边条数不同" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         Cs = []
         specs = []
         for A, B in zip(As, Bs):
             if len(A.shape) != 2 or len(B.shape) != 2:
-                raise CudaError("grouped_nt 需要 2D")
+                raise CudaError("grouped_nt 需要 2D" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             M, K = int(A.shape[0]), int(A.shape[1])
             N, K2 = int(B.shape[0]), int(B.shape[1])
             if K != K2:
-                raise CudaError("grouped_nt K 不匹配: %s @ %s^T" % (A.shape, B.shape))
+                raise CudaError("grouped_nt K 不匹配: %s @ %s^T" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             C = self.empty((M, N), dtype=np.float32)
             Cs.append(C)
             if M and N and K:
@@ -5148,14 +5148,14 @@ class CudaRuntime:
     def grouped_nn(self, As, Bs):
         """每个 C[M,N] = A[M,K] @ B[K,N]。"""
         if len(As) != len(Bs):
-            raise CudaError("grouped_nn 两边条数不同")
+            raise CudaError("grouped_nn 两边条数不同" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         Cs = []
         specs = []
         for A, B in zip(As, Bs):
             M, K = int(A.shape[0]), int(A.shape[1])
             K2, N = int(B.shape[0]), int(B.shape[1])
             if K != K2:
-                raise CudaError("grouped_nn K 不匹配: %s @ %s" % (A.shape, B.shape))
+                raise CudaError("grouped_nn K 不匹配: %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             C = self.empty((M, N), dtype=np.float32)
             Cs.append(C)
             if M and N and K:
@@ -5231,7 +5231,7 @@ class CudaRuntime:
         Cp = self.empty((nexp, M, N), dtype=np.float32)
         fn = self._strided_ready()
         if fn is None or M <= 0 or N <= 0 or kmax <= 0:
-            raise CudaError("strided gemm 不可用")
+            raise CudaError("strided gemm 不可用" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         alpha = ctypes.c_float(1.0)
         beta = ctypes.c_float(0.0)
         self._mark_submitted(Ap.ptr)
@@ -5268,7 +5268,7 @@ class CudaRuntime:
     def grouped_tn(self, As, Bs):
         """每个 C[M,N] = A[K,M]^T @ B[K,N]。"""
         if len(As) != len(Bs):
-            raise CudaError("grouped_tn 两边条数不同")
+            raise CudaError("grouped_tn 两边条数不同" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if len(As) >= 2:
             shapes_ok = True
             ks = []
@@ -5293,7 +5293,7 @@ class CudaRuntime:
             K, M = int(A.shape[0]), int(A.shape[1])
             K2, N = int(B.shape[0]), int(B.shape[1])
             if K != K2:
-                raise CudaError("grouped_tn K 不匹配: %s^T @ %s" % (A.shape, B.shape))
+                raise CudaError("grouped_tn K 不匹配: %s^T @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             C = self.empty((M, N), dtype=np.float32)
             Cs.append(C)
             if M and N and K:
@@ -5338,7 +5338,7 @@ class CudaRuntime:
             dl = self.empty((n, v), dtype=np.float32)
         else:
             if tuple(int(s) for s in out.shape) != (n, v) or int(out.n) != n * v:
-                raise CudaError("ce_bwd 输出形状 %s 不是 (%d, %d)" % (out.shape, n, v))
+                raise CudaError("ce_bwd 输出形状 %s 不是 (%d, %d)" % (out.shape, n, v) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             dl = out
             dl.known_scalar = None
         if n > 0 and v > 0:
@@ -5354,7 +5354,7 @@ class CudaRuntime:
 
     def mul(self, a, b):
         if a.shape != b.shape or a.n != b.n:
-            raise CudaError("ewise_mul 形状不同: %s vs %s" % (a.shape, b.shape))
+            raise CudaError("ewise_mul 形状不同: %s vs %s" % (a.shape, b.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         out = self.empty(a.shape, dtype=np.float32)
         n = int(a.n)
         if n:
@@ -5445,7 +5445,7 @@ class CudaRuntime:
     def silu_mul_fwd(self, a, b):
         """原地：a[i] = silu(a[i]) * b[i]。调用方要先 clone。"""
         if a.n != b.n:
-            raise CudaError("silu_mul 长度不同: %s vs %s" % (a.n, b.n))
+            raise CudaError("silu_mul 长度不同: %s vs %s" % (a.n, b.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if a.n:
             self._split_forget_ptr(a)
             grid, block = self._ewise_grid(a.n)
@@ -5467,7 +5467,7 @@ class CudaRuntime:
     def silu_bwd_da(self, g, a):
         """da = g * dsilu(a)，对应 b==1 且不需要 db。"""
         if g.n != a.n:
-            raise CudaError("silu_bwd_da 长度不同: %s vs %s" % (g.n, a.n))
+            raise CudaError("silu_bwd_da 长度不同: %s vs %s" % (g.n, a.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         da = self.empty(a.shape, dtype=np.float32)
         n = int(a.n)
         if n:
@@ -5495,12 +5495,12 @@ class CudaRuntime:
         n = int(x.n)
         if int(cos.n) != n or int(sin.n) != n:
             raise CudaError("%s 长度不同: x=%d cos=%d sin=%d"
-                            % (what, n, cos.n, sin.n))
+                            % (what, n, cos.n, sin.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if n % 2:
-            raise CudaError("%s 要求元素个数为偶数（交错配对），收到 %d" % (what, n))
+            raise CudaError("%s 要求元素个数为偶数（交错配对），收到 %d" % (what, n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         npair = n // 2
         if npair > 2147483647:
-            raise CudaError("%s 元素个数超过 int32" % what)
+            raise CudaError("%s 元素个数超过 int32" % what + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         return n, npair
 
     def fused_rope_(self, x, cos, sin):
@@ -5550,7 +5550,7 @@ class CudaRuntime:
         if int(cos.n) != int(seq) * dh or int(sin.n) != int(seq) * dh:
             raise CudaError(
                 "rope_half: cos/sin 形状不对（要 [seq,dh] = %d 个元素），"
-                "收到 cos=%d sin=%d" % (int(seq) * dh, int(cos.n), int(sin.n)))
+                "收到 cos=%d sin=%d" % (int(seq) * dh, int(cos.n), int(sin.n)) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         if npair:
             self._split_forget_ptr(x)
             grid, block = self._ewise_grid(npair)
@@ -5579,12 +5579,12 @@ class CudaRuntime:
     def add_(self, x, y):
         """原地 x += y。逐位等同 ewise_add/cuMemcpy 语义，只是不分配新缓冲。"""
         if int(x.n) != int(y.n):
-            raise CudaError("add_ 长度不同: %s vs %s" % (x.n, y.n))
+            raise CudaError("add_ 长度不同: %s vs %s" % (x.n, y.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         n = int(x.n)
         if n:
             self._split_forget_ptr(x)
             if n > 2147483647:
-                raise CudaError("add_ 元素个数超过 int32")
+                raise CudaError("add_ 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             if self._vec4_ok(n, x, y):
                 grid, block = self._vec4_grid(n >> 2)
                 self.launch("fused_add_ip_v4", grid, block, [
@@ -5600,7 +5600,7 @@ class CudaRuntime:
     def attn_mask_softmax_(self, s, causal=True, want_lse=False):
         """原地 causal-mask + softmax。s 是 [rows, k] 行主序；返回 (s, lse|None)。"""
         if len(s.shape) < 2:
-            raise CudaError("attn_mask_softmax 需要至少 2 维，收到 %s" % (s.shape,))
+            raise CudaError("attn_mask_softmax 需要至少 2 维，收到 %s" % (s.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         # n-D：末维是 k，其余维展平成 rows（行内连续，causal 的 pos=r%k 仍然正确）
         k = int(s.shape[-1])
         rows = int(s.n) // k if k else 0
@@ -5623,7 +5623,7 @@ class CudaRuntime:
         """dS = P * (dP - sum(dP*P))，就地写到新缓冲。"""
         if len(dp.shape) < 2 or tuple(dp.shape) != tuple(p.shape):
             raise CudaError("attn_mask_softmax_bwd 形状不一致: %s vs %s"
-                            % (dp.shape, p.shape))
+                            % (dp.shape, p.shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         k = int(dp.shape[-1])
         rows = int(dp.n) // k if k else 0
         ds = self.empty(dp.shape, dtype=np.float32)
@@ -5701,7 +5701,7 @@ class CudaRuntime:
                 offs.append(offs[-1] + n)
             total = offs[-1]
             if total > 2147483647:
-                raise CudaError("fused AdamW 元素总数 %d 超过 int32" % total)
+                raise CudaError("fused AdamW 元素总数 %d 超过 int32" % total + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             ps = self.h2d(np.array([int(ent[0].ptr) for ent in entries], np.uint64),
                           dtype=np.uint64)
             gs = self.h2d(np.array([int(ent[1].ptr) for ent in entries], np.uint64),
@@ -5734,11 +5734,11 @@ class CudaRuntime:
         n = int(p.n)
         if int(g.n) != n or int(m.n) != n or int(v.n) != n:
             raise CudaError(
-                "adamw 长度不一致: p=%d g=%d m=%d v=%d" % (n, g.n, m.n, v.n))
+                "adamw 长度不一致: p=%d g=%d m=%d v=%d" % (n, g.n, m.n, v.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if n <= 0:
             return
         if n > 2147483647:
-            raise CudaError("adamw 元素个数超过 int32")
+            raise CudaError("adamw 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         grid, block = self._ewise_grid(n)
         self.launch("adamw_update", grid, block, [
             self._ptr(p), self._ptr(g), self._ptr(m), self._ptr(v),
@@ -5756,7 +5756,7 @@ class CudaRuntime:
         out = self.empty(a.shape, dtype=np.float32)
         if a.n:
             if int(a.n) > 2147483647:
-                raise CudaError("div_scalar 元素个数超过 int32")
+                raise CudaError("div_scalar 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             grid, block = self._ewise_grid(a.n)
             self.launch("ewise_div_scalar", grid, block, [
                 self._ptr(a), (float(scalar), ctypes.c_float), self._ptr(out),
@@ -5769,11 +5769,11 @@ class CudaRuntime:
         self._split_forget_ptr(p)
         n = int(p.n)
         if int(o.n) != n:
-            raise CudaError("sub_scale 长度不一致: p=%d o=%d" % (n, o.n))
+            raise CudaError("sub_scale 长度不一致: p=%d o=%d" % (n, o.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if n <= 0:
             return p
         if n > 2147483647:
-            raise CudaError("sub_scale 元素个数超过 int32")
+            raise CudaError("sub_scale 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         grid, block = self._ewise_grid(n)
         self.launch("ewise_sub_scale", grid, block, [
             self._ptr(p), self._ptr(o), (float(scale), ctypes.c_float),
@@ -5789,11 +5789,11 @@ class CudaRuntime:
         n = int(p.n)
         if int(g.n) != n or int(buf.n) != n or int(u.n) != n:
             raise CudaError(
-                "muon_momentum 长度不一致: p=%d g=%d buf=%d u=%d" % (n, g.n, buf.n, u.n))
+                "muon_momentum 长度不一致: p=%d g=%d buf=%d u=%d" % (n, g.n, buf.n, u.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if n <= 0:
             return
         if n > 2147483647:
-            raise CudaError("muon_momentum 元素个数超过 int32")
+            raise CudaError("muon_momentum 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         grid, block = self._ewise_grid(n)
         self.launch("muon_momentum", grid, block, [
             self._ptr(p), self._ptr(g), self._ptr(buf), self._ptr(u),
@@ -5832,7 +5832,7 @@ class CudaRuntime:
         out = self.empty((), dtype=np.float32)
         n = int(buf.n)
         if n < 0 or n > 2147483647:
-            raise CudaError("sumsq 元素个数非法: %d" % n)
+            raise CudaError("sumsq 元素个数非法: %d" % n + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         self.launch("sumsq_sequential", (1, 1, 1), (1, 1, 1), [
             self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
         ])
@@ -5849,11 +5849,11 @@ class CudaRuntime:
     def moe_topk(self, logits, k):
         """每个 token 的 top-k。返回 (idx int32 [N,K], 选中 logit [N,K])。"""
         if len(logits.shape) != 2:
-            raise CudaError("moe_topk 需要 [N,E]，收到 %s" % (logits.shape,))
+            raise CudaError("moe_topk 需要 [N,E]，收到 %s" % (logits.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         n, e = int(logits.shape[0]), int(logits.shape[1])
         k = int(k)
         if k < 1 or k > e:
-            raise CudaError("moe_topk k=%d 超出专家数 %d" % (k, e))
+            raise CudaError("moe_topk k=%d 超出专家数 %d" % (k, e) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         idx = self.empty((n, k), dtype=np.int32)
         val = self.empty((n, k), dtype=np.float32)
         if n and e:
@@ -5963,10 +5963,10 @@ class CudaRuntime:
 
     def moe_row_scale(self, y, w):
         if len(y.shape) != 2:
-            raise CudaError("moe_row_scale 需要 2D，收到 %s" % (y.shape,))
+            raise CudaError("moe_row_scale 需要 2D，收到 %s" % (y.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         m, d = int(y.shape[0]), int(y.shape[1])
         if int(w.n) != m:
-            raise CudaError("moe_row_scale 权重长度 %d != 行数 %d" % (w.n, m))
+            raise CudaError("moe_row_scale 权重长度 %d != 行数 %d" % (w.n, m) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         out = self.empty((m, d), dtype=np.float32)
         if m and d:
             self.launch("moe_row_scale", (m, 1, 1), (self._moe_row_block(d), 1, 1), [
@@ -6028,9 +6028,9 @@ class CudaRuntime:
         """grid=(nh, ceil(seq/64), 1)，block=256，dynamic smem=32KB。
         seq 能被 64 整除时第二维就是 seq//64，和内核注释一致。"""
         if dh != 64:
-            raise CudaError("attn_nop 只接受 dh=64，收到 %d" % dh)
+            raise CudaError("attn_nop 只接受 dh=64，收到 %d" % dh + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if seq < 0 or nh < 0:
-            raise CudaError("attn_nop 形状非法 seq=%d nh=%d" % (seq, nh))
+            raise CudaError("attn_nop 形状非法 seq=%d nh=%d" % (seq, nh) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         gy = (int(seq) + _ATTN_NOP_BQ - 1) // _ATTN_NOP_BQ
         if gy < 1:
             gy = 1
@@ -6043,9 +6043,9 @@ class CudaRuntime:
     def _attn_flash_launch(self, name, seq, nh, dh, args):
         """与 nop 同一网格（query 块 64），动态 smem 给 flash 反向。"""
         if dh != 64:
-            raise CudaError("attn_flash 只接受 dh=64，收到 %d" % dh)
+            raise CudaError("attn_flash 只接受 dh=64，收到 %d" % dh + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if seq < 0 or nh < 0:
-            raise CudaError("attn_flash 形状非法 seq=%d nh=%d" % (seq, nh))
+            raise CudaError("attn_flash 形状非法 seq=%d nh=%d" % (seq, nh) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         ready = getattr(self, "_attn_flash_names", None)
         if ready is None:
             ready = self._attn_flash_names = set()
@@ -6067,7 +6067,7 @@ class CudaRuntime:
         """q,k,v 为 [seq, nh, dh] fp32。只写 O，不写 P。"""
         self.ensure_attn_nop()
         if len(q.shape) != 3 or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape):
-            raise CudaError("attn_nop_fwd 需要同形状 3D，收到 %s %s %s" % (q.shape, k.shape, v.shape))
+            raise CudaError("attn_nop_fwd 需要同形状 3D，收到 %s %s %s" % (q.shape, k.shape, v.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         seq, nh, dh = (int(x) for x in q.shape)
         o = self.zeros((seq, nh, dh), dtype=np.float32)
         self._attn_nop_launch("attn_fwd_nop", seq, nh, dh, [
@@ -6083,7 +6083,7 @@ class CudaRuntime:
         if (len(do.shape) != 3 or tuple(do.shape) != tuple(q.shape)
                 or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape)):
             raise CudaError("attn_nop_bwd 形状不一致: dO%s Q%s K%s V%s" % (
-                do.shape, q.shape, k.shape, v.shape))
+                do.shape, q.shape, k.shape, v.shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         seq, nh, dh = (int(x) for x in q.shape)
         dq = self.zeros((seq, nh, dh), dtype=np.float32)
         dk = self.zeros((seq, nh, dh), dtype=np.float32)
@@ -6100,7 +6100,7 @@ class CudaRuntime:
         """同 attn_nop_fwd，额外写出每行 online-softmax 的 m、l，形状 [seq, nh]。"""
         self.ensure_attn_nop()
         if len(q.shape) != 3 or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape):
-            raise CudaError("attn_nop_fwd_stats 需要同形状 3D，收到 %s %s %s" % (q.shape, k.shape, v.shape))
+            raise CudaError("attn_nop_fwd_stats 需要同形状 3D，收到 %s %s %s" % (q.shape, k.shape, v.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         seq, nh, dh = (int(x) for x in q.shape)
         o = self.zeros((seq, nh, dh), dtype=np.float32)
         m = self.empty((seq, nh), dtype=np.float32)
@@ -6120,11 +6120,11 @@ class CudaRuntime:
                 or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape)
                 or tuple(o.shape) != tuple(q.shape)):
             raise CudaError("attn_nop_bwd_flash 形状不一致: dO%s Q%s K%s V%s O%s" % (
-                do.shape, q.shape, k.shape, v.shape, o.shape))
+                do.shape, q.shape, k.shape, v.shape, o.shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         seq, nh, dh = (int(x) for x in q.shape)
         if tuple(m.shape) != (seq, nh) or tuple(lse.shape) != (seq, nh):
             raise CudaError("attn_nop_bwd_flash 的 m/l 应为 [%d,%d]，收到 %s %s" % (
-                seq, nh, m.shape, lse.shape))
+                seq, nh, m.shape, lse.shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         dq = self.zeros((seq, nh, dh), dtype=np.float32)
         dk = self.zeros((seq, nh, dh), dtype=np.float32)
         dv = self.zeros((seq, nh, dh), dtype=np.float32)
@@ -6168,7 +6168,7 @@ class CudaRuntime:
         cu = self.cu
         sym = getattr(cu, "cuMemcpyDtoDAsync_v2", None) or getattr(cu, "cuMemcpyDtoDAsync", None)
         if sym is None:
-            raise CudaError("驱动没有 cuMemcpyDtoDAsync")
+            raise CudaError("驱动没有 cuMemcpyDtoDAsync" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         sym.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_size_t, ctypes.c_void_p]
         sym.restype = ctypes.c_int
         cu.cuMemcpyDtoDAsync = sym
@@ -6333,13 +6333,13 @@ class CudaRuntime:
         try:
             self.ensure()
             if not self._bind_graph_api():
-                raise CudaError("驱动没有完整的 CUDA Graph 入口")
+                raise CudaError("驱动没有完整的 CUDA Graph 入口" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             self._bind_dto_async()
             self._activate()
             st = ctypes.c_void_p()
             self._chk(self.cu.cuStreamCreate(ctypes.byref(st), 0), "cuStreamCreate")
             if not st.value:
-                raise CudaError("cuStreamCreate 返回空流")
+                raise CudaError("cuStreamCreate 返回空流" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             self._stream = st
             self._stream_ready = True
             if self.handle is not None:
@@ -6367,7 +6367,7 @@ class CudaRuntime:
             if not self._stream_ready and not self.graph_arm():
                 return False
             if not self._bind_graph_api():
-                raise CudaError("驱动没有完整的 CUDA Graph 入口")
+                raise CudaError("驱动没有完整的 CUDA Graph 入口" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             # 把预热剩下的工作排空，避免它和捕获缠在一起。此时还没开始捕获，同步是合法的。
             self.sync()
             self._adamw_snaps = []
@@ -6383,7 +6383,7 @@ class CudaRuntime:
                     self._capture_mode = int(mode)
                     return True
                 err = self._err_text(rc)
-            raise CudaError("cuStreamBeginCapture 失败 %s" % (err,))
+            raise CudaError("cuStreamBeginCapture 失败 %s" % (err,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         except Exception as ex:
             self._graph_disable(ex)
             return False
@@ -6436,7 +6436,7 @@ class CudaRuntime:
                 return exec_
             tail = log.value.decode("utf-8", "replace") if log.value else ""
             errs.append("5-arg %s %s" % (self._err_text(rc), tail))
-        raise CudaError("cuGraphInstantiate 失败：%s" % ("; ".join(errs) or "no symbol",))
+        raise CudaError("cuGraphInstantiate 失败：%s" % ("; ".join(errs) or "no symbol",) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
 
     def _collect_adamw(self, graph):
         snaps = list(self._adamw_snaps)
@@ -6459,7 +6459,7 @@ class CudaRuntime:
         if len(found) != len(snaps):
             raise CudaError(
                 "AdamW 图节点 %d 与捕获时的调用 %d 不一致（struct 大小 %d）"
-                % (len(found), len(snaps), ctypes.sizeof(_CudaKernelNodeParams)))
+                % (len(found), len(snaps), ctypes.sizeof(_CudaKernelNodeParams)) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         packed = []
         for node, snap in zip(found, snaps):
             grid, block, shared, args = snap
@@ -6470,7 +6470,7 @@ class CudaRuntime:
                 holders.append(obj)
                 ptrs[i] = ctypes.cast(ctypes.byref(obj), ctypes.c_void_p)
             if len(holders) < 14:
-                raise CudaError("adamw 参数只有 %d 个" % len(holders))
+                raise CudaError("adamw 参数只有 %d 个" % len(holders) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             params = _CudaKernelNodeParams()
             params.func = want
             params.gridDimX, params.gridDimY, params.gridDimZ = grid
@@ -6494,9 +6494,9 @@ class CudaRuntime:
             if rc != 0 or self._graph_poison:
                 why = self._graph_poison or ""
                 raise CudaError(
-                    "cuStreamEndCapture %s %s" % (self._err_text(rc), why))
+                    "cuStreamEndCapture %s %s" % (self._err_text(rc), why) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             if not graph.value:
-                raise CudaError("cuStreamEndCapture 没有返回图")
+                raise CudaError("cuStreamEndCapture 没有返回图" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             self._graph = graph
             self._graph_exec = self._instantiate_graph(graph)
             nodes = self._graph_node_list(graph)

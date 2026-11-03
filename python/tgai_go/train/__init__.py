@@ -303,7 +303,7 @@ def set_device(device):
     """
     global _DEVICE
     if not isinstance(device, str):
-        raise TypeError("set_device 需要字符串，收到 %r" % (device,))
+        raise TypeError("set_device 需要字符串，收到 %r" % (device,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     name = device.strip().lower()
     if name.startswith("cuda:"):
         name = "cuda"                      # 与 torch 习惯一致，卡号当前不生效（单卡）
@@ -317,10 +317,10 @@ def set_device(device):
     if name in _FUTURE_BACKENDS:
         raise NotImplementedError(
             "set_device(%r) 暂不可用：%s。\n当前可用后端：'cuda'、'cpu'。"
-            % (device, _FUTURE_BACKENDS[name]))
+            % (device, _FUTURE_BACKENDS[name]) + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     raise ValueError(
         "set_device 只接受 'cuda' 或 'cpu'，收到 %r。\n已知但未实现的后端：%s"
-        % (device, "、".join(sorted(_FUTURE_BACKENDS))))
+        % (device, "、".join(sorted(_FUTURE_BACKENDS))) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
 
 
 _CUDA_INST = None
@@ -387,7 +387,7 @@ def _as_dtype(dt):
     try:
         np_dt = np.dtype(dt)
     except TypeError:
-        raise TypeError("不认识的 dtype: %r" % (dt,))
+        raise TypeError("不认识的 dtype: %r" % (dt,) + "。修法：本引擎张量统一 float32；需要低精度请用 rt.fp16_gemm，而不是改 dtype")
     for item in _DTYPES:
         if item.numpy_dtype == np_dt:
             return item
@@ -417,7 +417,7 @@ class Device:
     def __init__(self, type, index=None):
         if isinstance(type, Device):
             if index is not None:
-                raise RuntimeError("device() 不能同时从已有 device 再给 index")
+                raise RuntimeError("device() 不能同时从已有 device 再给 index" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             self.type = type.type
             self.index = type.index
             return
@@ -426,7 +426,7 @@ class Device:
             name, idx_s = text.split(":", 1)
             parsed = int(idx_s)
             if index is not None and int(index) != parsed:
-                raise RuntimeError("device 字符串里的 index 和参数冲突")
+                raise RuntimeError("device 字符串里的 index 和参数冲突" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             self.type = name
             self.index = parsed
         else:
@@ -463,7 +463,7 @@ def _device_arg(dev):
         if ":" in dev:
             return dev.split(":", 1)[0]
         return dev
-    raise TypeError("device 需要 str 或 torch.device，收到 %r" % (dev,))
+    raise TypeError("device 需要 str 或 torch.device，收到 %r" % (dev,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
 
 
 class _CudaAPI:
@@ -484,7 +484,7 @@ class _CudaAPI:
     @staticmethod
     def current_device():
         if not _CudaAPI.is_available():
-            raise RuntimeError("CUDA 不可用")
+            raise RuntimeError("CUDA 不可用" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         return 0
 
 
@@ -513,7 +513,7 @@ def _broadcast_shape(sa, sb):
     sb = tuple(int(s) for s in sb)
     ndim = len(sa) if len(sa) > len(sb) else len(sb)
     if ndim > 8:
-        raise NotImplementedError("CUDA 广播最高 8 维，收到 %s 与 %s" % (sa, sb))
+        raise NotImplementedError("CUDA 广播最高 8 维，收到 %s 与 %s" % (sa, sb) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     pa = (1,) * (ndim - len(sa)) + sa
     pb = (1,) * (ndim - len(sb)) + sb
     out = []
@@ -523,7 +523,7 @@ def _broadcast_shape(sa, sb):
         elif y == 1:
             out.append(x)
         else:
-            raise ValueError("形状不能广播: %s vs %s" % (sa, sb) + HINT_BCAST)
+            raise ValueError("形状不能广播: %s vs %s" % (sa, sb) + HINT_BCAST + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     return tuple(out)
 
 
@@ -552,13 +552,13 @@ def _norm_shape(shape, total):
     if not neg:
         return shape
     if len(neg) > 1:
-        raise ValueError("reshape 最多只能有一个 -1，收到 %s" % (shape,))
+        raise ValueError("reshape 最多只能有一个 -1，收到 %s" % (shape,) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     known = 1
     for v in shape:
         if v != -1:
             known *= v
     if known <= 0 or total % known:
-        raise ValueError("reshape 无法把 %d 个元素拆成 %s" % (total, shape))
+        raise ValueError("reshape 无法把 %d 个元素拆成 %s" % (total, shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     out = list(shape)
     out[neg[0]] = total // known
     return tuple(out)
@@ -587,13 +587,13 @@ class Tensor:
             # 整数/布尔只当显式 dtype 给出时才保留。默认路径与原来一样，强制 float32。
             if dtype is not None and not _is_float_dtype(dtype):
                 if requires_grad:
-                    raise RuntimeError("只有浮点张量可以 requires_grad")
+                    raise RuntimeError("只有浮点张量可以 requires_grad" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
                 self.data = np.asarray(data, dtype=_numpy_dtype(dtype))
                 return
             self.data = np.asarray(data, dtype=np.float32)
             return
         if dev != "cuda":
-            raise ValueError("Tensor device 只接受 cpu/cuda，收到 %r" % (dev,))
+            raise ValueError("Tensor device 只接受 cpu/cuda，收到 %r" % (dev,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         arr = np.ascontiguousarray(np.asarray(data, dtype=np.float32))
         self.data = None
         self._gpu = _cuda().h2d(arr)
@@ -614,7 +614,7 @@ class Tensor:
 
     def _cpu_only(self, op):
         if self.device == "cuda":
-            raise NotImplementedError("CUDA 后端还没有 %s" % op)
+            raise NotImplementedError("CUDA 后端还没有 %s" % op + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
 
     # ---- 属性 ----
     @property
@@ -661,7 +661,7 @@ class Tensor:
         if self.device == "cuda":
             return self._backward_cuda(grad)
         if not self.requires_grad:
-            raise RuntimeError("调用 backward 的张量不参与求导")
+            raise RuntimeError("调用 backward 的张量不参与求导" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if grad is None:
             grad = np.ones_like(self.data)
         # 拓扑排序（迭代，避免深图递归爆栈）
@@ -746,7 +746,7 @@ class Tensor:
         if not isinstance(other, Tensor):
             other = _as_tensor(other)
         if self.device != "cuda" or other.device != "cuda":
-            raise RuntimeError("add 不能混用 CPU 和 CUDA 张量")
+            raise RuntimeError("add 不能混用 CPU 和 CUDA 张量" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         rt = _cuda()
         buf = rt.add(self._gpu, other._gpu)
         rg = self.requires_grad or other.requires_grad
@@ -782,7 +782,7 @@ class Tensor:
                 return self._scale_cuda(float(other))
             other = _as_tensor(other)
         if self.device != "cuda" or other.device != "cuda":
-            raise RuntimeError("mul 不能混用 CPU 和 CUDA 张量")
+            raise RuntimeError("mul 不能混用 CPU 和 CUDA 张量" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         a_shape = tuple(int(s) for s in self.shape)
         b_shape = tuple(int(s) for s in other.shape)
         a, b = self._gpu, other._gpu
@@ -830,7 +830,7 @@ class Tensor:
         other = _as_tensor(other)
         if self.device == "cuda" or other.device == "cuda":
             if self.device != "cuda" or other.device != "cuda":
-                raise RuntimeError("matmul 不能混用 CPU 和 CUDA 张量")
+                raise RuntimeError("matmul 不能混用 CPU 和 CUDA 张量" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             return self._matmul_cuda(other)
         rg = self.requires_grad or other.requires_grad
         if self.ndim == 2 and other.ndim == 2:
@@ -847,7 +847,7 @@ class Tensor:
         if self.ndim == 3 and other.ndim == 3:
             if self.shape[0] != other.shape[0]:
                 raise ValueError("3D matmul 需要相同 batch: %s vs %s"
-                                 % (self.shape, other.shape))
+                                 % (self.shape, other.shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
             out = Tensor(np.matmul(self.data, other.data), requires_grad=rg, _parents=(self, other))
             a, b = self.data, other.data
 
@@ -872,14 +872,14 @@ class Tensor:
             out._backward = bw
             return out
         raise NotImplementedError("matmul 支持 2D/3D 以及带前导维的矩阵乘，收到 %dD x %dD"
-                                   % (self.ndim, other.ndim))
+                                   % (self.ndim, other.ndim) + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
 
     def _matmul_cuda(self, other):
         rt = _cuda()
         if self.ndim == 3 and other.ndim == 3:
             if self.shape[0] != other.shape[0]:
                 raise ValueError("3D matmul 需要相同 batch: %s vs %s"
-                                 % (self.shape, other.shape))
+                                 % (self.shape, other.shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
             buf = rt.bmm(self._gpu, other._gpu)
             rg = self.requires_grad or other.requires_grad
             out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
@@ -897,7 +897,7 @@ class Tensor:
             M, K = int(self.shape[0]), int(self.shape[1])
             N, K2 = int(src.shape[0]), int(src.shape[1])
             if K != K2:
-                raise ValueError("matmul K 不匹配: %s @ %s^T" % (self.shape, src.shape) + HINT_MATMUL)
+                raise ValueError("matmul K 不匹配: %s @ %s^T" % (self.shape, src.shape) + HINT_MATMUL + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
             if not rt._numpy_exact_gemm(M, N, K):
                 # ★ fp16 前向 GEMM（V100 Tensor Core）：只在 rt.fp16_gemm 打开时走。
                 #   前向用 fp16 计算（fp32 累加），**反向仍用 fp32 的 sgemm/gemm_tn**，
@@ -971,7 +971,7 @@ class Tensor:
             if self.ndim >= 2 and other.ndim >= 2:
                 return self._matmul_cuda_nd(other)
             raise NotImplementedError("CUDA matmul 目前只支持至少 2D，收到 %dD x %dD"
-                                      % (self.ndim, other.ndim))
+                                      % (self.ndim, other.ndim) + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
         buf = rt.sgemm(self._gpu, other._gpu)
         rg = self.requires_grad or other.requires_grad
         out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
@@ -1036,7 +1036,7 @@ class Tensor:
 
     def _transpose_cuda(self):
         if self.ndim != 2:
-            raise NotImplementedError("CUDA transpose 目前只支持 2D，收到 %dD" % self.ndim)
+            raise NotImplementedError("CUDA transpose 目前只支持 2D，收到 %dD" % self.ndim + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
         # 不物化。matmul 看见 _lazy_T 就走 gemm_nt，省掉词表那么大的转置。
         # 真要读数值时 to_numpy 再转。小矩阵的精确 GEMM 会在 matmul 里物化。
         rt = _cuda()
@@ -1052,7 +1052,7 @@ class Tensor:
 
     def _backward_cuda(self, grad):
         if not self.requires_grad:
-            raise RuntimeError("调用 backward 的张量不参与求导")
+            raise RuntimeError("调用 backward 的张量不参与求导" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         rt = _cuda()
         if grad is None:
             g0 = rt.full(self.shape, 1.0)
@@ -1086,7 +1086,7 @@ class Tensor:
             if g is None:
                 continue
             if getattr(node, "device", "cpu") != "cuda":
-                raise RuntimeError("CUDA 反传遇到 CPU 张量")
+                raise RuntimeError("CUDA 反传遇到 CPU 张量" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             # 只给叶子张量留 .grad，和 PyTorch 一样。中间激活的梯度以前每次都 clone
             # 一份，seq=8192 上这 100 多次拷贝既占时间也把显存顶过 13 GiB。
             # 叶子的 g 是父算子刚写出来的新缓冲，反向不再改它，可以直接挂上，不必再拷。
@@ -1095,7 +1095,7 @@ class Tensor:
                     node.grad = Tensor._from_gpu(g, requires_grad=False)
                 else:
                     if not isinstance(node.grad, Tensor) or getattr(node.grad, "device", "cpu") != "cuda":
-                        raise RuntimeError("CUDA 张量的 .grad 必须是 CUDA Tensor")
+                        raise RuntimeError("CUDA 张量的 .grad 必须是 CUDA Tensor" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
                     node.grad = Tensor._from_gpu(rt.add(node.grad._gpu, g), requires_grad=False)
             if node._backward is not None:
                 if _GRAD_ENABLED[0]:
@@ -1120,7 +1120,7 @@ class Tensor:
 
     def _swap_last2_cuda(self):
         if self.ndim < 2:
-            raise NotImplementedError("swap_last2 至少要 2 维，收到 %dD" % self.ndim)
+            raise NotImplementedError("swap_last2 至少要 2 维，收到 %dD" % self.ndim + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
         rt = _cuda()
         buf = rt.swap_last2(self._gpu)
         out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
@@ -1143,11 +1143,11 @@ class Tensor:
     def _pow_cuda(self, p):
         """标量指数。前向 powf，反向 g * p * x**(p-1)，与 CPU 同一公式。"""
         if isinstance(p, Tensor):
-            raise NotImplementedError("CUDA pow 的指数目前只支持标量，不支持张量")
+            raise NotImplementedError("CUDA pow 的指数目前只支持标量，不支持张量" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
         if isinstance(p, (bool, np.bool_)):
-            raise TypeError("pow 的指数不能是 bool")
+            raise TypeError("pow 的指数不能是 bool" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if not isinstance(p, (int, float, np.floating, np.integer)):
-            raise NotImplementedError("CUDA pow 的指数目前只支持标量，收到 %r" % (type(p).__name__,))
+            raise NotImplementedError("CUDA pow 的指数目前只支持标量，收到 %r" % (type(p).__name__,) + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
         pf = float(p)
         rt = _cuda()
         x = self._gpu
@@ -1235,7 +1235,7 @@ class Tensor:
         shape = tuple(int(s) for s in self.shape)
         nd = len(shape)
         if isinstance(axis, (tuple, list)):
-            raise NotImplementedError("CUDA sum 目前只支持单轴或全归约，收到 %r" % (axis,))
+            raise NotImplementedError("CUDA sum 目前只支持单轴或全归约，收到 %r" % (axis,) + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
         if axis is None:
             buf = rt.sum_all(self._gpu)
             if keepdims and nd:
@@ -1251,7 +1251,7 @@ class Tensor:
         if ax < 0:
             ax += nd
         if nd == 0 or ax < 0 or ax >= nd:
-            raise ValueError("sum 轴 %s 越界（shape=%s）" % (axis, shape))
+            raise ValueError("sum 轴 %s 越界（shape=%s）" % (axis, shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         buf = rt.sum_axis(self._gpu, ax, keepdims=bool(keepdims))
         out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
         dropped = not bool(keepdims)
@@ -1278,7 +1278,7 @@ class Tensor:
             keepdims = keepdim
         if self.device == "cuda":
             if isinstance(axis, (tuple, list)):
-                raise NotImplementedError("CUDA mean 目前只支持单轴或全归约，收到 %r" % (axis,))
+                raise NotImplementedError("CUDA mean 目前只支持单轴或全归约，收到 %r" % (axis,) + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
             shape = tuple(int(s) for s in self.shape)
             if axis is None:
                 n = 1
@@ -1289,10 +1289,10 @@ class Tensor:
                 if ax < 0:
                     ax += len(shape)
                 if not shape or ax < 0 or ax >= len(shape):
-                    raise ValueError("mean 轴 %s 越界（shape=%s）" % (axis, shape))
+                    raise ValueError("mean 轴 %s 越界（shape=%s）" % (axis, shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
                 n = int(shape[ax])
             if n == 0:
-                raise ValueError("mean 的归约长度是 0（shape=%s, axis=%s）" % (shape, axis))
+                raise ValueError("mean 的归约长度是 0（shape=%s, axis=%s）" % (shape, axis) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
             return self.sum(axis=axis, keepdims=keepdims) * (1.0 / float(n))
         n = self.data.size if axis is None else self.data.shape[axis]
         return self.sum(axis=axis, keepdims=keepdims) * (1.0 / n)
@@ -1337,7 +1337,7 @@ class Tensor:
             out._backward = bw
             return out
         if dim0 is None or dim1 is None:
-            raise TypeError("transpose() 要么不传参数，要么同时给 dim0 和 dim1")
+            raise TypeError("transpose() 要么不传参数，要么同时给 dim0 和 dim1" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if self.device == "cuda":
             nd = self.ndim
             a = int(dim0) + (nd if int(dim0) < 0 else 0)
@@ -1367,7 +1367,7 @@ class Tensor:
                 d += nd
             axes.append(d)
         if sorted(axes) != list(range(nd)):
-            raise ValueError("permute 必须是 0..%d 的一个排列，收到 %s" % (nd - 1, axes))
+            raise ValueError("permute 必须是 0..%d 的一个排列，收到 %s" % (nd - 1, axes) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if self.device == "cuda":
             return self._permute_cuda(tuple(axes))
         moved = np.transpose(self.data, axes)
@@ -1682,7 +1682,7 @@ def _slice_gather_plan(shape, idx):
     shape = tuple(int(s) for s in shape)
     nd = len(shape)
     if nd > 8:
-        raise NotImplementedError("切片最高支持 8 维，收到 %d 维" % nd)
+        raise NotImplementedError("切片最高支持 8 维，收到 %d 维" % nd + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     if not isinstance(idx, tuple):
         idx = (idx,)
     n_ellipsis = 0
@@ -1692,21 +1692,21 @@ def _slice_gather_plan(shape, idx):
             n_ellipsis += 1
             continue
         if it is None:
-            raise NotImplementedError("切片暂不支持 None（newaxis）")
+            raise NotImplementedError("切片暂不支持 None（newaxis）" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
         if _is_int_index(it) or isinstance(it, slice):
             consumed += 1
             continue
-        raise NotImplementedError("切片暂不支持索引类型 %s" % type(it).__name__)
+        raise NotImplementedError("切片暂不支持索引类型 %s" % type(it).__name__ + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     if n_ellipsis > 1:
-        raise IndexError("Ellipsis 只能出现一次")
+        raise IndexError("Ellipsis 只能出现一次" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     if n_ellipsis == 0:
         if consumed > nd:
-            raise IndexError("索引维数 %d 超过 ndim %d" % (consumed, nd))
+            raise IndexError("索引维数 %d 超过 ndim %d" % (consumed, nd) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         items = list(idx) + [slice(None)] * (nd - consumed)
     else:
         fill = nd - consumed
         if fill < 0:
-            raise IndexError("索引维数 %d 超过 ndim %d" % (consumed, nd))
+            raise IndexError("索引维数 %d 超过 ndim %d" % (consumed, nd) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         items = []
         for it in idx:
             if it is Ellipsis:
@@ -1721,7 +1721,7 @@ def _slice_gather_plan(shape, idx):
     axis = 0
     for it in items:
         if axis >= nd:
-            raise IndexError("索引维数超过 ndim %d" % nd)
+            raise IndexError("索引维数超过 ndim %d" % nd + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         length = int(shape[axis])
         src_st = int(strides_in[axis])
         if _is_int_index(it):
@@ -1729,7 +1729,7 @@ def _slice_gather_plan(shape, idx):
             if ii < 0:
                 ii += length
             if ii < 0 or ii >= length:
-                raise IndexError("索引 %d 越界（维 %d 长度 %d）" % (int(it), axis, length))
+                raise IndexError("索引 %d 越界（维 %d 长度 %d）" % (int(it), axis, length) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             base += ii * src_st
             axis += 1
             continue
@@ -1741,9 +1741,9 @@ def _slice_gather_plan(shape, idx):
         base += int(start) * src_st
         axis += 1
     if axis != nd:
-        raise IndexError("索引没有覆盖全部维度（%d/%d）" % (axis, nd))
+        raise IndexError("索引没有覆盖全部维度（%d/%d）" % (axis, nd) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     if len(out_shape) > 8:
-        raise NotImplementedError("切片结果最高支持 8 维")
+        raise NotImplementedError("切片结果最高支持 8 维" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     return tuple(out_shape), int(base), tuple(divs), tuple(strides)
 
 
@@ -1752,17 +1752,17 @@ def _repeat_gather_plan(shape, repeats, dim):
     shape = tuple(int(s) for s in shape)
     nd = len(shape)
     if nd == 0:
-        raise RuntimeError("标量不能 repeat_interleave，先 reshape 成 1 维")
+        raise RuntimeError("标量不能 repeat_interleave，先 reshape 成 1 维" + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     if nd > 8:
-        raise NotImplementedError("repeat_interleave 最高支持 8 维")
+        raise NotImplementedError("repeat_interleave 最高支持 8 维" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     repeats = int(repeats)
     if repeats < 0:
-        raise RuntimeError("repeats 必须 >= 0，收到 %d" % repeats)
+        raise RuntimeError("repeats 必须 >= 0，收到 %d" % repeats + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     axis = int(dim)
     if axis < 0:
         axis += nd
     if axis < 0 or axis >= nd:
-        raise IndexError("dim %s 越界（ndim=%d）" % (dim, nd))
+        raise IndexError("dim %s 越界（ndim=%d）" % (dim, nd) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     out = list(shape)
     out[axis] = int(shape[axis]) * repeats
     strides_in = _contig_strides(shape)
@@ -1814,10 +1814,10 @@ def _scalar_or_none(v, name):
         return None
     if isinstance(v, Tensor):
         if v.numel() != 1:
-            raise NotImplementedError("%s 目前只支持标量" % name)
+            raise NotImplementedError("%s 目前只支持标量" % name + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
         return float(np.asarray(v.to_numpy()).reshape(-1)[0])
     if isinstance(v, (bool, np.bool_)):
-        raise TypeError("%s 不接受布尔值" % name)
+        raise TypeError("%s 不接受布尔值" % name + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     return float(v)
 
 
@@ -1843,10 +1843,10 @@ def _infer_dtype(data):
             return int32
         if np.issubdtype(data.dtype, np.integer):
             return int64
-        raise TypeError("tensor 暂不支持 dtype=%s" % data.dtype)
+        raise TypeError("tensor 暂不支持 dtype=%s" % data.dtype + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     arr = np.asarray(data)
     if arr.dtype == np.bool_:
-        raise TypeError("bool 张量尚未实现")
+        raise TypeError("bool 张量尚未实现" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     if np.issubdtype(arr.dtype, np.floating):
         return float32
     if np.issubdtype(arr.dtype, np.integer):
@@ -1865,7 +1865,7 @@ def tensor(data, dtype=None, device=None, requires_grad=False):
     if _is_float_dtype(dtype):
         return Tensor(data, requires_grad=requires_grad, device=dev)
     if requires_grad:
-        raise RuntimeError("只有浮点张量可以 requires_grad")
+        raise RuntimeError("只有浮点张量可以 requires_grad" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     return Tensor(data, requires_grad=False, device=dev, dtype=dtype)
 
 
@@ -1875,7 +1875,7 @@ def _constant(shape, value, dt, device, requires_grad):
         data = np.full(shape, value, dtype=np.float32)
         return Tensor(data, requires_grad=requires_grad, device=dev)
     if requires_grad:
-        raise RuntimeError("只有浮点张量可以 requires_grad")
+        raise RuntimeError("只有浮点张量可以 requires_grad" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     data = np.full(shape, value, dtype=_numpy_dtype(dt))
     return Tensor(data, requires_grad=False, device=dev, dtype=_as_dtype(dt))
 
@@ -1898,14 +1898,14 @@ def full(size, fill_value, dtype=None, device=None, requires_grad=False):
 
 def randn(*size, dtype=None, device=None, requires_grad=False):
     if dtype is not None and not _is_float_dtype(dtype):
-        raise TypeError("randn 只支持浮点 dtype")
+        raise TypeError("randn 只支持浮点 dtype" + "。修法：本引擎张量统一 float32；需要低精度请用 rt.fp16_gemm，而不是改 dtype")
     data = np.random.standard_normal(_normalize_size(size)).astype(np.float32)
     return Tensor(data, requires_grad=requires_grad, device=_device_arg(device))
 
 
 def rand(*size, dtype=None, device=None, requires_grad=False):
     if dtype is not None and not _is_float_dtype(dtype):
-        raise TypeError("rand 只支持浮点 dtype")
+        raise TypeError("rand 只支持浮点 dtype" + "。修法：本引擎张量统一 float32；需要低精度请用 rt.fp16_gemm，而不是改 dtype")
     data = np.random.random(_normalize_size(size)).astype(np.float32)
     return Tensor(data, requires_grad=requires_grad, device=_device_arg(device))
 
@@ -1928,7 +1928,7 @@ def arange(start, end=None, step=1, dtype=None, device=None, requires_grad=False
         data = np.arange(start, end, step, dtype=np.float32)
         return Tensor(data, requires_grad=requires_grad, device=dev)
     if requires_grad:
-        raise RuntimeError("只有浮点张量可以 requires_grad")
+        raise RuntimeError("只有浮点张量可以 requires_grad" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     data = np.arange(start, end, step, dtype=_numpy_dtype(dtype))
     return Tensor(data, requires_grad=False, device=dev, dtype=dtype)
 
@@ -1946,16 +1946,16 @@ def manual_seed(seed):
 def from_numpy(ndarray):
     """近似：总是拷贝，不和调用方共享内存。浮点收成 float32。"""
     if not isinstance(ndarray, np.ndarray):
-        raise TypeError("from_numpy 需要 numpy.ndarray，收到 %s" % type(ndarray).__name__)
+        raise TypeError("from_numpy 需要 numpy.ndarray，收到 %s" % type(ndarray).__name__ + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     if ndarray.dtype == np.bool_:
-        raise TypeError("bool 张量尚未实现")
+        raise TypeError("bool 张量尚未实现" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     if np.issubdtype(ndarray.dtype, np.floating):
         return Tensor(np.asarray(ndarray, dtype=np.float32).copy())
     if ndarray.dtype == np.int32:
         return Tensor(ndarray.copy(), dtype=int32)
     if np.issubdtype(ndarray.dtype, np.integer):
         return Tensor(np.asarray(ndarray, dtype=np.int64).copy(), dtype=int64)
-    raise TypeError("from_numpy 暂不支持 dtype=%s" % ndarray.dtype)
+    raise TypeError("from_numpy 暂不支持 dtype=%s" % ndarray.dtype + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
 
 
 def _cat_check(ts, dim):
@@ -1967,22 +1967,22 @@ def _cat_check(ts, dim):
             raise ValueError(
                 "cat 各张量维度数必须相同，张量 0 是 %d 维 %s，张量 %d 是 %d 维 %s"
                 % (nd, tuple(int(s) for s in ts[0].shape),
-                   i, int(t.ndim), tuple(int(s) for s in t.shape)))
+                   i, int(t.ndim), tuple(int(s) for s in t.shape)) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         shapes.append(tuple(int(s) for s in t.shape))
     if nd == 0:
-        raise ValueError("cat 不支持 0 维张量（形状 %s）" % (shapes[0],))
+        raise ValueError("cat 不支持 0 维张量（形状 %s）" % (shapes[0],) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     axis = int(dim)
     if axis < 0:
         axis += nd
     if axis < 0 or axis >= nd:
-        raise ValueError("cat 轴 %s 越界（ndim=%d）" % (dim, nd))
+        raise ValueError("cat 轴 %s 越界（ndim=%d）" % (dim, nd) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     ref = shapes[0]
     for i, sh in enumerate(shapes[1:], 1):
         for d, (a, b) in enumerate(zip(ref, sh)):
             if d != axis and a != b:
                 raise ValueError(
                     "cat 除拼接轴 %d 外形状必须一致：张量 0 %s，张量 %d %s"
-                    % (axis, ref, i, sh))
+                    % (axis, ref, i, sh) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     return axis, shapes
 
 
@@ -2002,9 +2002,9 @@ def _cat_cuda(ts, dim):
         src = t._cuda_logical_storage()
         got = tuple(int(s) for s in src.shape)
         if got != sh:
-            raise RuntimeError("cat 设备布局 %s 与逻辑形状 %s 不一致" % (got, sh))
+            raise RuntimeError("cat 设备布局 %s 与逻辑形状 %s 不一致" % (got, sh) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         if src.dtype != np.float32:
-            raise TypeError("CUDA cat 目前只支持 float32，收到 %s" % (src.dtype,))
+            raise TypeError("CUDA cat 目前只支持 float32，收到 %s" % (src.dtype,) + "。修法：本引擎张量统一 float32；需要低精度请用 rt.fp16_gemm，而不是改 dtype")
         srcs.append(src)
     dst = rt.empty(out_shape, dtype=np.float32)
     # 逻辑存储若是临时转置，必须活过默认流上的拷贝核。
@@ -2033,12 +2033,12 @@ def _cat_cuda(ts, dim):
 def cat(tensors, dim=0):
     ts = [_as_tensor(t) for t in tensors]
     if not ts:
-        raise ValueError("cat 至少需要一个张量")
+        raise ValueError("cat 至少需要一个张量" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     if any(getattr(t, "device", "cpu") == "cuda" for t in ts):
         if any(getattr(t, "device", "cpu") != "cuda" for t in ts):
             raise RuntimeError(
                 "cat 不能混用 CPU 和 CUDA 张量，收到 %s"
-                % ", ".join(str(getattr(t, "device", "cpu")) for t in ts))
+                % ", ".join(str(getattr(t, "device", "cpu")) for t in ts) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         return _cat_cuda(ts, dim)
     axis = int(dim)
     if axis < 0:
@@ -2063,9 +2063,9 @@ def cat(tensors, dim=0):
 def stack(tensors, dim=0):
     ts = [_as_tensor(t) for t in tensors]
     if not ts:
-        raise ValueError("stack 至少需要一个张量")
+        raise ValueError("stack 至少需要一个张量" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     if any(getattr(t, "device", "cpu") == "cuda" for t in ts):
-        raise NotImplementedError("CUDA stack 尚未实现")
+        raise NotImplementedError("CUDA stack 尚未实现" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     axis = int(dim)
     data = np.stack([t.data for t in ts], axis=axis)
     floating = all(np.issubdtype(t.data.dtype, np.floating) for t in ts)
@@ -2091,7 +2091,7 @@ def bmm(input, mat2):
     a = _as_tensor(input)
     b = _as_tensor(mat2)
     if a.ndim != 3 or b.ndim != 3:
-        raise ValueError("bmm 需要两个 3D 张量，收到 %s x %s" % (a.shape, b.shape))
+        raise ValueError("bmm 需要两个 3D 张量，收到 %s x %s" % (a.shape, b.shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     return a @ b
 
 
@@ -2128,7 +2128,7 @@ def _reduce_values_grad(data, grad, axis, keepdim, pick):
 
 def _reduce_pair(t, dim, keepdim, value_fn, index_fn):
     if getattr(t, "device", "cpu") == "cuda":
-        raise NotImplementedError("CUDA max/min 尚未实现")
+        raise NotImplementedError("CUDA max/min 尚未实现" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     floating = np.issubdtype(t.data.dtype, np.floating)
     if dim is None:
         flat = t.data.reshape(-1)
@@ -2177,14 +2177,14 @@ def topk(input, k, dim=-1, largest=True, sorted=True):
     """近似：并列时名次跟 numpy.argpartition，不保证和 PyTorch 的稳定排序一致。"""
     t = _as_tensor(input)
     if getattr(t, "device", "cpu") == "cuda":
-        raise NotImplementedError("CUDA topk 尚未实现")
+        raise NotImplementedError("CUDA topk 尚未实现" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     k = int(k)
     axis = int(dim)
     if axis < 0:
         axis += t.ndim
     n = int(t.shape[axis])
     if k < 0 or k > n:
-        raise ValueError("topk 的 k=%d 超出维度长度 %d" % (k, n))
+        raise ValueError("topk 的 k=%d 超出维度长度 %d" % (k, n) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     data = t.data
     if k == 0:
         shape = list(data.shape)
@@ -2230,11 +2230,11 @@ def where(condition, x=None, y=None):
     if x is None and y is None:
         return tuple(Tensor(np.asarray(a, dtype=np.int64), dtype=int64) for a in np.nonzero(cond))
     if x is None or y is None:
-        raise TypeError("where 需要只给 condition，或者同时给 x 和 y")
+        raise TypeError("where 需要只给 condition，或者同时给 x 和 y" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     xt = _as_tensor(x)
     yt = _as_tensor(y)
     if getattr(xt, "device", "cpu") == "cuda" or getattr(yt, "device", "cpu") == "cuda":
-        raise NotImplementedError("CUDA where 尚未实现")
+        raise NotImplementedError("CUDA where 尚未实现" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     mask = np.asarray(cond, dtype=bool)
     floating = np.issubdtype(xt.data.dtype, np.floating) or np.issubdtype(yt.data.dtype, np.floating)
     if not floating:
@@ -2256,7 +2256,7 @@ def where(condition, x=None, y=None):
 def _split_einsum(equation, operands):
     eq = equation.replace(" ", "")
     if "..." in eq:
-        raise NotImplementedError("einsum 暂不支持省略号")
+        raise NotImplementedError("einsum 暂不支持省略号" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     if "->" in eq:
         lhs, rhs = eq.split("->")
     else:
@@ -2268,13 +2268,13 @@ def _split_einsum(equation, operands):
         rhs = "".join(ch for ch in sorted(counts) if counts[ch] == 1)
     labels = lhs.split(",") if lhs else []
     if len(labels) != len(operands):
-        raise ValueError("einsum 操作数个数 %d 和方程 %r 不一致" % (len(operands), equation))
+        raise ValueError("einsum 操作数个数 %d 和方程 %r 不一致" % (len(operands), equation) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     for lab in labels + [rhs]:
         letters = [c for c in lab if c.isalpha()]
         if len(letters) != len(set(letters)):
-            raise NotImplementedError("einsum 暂不支持重复字母: %r" % equation)
+            raise NotImplementedError("einsum 暂不支持重复字母: %r" % equation + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
         if any(not c.isalpha() for c in lab):
-            raise NotImplementedError("einsum 暂不支持字母以外的下标: %r" % equation)
+            raise NotImplementedError("einsum 暂不支持字母以外的下标: %r" % equation + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     return labels, rhs
 
 
@@ -2323,13 +2323,13 @@ def einsum(equation, *operands):
     """近似：不支持省略号和重复字母。浮点结果收成 float32。"""
     ops = [_as_tensor(o) for o in operands]
     if any(getattr(o, "device", "cpu") == "cuda" for o in ops):
-        raise NotImplementedError("CUDA einsum 尚未实现")
+        raise NotImplementedError("CUDA einsum 尚未实现" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     if not ops or not all(np.issubdtype(o.data.dtype, np.floating) for o in ops):
-        raise NotImplementedError("einsum 目前只支持浮点张量")
+        raise NotImplementedError("einsum 目前只支持浮点张量" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     labels, rhs = _split_einsum(equation, ops)
     for o, lab in zip(ops, labels):
         if o.ndim != len(lab):
-            raise ValueError("einsum %r 的字母数和形状 %s 不一致" % (lab, o.shape))
+            raise ValueError("einsum %r 的字母数和形状 %s 不一致" % (lab, o.shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     out_data = np.einsum(",".join(labels) + "->" + rhs, *[o.data for o in ops])
     rg = any(o.requires_grad for o in ops)
     out = Tensor(np.asarray(out_data, dtype=np.float32), requires_grad=rg, _parents=tuple(ops))
@@ -2361,7 +2361,7 @@ def _pack(obj):
         return {"__tgai__": "ndarray", "data": np.array(obj, copy=True)}
     if isinstance(obj, (str, int, float, bool)) or obj is None:
         return obj
-    raise TypeError("save 不支持 %s。这不是 torch.save 的 zip 格式。" % type(obj).__name__)
+    raise TypeError("save 不支持 %s。这不是 torch.save 的 zip 格式。" % type(obj).__name__ + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
 
 
 def _unpack(obj):
@@ -2383,7 +2383,7 @@ def _unpack(obj):
         return tuple(_unpack(v) for v in obj["data"])
     if kind == "state_dict":
         return {k: np.array(v, copy=True) for k, v in obj["data"].items()}
-    raise TypeError("未知存档类型 %s" % kind)
+    raise TypeError("未知存档类型 %s" % kind + "。修法：本引擎张量统一 float32；需要低精度请用 rt.fp16_gemm，而不是改 dtype")
 
 
 def _move_loaded(obj, dev):
@@ -2417,7 +2417,7 @@ def load(f, map_location=None):
         with open(f, "rb") as fh:
             payload = pickle.load(fh)
     if not isinstance(payload, dict) or payload.get("__tgai_save__") != 1:
-        raise TypeError("不是 tgai_go.train.save 写出的文件（不能读 torch.save 的 zip）")
+        raise TypeError("不是 tgai_go.train.save 写出的文件（不能读 torch.save 的 zip）" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     obj = _unpack(payload["obj"])
     dest = None
     if isinstance(map_location, Device):
@@ -2529,7 +2529,7 @@ class _Functional:
         n = int(x.shape[0])
         if int(target.shape[0]) != n:
             raise ValueError("linear_cross_entropy 目标长度 %d != N=%d"
-                             % (int(target.shape[0]), n))
+                             % (int(target.shape[0]), n) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         c = int(chunk) if chunk else n
         if c <= 0:
             c = n
@@ -2862,9 +2862,9 @@ def _sdpa_lowmem(q, k, v, scale):
 def _softmax_cuda(x, axis):
     """最后一维 softmax。反向用 y*(dy - sum(dy*y))，和 CPU 那条 exp/sum 链在 fp32 上差 ~1e-7。"""
     if axis != -1 and axis != x.ndim - 1:
-        raise NotImplementedError("CUDA softmax 目前只支持最后一维，收到 axis=%r" % (axis,))
+        raise NotImplementedError("CUDA softmax 目前只支持最后一维，收到 axis=%r" % (axis,) + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     if x.ndim < 1:
-        raise NotImplementedError("CUDA softmax 需要至少 1 维")
+        raise NotImplementedError("CUDA softmax 需要至少 1 维" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     rt = _cuda()
     y = rt.softmax_lastdim(x._gpu)
     out = Tensor._from_gpu(y, requires_grad=x.requires_grad, _parents=(x,))
@@ -2895,9 +2895,9 @@ def _silu_cuda(x):
 def _log_softmax_cuda(x, axis):
     """最后一维 log_softmax。反向是 g - softmax(x) * sum(g)。"""
     if axis != -1 and axis != x.ndim - 1:
-        raise NotImplementedError("CUDA log_softmax 目前只支持最后一维，收到 axis=%r" % (axis,))
+        raise NotImplementedError("CUDA log_softmax 目前只支持最后一维，收到 axis=%r" % (axis,) + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     if x.ndim < 1:
-        raise NotImplementedError("CUDA log_softmax 需要至少 1 维")
+        raise NotImplementedError("CUDA log_softmax 需要至少 1 维" + "。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）")
     rt = _cuda()
     y = rt.log_softmax_lastdim(x._gpu)
     out = Tensor._from_gpu(y, requires_grad=x.requires_grad, _parents=(x,))
@@ -2914,11 +2914,11 @@ def _cross_entropy_cuda(logits, target, ignore_index):
     tgt = _as_index_array(target).reshape(-1)
     n, v = logits.shape
     if tgt.shape != (n,):
-        raise ValueError("cross_entropy 目标长度 %s != N=%d" % (tgt.shape, n))
+        raise ValueError("cross_entropy 目标长度 %s != N=%d" % (tgt.shape, n) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     if np.any(tgt == ignore_index):
         return _cross_entropy_cuda_ignore(logits, tgt, ignore_index)
     if np.any((tgt < 0) | (tgt >= v)):
-        raise ValueError("cross_entropy 目标越界，合法范围是 [0, %d)" % v + HINT_CE)
+        raise ValueError("cross_entropy 目标越界，合法范围是 [0, %d)" % v + HINT_CE + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     rt = _cuda()
     tgt_buf = rt.h2d(tgt, dtype=np.int32, cache_slot="ce_tgt")
     loss_buf = rt.ce_fwd(logits._gpu, tgt_buf, n, v)
@@ -3077,7 +3077,7 @@ class Module:
     def load_state_dict(self, sd):
         for name, p in self.named_parameters():
             if name not in sd:
-                raise KeyError("缺少参数: %s" % name)
+                raise KeyError("缺少参数: %s" % name + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             if getattr(p, "device", "cpu") == "cuda":
                 arr = np.asarray(sd[name], dtype=np.float32).reshape(p.shape)
                 p._gpu = _cuda().h2d(arr)
@@ -3157,7 +3157,7 @@ class Embedding(Module):
         vocab = int(self.weight.shape[0])
         d = int(self.weight.shape[1])
         if flat.size and ((flat < 0) | (flat >= vocab)).any():
-            raise IndexError("Embedding 下标越界，合法范围是 [0, %d)" % vocab)
+            raise IndexError("Embedding 下标越界，合法范围是 [0, %d)" % vocab + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         seq = int(flat.shape[0])
         ids = rt.h2d(flat.astype(np.int32), dtype=np.int32, cache_slot="emb_ids")
         out_shape = tuple(int(s) for s in idx.shape) + (d,)
@@ -3247,7 +3247,7 @@ def _rope_composed(x, cos, sin):
     """参考实现（与 examples 里的 rope() 逐位一致）：x*cos + (x@P)*sin。"""
     dh = int(x.shape[-1]) if x.ndim else 0
     if dh < 2 or dh % 2:
-        raise ValueError("RoPE 需要最后一维为 >=2 的偶数，收到 %s" % (x.shape,))
+        raise ValueError("RoPE 需要最后一维为 >=2 的偶数，收到 %s" % (x.shape,) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     return x * cos + (x @ _rope_perm(dh)) * sin
 
 
@@ -3446,10 +3446,10 @@ class RMSNorm(Module):
     def _forward_cuda(self, x):
         rt = _cuda()
         if x.ndim < 1:
-            raise ValueError("RMSNorm 需要至少 1 维")
+            raise ValueError("RMSNorm 需要至少 1 维" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         d = int(x.shape[-1])
         if int(self.weight.numel()) != d:
-            raise ValueError("RMSNorm weight 长度 %d != 最后一维 %d" % (self.weight.numel(), d))
+            raise ValueError("RMSNorm weight 长度 %d != 最后一维 %d" % (self.weight.numel(), d) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         seq = int(x.numel() // d) if d else 0
         eps = float(self.eps)
         y = rt.rmsnorm_fwd(x._gpu, self.weight._gpu, seq, d, eps)
@@ -3484,7 +3484,7 @@ class CausalSelfAttention(Module):
     def __init__(self, d_model, n_heads):
         super().__init__()
         if d_model % n_heads:
-            raise ValueError("d_model 必须能被 n_heads 整除")
+            raise ValueError("d_model 必须能被 n_heads 整除" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
@@ -3856,13 +3856,13 @@ class MoE(Module):
         n_experts = int(n_experts)
         top_k = int(top_k)
         if d_model < 1 or d_ff < 1:
-            raise ValueError("MoE 的 d_model / d_ff 必须为正")
+            raise ValueError("MoE 的 d_model / d_ff 必须为正" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if n_experts < 1:
-            raise ValueError("MoE 至少要 1 个专家")
+            raise ValueError("MoE 至少要 1 个专家" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if top_k < 1 or top_k > n_experts:
-            raise ValueError("top_k=%d 必须落在 [1, %d]" % (top_k, n_experts))
+            raise ValueError("top_k=%d 必须落在 [1, %d]" % (top_k, n_experts) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if gate not in ("softmax", "sigmoid"):
-            raise ValueError("gate 只接受 softmax / sigmoid，收到 %r" % (gate,))
+            raise ValueError("gate 只接受 softmax / sigmoid，收到 %r" % (gate,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         self.d_model = d_model
         self.d_ff = d_ff
         self.n_experts = n_experts
@@ -3877,19 +3877,19 @@ class MoE(Module):
         if not isinstance(x, Tensor):
             x = _as_tensor(x)
         if x.ndim < 1:
-            raise ValueError("MoE 输入至少 1 维")
+            raise ValueError("MoE 输入至少 1 维" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if int(x.shape[-1]) != self.d_model:
             raise ValueError(
-                "MoE 最后一维 %d != d_model %d" % (int(x.shape[-1]), self.d_model))
+                "MoE 最后一维 %d != d_model %d" % (int(x.shape[-1]), self.d_model) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
         dev_x = getattr(x, "device", "cpu")
         dev_w = getattr(self.router.weight, "device", "cpu")
         if dev_x != dev_w:
-            raise RuntimeError("MoE 参数在 %s，输入在 %s" % (dev_w, dev_x))
+            raise RuntimeError("MoE 参数在 %s，输入在 %s" % (dev_w, dev_x) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         n = 1
         for s in x.shape[:-1]:
             n *= int(s)
         if n > 2147483647 // self.top_k:
-            raise ValueError("MoE token 数过大")
+            raise ValueError("MoE token 数过大" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         flat = x.reshape((n, self.d_model))
         y = flat * 0.0 if n == 0 else self._forward_flat(flat)
         return y.reshape(tuple(int(s) for s in x.shape))
@@ -4153,7 +4153,7 @@ class AdamW(_Optim):
                 # PyTorch 的 AdamW 跳过 grad is None；这里同样跳过，更新本身在 GPU 上做。
                 g = p.grad
                 if not isinstance(g, Tensor) or getattr(g, "device", "cpu") != "cuda":
-                    raise TypeError("CUDA AdamW 需要 CUDA Tensor 梯度，收到 %s" % type(g).__name__)
+                    raise TypeError("CUDA AdamW 需要 CUDA Tensor 梯度，收到 %s" % type(g).__name__ + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
                 _cuda().adamw(
                     p._gpu, g._gpu, self.m[i], self.v[i],
                     b1, omb1, b2, omb2, lr, wd_lr, eps, bc1s, bc2s, do_wd,
@@ -4271,7 +4271,7 @@ class Muon(_Optim):
         rt = _cuda()
         g = p.grad
         if not isinstance(g, Tensor) or getattr(g, "device", "cpu") != "cuda":
-            raise TypeError("CUDA Muon 需要 CUDA Tensor 梯度，收到 %s" % type(g).__name__)
+            raise TypeError("CUDA Muon 需要 CUDA Tensor 梯度，收到 %s" % type(g).__name__ + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if len(p.shape) != 2:
             b1, b2, eps = 0.9, 0.999, 1e-8
             bc1 = 1.0 - b1 ** self.t
@@ -4348,7 +4348,7 @@ optim = _OptimModule()
 def permute(input, dims):
     """对应 torch.permute(input, dims)。dims 是轴的排列。"""
     if not isinstance(dims, (tuple, list)):
-        raise TypeError("permute 的 dims 需要 tuple 或 list，收到 %s" % type(dims).__name__)
+        raise TypeError("permute 的 dims 需要 tuple 或 list，收到 %s" % type(dims).__name__ + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     return _as_tensor(input).permute(*dims)
 
 
@@ -4356,10 +4356,10 @@ def _repeat_interleave_impl(input, repeats, dim=None):
     """整数 repeats：沿 dim 把每个元素连续复制 repeats 次。dim=None 时先展平。"""
     t = _as_tensor(input)
     if isinstance(repeats, (bool, np.bool_)) or not isinstance(repeats, (int, np.integer)):
-        raise TypeError("repeat_interleave 的 repeats 目前只支持整数，收到 %s" % type(repeats).__name__)
+        raise TypeError("repeat_interleave 的 repeats 目前只支持整数，收到 %s" % type(repeats).__name__ + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     repeats = int(repeats)
     if repeats < 0:
-        raise RuntimeError("repeats 必须 >= 0，收到 %d" % repeats)
+        raise RuntimeError("repeats 必须 >= 0，收到 %d" % repeats + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     if dim is None:
         t = t.reshape((int(t.numel()),))
         dim = 0
@@ -4369,11 +4369,11 @@ def _repeat_interleave_impl(input, repeats, dim=None):
         return t._repeat_interleave_cuda(repeats, dim)
     axis = int(dim)
     if t.ndim == 0:
-        raise RuntimeError("标量不能 repeat_interleave，先 reshape 成 1 维")
+        raise RuntimeError("标量不能 repeat_interleave，先 reshape 成 1 维" + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
     if axis < 0:
         axis += t.ndim
     if axis < 0 or axis >= t.ndim:
-        raise IndexError("dim %s 越界（ndim=%d）" % (dim, t.ndim))
+        raise IndexError("dim %s 越界（ndim=%d）" % (dim, t.ndim) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
     data = np.repeat(t.data, repeats, axis=axis)
     if not np.issubdtype(t.data.dtype, np.floating):
         return Tensor(data, dtype=t.dtype, requires_grad=False)

@@ -23,10 +23,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRAIN = os.path.join(REPO, "python", "tgai_go", "train")
 
 # 存量基线：只允许减少，不允许增加（增加会让测试红）
-BASELINE = {
-    "cuda.py": 149,
-    "__init__.py": 119,
-}
+BASELINE = {}   # 2026-11-03：存量 268 条已全部补齐，现在**全模块强制**
 
 
 def _scan(path):

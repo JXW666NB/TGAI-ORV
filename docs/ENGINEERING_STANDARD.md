@@ -223,8 +223,10 @@ aise ValueError(msg)）时静态判不了，扫描器会**跳过并计数**，
 | ops_* / dtypes / dist_p2p / graph_train（本会话新增） | 0 / 53 | ✅ 强制 |
 | checkpoints / data / 
 n_ops / export / pipeline / dist / ackend / ops_plugin / doctor / qwen | **0** | ✅ 强制（本轮补齐 30 条） |
-| cuda.py | 149 | 🟡 棘轮锁定基线（只减不增） |
-| __init__.py | 119 | 🟡 棘轮锁定基线（只减不增） |
+| cuda.py | **0**（原 149） | ✅ 强制（本轮补齐 149 条：编译/显存/BLAS 分类提示 + 22 条多行） |
+| __init__.py | **0**（原 119） | ✅ 强制（本轮补齐 119 条：形状/不支持/dtype 分类提示） |
+
+**全包 268 条 raise 现在 100% 带「修法」**，BASELINE 已清空 = 全模块强制。
 
 「棘轮」= 	ests/test_error_messages.py 里记了基线数字，**新增的 raise 不带「修法」就会红**，
 补完一批就把基线调低。这样大文件也能持续收敛，而不是一次性堵死。
