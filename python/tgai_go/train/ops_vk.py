@@ -125,12 +125,9 @@ def load_spirv(path, entry="main"):
     """
     if not os.path.isfile(path):
         raise FileNotFoundError("找不到 SPIR-V：%s。修法：用 glslc 把 .comp 编成 .spv" % path)
-    devs = devices()
-    if not devs:
-        raise RuntimeError(
-            "本机没有可用的 Vulkan 设备（或 loader 缺失）。修法：装显卡驱动里的 Vulkan 运行时；"
-            "核显通常自带 Vulkan，但没有 CUDA，此时可用 python 档兜底")
+    # 这个入口是早期骨架，已被 ops_vk_compute / ops_vk_ops 取代。
+    # 这里**不再枚举设备**：AMD 驱动在同一进程里反复建/销毁 instance 会崩测试进程。
     raise NotImplementedError(
-        "Vulkan 的 dispatch 还没实现（已探测到设备：%s）。"
-        "当前可用后端：cuda（NVIDIA）与 cpu。修法：插件包里加 python 或 cpu 档"
-        % ", ".join(d["name"] for d in devs))
+        "ops_vk.load_spirv 是早期骨架，已被 ops_vk_ops.register_elementwise 取代。"
+        "修法：用 `from tgai_go.train import ops_vk_ops; ops_vk_ops.register_elementwise("
+        "name, fwd_spv, bwd_spv)`；或在 .tgop 里写 vulkan 档")

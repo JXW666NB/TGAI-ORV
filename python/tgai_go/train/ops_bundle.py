@@ -138,11 +138,17 @@ def load(path, verbose=True):
             fwd = spec.get("fwd") or (name + "_fwd")
             bwd = spec.get("bwd") or (name + "_bwd")
             ops_cpu.register_elementwise(name, h, fwd, bwd, spec.get("bwd2"), arity=arity)
+        elif chosen == "vulkan":
+            from tgai_go.train import ops_vk_ops
+            fwd = ops_vk_ops.spv_of(zf.read(spec["spirv"]))
+            bwd = (ops_vk_ops.spv_of(zf.read(spec["bwd_spirv"]))
+                   if spec.get("bwd_spirv") else fwd)
+            ops_vk_ops.register_elementwise(name, fwd, bwd, arity=arity)
         elif chosen == "python":
             ops_plugin.register(name, _python_impl(zf, spec, name))
         else:
             raise BundleError(
-                "后端 %r 的加载器还没实现（引擎当前只实现了 cuda 与 python）。"
+                "后端 %r 的加载器还没实现（引擎当前只实现了 cuda / cpu / vulkan / python）。"
                 "修法：临时用 python 档，或在 issue 里说明需要 %r" % (chosen, chosen))
     if verbose:
         print("[tgop] 加载 %s：本机可用=%s，选中=%s" % (os.path.basename(path),

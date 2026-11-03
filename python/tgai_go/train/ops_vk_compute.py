@@ -41,10 +41,11 @@ ST_COMMAND_BUFFER_BEGIN = 42
 ST_MEMORY_BARRIER = 46
 
 USAGE_STORAGE = 0x20
+USAGE_TRANSFER_DST = 0x2
 SHARING_EXCLUSIVE = 0
 DESC_STORAGE_BUFFER = 7
 STAGE_COMPUTE = 0x20
-BIND_COMPUTE = 4
+BIND_COMPUTE = 1  # VK_PIPELINE_BIND_POINT_COMPUTE（之前错写成 4，导致绑定非法、写被丢弃）
 CMD_ONE_TIME_SUBMIT = 0x1
 QUEUE_COMPUTE = 0x2
 MEM_HOST_VISIBLE = 0x2
@@ -372,11 +373,34 @@ class VulkanCompute:
         L.vkCreateCommandPool.restype = ctypes.c_int
         self._chk(L.vkCreateCommandPool(self.dev, ctypes.byref(pci), None,
                                         ctypes.byref(self.cmd_pool)), "vkCreateCommandPool")
+        # 复用：命令缓冲与 fence 只建一次（每次 dispatch 重建成 1.8 ms 固定开销）
+        cba = _CommandBufferAllocI(ST_COMMAND_BUFFER_ALLOC, None, self.cmd_pool, 0, 1)
+        self._cmd = ctypes.c_void_p()
+        L.vkAllocateCommandBuffers.restype = ctypes.c_int
+        self._chk(L.vkAllocateCommandBuffers(self.dev, ctypes.byref(cba),
+                                             ctypes.byref(self._cmd)), "vkAllocateCommandBuffers")
+        fci = _FenceCI(ST_FENCE, None, 0)
+        self._fence = ctypes.c_void_p()
+        L.vkCreateFence.restype = ctypes.c_int
+        self._chk(L.vkCreateFence(self.dev, ctypes.byref(fci), None,
+                                  ctypes.byref(self._fence)), "vkCreateFence")
+        self._buf_pool = {}          # nbytes -> [buffer dict, ...]（空闲可复用）
+        L.vkResetCommandBuffer.restype = ctypes.c_int
+        L.vkResetFences.restype = ctypes.c_int
 
-    # ---------- 资源 ----------
-    def _buffer(self, nbytes):
+    # ---------- 资源（带池化）----------
+    def _acquire(self, nbytes):
+        pool = self._buf_pool.setdefault(int(nbytes), [])
+        if pool:
+            return pool.pop()
+        return self._buffer(int(nbytes))
+
+    def _release(self, b):
+        self._buf_pool.setdefault(b["n"], []).append(b)
+
+    def _buffer(self, nbytes, usage=USAGE_STORAGE):
         L = self.lib
-        ci = _BufferCI(ST_BUFFER, None, 0, int(nbytes), USAGE_STORAGE, SHARING_EXCLUSIVE, 0, None)
+        ci = _BufferCI(ST_BUFFER, None, 0, int(nbytes), usage, SHARING_EXCLUSIVE, 0, None)
         buf = ctypes.c_void_p()
         L.vkCreateBuffer.restype = ctypes.c_int
         self._chk(L.vkCreateBuffer(self.dev, ctypes.byref(ci), None, ctypes.byref(buf)),
@@ -433,7 +457,8 @@ class VulkanCompute:
                                              ctypes.byref(pipe)),
                   "vkCreateComputePipelines")
         psi = _DescriptorPoolSize(DESC_STORAGE_BUFFER, max(1, nbuf))
-        dpci = _DescriptorPoolCI(ST_DESCRIPTOR_POOL, None, 0x2, 1, 1, ctypes.pointer(psi))
+        # flags 用 0：之前传的 0x2 不是合法 flag（FREE_DESCRIPTOR_SET 是 0x1）
+        dpci = _DescriptorPoolCI(ST_DESCRIPTOR_POOL, None, 0, 1, 1, ctypes.pointer(psi))
         pool = ctypes.c_void_p()
         L.vkCreateDescriptorPool.restype = ctypes.c_int
         self._chk(L.vkCreateDescriptorPool(self.dev, ctypes.byref(dpci), None,
@@ -448,14 +473,19 @@ class VulkanCompute:
         return info
 
     # ---------- 执行 ----------
-    def run(self, spv, inputs, out_bytes, n_elem, local_size=64):
-        """跑一个计算内核：inputs 是字节串列表，返回 out_bytes 字节的输出。"""
+    def run(self, spv, inputs, out_bytes, n_elem, local_size=64, prefill=None):
+        """跑一个计算内核：inputs 是字节串列表，返回 out_bytes 字节的输出。
+
+        `prefill`：先把输出缓冲填成这个字节串（诊断用，验证内核到底有没有写）。
+        """
         L = self.lib
         p = self._pipeline(spv, len(inputs) + 1)
-        bufs = [self._buffer(len(b)) for b in inputs]
-        obuf = self._buffer(out_bytes)
+        bufs = [self._acquire(len(b)) for b in inputs]
+        obuf = self._acquire(out_bytes)
         for b, data in zip(bufs, inputs):
             ctypes.memmove(b["ptr"], data, len(data))
+        if prefill is not None:
+            ctypes.memmove(obuf["ptr"], prefill, min(len(prefill), out_bytes))
         # 每个 write 需要自己的 VkDescriptorBufferInfo 指针；用 list 持有引用防 GC
         infos = [_DescriptorBufferInfo(b["buf"], 0, b["n"]) for b in bufs + [obuf]]
         writes = (_WriteDescriptorSet * (len(bufs) + 1))()
@@ -466,11 +496,10 @@ class VulkanCompute:
         L.vkUpdateDescriptorSets.restype = None
         L.vkUpdateDescriptorSets(self.dev, len(bufs) + 1, writes, 0, None)
 
-        cba = _CommandBufferAllocI(ST_COMMAND_BUFFER_ALLOC, None, self.cmd_pool, 0, 1)
-        cmd = ctypes.c_void_p()
-        L.vkAllocateCommandBuffers.restype = ctypes.c_int
-        self._chk(L.vkAllocateCommandBuffers(self.dev, ctypes.byref(cba), ctypes.byref(cmd)),
-                  "vkAllocateCommandBuffers")
+        # 复用同一个命令缓冲 + fence（每次重建约 1.8 ms，是之前慢 numpy 几十倍的主因）
+        cmd = self._cmd
+        fence = self._fence
+        self._chk(L.vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer")
         begin = _CommandBufferBeginI(ST_COMMAND_BUFFER_BEGIN, None, CMD_ONE_TIME_SUBMIT, None)
         L.vkBeginCommandBuffer.restype = ctypes.c_int
         self._chk(L.vkBeginCommandBuffer(cmd, ctypes.byref(begin)), "vkBeginCommandBuffer")
@@ -479,15 +508,15 @@ class VulkanCompute:
         L.vkCmdBindDescriptorSets(cmd, BIND_COMPUTE, p["pl"], 0, 1, dsets, 0, None)
         groups = (int(n_elem) + local_size - 1) // local_size
         L.vkCmdDispatch(cmd, max(1, groups), 1, 1)
-        bar = _MemoryBarrier(ST_MEMORY_BARRIER, None, 0x1000 | 0x2000, 0x1000 | 0x2000)
-        L.vkCmdPipelineBarrier(cmd, 0x1000, 0x1000, 0, 1, ctypes.byref(bar), 0, None, 0, None)
+        # 让 compute 的写对 HOST 可见。之前这里掩码写错（用了 TRANSFER/HOST 的旧值），
+        # GPU 写了但主机读到旧值 —— 表现就是"输出全 0"。
+        # srcAccess=SHADER_WRITE(0x40) dstAccess=HOST_READ(0x2000)
+        # srcStage=COMPUTE_SHADER(0x800) dstStage=HOST(0x4000)
+        bar = _MemoryBarrier(ST_MEMORY_BARRIER, None, 0x40, 0x2000)
+        L.vkCmdPipelineBarrier(cmd, 0x800, 0x4000, 0, 1, ctypes.byref(bar), 0, None, 0, None)
         L.vkEndCommandBuffer.restype = ctypes.c_int
         self._chk(L.vkEndCommandBuffer(cmd), "vkEndCommandBuffer")
-        fci = _FenceCI(ST_FENCE, None, 0)
-        fence = ctypes.c_void_p()
-        L.vkCreateFence.restype = ctypes.c_int
-        self._chk(L.vkCreateFence(self.dev, ctypes.byref(fci), None, ctypes.byref(fence)),
-                  "vkCreateFence")
+        self._chk(L.vkResetFences(self.dev, 1, ctypes.byref(fence)), "vkResetFences")
         cmds = (ctypes.c_void_p * 1)(cmd)
         si = _SubmitInfo(ST_SUBMIT, None, 0, None, None, 1, cmds, 0, None)
         L.vkQueueSubmit.restype = ctypes.c_int
@@ -495,18 +524,31 @@ class VulkanCompute:
         L.vkWaitForFences.restype = ctypes.c_int
         self._chk(L.vkWaitForFences(self.dev, 1, ctypes.byref(fence), 1, 10 ** 10),
                   "vkWaitForFences")
+        L.vkDeviceWaitIdle.restype = ctypes.c_int
+        L.vkDeviceWaitIdle(self.dev)
         out = ctypes.string_at(obuf["ptr"], out_bytes)
-        # 清理（简单起见每次新建/销毁；核显上这点开销可接受，后续再做池化）
-        L.vkDestroyFence(self.dev, fence, None)
-        L.vkFreeCommandBuffers(self.dev, self.cmd_pool, 1, ctypes.byref(cmd))
+        # 缓冲归还池子，下次同尺寸直接复用（不再每次新建/销毁）
         for b in bufs + [obuf]:
-            L.vkUnmapMemory(self.dev, b["mem"])
-            L.vkDestroyBuffer(self.dev, b["buf"], None)
-            L.vkFreeMemory(self.dev, b["mem"], None)
+            self._release(b)
         return out
 
     def close(self):
+        """幂等销毁。Vulkan 对象必须在进程退出前显式释放，否则驱动 teardown 会段错误。"""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         L = self.lib
+        for pool in getattr(self, "_buf_pool", {}).values():
+            for b in pool:
+                L.vkUnmapMemory(self.dev, b["mem"])
+                L.vkDestroyBuffer(self.dev, b["buf"], None)
+                L.vkFreeMemory(self.dev, b["mem"], None)
+        if getattr(self, "_buf_pool", None):
+            self._buf_pool.clear()
+        if getattr(self, "_fence", None):
+            L.vkDestroyFence(self.dev, self._fence, None)
+        if getattr(self, "_cmd", None):
+            L.vkFreeCommandBuffers(self.dev, self.cmd_pool, 1, ctypes.byref(self._cmd))
         for info in self._cache.values():
             L.vkDestroyDescriptorPool(self.dev, info["pool"], None)
             L.vkDestroyPipeline(self.dev, info["pipe"], None)
