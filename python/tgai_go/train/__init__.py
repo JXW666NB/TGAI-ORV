@@ -4016,6 +4016,11 @@ def _invalidate_fp16_after_step(fn):
             fp16_shadows_invalidate()
         except Exception:
             pass
+        try:                       # AMP 的权重 fp16 影子也必须跟着失效
+            from tgai_go.train import amp_mlp as _amp
+            _amp.invalidate()
+        except Exception:
+            pass
         return out
     return wrapped
 

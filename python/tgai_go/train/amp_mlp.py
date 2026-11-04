@@ -52,26 +52,34 @@ def invalidate():
 # ---------------------------------------------------------------- CUDA 源码
 _SRC = r"""
 /* fp16 位模式与 fp32 互转（与 cuda.py 里的实现同源，这里自包含） */
-__device__ unsigned short tg_f32_to_f16_bits(float f) {
-    unsigned int u = __float_as_uint(f);
-    unsigned int s = (u >> 16) & 0x8000u;
-    int e = (int)((u >> 23) & 0xffu) - 127 + 15;
-    unsigned int m = u & 0x7fffffu;
-    if (((u >> 23) & 0xffu) == 0xffu) {
-        return (unsigned short)(s | 0x7c00u | (m ? 0x200u : 0u));
+__device__ __forceinline__ unsigned int amp_f32_to_f16_bits(float f) {
+    unsigned int x = __float_as_uint(f);
+    unsigned int s = x & 0x80000000u;
+    unsigned int mag = x & 0x7fffffffu;
+    if (mag >= 0x7f800000u) {                    /* inf / nan */
+        unsigned int payload = (mag > 0x7f800000u) ? 0x200u : 0u;
+        return (s >> 16) | 0x7c00u | payload;
     }
-    if (e <= 0) {
-        if (e < -10) return (unsigned short)s;
+    if (mag >= 0x477ff000u) {                    /* >= 65520 一律进位成 inf */
+        return (s >> 16) | 0x7c00u;
+    }
+    int e = (int)(mag >> 23);                    /* 偏置 127 的指数 */
+    unsigned int m = mag & 0x7fffffu;
+    int ne = e - 127 + 15;                       /* 换成偏置 15 */
+    if (ne <= 0) {                               /* half 的次正规 / 0（< 2^-14） */
+        if (ne < -10) return s >> 16;            /* 太小，舍到 0 */
         m |= 0x800000u;
-        int sh = 1 - e;
-        unsigned int t = m >> (13 + sh);
-        if ((m >> (12 + sh)) & 1u) t += 1u;
-        return (unsigned short)(s | t);
+        int sh = 14 - ne;                        /* 14..24，留 10 位 */
+        unsigned int h = m >> sh;
+        unsigned int rem = m & ((1u << sh) - 1u);
+        unsigned int mid = 1u << (sh - 1);
+        if (rem > mid || (rem == mid && (h & 1u))) h++;
+        return (s >> 16) | h;
     }
-    if (e >= 31) return (unsigned short)(s | 0x7c00u);
-    unsigned int t = m >> 13;
-    if (m & 0x1000u) t += 1u;
-    return (unsigned short)(s | ((unsigned int)e << 10) | t);
+    unsigned int h = ((unsigned int)ne << 10) | (m >> 13);
+    unsigned int rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
+    return (s >> 16) | h;
 }
 
 __device__ float tg_f16_bits_to_f32(unsigned int h) {
@@ -92,7 +100,7 @@ __device__ float tg_f16_bits_to_f32(unsigned int h) {
 extern "C" __global__ void amp_cast_f32_to_f16(const float* __restrict__ a,
                                                unsigned short* __restrict__ o, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) o[i] = tg_f32_to_f16_bits(a[i]);
+    if (i < n) o[i] = amp_f32_to_f16_bits(a[i]);
 }
 
 /* act = silu(g) * u，全部 fp16 存储、fp32 计算 */
@@ -104,7 +112,7 @@ extern "C" __global__ void amp_silu_mul_f16(const unsigned short* __restrict__ g
         float gv = tg_f16_bits_to_f32((unsigned int)g[i]);
         float uv = tg_f16_bits_to_f32((unsigned int)u[i]);
         float s = 1.0f / (1.0f + __expf(-gv));
-        o[i] = tg_f32_to_f16_bits(gv * s * uv);
+        o[i] = amp_f32_to_f16_bits(gv * s * uv);
     }
 }
 
@@ -121,8 +129,8 @@ extern "C" __global__ void amp_silu_mul_f16_bwd(const unsigned short* __restrict
         float s = 1.0f / (1.0f + __expf(-gv));
         /* dsilu/dg = s * (1 + g*(1-s)) */
         float ds = s * (1.0f + gv * (1.0f - s));
-        dg[i] = tg_f32_to_f16_bits(d * uv * ds);
-        du[i] = tg_f32_to_f16_bits(d * gv * s);
+        dg[i] = amp_f32_to_f16_bits(d * uv * ds);
+        du[i] = amp_f32_to_f16_bits(d * gv * s);
     }
 }
 """
@@ -277,18 +285,18 @@ def mlp(h, W1, W2, W3):
     def bw(g, grads):
         dy = g
         dy16 = to_f16(dy._gpu if hasattr(dy, "_gpu") else dy)
-        d_act16 = _gemm_nn_out16(dy16, W316, N, FF, D)
+        d_act16 = _gemm_nn_out16(dy16, W316, N, D, FF)
         dg16, du16 = silu_mul_bwd_f16(d_act16, g16, u16, N * FF)
         if t.requires_grad:
-            dh = _gemm_nn_raw(dg16, W116, N, D, FF)
-            dh2 = _gemm_nn_raw(du16, W216, N, D, FF)
+            dh = _gemm_nn_raw(dg16, W116, N, FF, D)
+            dh2 = _gemm_nn_raw(du16, W216, N, FF, D)
             T._acc(grads, t, _add_bufs(dh, dh2, (N, D)))
         if W1.requires_grad:
-            T._acc(grads, W1, _gemm_tn_raw(dg16, h16, N, D, FF))
+            T._acc(grads, W1, _gemm_tn_raw(dg16, h16, N, FF, D))
         if W2.requires_grad:
-            T._acc(grads, W2, _gemm_tn_raw(du16, h16, N, D, FF))
+            T._acc(grads, W2, _gemm_tn_raw(du16, h16, N, FF, D))
         if W3.requires_grad:
-            T._acc(grads, W3, _gemm_tn_raw(dy16, act16, N, FF, D))
+            T._acc(grads, W3, _gemm_tn_raw(dy16, act16, N, D, FF))
 
     out._backward = bw
     return out

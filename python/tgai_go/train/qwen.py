@@ -20,6 +20,7 @@ import os
 import numpy as np
 
 import tgai_go.train as T
+from tgai_go.train import amp_mlp as _amp_mlp
 from tgai_go.train import checkpoints as C
 from tgai_go.train import functional as F
 from tgai_go.train import nn_ops as O
@@ -231,6 +232,12 @@ class Qwen25:
         x = x + (o @ p[b + "attn.out_proj.weight"].T).reshape(B, S, D)
 
         h2 = self.ln2[i](x).reshape(B * S, D)
+        # AMP：激活存 fp16（开关 cfg["MLP_FP16"]，默认关；数值实测 前向 6.4e-4/梯度 1.2e-3）
+        if cfg.get("MLP_FP16") and _amp_mlp.enabled():
+            _y = _amp_mlp.mlp(h2, p[b + "ffn.w1.weight"], p[b + "ffn.w2.weight"],
+                              p[b + "ffn.w3.weight"])
+            x = x + _y.reshape(B, S, D)
+            return x
         g = h2 @ p[b + "ffn.w1.weight"].T
         u = h2 @ p[b + "ffn.w2.weight"].T
         # 融合 silu(g)*u：CUDA 上 fwd/bwd 各 1 个 kernel（组合实现要 5 个）。
