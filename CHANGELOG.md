@@ -3,6 +3,14 @@
 这一版几乎全是**性能与可复现性**，每条都有实测数字。判据与证据见
 `docs/GAP_VS_PYTORCH.md` §10~§22 与 `docs/PRODUCTION_READINESS.md`。
 
+### 新增 · 真 AMP（激活存 fp16）
+- `train/amp_mlp.py`：MLP 块内部激活存 fp16，**主权重 fp32 + fp32 累加**（标准 AMP 语义）。
+- 数值（块级 vs fp32）：前向 **6.36e-04**、dh **7.56e-04**、dW1/2/3 **8.4e-04 ~ 1.17e-03**；
+  端到端 3 步 loss 相对差 **1.54e-05**。
+- 步时（V100，0.5B 形状，24 层，6 步）：fp32 527.2 → 仅 fp16 GEMM 354.0 → **AMP 263.5 ms**
+  ⇒ 对原现状 **1.34×**、对 fp32 **2.00×**。
+- 开关 `cfg["MLP_FP16"]`，**默认关**（fp16 有精度地板：1000 步任务 fp16 停在 1.2e-02、fp32 到 2e-06）。
+- 过程中修掉的三个自有 bug 记录在 `docs/PRODUCTION_READINESS.md`。
 ### 新增 · 存储精度 float32 / float16 / bfloat16（新模块 	rain/dtypes.py）
 - save_weights(path, weights, dtype="bfloat16") / load_weights(path)：
   检查点可按 fp16 或 bf16 存储（体积减半），文件内**逐张量记 dtype**，允许混合精度。
