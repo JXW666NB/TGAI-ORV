@@ -97,6 +97,14 @@ __device__ float tg_f16_bits_to_f32(unsigned int h) {
     return __uint_as_float(s | ((e + 112u) << 23) | (m << 13));
 }
 
+extern "C" __global__ void amp_count_nonfinite(const float* __restrict__ a, int* __restrict__ flag, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = a[i];
+        if (!(v == v) || v > 3.402823466e38f || v < -3.402823466e38f) atomicOr(flag, 1);
+    }
+}
+
 extern "C" __global__ void amp_cast_f32_to_f16(const float* __restrict__ a,
                                                unsigned short* __restrict__ o, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -256,6 +264,71 @@ def silu_mul_bwd_f16(dy16, g16, u16, n):
     du = _f16_buf((int(n),))
     _launch("amp_silu_mul_f16_bwd", [dy16, g16, u16, dg, du], int(n))
     return dg, du
+
+
+
+class GradScaler:
+    """等价于 torch.cuda.amp.GradScaler：**动态**梯度缩放 + 溢出跳步。
+
+    为什么必须有：静态缩放在 0.5B 上两头不讨好 —— 缩放小则梯度下溢（学不动），
+    缩放大到能用则迟早溢出成 inf，参数被污染，loss 出现尖峰。
+    做法与 PyTorch 一致：先按需放大、每步检查梯度是否有限；非有限就**跳过更新**并把
+    scale 减半；连续若干步正常再把 scale 翻倍。
+    """
+
+    def __init__(self, init_scale=1024.0, growth=2.0, backoff=0.5,
+                 growth_interval=200, max_scale=2.0 ** 16):
+        self.scale = float(init_scale)
+        self.growth = float(growth)
+        self.backoff = float(backoff)
+        self.growth_interval = int(growth_interval)
+        self.max_scale = float(max_scale)
+        self.good = 0
+        self.skipped = 0
+
+    def begin(self):
+        """把当前 scale 应用给块内反向（每个 step 前调用一次）。"""
+        global AMP_GRAD_SCALE
+        AMP_GRAD_SCALE = self.scale
+
+    def _grads_finite(self, params):
+        rt = _rt()
+        flag = rt.zeros((1,), dtype=np.int32)
+        total = 0
+        for p in params:
+            g = getattr(p, "grad", None)
+            if g is None or getattr(g, "device", "cpu") != "cuda":
+                continue
+            n = int(g._gpu.n)
+            if not n:
+                continue
+            grid, block = rt._ewise_grid(n)
+            _launch("amp_count_nonfinite", [g._gpu, flag], n)
+            total += n
+        if not total:
+            return True
+        return int(rt.read_scalar(flag)) == 0
+
+    def end(self, params):
+        """反向结束、优化器更新前调用。返回 True 表示**可以更新**（并已把梯度还原）。"""
+        if not self._grads_finite(params):
+            self.skipped += 1
+            self.scale = max(1.0, self.scale * self.backoff)
+            self.good = 0
+            return False
+        rt = _rt()
+        inv = 1.0 / self.scale
+        if inv != 1.0:
+            for p in params:
+                g = getattr(p, "grad", None)
+                if g is None or getattr(g, "device", "cpu") != "cuda":
+                    continue
+                rt.scale_inplace(g._gpu, inv)
+        self.good += 1
+        if self.good >= self.growth_interval and self.scale < self.max_scale:
+            self.scale = min(self.max_scale, self.scale * self.growth)
+            self.good = 0
+        return True
 
 
 def mlp(h, W1, W2, W3):
