@@ -283,23 +283,58 @@ def mlp(h, W1, W2, W3):
                              _parents=(t, W1, W2, W3))
 
     def bw(g, grads):
+        # ★ 梯度缩放（等价于 torch 的 GradScaler）：梯度直接转 fp16 会**下溢**
+        #   （fp16 最小正规数 6e-5；深层梯度常远小于此），实测 0.5B/300 步会明显退化。
+        #   先把 dy 乘 AMP_GRAD_SCALE 再转 fp16，所有中间梯度同步放大，
+        #   最后在写回 grads 前除回 —— 全程 fp16 精度被拉回可用区间。
+        S = float(AMP_GRAD_SCALE)
         dy = g
-        dy16 = to_f16(dy._gpu if hasattr(dy, "_gpu") else dy)
+        dy_buf = dy._gpu if hasattr(dy, "_gpu") else dy
+        if S != 1.0:
+            dy_buf = _scaled_copy(dy_buf, S)
+        dy16 = to_f16(dy_buf)
         d_act16 = _gemm_nn_out16(dy16, W316, N, D, FF)
         dg16, du16 = silu_mul_bwd_f16(d_act16, g16, u16, N * FF)
         if t.requires_grad:
             dh = _gemm_nn_raw(dg16, W116, N, FF, D)
             dh2 = _gemm_nn_raw(du16, W216, N, FF, D)
-            T._acc(grads, t, _add_bufs(dh, dh2, (N, D)))
+            merged = _add_bufs(dh, dh2, (N, D))
+            T._acc(grads, t, _unscale_inplace(merged, S))
         if W1.requires_grad:
-            T._acc(grads, W1, _gemm_tn_raw(dg16, h16, N, FF, D))
+            T._acc(grads, W1, _unscale_inplace(_gemm_tn_raw(dg16, h16, N, FF, D), S))
         if W2.requires_grad:
-            T._acc(grads, W2, _gemm_tn_raw(du16, h16, N, FF, D))
+            T._acc(grads, W2, _unscale_inplace(_gemm_tn_raw(du16, h16, N, FF, D), S))
         if W3.requires_grad:
-            T._acc(grads, W3, _gemm_tn_raw(dy16, act16, N, D, FF))
+            T._acc(grads, W3, _unscale_inplace(_gemm_tn_raw(dy16, act16, N, D, FF), S))
 
     out._backward = bw
     return out
+
+
+AMP_GRAD_SCALE = 256.0     # 梯度缩放系数（2 的幂，乘除无误差）
+
+
+def _scaled_copy(buf, s):
+    """返回 buf*s 的新缓冲（不改原缓冲）。"""
+    rt = _rt()
+    out = rt.empty(tuple(buf.shape), dtype=np.float32)
+    rt.launch("ewise_scale", *(_grid(rt, int(buf.n))),
+              [rt._ptr(buf), (float(s), ctypes.c_float), rt._ptr(out),
+               (int(buf.n), ctypes.c_int)])
+    return out
+
+
+def _unscale_inplace(buf, s):
+    """原地除以 s（梯度缩放还原）。"""
+    if s == 1.0:
+        return buf
+    rt = _rt()
+    rt.scale_inplace(buf, 1.0 / float(s))
+    return buf
+
+
+def _grid(rt, n):
+    return rt._ewise_grid(int(n))
 
 
 def _to_f32(a16, shape):
