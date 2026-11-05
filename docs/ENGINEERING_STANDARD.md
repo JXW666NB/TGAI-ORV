@@ -268,3 +268,16 @@ n_ops 是子模块，	gai_go.train 上没有这个属性）；改成方法内 r
 5. 只有以上都排除后，才去二分内核（`CUDA_LAUNCH_BLOCKING=1` 能让错误更早暴露）。
 
 > 同理：长稳跑挂不等于引擎不稳。先确认机器健康，再谈判据 —— 这是"实测优先"的一部分。
+
+### 环境限制记录（2026-11-05）
+
+`tools/verify_all.py` 的「Qwen3 真权重对拍」在本机跑挂过一次，原因是**主机内存不足**：
+
+```
+numpy._core._exceptions._ArrayMemoryError: Unable to allocate 594. MiB
+for an array with shape (151936, 1024) and data type float32
+可用内存: 3.0 GB / 共 15.4 GB
+```
+
+同一门禁此前多次 PASS，且另外三道（单元测试 / 打包自检 / LLaMA 结构对拍）本次全过
+⇒ **判定为环境限制，不是代码回归**。要跑这一项请先释放主机内存（它要载入 151936×1024 的 embedding）。

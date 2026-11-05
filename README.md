@@ -238,6 +238,40 @@ print(r.probe_base, "->", r.probe_final, r.drop_pct, "%", r.verdict)
 > `tgai_go/train/qwen.py`，与 `examples/qwen25_sft.py` 共用同一份代码（不是复制）。
 > 所以 `pip install` 之后就能用，不再需要仓库目录。
 
+## AMP（激活存 fp16）/ Activation-fp16 AMP
+
+**什么时候开**：真实 LLM 预训练/微调（loss 通常 1.5~4）—— 更快且稳定。
+**什么时候别开**：需要把 loss 压到 **< 1e-2**（玩具任务、极限蒸馏、数值验证）——
+fp16 激活的 logits 相对精度约 1e-3，压不下去（实测 0.5B/1200 步：AMP 停在 **0.79**，fp32 到 **5.3e-4**）。
+
+```python
+import tgai_go.train as T
+from tgai_go.train import amp_mlp
+
+cfg["MLP_FP16"] = True            # 激活存 fp16（主权重仍 fp32、GEMM 仍 fp32 累加）
+amp_mlp.enable(True)
+scaler = amp_mlp.GradScaler(init_scale=1024.0)   # ★ 必须配，否则梯度下溢/溢出
+
+for ids, tgt in loader:
+    scaler.begin()                # 把当前 scale 注入反向
+    loss = ce(model(ids), tgt)
+    loss.backward()
+    if scaler.end(model.params()):   # 梯度有限 → 已还原 scale → 可以更新
+        opt.step()
+    opt.zero_grad()
+```
+
+**为什么必须配 `GradScaler`**（实测踩过）：
+
+| 配置 | 结果 |
+| --- | --- |
+| 不缩放（S=1） | 梯度**下溢**，学不动（loss 停在 5.5）|
+| 静态 S=256 | 前 250 步收敛最快，第 300 步**溢出尖峰**（5.36）|
+| **动态缩放（GradScaler）** | 1200 步只跳步 **2 次（0.17%）**，scale 自愈 256→8192，无 NaN |
+
+数值：块级前向 **6.4e-04**、梯度 **8e-04~1.2e-03**；端到端 3 步 loss 相对差 **1.5e-05**。
+速度：V100/0.5B 形状 **209~221 ms/step**（fp32 488.5 ms，约 **2.2~2.3×**），
+scaler 开销仅 **+1.2%**。
 ## 装 / Install
 
 ```bash
