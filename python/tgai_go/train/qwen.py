@@ -21,6 +21,8 @@ import numpy as np
 
 import tgai_go.train as T
 from tgai_go.train import amp_mlp as _amp_mlp
+import os as _os
+_MLP_FP16_ENV = _os.environ.get("TG_MLP_FP16", "") not in ("", "0")
 from tgai_go.train import checkpoints as C
 from tgai_go.train import functional as F
 from tgai_go.train import nn_ops as O
@@ -233,7 +235,8 @@ class Qwen25:
 
         h2 = self.ln2[i](x).reshape(B * S, D)
         # AMP：激活存 fp16（开关 cfg["MLP_FP16"]，默认关；数值实测 前向 6.4e-4/梯度 1.2e-3）
-        if cfg.get("MLP_FP16") and _amp_mlp.enabled():
+        # TG_MLP_FP16=1 也能开（方便剖析/基准工具，不必改 cfg）
+        if ((cfg.get("MLP_FP16") or _MLP_FP16_ENV) and _amp_mlp.enabled()):
             _y = _amp_mlp.mlp(h2, p[b + "ffn.w1.weight"], p[b + "ffn.w2.weight"],
                               p[b + "ffn.w3.weight"])
             x = x + _y.reshape(B, S, D)

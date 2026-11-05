@@ -951,6 +951,26 @@ extern "C" __global__ void broadcast_to8(
 }
 
 /* 沿 axis 求和，输出按该维长度视为 1 的行主序写下（keepdims 布局）。 */
+/* 2D 沿 axis=0 求和：out[c] = sum_r in[r*nc + c]。
+ * 为什么单独写：通用 sum_axis8 是一个输出一个线程，bias 梯度是 896 输出 x 2048 累加，
+ * 只有 896 个线程（<1 个 block 的并行度），占用率极低。这里一列一个 block、256 线程并行归约。 */
+extern "C" __global__ void sum_axis0_rows(const float* __restrict__ in,
+                                          float* __restrict__ out,
+                                          int n_rows, int n_cols) {
+    int c = blockIdx.x;
+    if (c >= n_cols) return;
+    float acc = 0.0f;
+    for (int r = threadIdx.x; r < n_rows; r += blockDim.x) acc += in[(long)r * n_cols + c];
+    __shared__ float sh[256];
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (threadIdx.x < step) sh[threadIdx.x] += sh[threadIdx.x + step];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[c] = sh[0];
+}
+
 extern "C" __global__ void sum_axis8(
     const float* in, float* out, int n_out, int axis, int extent,
     int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
@@ -3687,13 +3707,20 @@ class CudaRuntime:
             out = self.empty(tuple(out_keep), dtype=np.float32)
             n_out = int(out.n)
             if n_out:
-                shp8 = self._left_pad8(shape, 1)
-                axis8 = axis + (8 - nd)
-                grid, block = self._ewise_grid(n_out)
-                self.launch("sum_axis8", grid, block, [
-                    self._ptr(buf), self._ptr(out),
-                    (n_out, ctypes.c_int), (axis8, ctypes.c_int), (extent, ctypes.c_int),
-                ] + [(int(s), ctypes.c_int) for s in shp8])
+                if nd == 2 and axis == 0 and int(shape[1]) <= 4096:
+                    # 常见情形（bias/embedding 的梯度）：一列一个 block，并行归约
+                    self.launch("sum_axis0_rows", (int(shape[1]), 1, 1), (256, 1, 1), [
+                        self._ptr(buf), self._ptr(out),
+                        (int(shape[0]), ctypes.c_int), (int(shape[1]), ctypes.c_int),
+                    ])
+                else:
+                    shp8 = self._left_pad8(shape, 1)
+                    axis8 = axis + (8 - nd)
+                    grid, block = self._ewise_grid(n_out)
+                    self.launch("sum_axis8", grid, block, [
+                        self._ptr(buf), self._ptr(out),
+                        (n_out, ctypes.c_int), (axis8, ctypes.c_int), (extent, ctypes.c_int),
+                    ] + [(int(s), ctypes.c_int) for s in shp8])
         if keepdims:
             return out
         dropped = shape[:axis] + shape[axis + 1:]
