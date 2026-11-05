@@ -29,20 +29,27 @@ def _run(name, cmd, timeout=1800):
     t0 = time.time()
     print("\n=== %s ===" % name)
     print("$ " + " ".join(cmd))
+    skipped_local = False
     try:
         p = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=timeout)
         out = (p.stdout or "") + (p.stderr or "")
         tail = "\n".join([ln for ln in out.strip().split("\n") if ln.strip()][-12:])
         print(tail)
-        ok = p.returncode == 0
+        # 77 = 约定“环境不满足”（如主机内存不足）→ SKIP，**不算失败**
+        if p.returncode == 77:
+            print("[skip] 环境不满足，本项跳过（不计入失败）")
+            ok = True
+            skipped_local = True
+        else:
+            ok = p.returncode == 0
     except subprocess.TimeoutExpired:
         print("超时（%ds）" % timeout)
         ok = False
     except Exception as ex:                        # noqa: BLE001
         print("异常：%s" % (ex,))
         ok = False
-    return ok, time.time() - t0
+    return ok, time.time() - t0, skipped_local
 
 
 def main(argv=None):
@@ -74,14 +81,17 @@ def main(argv=None):
                                           "--tg", tg]))
     else:
         print("\n（跳过 Qwen3 真权重对拍：找不到 %s）" % tg)
-        results.append(("Qwen3 真权重对拍", True, 0.0))
+        results.append(("Qwen3 真权重对拍", True, 0.0, True))
 
     print("\n" + "=" * 60)
     print("%-22s %-6s %8s" % ("门禁", "结果", "耗时"))
     print("-" * 60)
     all_ok = True
-    for name, ok, dt in results:
-        print("%-22s %-6s %7.1fs" % (name, "PASS" if ok else "FAIL", dt))
+    for row in results:
+        name, ok, dt = row[0], row[1], row[2]
+        skipped = row[3] if len(row) > 3 else False
+        status = "SKIP" if (ok and skipped) else ("PASS" if ok else "FAIL")
+        print("%-22s %-6s %7.1fs" % (name, status, dt))
         all_ok = all_ok and ok
     print("=" * 60)
     print("总判定：%s" % ("PASS —— 可以发布" if all_ok else "FAIL —— 先修再发"))

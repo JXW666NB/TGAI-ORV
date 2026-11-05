@@ -13,6 +13,8 @@ import argparse
 import os
 import sys
 
+EXIT_SKIP = 77      # 约定：环境不满足（如内存不足）→ 上游按 SKIP 处理，不算失败
+
 import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -135,4 +137,11 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except MemoryError:
+        sys.stderr.write(
+            "[skip] 主机内存不足：本项要载入大 embedding（如 151936x1024 约 594 MiB）。\n"
+            "       修法：先释放主机内存再跑；本项按 SKIP 处理（不计入失败）。\n")
+        raise SystemExit(EXIT_SKIP)
+
