@@ -23,6 +23,7 @@ import tgai_go.train as T
 from tgai_go.train import amp_mlp as _amp_mlp
 import os as _os
 _MLP_FP16_ENV = _os.environ.get("TG_MLP_FP16", "") not in ("", "0")
+_LOWMEM_ENV = _os.environ.get("TG_SDPA_LOWMEM", "") not in ("", "0")
 from tgai_go.train import checkpoints as C
 from tgai_go.train import functional as F
 from tgai_go.train import nn_ops as O
@@ -229,7 +230,7 @@ class Qwen25:
         # 与物化实现等价；默认关闭，SDPA_LOWMEM=1 打开（等显存/速度收益实测后再定默认）。
         o = F.scaled_dot_product_attention(
             q, k, v, is_causal=True,
-            lowmem=bool(cfg.get("SDPA_LOWMEM", False)))
+            lowmem=bool(cfg.get("SDPA_LOWMEM", False) or _LOWMEM_ENV))
         o = o.reshape(B, NH, S, DH).permute(0, 2, 1, 3).reshape(B * S, NH * DH)
         x = x + (o @ p[b + "attn.out_proj.weight"].T).reshape(B, S, D)
 
