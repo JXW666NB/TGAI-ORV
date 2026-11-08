@@ -536,3 +536,31 @@ v4: load=OK err=0 耗时=1.2s  大小=5.64 GB
 1. **GPU 版**（产线在用的是 `libtgai_engine_gpu.dll`）：需 nvcc + cl（`-ccbin`），clang-cl 缺失需替换；
 2. 双格式**输出逐字一致**（同一 prompt 生成对比）；
 3. 之后才谈把产线切到 v4（切前会再向用户确认）。
+## 23. GPU 版引擎编译：卡在工具链，CPU 版已证 v4 可行（2026-11-09）
+
+### 试过什么
+
+`cuda\build_cuda_win.ps1` 的主机编译器探测顺序是 **vswhere 找 MSVC → clang-cl 兜底**。
+本机既没有注册的 VS（只有 `D:\msvc_portable` 便携版），也没有 clang-cl ⇒ 脚本直接报
+"未找到可用主机编译器"。
+
+我尝试给脚本加显式 `-ClExe` 参数，但注入位置破坏了 param 块（PowerShell 报一串
+"赋值表达式无效"），**该副本脚本已处于半改状态，下轮应先从原始 `TGAI-GO-wt\cuda\build_cuda_win.ps1` 重新复制一份**。
+
+### 结论（区分实测与推断）
+
+| 项 | 状态 |
+| --- | --- |
+| CPU 版 v4 支持 | ✅ **实测**：新 DLL 同时加载 v3/v4，`err=0` |
+| GPU 版 v4 支持 | ❌ 未编译（工具链缺失/脚本探测不通过）|
+| v3↔v4 行为等价 | **由实测推导**：两文件 TOK/权重索引/WGT 三段逐位一致，且 v4 在引擎里走与 v3 **同一代码路径** ⇒ 输出必然相同（尚未做端到端生成对比）|
+
+### GPU 版的下轮路线（三选一，我倾向 1）
+
+1. **直接调 nvcc**（绕过 ps1）：`nvcc -ccbin <portable cl> -shared -arch=sm_70` + `-Xcompiler /utf-8`，
+   源文件 `cuda\tgai_cuda.cu` + `src\{tgai_engine,tgai_kv_cache,tgai_backend,tgai_chat_meta}.c`，
+   链接 cublas/cublasLt/cudart；脚本里的 flag 列表可照抄；
+2. 安装 clang-cl（约 1 GB，机器有代理）；
+3. 装 VS Build Tools（约 2–4 GB），让 vswhere 能发现。
+
+⚠ 无论哪条，编译产物**只放 `D:\v4build\out_gpu`**，绝不覆盖 `D:\tgai\libtgai_engine_gpu.dll`。
