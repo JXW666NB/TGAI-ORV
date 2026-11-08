@@ -437,3 +437,36 @@ TOK 分区（tokens/merges/specials），使导出的 v4 文件**自带分词表
 * **P0 级**：验证引擎能否读 v4；不能则需引擎侧支持（这是对外口径的基础设施）。
 * **P0 级**：`write_tg4_stream` 补 TOK 分区，使训练产物 = 可推理文件。
 * 之后才是正式训练启动（仍需用户确认质量合格）。
+## 20. 格式事实核对（2026-11-09，读源码 + 读生产文件头，均为实测）
+
+### 生产文件 `TGAI_NB_V2.7.tg` 的实际头部
+
+```
+magic=TGAI  version=3  weight_dtype=6(BF16)
+L=28 D=1024 NH=16 FF=4096 V=32779 max_seq=8192 NE=8 NA=2 theta=10000
+pad/bos/eos/unk = 0/2/3/1
+tok_off=128 tok_len=296520   wt_off=296648 wt_cnt=982
+wd_off=347712 wd_len=6,057,748,928
+arch_type=0 num_kv_heads=0 modality_flags=1(TEXT) extension_off=4294966890
+文件大小=6,058,097,046（wd_off+wd_len=6,058,096,640，尾部另有 406 字节扩展段）
+```
+
+### 引擎侧格式（`tgai_format.h` / `tgai_engine.c`）
+
+* 容器：**128B 头 + 分词段 + 52B 权重索引 + 权重数据**
+* 权重名**不入文件**：用 **FNV-1a 哈希**查表
+* `TG_MAGIC = 0x49414754`（`TGAI`），`TG_VERSION=1`、`TG_VERSION_V3=3`
+* `weight_dtype` 里 **BF16=6 与 Q4K=7 的注释都写着 "v4:"**
+* `extension_off` 用**负偏移**（这里 -406）指向文件尾的扩展段
+
+### 与 ORV Python 端 `tg4.py` 的差异（重大）
+
+| 项 | 引擎容器（生产在用）| ORV `tg4.py`（自称 v4）|
+| --- | --- | --- |
+| magic | `TGAI` | `TG4\0` |
+| version | 3 | 4 |
+| 名字 | **FNV-1a 哈希**（不入文件）| JSON `NAM` 分区（名字入文件）|
+| 分区 | 无分区表，固定 4 段 | 32B 分区表 + 流式 WGT |
+
+⇒ **这是两种互不兼容的容器**。生产文件 = 引擎容器（v3 头 + BF16）。
+`tg4.py` 的 "v4" 引擎不认识；而 format.h 里说的 "v4" 指 **BF16/Q4K 数据类型**，不是新容器。
