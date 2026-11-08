@@ -73,3 +73,30 @@ def test_missing_tensor_is_loud(tmp_path):
             assert "names()" in str(e)
         else:
             raise AssertionError("取不存在的张量必须报错并给修法")
+
+def test_pt_to_v4_roundtrip(tmp_path):
+    """S2 第一步：`.pt` → v4 → 读回，fp32 张量必须**逐位相等**。
+
+    注意：这里测的是"格式搬运"是否无损，不测模型语义。
+    CI 没装 torch 时自动跳过（importorskip），不掩盖失败。
+    """
+    torch = pytest.importorskip("torch")
+    rng = np.random.default_rng(5)
+    ts = {"token_embedding.weight": rng.normal(0, .02, (16, 8)).astype(np.float32),
+          "blocks.0.ln1.weight": rng.normal(0, .02, (8,)).astype(np.float32),
+          "blocks.0.moe._qb_bias": np.arange(2, dtype=np.float32)}
+    pt = str(tmp_path / "ck.pt")
+    torch.save({"model_state_dict": {k: torch.from_numpy(v) for k, v in ts.items()},
+                "model_config": {"n_experts": 2}}, pt)
+
+    obj = torch.load(pt, map_location="cpu", weights_only=False)
+    sd = {k: v.numpy() for k, v in obj["model_state_dict"].items()}
+
+    cfg = dict(CFG, weight_dtype=tg4.DT_FP32)     # fp32 存：要求逐位相等
+    p = str(tmp_path / "ck.tg4")
+    tg4.write_tg4(p, sd, cfg, train={"step": 0})
+    with tg4.TG4(p) as r:
+        assert sorted(r.names()) == sorted(sd)
+        for k, v in sd.items():
+            got = r.get(k)
+            np.testing.assert_array_equal(got, v, err_msg="%s 不是逐位相等" % k)
