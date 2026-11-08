@@ -34,36 +34,56 @@ TG = r"D:\TGAI\models\V2.7\TGAI_NB_V2.7.tg"
 log = RUN.log
 
 
-def find_corpus(min_cjk=200, max_chars=4000):
-    patterns = (r"D:\tgai_stage2\**\*.txt", r"D:\TGAI\**\*.txt", r"D:\tgai_nlp\**\*.txt")
-    for pat in patterns:
-        for p in glob.glob(pat, recursive=True):
-            try:
-                if os.path.getsize(p) < 20000:
+SFT_DIR = "D:\\SFT\u8bed\u6599\u5e93"            # D:\SFT语料库
+PRETRAIN_DIR = r"D:\tgai_corpus\zh"              # 53.7 GB 预训练语料（{"text": ...}）
+
+
+def _read_jsonl_text(path, want_cjk=200, max_chars=4000):
+    """从 jsonl 里取一条足够长的中文样本（`{"text": ...}` 格式，实测两种语料都是这个字段）。"""
+    import json
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for _ in range(20):
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    obj = json.loads(line)
+                except Exception:
                     continue
-                t = open(p, encoding="utf-8", errors="ignore").read(max_chars)
-            except Exception:
-                continue
-            if sum("\u4e00" <= ch <= "\u9fff" for ch in t) > min_cjk:
+                t = obj.get("text") or ""
+                if len(t) >= 200 and sum("\u4e00" <= ch <= "\u9fff" for ch in t) >= want_cjk:
+                    return t[:max_chars]
+    except Exception:
+        return None
+    return None
+
+
+def find_corpus(min_cjk=200, max_chars=4000):
+    """优先用机器上**现成的真实语料**：SFT 语料库 → 预训练中文语料。"""
+    patterns = (os.path.join(SFT_DIR, "**", "*.jsonl"), os.path.join(PRETRAIN_DIR, "*.jsonl"))
+    for pat in patterns:
+        for p in sorted(glob.glob(pat, recursive=True)):
+            t = _read_jsonl_text(p, min_cjk, max_chars)
+            if t:
                 return p, t
     return None, ""
 
 
 def encode_corpus(path, text, seq):
-    from tgai_go.bpe import BpeTokenizer
+    from tgai_go.bpe import BOS_ID, UNK_ID, BpeTokenizer
     from tgai_go.read_tg import close_tg, read_tg
 
     info = read_tg(TG)
     toks, merges = info["tokens"], info["merges"]
-    hdr = info.get("header") or {}
     close_tg(info)
-    tk = BpeTokenizer(toks, merges, unk_id=int(hdr.get("unk_id", 0) or 0),
-                      bos_id=int(hdr.get("bos_id", 1) or 1))
+    tk = BpeTokenizer(toks, merges, unk_id=UNK_ID, bos_id=BOS_ID)
     ids = tk.encode(text, add_bos=True)[:seq]
-    back = tk.decode(ids)
-    log("语料 %s：%d 字符 → %d 个 token" % (os.path.basename(path), len(text), len(ids)))
+    back = tk.decode([i for i in ids if i != BOS_ID])
+    log("语料 %s：%d 字符 → %d 个 token（base=%d, merges=%d）"
+        % (os.path.basename(path), len(text), len(ids), tk.base, len(tk.ranks)))
     log("回译前 60 字：%r" % back[:60])
-    same = tk.encode(back, add_bos=True)[:len(ids)] == ids
+    same = tk.roundtrip_ok(ids)
     log("分词往返一致：%s" % same)
     return np.asarray(ids, np.int64), bool(same)
 
