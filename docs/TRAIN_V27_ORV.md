@@ -498,3 +498,41 @@ WGT段      逐位一致=True  (d7a710295ee5ff87…)   ← 6.06 GB 权重区
 1. 在**源码副本**上编译引擎（不覆盖产线 DLL），跑通 v3/v4 双格式加载；
 2. 双格式输出比对（同一 prompt 逐字一致）后，再谈把产线切到 v4；
 3. 支持容器 B（`TG4\0` + 分区表 + JSON NAM）：在 `tg_load` 里加 magic 分支解析。
+## 22. ★ V4 引擎支持：CPU 版编译并双通验证（2026-11-09）
+
+### 工具链（机器上现成的，无需下载）
+
+* **portable MSVC 14.44**：`D:\msvc_portable\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe`
+* **Windows 10 SDK**：`D:\msvc_portable\Kits\10`（INCLUDE/LIB 手工设置即可，无需 vcvars）
+* CUDA 12.4 的 `nvcc`：`C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\nvcc.exe`
+* ⚠️ **本机没有 clang-cl / MSVC 安装版**；`cpu\build.ps1` 默认选自带 **TCC**，而 TCC 编不过（`undefined symbol 'GetFileSizeEx'`）
+
+### 构建（在副本上，未碰产线）
+
+```
+源树副本: D:\v4build\TGAI-GO   （从 D:\tgai\01_源码\TGAI-GO-wt 复制，已打 v4 补丁）
+补丁:     src\tgai_format.h  + TG_VERSION_V4=4u、TG4_MAGIC=0x00344754u
+          src\tgai_engine.c  版本校验接受 v1/v3/v4；v4 与 v3 同走模态分支
+编译:     cl /nologo /O2 /LD /utf-8 /DTG_SINGLE_THREAD /I src
+             src\tgai_engine.c src\tgai_kv_cache.c src\tgai_backend.c src\tgai_chat_meta.c
+产物:     cpu\build_v4test\libtgai_engine.dll  （253,952 字节）
+```
+
+两个必须记住的编译坑：
+1. **必须加 `/utf-8`** —— 否则 MSVC 按 GBK 读 UTF-8 中文注释，报 `C2001 常量中有换行符` / `C1004`；
+2. **必须带 `tgai_backend.c`（和 `tgai_chat_meta.c`）** —— 否则链接 `tg_kv_create` 缺 `tg_be_current`（LNK2019）。
+
+### 双格式加载验证（用新 DLL 直接 ctypes 调用 `tg_load`）
+
+```
+v3: load=OK err=0 耗时=1.0s  大小=5.64 GB
+v4: load=OK err=0 耗时=1.2s  大小=5.64 GB
+```
+
+⇒ **引擎已同时接受 v3 与 v4**（CPU 版；生成结果等价性待 GPU 版再验）。
+
+### 待办
+
+1. **GPU 版**（产线在用的是 `libtgai_engine_gpu.dll`）：需 nvcc + cl（`-ccbin`），clang-cl 缺失需替换；
+2. 双格式**输出逐字一致**（同一 prompt 生成对比）；
+3. 之后才谈把产线切到 v4（切前会再向用户确认）。
