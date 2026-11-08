@@ -143,3 +143,28 @@ out = Σ_i w_i * Expert_id_i(x)      # Expert: silu(x@gate.T)*(x@up.T) @ down.T
 
 **仍需实测确认的一点**（下一轮用 logits 比对判定）：softmax 是在 **top-k 选中的 2 个** logits 上做，
 还是在**全部 8 个**上做后再取前 2。两种都自洽，必须用数值比对定夺，不靠猜。
+## 11. 路由数值语义**定案**（生产 GPU 路径源码，2026-11-08）
+
+`D:\TGAI\01_源码\TGAI-GO-wt\cuda\tgai_cuda.cu:301-307`（`moe_route_kernel` 上方原注释）：
+
+```
+★ MoE 路由：偏置 + top-k + softmax 一次算完
+数值语义【必须】与 CPU 引擎 tgai_engine.c:3352-3382 完全一致：
+  ① logits[e] += qb_bias[e]                 （has_bias 时，softmax 之前）
+  ② top-k：选择排序，第 k 轮跳过前 k 轮已选编号，取最大值
+  ③ softmax：仅对选中的 k 个做（减去其中最大值后 exp，再归一化）
+```
+
+⇒ **`smax = "topk"`**（不是全量 softmax 再取前 k）。`tools/v27_ref.py` 的默认值即为该语义。
+
+### 参考前向已在真实权重上跑通（CPU，不停产线）
+
+用 `tgai_v27_v5_merged.pt`（mmap）+ **逐层惰性转 fp32**（峰值内存仅一层）：
+
+```
+topk: 10.1s logits (8, 32779) argmax=8 first4=[-9.3644, 1.3957, -5.3044, -14.5398]
+all :  6.6s logits (8, 32779) argmax=8 first4=[-9.2626, 1.2654, -9.1123, -11.8647]
+```
+
+两变体确实不同 ⇒ 必须定夺（现已由源码定案为 `topk`）。logits 已存盘供 ORV 侧比对：
+`D:\tgai_orv\p1_logits_topk.npy` / `p1_logits_all.npy`。
