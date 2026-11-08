@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """V2.7 全参训练循环（ORV）：**逐层反向**，把梯度显存压到"单层"。
 
-为什么这样设计（实测依据）：3.033B 全参的 fp32 权重 11.3 GB、fp16 动量 11.3 GB，
-若梯度也全量常驻（fp32 11.3 GB）合计 33.9 GB ⇒ 超 32 GB。
-逐层反向把梯度变成"算完这层立刻 step 再释放"，峰值 ≈ 23.4 GB。
+为什么这样设计（实测依据，见 docs/TRAIN_V27_ORV.md）：
+* 3.033B 全参 fp32 权重 11.3 GB、fp16 动量 11.3 GB；
+* 若梯度也全量常驻（fp32 11.3 GB）合计 33.9 GB ⇒ 超 32 GB；
+* 逐层反向把梯度变成"算完这层立刻 step 再释放" ⇒ 峰值约 23 GB。
 
-用法（伪代码）：
-    m = V27Trainer(cfg)
-    m.load_all(sd, arr)               # 逐张量上传，主机零增长
-    for step in range(N):
-        loss = m.train_step(tokens, targets, opt, lr)
+用法：
+    tr = V27Trainer(cfg).load_all(sd)          # sd: {name: torch/np 张量}
+    opts = tr.make_optimizers(lr=1e-5)
+    xs = tr.forward_all(x0, cos, sin)          # 不建图，只缓存每层输入
+    tr.backward_and_step(xs, g_out, cos, sin, opts)
 """
 from __future__ import annotations
 
@@ -20,15 +21,21 @@ import numpy as np
 import tgai_go.train as T
 from tgai_go.train import Linear, MoE, RMSNorm
 
-HINT = "。修法：检查层号/形状是否与 cfg 一致"
+
+def _np(z):
+    """Tensor/ndarray → ndarray（CPU 上 grad 是 ndarray，GPU 上是 Tensor）。"""
+    return z.to_numpy() if hasattr(z, "to_numpy") else np.asarray(z)
 
 
-def _arr(sd, key):
-    return np.ascontiguousarray(sd[key].float().numpy(), np.float32)
+def _as_np(a):
+    """torch tensor / ndarray → fp32 连续 ndarray（流式装载要求逐张量）。"""
+    if hasattr(a, "float") and hasattr(a, "numpy"):
+        a = a.float().numpy()
+    return np.ascontiguousarray(a, np.float32)
 
 
 class V27Trainer(object):
-    """按层组织，支持逐层反向；参数上传走 load_state_dict（GPU 上已验证）。"""
+    """按层组织，支持逐层反向；权重经 `load_state_dict_stream` 流式上卡。"""
 
     def __init__(self, cfg, n_layers=None):
         self.cfg = dict(cfg)
@@ -41,44 +48,61 @@ class V27Trainer(object):
         self.NL = int(n_layers if n_layers is not None else cfg["n_layers"])
         self.layers = []
 
+    # ---------- 建层 ----------
+    def _build_layer(self):
+        D, NH, DH, FF, E, K = self.D, self.NH, self.DH, self.FF, self.E, self.K
+        L = dict(ln1=RMSNorm(D), ln2=RMSNorm(D), q=[], k=[], v=[], o=[])
+        for _ in range(NH):
+            L["q"].append(Linear(D, DH, bias=False))
+            L["k"].append(Linear(D, DH, bias=False))
+            L["v"].append(Linear(D, DH, bias=False))
+            L["o"].append(Linear(DH, D, bias=False))
+        L["moe"] = MoE(D, FF, E, top_k=K, gate="softmax_topk",
+                       qb_bias=np.zeros(E, np.float32))
+        return L
+
     # ---------- 装载 ----------
     def load_layer(self, i, sd):
-        D, NH, DH, FF, E, K = self.D, self.NH, self.DH, self.FF, self.E, self.K
+        """把第 i 层权重流式装进已在卡上的模块（宿主峰值 = 单张量）。"""
+        D, NH, DH = self.D, self.NH, self.DH
+        L = self._build_layer()
         p = "blocks.%d." % i
-        ln1, ln2 = RMSNorm(D), RMSNorm(D)
-        ln1.load_state_dict({"weight": _arr(sd, p + "ln1.weight")})
-        ln2.load_state_dict({"weight": _arr(sd, p + "ln2.weight")})
-        qw, kw, vw, ow = (_arr(sd, p + "attn.q_proj.weight"), _arr(sd, p + "attn.k_proj.weight"),
-                          _arr(sd, p + "attn.v_proj.weight"), _arr(sd, p + "attn.out_proj.weight"))
-        qs, ks, vs, os_ = [], [], [], []
+
+        def items():
+            yield "ln1.weight", _as_np(sd[p + "ln1.weight"])
+            yield "ln2.weight", _as_np(sd[p + "ln2.weight"])
+        for mod, key in ((L["ln1"], "ln1.weight"), (L["ln2"], "ln2.weight")):
+            mod.load_state_dict_stream(iter([(key.split(".")[-1], _as_np(sd[p + key]))]))
+
+        qw = _as_np(sd[p + "attn.q_proj.weight"])
+        kw = _as_np(sd[p + "attn.k_proj.weight"])
+        vw = _as_np(sd[p + "attn.v_proj.weight"])
+        ow = _as_np(sd[p + "attn.out_proj.weight"])
         for h in range(NH):
             sl = slice(h * DH, (h + 1) * DH)
-            lq, lk, lv = Linear(D, DH, bias=False), Linear(D, DH, bias=False), Linear(D, DH, bias=False)
-            lq.load_state_dict({"weight": np.ascontiguousarray(qw[sl])})
-            lk.load_state_dict({"weight": np.ascontiguousarray(kw[sl])})
-            lv.load_state_dict({"weight": np.ascontiguousarray(vw[sl])})
-            lo = Linear(DH, D, bias=False)
-            lo.load_state_dict({"weight": np.ascontiguousarray(ow[:, sl].T)})
-            qs.append(lq); ks.append(lk); vs.append(lv); os_.append(lo)
-        moe = MoE(D, FF, E, top_k=K, gate="softmax_topk",
-                  qb_bias=_arr(sd, p + "moe._qb_bias") if (p + "moe._qb_bias") in sd else None)
-        ms = {"router.weight": _arr(sd, p + "moe.router.weight")}
-        for e in range(E):
-            ms["experts.%d.gate.weight" % e] = _arr(sd, p + "moe.experts.%d.w1.weight" % e)
-            ms["experts.%d.up.weight" % e] = _arr(sd, p + "moe.experts.%d.w2.weight" % e)
-            ms["experts.%d.down.weight" % e] = _arr(sd, p + "moe.experts.%d.w3.weight" % e)
-        moe.load_state_dict(ms)
-        for m_ in [ln1, ln2, moe] + qs + ks + vs + os_:
-            self._drop_host(m_)
-        self.layers.append(dict(ln1=ln1, ln2=ln2, q=qs, k=ks, v=vs, o=os_, moe=moe))
-        return self
+            L["q"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(qw[sl]))]))
+            L["k"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(kw[sl]))]))
+            L["v"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(vw[sl]))]))
+            L["o"][h].load_state_dict_stream(
+                iter([("weight", np.ascontiguousarray(ow[:, sl]))]))
+        del qw, kw, vw, ow
 
-    @staticmethod
-    def _drop_host(mod):
-        """上传后释放宿主副本：3B 权重若都留着宿主数组，加载会先把主机内存撑爆（实测）。"""
-        for p_ in mod.parameters():
-            if getattr(p_, "device", "cpu") == "cuda":
-                p_.data = None
+        moe_items = [("router.weight", _as_np(sd[p + "moe.router.weight"]))]
+        for e in range(self.E):
+            moe_items.append(("experts.%d.gate.weight" % e,
+                              _as_np(sd[p + "moe.experts.%d.w1.weight" % e])))
+            moe_items.append(("experts.%d.up.weight" % e,
+                              _as_np(sd[p + "moe.experts.%d.w2.weight" % e])))
+            moe_items.append(("experts.%d.down.weight" % e,
+                              _as_np(sd[p + "moe.experts.%d.w3.weight" % e])))
+        L["moe"].load_state_dict_stream(iter(moe_items))
+        qb = _as_np(sd[p + "moe._qb_bias"]) if (p + "moe._qb_bias") in sd else None
+        if qb is not None:
+            L["moe"].qb_bias = T.tensor(qb)
+            if getattr(L["moe"].qb_bias, "device", "cpu") == "cuda":
+                L["moe"].qb_bias.data = None
+        self.layers.append(L)
+        return L
 
     def load_all(self, sd, on_layer=None):
         for i in range(self.NL):
@@ -87,44 +111,63 @@ class V27Trainer(object):
                 on_layer(i)
         return self
 
-    # ---------- 前向（单层）----------
-    def fwd(self, x, i, cos, sin, need_grad=False):
+    # ---------- 参数与优化器 ----------
+    def modules_of(self, i):
+        L = self.layers[i]
+        return [L["ln1"], L["ln2"], L["moe"]] + L["q"] + L["k"] + L["v"] + L["o"]
+
+    def params_of(self, i):
+        out = []
+        for m in self.modules_of(i):
+            out += [p for p in m.parameters() if getattr(p, "requires_grad", False)]
+        return out
+
+    def make_optimizers(self, lr=1e-5, **kw):
+        return [T.optim.AdamW(self.params_of(i), lr=lr, **kw) for i in range(self.NL)]
+
+    # ---------- 前向 ----------
+    def fwd(self, x, i, cos, sin):
         L = self.layers[i]
         h = L["ln1"](x)
         acc = None
+        inv = 1.0 / math.sqrt(self.DH)
         for hh in range(self.NH):
             qh = T._rope_composed(L["q"][hh](h), cos, sin)
             kh = T._rope_composed(L["k"][hh](h), cos, sin)
             vh = L["v"][hh](h)
-            sc = (qh @ kh.T) * (1.0 / math.sqrt(self.DH))
-            pr = T.functional.softmax(sc, axis=-1)
+            pr = T.functional.softmax((qh @ kh.T) * inv, axis=-1)
             part = L["o"][hh](pr @ vh)
             acc = part if acc is None else acc + part
         y = x + acc
-        y = y + L["moe"](L["ln2"](y))
-        return y
+        return y + L["moe"](L["ln2"](y))
 
-    def params_of(self, i):
-        L = self.layers[i]
-        out = [L["ln1"].weight, L["ln2"].weight, L["moe"].router.weight]
-        for hh in range(self.NH):
-            out += [L["q"][hh].weight, L["k"][hh].weight, L["v"][hh].weight, L["o"][hh].weight]
-        for e in range(self.E):
-            out += [L["moe"].experts[e].gate.weight, L["moe"].experts[e].up.weight,
-                    L["moe"].experts[e].down.weight]
-        if getattr(L["moe"], "qb_bias", None) is not None:
-            out.append(L["moe"].qb_bias)
-        return out
+    def forward_all(self, x0, cos, sin, keep=None):
+        """不建图地跑完所有层，缓存每层输入。`keep=lambda i,x: None` 可用于逐步落盘。"""
+        xs = [np.asarray(x0, np.float32) if not isinstance(x0, np.ndarray) else x0]
+        for i in range(self.NL):
+            y = self.fwd(T.tensor(xs[-1]), i, cos, sin)
+            arr = np.asarray(_np(y), np.float32)
+            xs.append(arr)
+            if keep:
+                keep(i, arr)
+        return xs
 
-    # ---------- 逐层反向 ----------
-    def backward_layerwise(self, x_last, g_out, cos, sin):
-        """从最后一层往回：每层重算前向→对 (y·g) 求和反向→拿到该层梯度与上游梯度。"""
-        g = g_out
+    # ---------- 逐层反向 + step ----------
+    def backward_and_step(self, xs, g_out, cos, sin, opts):
+        """从最后一层往回：重算该层前向 → 对 (y·g) 求和反向 → 拿到该层梯度与上游梯度 → step。"""
+        g = np.asarray(g_out, np.float32)
+        stats = []
         for i in range(self.NL - 1, -1, -1):
-            x_in = T.tensor(np.asarray(x_last[i + 1].to_numpy(), np.float32), requires_grad=True)
+            x_in = T.tensor(xs[i], requires_grad=True)
             y = self.fwd(x_in, i, cos, sin)
-            scalar = (y * g).sum()
-            scalar.backward()
-            g = x_in.grad
-            del y, scalar, x_in
-        return g
+            gt = T.tensor(g)
+            (y * gt).sum().backward()
+            n_grad = sum(1 for p in self.params_of(i) if getattr(p, "grad", None) is not None)
+            if x_in.grad is not None:
+                g = np.asarray(_np(x_in.grad), np.float32)
+            opts[i].step()
+            opts[i].zero_grad()
+            for p in self.params_of(i):
+                p.grad = None
+            stats.append(dict(layer=i, with_grad=n_grad))
+        return g, stats
