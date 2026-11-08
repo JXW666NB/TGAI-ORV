@@ -194,3 +194,31 @@ class V27Trainer(object):
                 p.grad = None
             stats.append(dict(layer=i, with_grad=n_grad))
         return g, stats
+
+    # ---------- LM head（tied embed + CE）----------
+    def attach_head(self, sd, embed_key="token_embedding.weight", norm_key="final_norm.weight"):
+        """挂上 final_norm 与 tied 输出权重（V2.7 没有独立 lm_head）。"""
+        self.final_norm = RMSNorm(self.D)
+        self.final_norm.load_state_dict_stream(iter([("weight", _as_np(sd[norm_key]))]))
+        self.head = Linear(self.D, int(sd[embed_key].shape[0]), bias=False)
+        self.head.load_state_dict_stream(iter([("weight", _as_np(sd[embed_key]))]))
+        return self
+
+    def head_params(self):
+        return [p for p in (self.final_norm.weight, self.head.weight)
+                if getattr(p, "requires_grad", False)]
+
+    def loss_and_head_backward(self, x_last, targets, cos, sin):
+        """算 CE loss，反传到第 0..N-1 层的上游梯度，并返回 (loss, 上游梯度 g)。
+
+        注意：这里顺便把 head（final_norm/embed）的梯度算出来，调用方 step 完要清。
+        """
+        x_t = T.tensor(np.asarray(x_last, np.float32), requires_grad=True)
+        logits = self.head(self.final_norm(x_t))
+        loss = T.functional.cross_entropy(logits, np.asarray(targets, np.int64))
+        loss.backward()
+        g = np.asarray(_np(x_t.grad), np.float32) if x_t.grad is not None else None
+        return loss, g
+
+    def head_grads(self):
+        return [getattr(p, "grad", None) for p in self.head_params()]

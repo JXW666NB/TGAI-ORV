@@ -86,3 +86,26 @@ def test_stream_load_rejects_missing_tensor():
     sd.pop("blocks.0.ln1.weight")
     with pytest.raises(KeyError):
         V27Trainer(CFG).load_all(sd)
+def test_lm_head_loss_cpu():
+    """真实 CE loss：tied embed 输出 + 交叉熵，梯度能反传到最后一层输入。"""
+    import tgai_go.train as T
+
+    cfg = dict(CFG, n_layers=2)
+    sd = _fake_state(cfg)
+    sd["token_embedding.weight"] = np.random.default_rng(5).normal(0, .02, (40, cfg["d_model"])).astype(np.float32)
+    sd["final_norm.weight"] = np.random.default_rng(6).normal(0, .02, cfg["d_model"]).astype(np.float32)
+    tr = V27Trainer(cfg).load_all(sd).attach_head(sd)
+
+    TK = 8
+    cos_np, sin_np = _rope(TK, cfg["d_model"] // cfg["n_heads"], cfg["rope_theta"])
+    cos, sin = T.tensor(cos_np), T.tensor(sin_np)
+    x0 = np.random.default_rng(1).normal(0, .1, (TK, cfg["d_model"])).astype(np.float32)
+    xs = tr.forward_all(x0, cos, sin)
+
+    targets = np.random.default_rng(2).integers(0, 40, TK)
+    loss, g = tr.loss_and_head_backward(xs[-1], targets, cos, sin)
+    lv = float(np.asarray(loss.to_numpy() if hasattr(loss, "to_numpy") else loss))
+    assert np.isfinite(lv) and lv > 0, "CE loss 异常：%r" % lv
+    assert g is not None and np.isfinite(g).all(), "CE 梯度没回传到最后一层"
+    gs = tr.head_grads()
+    assert any(x is not None for x in gs), "head 参数没拿到梯度"
