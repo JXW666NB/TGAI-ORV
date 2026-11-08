@@ -213,3 +213,69 @@ class TG4(object):
 
     def __exit__(self, *a):
         self.close()
+
+def write_tg4_stream(path, items, cfg, arc=None, train=None, per_tensor_hash=False):
+    """**流式**写 TG4：items 是 (name, ndarray) 的迭代器，写一个释放一个。
+
+    为什么需要：3B 模型 983 个张量合计 fp32 约 12 GB，而 write_tg4 要求全部同时在内存
+    （实测在 32 GB 机器上会把进程拖死）。这里改成**先流式写 WGT，再写 NAM 与分区表**，
+    峰值内存 = 单张量（embedding ≈ 67 MB）。
+
+    布局与 write_tg4 兼容（读端不需要区分）：
+        128B 头占位 → WGT（边写边记偏移/哈希）→ NAM/ARC/TRAIN/HASH → section table → 回填头
+    """
+    WGT_START = HEADER_BYTES
+    meta, hashes = [], {}
+    with open(path, "wb") as f:
+        f.write(b"\x00" * HEADER_BYTES)
+        pos = HEADER_BYTES
+        for name, arr in items:
+            a = np.ascontiguousarray(arr, dtype=np.float32)
+            pad = (-pos) % ALIGN
+            if pad:
+                f.write(b"\x00" * pad)
+                pos += pad
+            blob = _enc(a, cfg.get("weight_dtype", DT_BF16))
+            f.write(blob)
+            meta.append({"name": name, "off": pos - WGT_START,
+                         "dtype": cfg.get("weight_dtype", DT_BF16),
+                         "shape": list(a.shape)})
+            if per_tensor_hash:
+                hashes[name] = hashlib.sha256(blob).digest()
+            pos += len(blob)
+        wgt_len = pos - WGT_START
+        # 之后的分区；最后写表
+        payloads = [(SEC_NAM, json.dumps(
+            [{"name": m["name"], "off": m["off"], "dtype": m["dtype"],
+              "shape": m["shape"]} for m in meta], ensure_ascii=False).encode("utf-8"))]
+        if arc is not None:
+            payloads.append((SEC_ARC, json.dumps(arc, ensure_ascii=False).encode("utf-8")))
+        if train is not None:
+            payloads.append((SEC_TRAIN, json.dumps(train, ensure_ascii=False).encode("utf-8")))
+        if per_tensor_hash:
+            payloads.append((SEC_HASH, b"".join(hashes[m["name"]] for m in meta)))
+        entries = [(SEC_WGT, 0, WGT_START, wgt_len, ALIGN, 0)]
+        pos = HEADER_BYTES + wgt_len
+        for typ, data in payloads:
+            pad = (-pos) % ALIGN
+            if pad:
+                f.write(b"\x00" * pad)
+                pos += pad
+            entries.append((typ, 0, pos, len(data), ALIGN, 0))
+            f.write(data)
+            pos += len(data)
+        pad = (-pos) % ALIGN
+        if pad:
+            f.write(b"\x00" * pad)
+            pos += pad
+        tbl_off = pos
+        tbl = bytearray()
+        for e in entries:
+            tbl += _SEC.pack(*e)
+        f.write(bytes(tbl))
+        h = dict(cfg)
+        h["tok_off"], h["tok_len"] = 0, 0
+        h["sect_off"], h["sect_cnt"] = tbl_off, len(entries)
+        f.seek(0)
+        f.write(_pack_header(h))
+    return path

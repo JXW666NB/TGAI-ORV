@@ -100,3 +100,16 @@ def test_pt_to_v4_roundtrip(tmp_path):
         for k, v in sd.items():
             got = r.get(k)
             np.testing.assert_array_equal(got, v, err_msg="%s 不是逐位相等" % k)
+def test_stream_write(tmp_path):
+    """流式写：峰值内存只与单张量有关；读回必须与 write_tg4 等价。"""
+    rng = np.random.default_rng(9)
+    ts = [("token_embedding.weight", rng.normal(0, .02, (16, 8)).astype(np.float32)),
+          ("blocks.0.moe.experts.0.w3.weight", rng.normal(0, .02, (8, 16)).astype(np.float32))]
+    p = str(tmp_path / "s.tg4")
+    tg4.write_tg4_stream(p, iter(ts), CFG, train={"step": 0}, per_tensor_hash=True)
+    with tg4.TG4(p) as r:
+        assert sorted(r.names()) == sorted(k for k, _ in ts)
+        for k, v in ts:
+            exp = ((np.ascontiguousarray(v, np.float32).view(np.uint32) >> 16) << 16).view(np.float32)
+            np.testing.assert_array_equal(r.get(k), exp, err_msg=k)
+        assert r.json_section(tg4.SEC_TRAIN)["step"] == 0
