@@ -3095,6 +3095,46 @@ class Module:
             out.update(m.state_dict(prefix + k + "."))
         return out
 
+    def load_state_dict_stream(self, items):
+        """**流式**装载：`items` 是 (name, ndarray) 的可迭代对象，逐个上传即释放。
+
+        与 `load_state_dict(dict)` 的区别（3B 权重装载必用这个）：
+        * 调用方无需把全部权重同时放进内存（dict 版本要求 12 GB 宿主张量，实测会 OOM）；
+        * 覆盖已有 `_gpu` 时**先释放旧块**（否则构造期分配的随机权重会泄漏一半显存）。
+
+        宿主峰值 = 单个张量；显存峰值 = 参数总量。任一张量缺失/多余/形状不符都直接报错。
+        """
+        params = {n: p for n, p in self.named_parameters()}
+        seen = set()
+        for name, arr in items:
+            p = params.get(name)
+            if p is None:
+                raise KeyError("没有参数 %r。修法：用 named_parameters() 核对名字（%d 个可用）"
+                               % (name, len(params)))
+            arr = np.ascontiguousarray(arr, np.float32)
+            if tuple(arr.shape) != tuple(p.shape):
+                raise ValueError("参数 %r 形状不符：给的是 %s，要的是 %s。修法：核对导出脚本"
+                                 % (name, arr.shape, p.shape))
+            if getattr(p, "device", "cpu") == "cuda":
+                rt = _cuda()
+                old = getattr(p, "_gpu", None)
+                p._gpu = rt.h2d(arr)
+                p.data = None
+                if old is not None and int(old.n) > 0:
+                    try:
+                        rt.free(int(old.ptr))
+                    except Exception as exc:        # noqa: BLE001
+                        raise RuntimeError("释放旧缓冲失败（%s）：%r。修法：检查是否被别的张量共享"
+                                           % (name, exc)) from exc
+            else:
+                p.data = arr.copy()
+            seen.add(name)
+        missing = set(params) - seen
+        if missing:
+            raise KeyError("缺 %d 个参数，例如 %s。修法：补齐或确认模型结构与权重一致"
+                           % (len(missing), sorted(missing)[:3]))
+        return self
+
     def load_state_dict(self, sd):
         for name, p in self.named_parameters():
             if name not in sd:
