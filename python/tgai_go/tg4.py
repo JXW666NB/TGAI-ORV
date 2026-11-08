@@ -118,14 +118,10 @@ def write_tg4(path, tensors, cfg, tok=None, arc=None, train=None, per_tensor_has
         wgt += _enc(a, dt_file)
         ent_meta.append((n, res))
 
-    pool, ents = bytearray(), bytearray()
-    for n, res in ent_meta:
-        nb = n.encode("utf-8")
-        sh = list(res["shape"])[:4] + [1] * max(0, 4 - len(res["shape"]))
-        ents += _NAM.pack(len(pool), len(nb), min(4, len(res["shape"])),
-                          res["dtype"], res["off"], *sh)
-        pool += nb
-    nam = struct.pack("<I", len(names)) + bytes(ents) + bytes(pool)
+    # NAM 用 JSON：982 个名字约 100 KB，换来"不会错位"（二进制池的越界解码已踩过）
+    nam = json.dumps(
+        [{"name": n, "off": r["off"], "dtype": r["dtype"], "shape": list(r["shape"])}
+         for n, r in ent_meta], ensure_ascii=False).encode("utf-8")
 
     payloads = [(SEC_TOK, tok or b""), (SEC_NAM, nam), (SEC_WGT, bytes(wgt))]
     if arc is not None:
@@ -179,15 +175,13 @@ class TG4(object):
             raise ValueError("TG4 缺 NAM 名字表。修法：用本仓库 write_tg4 重写；"
                              "没有名字表就无法按名取张量")
         off, ln = self.sections[SEC_NAM]
-        n = struct.unpack_from("<I", self._m, off)[0]
+        rows = json.loads(self._m[off:off + ln].decode("utf-8"))
         names, ent = [], {}
-        pool_base = off + 4 + n * _NAM.size
-        for i in range(n):
-            e = _NAM.unpack_from(self._m, off + 4 + i * _NAM.size)
-            name_off, name_len, ndim, dt, data_off, *shape = e
-            nm = self._m[pool_base + name_off: pool_base + name_off + name_len].decode("utf-8")
+        for r in rows:
+            nm = r["name"]
             names.append(nm)
-            ent[nm] = dict(off=data_off, dtype=dt, shape=tuple(shape[:ndim]))
+            ent[nm] = dict(off=int(r["off"]), dtype=int(r["dtype"]),
+                           shape=tuple(int(x) for x in r["shape"]))
         return names, ent, None
 
     def names(self):
