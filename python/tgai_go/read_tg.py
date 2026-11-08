@@ -4,6 +4,8 @@
 用法:
     python tg_read_tg.py <file.tg> [--dump]
 """
+import json
+import os
 import struct
 import sys
 
@@ -221,3 +223,85 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(2)
     main(sys.argv[1])
+
+
+# ---------------------------------------------------------------- 名字旁挂
+# `.TG` 权重表只存 FNV-1a 哈希、**不存名字**（推理够用，检查点不够用：
+# 不能枚举参数就没法做优化器映射 / LoRA 挂载 / 部分加载 / diff）。
+# 因此新增一个**可选旁挂文件** `<model>.TG.names.json`：
+#   · 它是纯旁挂，产线 C 引擎根本不读它 ⇒ 对推理零风险；
+#   · 有了它，`list_tensors()` 才能把"哈希表"变成"名字表"。
+
+
+def sidecar_path(path):
+    return path + ".names.json"
+
+
+def write_names(path, info, extra=None):
+    """按 `.TG` 的实际表项写旁挂名字文件（哈希由表项自带，不重算）。"""
+    from collections import Counter
+    h = info["header"]
+    rows = []
+    for e in info["table"]:
+        rows.append({"fnv1a64": "%016x" % int(e["hash"]), "off": int(e["off"]),
+                     "len": int(e["len"]), "dtype": int(e["dtype"]),
+                     "shape": [int(x) for x in e["shape"]], "name": None})
+    # 名字由调用方通过 `name_by_hash` 填（见 tools/make_tg_names.py）
+    name_by_hash = (extra or {}).get("name_by_hash") or {}
+    uniq = Counter()
+    for r in rows:
+        nm = name_by_hash.get(r["fnv1a64"])
+        r["name"] = nm
+        if nm:
+            uniq[nm] += 1
+    dup = sorted([k for k, v in uniq.items() if v > 1])
+    doc = {"schema": "tg-names/1", "tg": os.path.basename(path),
+           "tg_size": os.path.getsize(path),
+           "header": {k: (v if isinstance(v, int) else str(v)) for k, v in h.items()},
+           "n_tensors": len(rows),
+           "n_named": sum(1 for r in rows if r["name"]),
+           "duplicate_names": dup[:20],
+           "tensors": rows}
+    if extra:
+        doc.update({k: v for k, v in extra.items() if k != "name_by_hash"})
+    out = sidecar_path(path)
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=1)
+    return out
+
+
+def load_names(path, verify=True):
+    """读旁挂名字文件；`verify=True` 时校验文件大小与张量数是否仍匹配。"""
+    p = sidecar_path(path)
+    if not os.path.isfile(p):
+        return None
+    with open(p, encoding="utf-8") as f:
+        doc = json.load(f)
+    if verify:
+        if doc.get("tg_size") and doc["tg_size"] != os.path.getsize(path):
+            raise ValueError(
+                "%s 与旁挂名字文件不匹配：.TG 为 %d B，旁挂记录 %d B。"
+                "修法：重新生成旁挂（tools/make_tg_names.py），不要手工改"
+                % (path, os.path.getsize(path), doc["tg_size"]))
+    return doc
+
+
+def list_tensors(path_or_info, path=None):
+    """返回 [(name, shape, dtype, off, len)]；无名张量 name 为 None。
+
+    优先用旁挂名字文件；没有旁挂时返回全 None 名字（**不会编造名字**）。
+    """
+    if isinstance(path_or_info, dict):
+        info, p = path_or_info, (path or path_or_info.get("path"))
+    else:
+        info, p = read_tg(path_or_info), path_or_info
+    names = load_names(p) if p else None
+    by_hash = {}
+    if names:
+        for r in names.get("tensors", []):
+            by_hash[r["fnv1a64"]] = r.get("name")
+    out = []
+    for e in info["table"]:
+        out.append((by_hash.get("%016x" % int(e["hash"])), list(e["shape"]),
+                    int(e["dtype"]), int(e["off"]), int(e["len"])))
+    return out

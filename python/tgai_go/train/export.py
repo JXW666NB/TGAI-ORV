@@ -154,4 +154,19 @@ def save_tg(path, params, *, n_layers, d_model, n_heads, d_ff, vocab_tokens, mer
     wr.set_tokenizer(vocab_tokens, merges=merges,
                      special_ids=special_ids or [0, 0, 0, 0])
     wr.write(path)
+    # ★ 旁挂名字表（2026-11-08）：`.TG` 表里只有 FNV 哈希，不存名字 —— 推理够用，
+    #   但当检查点用就**无法枚举参数**（做不了优化器映射/LoRA 挂载/部分加载）。
+    #   这里顺手写一个 `<model>.TG.names.json`：纯旁挂，引擎不读 ⇒ 对产线零风险。
+    #   哪怕名字表生成失败也**不影响** .TG 本身可用，所以整体 try 住。
+    try:
+        from ..read_tg import read_tg as _read_tg, write_names as _write_names, \
+            fnv1a64 as _fnv1a64, close_tg as _close_tg
+        _info = _read_tg(path)
+        try:
+            _write_names(path, _info,
+                         {"name_by_hash": {"%016x" % _fnv1a64(n): n for n in w}})
+        finally:
+            _close_tg(_info)
+    except Exception:                                       # noqa: BLE001
+        pass
     return path
