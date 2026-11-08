@@ -97,3 +97,25 @@ moe/experts 相关张量 **756 个**（≈ 28 层 × 8 专家 × 3 + router/qb�
 
 `last_step.pt` 里有 `lm_head.weight`，而 `.TG` 里**没有** ⇒ **产线 `.TG` 是词嵌入绑定（tied embedding）**。
 因此 ORV 侧建模 V2.7 必须用 `TIE=True`，否则会多/少一份输出层权重、logits 对不上。
+## 8. 路由语义（以 C 引擎源码为准，2026-11-08 查证）
+
+来源：`D:\TGAI\01_源码\TGAI-GO-wt\cuda\tgai_cuda.cu` 第 151~164 行的字段注释
+（引擎结构体 `d_router / d_qb_bias / d_expert_w1..w3`）：
+
+| 项 | 引擎语义 |
+| --- | --- |
+| `_qb_bias` | **形状 `[n_experts]`(F32)，必须在 top-k 之前加到 router logits 上**。缺失时为 NULL（老模型 V2.5/V2.6 行为不变）|
+| 不读它的后果 | 源码原话："旧实现完全没读这个张量 ⇒ **top-k 选错专家 ⇒ 输出乱码/退化**"（2026-10-13 修掉的乱码根因）|
+| 专家权重布局 | `d_expert_w1/w2/w3` = `[L, E, d_ff, d_model]` / `[L,E,d_ff,d_model]` / `[L,E,d_model,d_ff]` ⇒ 与 `.pt` 的 `w1(ff,d) / w2(ff,d) / w3(d,ff)` 一致 |
+| LM head | `d_emb_t` = `[d_model, vocab]`（由 `d_emb` 转置而来）⇒ **确证 tied embedding** |
+
+⇒ ORV 侧建模 V2.7 必须：
+1. `TIE=True`（无独立 lm_head）；
+2. 路由：`z = x @ router.T; z += qb_bias; topk(z, k=2)`（**偏置只影响"选谁"，语义按上表**）；
+3. 专家：`w1→gate`、`w2→up`、`w3→down`，SwiGLU。
+
+## 9. ORV 已有能力复核（避免重复造）
+
+`nn.MoE(d_model, d_ff, n_experts, top_k=2, gate="softmax")` —— **构造默认就是 top_k=2**，
+且前向支持"按 token 分组、空专家不参与 GEMM"。⇒ P1 里"实现 top-2 路由"**不需要**从零写，
+只需：① 把 `qb_bias` 加在 top-k 之前；② 权重名映射。
