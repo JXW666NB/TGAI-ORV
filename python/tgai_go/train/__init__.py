@@ -74,6 +74,7 @@ MoE（nn.MoE，CPU / CUDA 同一份模块，激活不整段拉回主机）：
 """
 from __future__ import annotations
 
+import os
 import numpy as np
 
 # 模块最后会把 max 绑成 torch.max。这两处要的是内置 max，先留住。
@@ -3766,6 +3767,12 @@ def _moe_grouped_cuda(x, w, tok_buf, slot_buf, off, experts, n, d, k):
     """
     counts = [int(off[e + 1]) - int(off[e]) for e in range(len(experts))]
     active = [e for e, c in enumerate(counts) if c > 0]
+    # ★ 2026-11-08：融合分组路径（cublasSgemmGroupedBatched）在**某专家行数 >64** 时
+    # `ewise_mul_v4` 越界（实测 n=128 崩、n=8 正常）。在它修好之前**默认关闭**，
+    # 走已验证的逐专家回退（数值一致，只是慢一些）。
+    # 需要重新打开做性能对比时：设环境变量 TGAI_MOE_GROUPED=1。
+    if os.environ.get("TGAI_MOE_GROUPED", "0") != "1":
+        return None
     if not active or _builtin_max(counts) <= 64:
         return None
     rt = _cuda()

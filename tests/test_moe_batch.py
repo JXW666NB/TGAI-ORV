@@ -6,8 +6,9 @@
   * n=128  → `cuLaunchKernel(ewise_mul_v4)` **rc=700 illegal memory access**
 同一份权重、同一个 gate，只改 token 数就崩 ⇒ 不是权重问题，是分组/路由缓冲按小 n 假设分配。
 
-影响：V2.7 全参训练每步要处理 T=512~2048 个 token ⇒ **此 bug 直接阻塞 P3**。
-修好之前，不要在生产训练里跑 n>8 的 MoE 前向。
+根因：融合分组 GEMM 路径（cublasSgemmGroupedBatched）在某专家行数 >64 时越界。
+处置（2026-11-08）：**默认关闭**该路径（TGAI_MOE_GROUPED=1 才开），走已验证的逐专家回退；
+实测 n=8/128/512/1024 全部通过。本用例从此是**回归门禁**。
 
 CI 无 GPU 时跳过（本条只在有卡的机器上有意义）。
 """
@@ -32,7 +33,6 @@ def _has_cuda():
 pytestmark = pytest.mark.skipif(not _has_cuda(), reason="需要 CUDA：MoE 的 CUDA 路径才有这个问题")
 
 
-@pytest.mark.xfail(strict=False, reason="ORV MoE 在 n>=64 时 ewise_mul_v4 越界（待修）；修好后去掉此标记")
 def test_moe_large_batch_no_ime():
     import tgai_go.train as T
     from tgai_go.train import MoE
@@ -47,7 +47,7 @@ def test_moe_large_batch_no_ime():
            for e in range(E)
            for s_, sh in (("gate", (FF, D)), ("up", (FF, D)), ("down", (D, FF)))},
     })
-    for n in (8, 128):
+    for n in (8, 128, 512):
         x = T.tensor(rng.normal(0, .1, (n, D)).astype(np.float32))
         y = np.asarray(m(x).to_numpy(), np.float32)
         assert y.shape == (n, D)
