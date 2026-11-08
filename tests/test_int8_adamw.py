@@ -82,3 +82,20 @@ def test_no_nan_1000_steps():
     tgt = rng.normal(0, 1, 1024).astype(np.float32)
     w, losses = _run(Int8AdamW(resid_dtype="float16", lr=1e-2), w0, tgt, steps=1000)
     assert np.isfinite(w).all() and losses[-1] < losses[0]
+def test_fp16_moments_meets_criteria():
+    """**推荐方案**：m/v 存 fp16（4 B/参数）—— 2.97B 只占 11.9 GB，且精度达标。"""
+    from tgai_go.train.int8_adamw import Fp16AdamW
+    w0, tgt = _problem()
+    rel, cos, dev = _cmp(Fp16AdamW(), w0, tgt)
+    print("\nfp16 m/v: 偏差=%.2e 余弦=%.6f loss=%.2e" % (rel, cos, dev))
+    assert rel <= 1e-3 and cos >= 0.999 and dev <= 1e-2
+    assert abs(Fp16AdamW().bytes_per_param() - 4.0) < 1e-9
+
+
+def test_fp16_moments_no_nan_1000():
+    from tgai_go.train.int8_adamw import Fp16AdamW
+    rng = np.random.default_rng(3)
+    w0 = rng.normal(0, 1, 1024).astype(np.float32)
+    tgt = rng.normal(0, 1, 1024).astype(np.float32)
+    w, losses = _run(Fp16AdamW(lr=1e-2), w0, tgt, steps=1000)
+    assert np.isfinite(w).all() and losses[-1] < losses[0]
