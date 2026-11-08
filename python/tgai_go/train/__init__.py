@@ -3112,9 +3112,13 @@ class Module:
                 raise KeyError("没有参数 %r。修法：用 named_parameters() 核对名字（%d 个可用）"
                                % (name, len(params)))
             arr = np.ascontiguousarray(arr, np.float32)
-            if tuple(arr.shape) != tuple(p.shape):
+            try:
+                want = tuple(int(x) for x in p.shape)
+            except Exception:                      # _gpu 已被释放：用构造时记下的形状
+                want = tuple(int(x) for x in (getattr(p, "_lazy_shape", None) or arr.shape))
+            if tuple(arr.shape) != want:
                 raise ValueError("参数 %r 形状不符：给的是 %s，要的是 %s。修法：核对导出脚本"
-                                 % (name, arr.shape, p.shape))
+                                 % (name, arr.shape, want))
             if getattr(p, "device", "cpu") == "cuda":
                 rt = _cuda()
                 old = getattr(p, "_gpu", None)

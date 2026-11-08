@@ -60,9 +60,19 @@ class V27Trainer(object):
             L["o"].append(Linear(DH, D, bias=False))
         L["moe"] = MoE(D, FF, E, top_k=K, gate="softmax_topk",
                        qb_bias=np.zeros(E, np.float32))
+        # 构造期分配的随机权重在 GPU 上会占满一份（MoE 每层 384 MB）；
+        # 这里**连设备缓冲一起释放**，之后由流式装载只分配一次 ⇒ 避免 2~3 倍开销。
         for m in [L["ln1"], L["ln2"], L["moe"]] + L["q"] + L["k"] + L["v"] + L["o"]:
             for prm in m.parameters():
                 if getattr(prm, "device", "cpu") == "cuda":
+                    buf = getattr(prm, "_gpu", None)
+                    if buf is not None and int(getattr(buf, "n", 0)) > 0:
+                        try:
+                            _cuda().free(int(buf.ptr))
+                        except Exception:
+                            pass
+                    prm._lazy_shape = tuple(int(x) for x in buf.shape) if buf is not None else prm._lazy_shape
+                    prm._gpu = None
                     prm.data = None
         if getattr(L["moe"].qb_bias, "device", "cpu") == "cuda":
             L["moe"].qb_bias.data = None
