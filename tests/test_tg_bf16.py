@@ -29,9 +29,11 @@ def _mk(path, arrays, dtype):
 
 
 def _bf16_round(x):
-    """numpy 里的 bf16 往返（截断高 16 位），用于算期望值。"""
+    """numpy 里的 bf16 往返（**就近舍入**，与写端一致），用于算期望值。"""
     x = np.ascontiguousarray(x, dtype=np.float32)
-    return ((x.view(np.uint32) >> 16) << 16).view(np.float32)
+    u = x.view(np.uint32).astype(np.uint64)
+    u = (u + 0x7FFF + ((u >> 16) & 1)) >> 16
+    return (u.astype(np.uint32) << 16).view(np.float32)
 
 
 def test_bf16_constants_exist():

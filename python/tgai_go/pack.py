@@ -143,8 +143,9 @@ class TGWriter:
                 dt = DT_FP16
             elif dtype == DT_BF16:
                 # bf16 = fp32 的高 16 位（截断，与产线 V2.7 的 bf16 .TG 一致）
-                bits = np.ascontiguousarray(flat, dtype=np.float32).view(np.uint32)
-                data = (bits >> 16).astype(np.uint16).tobytes()
+                u = np.ascontiguousarray(flat, dtype=np.float32).view(np.uint32).astype(np.uint64)
+                u = (u + 0x7FFF + ((u >> 16) & 1)) >> 16      # 就近舍入，与产线一致
+                data = u.astype(np.uint16).tobytes()
                 dt = DT_BF16
             else:
                 data = flat.astype(np.float32).tobytes()

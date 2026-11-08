@@ -17,8 +17,11 @@ CFG = dict(n_layers=1, d_model=8, n_heads=2, head_dim=4, d_ff=16, vocab=16,
 
 
 def _bf(x):
+    """bf16 就近舍入（与写端 _enc 同规则）。"""
     x = np.ascontiguousarray(x, dtype=np.float32)
-    return ((x.view(np.uint32) >> 16) << 16).view(np.float32)
+    u = x.view(np.uint32).astype(np.uint64)
+    u = (u + 0x7FFF + ((u >> 16) & 1)) >> 16
+    return (u.astype(np.uint32) << 16).view(np.float32)
 
 
 def test_roundtrip_enumerable(tmp_path):
@@ -110,6 +113,5 @@ def test_stream_write(tmp_path):
     with tg4.TG4(p) as r:
         assert sorted(r.names()) == sorted(k for k, _ in ts)
         for k, v in ts:
-            exp = ((np.ascontiguousarray(v, np.float32).view(np.uint32) >> 16) << 16).view(np.float32)
-            np.testing.assert_array_equal(r.get(k), exp, err_msg=k)
+            np.testing.assert_array_equal(r.get(k), _bf(v), err_msg=k)
         assert r.json_section(tg4.SEC_TRAIN)["step"] == 0
