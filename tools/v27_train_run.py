@@ -84,7 +84,12 @@ def isolate_soft():
         sh('schtasks /end /tn "%s"' % t)
 
 
+def _port_up(port):
+    return bool(sh("netstat -ano | findstr :%d | findstr LISTENING" % port).strip())
+
+
 def restore():
+    """恢复产线：改回 launcher → 启用任务 → 起服务 → **逐端口验证并重试**，失败要大声报。"""
     for f in LAUNCHERS:
         if os.path.isfile(f + ".off"):
             os.rename(f + ".off", f)
@@ -92,10 +97,20 @@ def restore():
         sh('schtasks /change /tn "%s" /enable' % t)
     for t in ("TGAI-GO-11440", "TGAI-GO-11441"):
         sh('schtasks /Run /TN "%s"' % t)
-    for f in LAUNCHERS:
-        if os.path.isfile(f):
-            subprocess.Popen([r"C:\Python311\python.exe", "-u", f],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(6):
+        for port, f in zip((11450, 11451), LAUNCHERS):
+            if not _port_up(port) and os.path.isfile(f):
+                sh('schtasks /Run /TN "TGAI-GO-%d"' % port)
+                subprocess.Popen([r"C:\Python311\python.exe", "-u", f],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(10):
+            time.sleep(5)
+            if _port_up(11450) and _port_up(11451):
+                log("产线恢复成功：11450/11451 均在监听，显存 %d MiB" % vram())
+                return True
+    log("!!! 产线恢复失败：11450=%s 11451=%s，显存 %d MiB —— 需要人工介入"
+        % (_port_up(11450), _port_up(11451), vram()))
+    return False
 
 
 def main():
@@ -163,6 +178,8 @@ def main():
             for p in tr.head_params():
                 p.grad = None
             tr.backward_and_step(xs, g, cos, sin, opts)
+            if step % 10 == 9:
+                T._cuda().empty_cache()   # 池里的临时缓冲真还驱动，避免长跑缓慢爬升
             if step % args.log_every == 0 or step == args.steps - 1:
                 log("step %4d  loss=%.4f  显存 %d MiB  %.2fs"
                     % (step, lv, vram(), time.time() - t1))
@@ -173,6 +190,19 @@ def main():
         log("峰值显存 %d MiB（%.1f GB / 32 GB）" % (vram(), vram() / 1024))
     finally:
         if not args.no_restore:
+            # **先把我们占的显存还回去**，否则 launcher 抢不到卡会直接死掉（实测踩过）
+            try:
+                tr = None
+                opts = None
+                head_opt = None
+                T._cuda().empty_cache()
+            except Exception:
+                pass
+            for _ in range(12):
+                time.sleep(5)
+                if vram() < 2000:
+                    break
+            log("训练进程已释放显存（%d MiB），开始恢复产线" % vram())
             restore()
             for _ in range(24):
                 time.sleep(5)
