@@ -3031,6 +3031,26 @@ class Parameter(Tensor):
         super().__init__(data, requires_grad=True)
 
 
+def empty_gpu(shape, dtype=np.float32, requires_grad=False):
+    """**只分配设备内存**、不建宿主 numpy 副本的 Tensor 构造。
+
+    为什么必须有：`T.tensor(np_array)` 会先在宿主建数组再 h2d —— 3B 参数就是 12 GB 主机内存，
+    与 ★3「不用到内存」直接冲突（实测：分配 3B fp32 权重时主机 OOM）。
+    这里走 `rt.empty()`（纯 cuMemAlloc），`data` 保持 None ⇒ 主机内存不增长。
+    """
+    t = Tensor.__new__(Tensor)
+    t.device = "cuda"
+    t.data = None
+    t.grad = None
+    t.requires_grad = bool(requires_grad)
+    t._parents = ()
+    t._backward = None
+    t._gpu = _cuda().empty(tuple(int(x) for x in shape), dtype)
+    t._lazy_T = None
+    t._lazy_shape = None
+    return t
+
+
 class Module:
     """对应 torch.nn.Module：参数注册、子模块、state_dict。"""
 
