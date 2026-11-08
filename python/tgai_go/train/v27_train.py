@@ -175,7 +175,7 @@ class V27Trainer(object):
         return xs
 
     # ---------- 逐层反向 + step ----------
-    def backward_and_step(self, xs, g_out, cos, sin, opts):
+    def backward_and_step(self, xs, g_out, cos, sin, opts=None):
         """从最后一层往回：重算该层前向 → 对 (y·g) 求和反向 → 拿到该层梯度与上游梯度 → step。"""
         g = np.asarray(g_out, np.float32)
         stats = []
@@ -187,8 +187,9 @@ class V27Trainer(object):
             n_grad = sum(1 for p in self.params_of(i) if getattr(p, "grad", None) is not None)
             if x_in.grad is not None:
                 g = np.asarray(_np(x_in.grad), np.float32)
-            opts[i].step()
-            opts[i].zero_grad()
+            if opts is not None:
+                opts[i].step()
+                opts[i].zero_grad()
             for p in self.params_of(i):
                 p.grad = None
             stats.append(dict(layer=i, with_grad=n_grad))
