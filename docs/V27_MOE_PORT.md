@@ -119,3 +119,27 @@ moe/experts 相关张量 **756 个**（≈ 28 层 × 8 专家 × 3 + router/qb�
 `nn.MoE(d_model, d_ff, n_experts, top_k=2, gate="softmax")` —— **构造默认就是 top_k=2**，
 且前向支持"按 token 分组、空专家不参与 GEMM"。⇒ P1 里"实现 top-2 路由"**不需要**从零写，
 只需：① 把 `qb_bias` 加在 top-k 之前；② 权重名映射。
+## 10. 路由语义（C 引擎源码权威注释，2026-11-08 二次确认）
+
+`D:\TGAI\01_源码\TGAI-GO-wt\src\tgai_engine.c:1117-1125`：
+
+```
+/* ★ QB 路由偏置 (2026-10-09 加，TGAI 2.7 必需)
+ * TGAI V2.7 用 quantile balancing（model_config.moe_balance='both'），
+ * 每层有 blocks.{i}.moe._qb_bias [n_experts]。语义：router logits **先加本偏置**，
+ * **再做 top-k 选择（softmax 之前）**。
+ * 向后兼容：老模型（V1/V2/V2.5/V2.6/mini）没有这个权重 ⇒ 保持 NULL ⇒ 行为不变。 */
+```
+
+⇒ ORV 侧 V2.7 前向的 MoE 部分确定为：
+
+```
+z = x @ router.T
+z = z + qb_bias          # 只在有该张量时（V2.7 有）
+ids, w = topk(z, k=2)    # 大值优先，平局取小下标（与 nn.MoE 文档一致）
+w = softmax(w)           # 源码明确 "softmax 之前" 才加偏置 ⇒ 门控是 softmax
+out = Σ_i w_i * Expert_id_i(x)      # Expert: silu(x@gate.T)*(x@up.T) @ down.T
+```
+
+**仍需实测确认的一点**（下一轮用 logits 比对判定）：softmax 是在 **top-k 选中的 2 个** logits 上做，
+还是在**全部 8 个**上做后再取前 2。两种都自洽，必须用数值比对定夺，不靠猜。
