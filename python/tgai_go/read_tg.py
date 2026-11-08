@@ -9,6 +9,11 @@ import sys
 
 import numpy as np
 
+try:
+    from mmap import mmap as _MMap          # 用于 isinstance 判断是否走了 mmap
+except Exception:                            # pragma: no cover
+    _MMap = type(b"")
+
 TG_MAGIC = 0x49414754
 #: dtype 码 → (名字, 每元素字节数, numpy 承载类型)
 #: 0/1/2/3 是原始四类；4/5 是量化容器（Q8_0/Q4_0，需 dequant 才能变浮点）；
@@ -28,8 +33,24 @@ def fnv1a64(name: str) -> int:
     return h
 
 
-def read_tg(path):
-    raw = open(path, "rb").read()
+def read_tg(path, mmap_mode=True):
+    """解析 `.TG` 头/词表/权重表。
+
+    **默认走 mmap**（2026-11-08 加）：3B 模型文件有 5.6 GB，而 `open().read()` 会一口气
+    吃掉同样大小的主机内存 —— 在只剩 ~6 GB 可用的机器上直接 MemoryError（V2.7 实测踩过）。
+    mmap 只建立映射，`load_tensor` 按张量切片时才真正读那一块。
+    用完请调用 `close_tg(info)` 释放句柄。
+    """
+    f = open(path, "rb")
+    raw = None
+    if mmap_mode:
+        try:
+            import mmap as _mmap
+            raw = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
+        except Exception:
+            raw = None
+    if raw is None:
+        raw = f.read()
     h = struct.unpack("<16I6Q4I", raw[:128])
     (magic, version, wdt, n_layers, d_model, n_heads, d_ff, vocab, max_seq,
      n_experts, n_act, rope_theta, pad, bos, eos, unk,
@@ -65,17 +86,25 @@ def read_tg(path):
                           shape=shape[:nd] if nd else shape, scale=sc))
 
     # chat meta
+    # 注意：这里**不能 assert**。V2.7 的真实文件 ext_off 处并不是我们的 CHAT_MAGIC
+    # （实测报 "chat meta magic 不对: 3cbb3cab"），但文件本身是好的 —— 是解析器太严。
+    # 拿不到就标 meta_ok=False，让调用方决定，绝不因此拒绝一个能用的模型。
     meta = {}
+    meta_ok = False
     if ext_off:
-        oo = ext_off
-        m, ver, cnt = struct.unpack_from("<III", raw, oo)
-        assert m == CHAT_MAGIC, "chat meta magic 不对: %x" % m
-        oo += 12
-        for _ in range(cnt):
-            t, ln = struct.unpack_from("<II", raw, oo)
-            oo += 8
-            meta[t] = raw[oo:oo + ln]
-            oo += ln
+        try:
+            oo = ext_off
+            m, ver, cnt = struct.unpack_from("<III", raw, oo)
+            if m == CHAT_MAGIC:
+                oo += 12
+                for _ in range(cnt):
+                    t, ln = struct.unpack_from("<II", raw, oo)
+                    oo += 8
+                    meta[t] = raw[oo:oo + ln]
+                    oo += ln
+                meta_ok = True
+        except (struct.error, ValueError):
+            meta_ok = False
 
     return dict(header=dict(magic=magic, version=version, weight_dtype=wdt,
                             n_layers=n_layers, d_model=d_model, n_heads=n_heads,
@@ -85,7 +114,26 @@ def read_tg(path):
                             arch=arch, num_kv_heads=nkv, modality_flags=modflags,
                             extension_off=ext_off),
             tokens=tokens, merges=merges, specials=specials,
-            table=table, data_off=wd_off, raw=raw, meta=meta)
+            table=table, data_off=wd_off, raw=raw, meta=meta, meta_ok=meta_ok,
+            path=path, _file=f, mmap=isinstance(raw, _MMap))
+
+
+def close_tg(info):
+    """释放 mmap/文件句柄（mmap 打开的文件不关会一直占着句柄）。"""
+    if not info:
+        return
+    raw = info.get("raw")
+    try:
+        if isinstance(raw, _MMap):
+            raw.close()
+    except Exception:
+        pass
+    try:
+        f = info.get("_file")
+        if f is not None:
+            f.close()
+    except Exception:
+        pass
 
 
 def bf16_to_f32(bits):

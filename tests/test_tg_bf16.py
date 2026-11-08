@@ -64,3 +64,28 @@ def test_q4_q8_have_dtype_codes():
     """量化容器码要能被识别（真正的 dequant 由 read_tg 的 dequant_* 处理）。"""
     assert R.DT[4][0] == "q8_0"
     assert R.DT[5][0] == "q4_0"
+
+def test_mmap_streaming(tmp_path):
+    """默认必须走 mmap：3B 文件（5.6 GB）整块 read() 会吃光内存。"""
+    import mmap as _mm
+    from tgai_go import read_tg as R
+    rng = np.random.default_rng(1)
+    w = rng.normal(0, 0.02, size=(4, 8)).astype(np.float32)
+    p = str(tmp_path / "s.tg")
+    _mk(p, {"blocks.0.mlp.down.weight": w}, P.DT_BF16)
+
+    info = R.read_tg(p)
+    try:
+        assert isinstance(info["raw"], _mm.mmap), "默认应走 mmap"
+        assert info["mmap"] is True
+        got = R.load_tensor(info, "blocks.0.mlp.down.weight")
+        np.testing.assert_allclose(got, _bf16_round(w), rtol=0, atol=0)
+    finally:
+        R.close_tg(info)
+
+    # 显式关掉 mmap 也要能读（回退路径）
+    info2 = R.read_tg(p, mmap_mode=False)
+    assert info2["mmap"] is False
+    np.testing.assert_allclose(R.load_tensor(info2, "blocks.0.mlp.down.weight"),
+                               _bf16_round(w), rtol=0, atol=0)
+    R.close_tg(info2)
