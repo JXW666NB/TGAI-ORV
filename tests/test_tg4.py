@@ -21,7 +21,6 @@ def _bf(x):
     return ((x.view(np.uint32) >> 16) << 16).view(np.float32)
 
 
-@pytest.mark.skip(reason="S1 未完成：TG4.json_section 的分区偏移读到错位字节（0xe0），已在 goal 记录，下一轮修")
 def test_roundtrip_enumerable(tmp_path):
     rng = np.random.default_rng(0)
     ts = {"token_embedding.weight": rng.normal(0, .02, (16, 8)).astype(np.float32),
@@ -38,7 +37,11 @@ def test_roundtrip_enumerable(tmp_path):
         assert r.header["n_layers"] == 1 and r.header["weight_dtype"] == tg4.DT_BF16
         assert r.json_section(tg4.SEC_ARC)["moe_balance"] == "both"
         assert r.json_section(tg4.SEC_TRAIN)["step"] == 7
-        assert r.json_section(tg4.SEC_HASH) is None       # HASH 是二进制分区
+        # HASH 是**二进制**分区（sha256），不是 JSON —— 早先这里误调 json_section，
+        # 把 sha256 字节当 UTF-8 解，才报出 0xe0 的假 bug。
+        assert tg4.SEC_HASH in r.sections
+        off, ln = r.sections[tg4.SEC_HASH]
+        assert ln == 32 * len(ts)
         assert tg4.SEC_HASH in r.sections
 
 
