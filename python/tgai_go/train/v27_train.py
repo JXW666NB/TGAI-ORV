@@ -68,8 +68,17 @@ class V27Trainer(object):
             ms["experts.%d.up.weight" % e] = _arr(sd, p + "moe.experts.%d.w2.weight" % e)
             ms["experts.%d.down.weight" % e] = _arr(sd, p + "moe.experts.%d.w3.weight" % e)
         moe.load_state_dict(ms)
+        for m_ in [ln1, ln2, moe] + qs + ks + vs + os_:
+            self._drop_host(m_)
         self.layers.append(dict(ln1=ln1, ln2=ln2, q=qs, k=ks, v=vs, o=os_, moe=moe))
         return self
+
+    @staticmethod
+    def _drop_host(mod):
+        """上传后释放宿主副本：3B 权重若都留着宿主数组，加载会先把主机内存撑爆（实测）。"""
+        for p_ in mod.parameters():
+            if getattr(p_, "device", "cpu") == "cuda":
+                p_.data = None
 
     def load_all(self, sd, on_layer=None):
         for i in range(self.NL):
