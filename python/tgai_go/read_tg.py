@@ -10,8 +10,13 @@ import sys
 import numpy as np
 
 TG_MAGIC = 0x49414754
+#: dtype 码 → (名字, 每元素字节数, numpy 承载类型)
+#: 0/1/2/3 是原始四类；4/5 是量化容器（Q8_0/Q4_0，需 dequant 才能变浮点）；
+#: 6 是 **BF16**（V2.7 的实际存储类型，实测 header weight_dtype=6）。
 DT = {0: ("fp32", 4, np.float32), 1: ("fp16", 2, np.float16),
-      2: ("int8", 1, np.int8), 3: ("int32", 4, np.int32)}
+      2: ("int8", 1, np.int8), 3: ("int32", 4, np.int32),
+      4: ("q8_0", 2, np.uint8), 5: ("q4_0", 1, np.uint8),
+      6: ("bf16", 2, np.uint16)}
 CHAT_MAGIC = 0x46434754
 
 
@@ -83,14 +88,61 @@ def read_tg(path):
             table=table, data_off=wd_off, raw=raw, meta=meta)
 
 
+def bf16_to_f32(bits):
+    """bf16 位模式 → fp32（左移 16 位，无损还原 bf16 能表示的值）。"""
+    return ((np.asarray(bits, dtype=np.uint32) << 16).view(np.float32))
+
+
+def dequant_q8_0(buf, n):
+    """Q8_0：每 32 元素 = fp16 scale(2B) + 32×int8。"""
+    raw = np.frombuffer(buf, dtype=np.uint8)
+    blk, rem = divmod(len(raw), 34)
+    if rem or blk * 32 < n:
+        raise ValueError("Q8_0 数据长度不对：%d 字节，期望 %d 个 34B 块（n=%d）。"
+                         "修法：确认 .TG 表项 len 与 shape 一致；必要时用 "
+                         "tools/tg_requantize.py 重新量化" % (len(raw), blk, n))
+    b = raw.reshape(blk, 34)
+    scale = b[:, :2].copy().view(np.float16).astype(np.float32)
+    q = b[:, 2:].copy().view(np.int8).astype(np.float32)
+    return (q * scale).reshape(-1)[:n]
+
+
+def dequant_q4_0(buf, n):
+    """Q4_0：每 32 元素 = fp16 scale(2B) + 16B 打包（低/高 nibble 各 16 个）。"""
+    raw = np.frombuffer(buf, dtype=np.uint8)
+    blk, rem = divmod(len(raw), 18)
+    if rem or blk * 32 < n:
+        raise ValueError("Q4_0 数据长度不对：%d 字节，期望 %d 个 18B 块（n=%d）。"
+                         "修法：确认表项 len 与 shape 一致" % (len(raw), blk, n))
+    b = raw.reshape(blk, 18)
+    scale = b[:, :2].copy().view(np.float16).astype(np.float32)
+    qs = b[:, 2:]
+    lo = (qs & 0x0F).astype(np.int8) - 8          # 4bit 有符号：减 8
+    hi = (qs >> 4).astype(np.int8) - 8
+    out = np.empty((blk, 32), dtype=np.float32)
+    out[:, 0::2] = lo
+    out[:, 1::2] = hi
+    return (out * scale[:, None]).reshape(-1)[:n]
+
+
 def load_tensor(info, name):
-    """按参数名取出张量（用 FNV-1a 匹配）"""
+    """按参数名取出张量（用 FNV-1a 匹配），统一返回 fp32。"""
     want = fnv1a64(name)
     for e in info["table"]:
         if e["hash"] == want:
-            _, esize, np_t = DT[e["dtype"]]
+            dname, esize, np_t = DT[e["dtype"]]
             start = info["data_off"] + e["off"]
             buf = info["raw"][start:start + e["len"]]
+            n = int(np.prod(e["shape"])) if e["shape"] else 0
+            if e["dtype"] == 6:                              # BF16
+                arr = bf16_to_f32(np.frombuffer(buf, dtype=np.uint16))
+                return arr.reshape(e["shape"]).astype(np.float32)
+            if e["dtype"] == 4:                              # Q8_0
+                return dequant_q8_0(buf, n).reshape(e["shape"]).astype(np.float32)
+            if e["dtype"] == 5:                              # Q4_0
+                return dequant_q4_0(buf, n).reshape(e["shape"]).astype(np.float32)
+            if e["dtype"] in (2, 3):                         # 整型：保留数值
+                return np.frombuffer(buf, dtype=np_t).reshape(e["shape"]).astype(np.float32)
             return np.frombuffer(buf, dtype=np_t).reshape(e["shape"]).astype(np.float32)
     return None
 

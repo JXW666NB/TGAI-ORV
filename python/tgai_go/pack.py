@@ -28,6 +28,11 @@ TG_MAGIC = 0x49414754
 TG_VERSION = 1
 TG_ARCH_TGAI_MOE = 0
 DT_FP32, DT_FP16, DT_INT8, DT_INT32 = 0, 1, 2, 3
+#: 量化 / 半精度扩展（与产线一致）：
+#: 4=Q8_0、5=Q4_0 是 `.TG` 里已有的量化容器码；6=BF16 是 V2.7 用的实际存储类型
+#:   （实测 D:\TGAI\models\V2.7\TGAI_NB_V2.7.tg 头 weight_dtype=6、869/982 张量是 dtype 6）。
+#: bf16 与 fp32 的换算只是左移/右移 16 位，无损。
+DT_Q8_0, DT_Q4_0, DT_BF16 = 4, 5, 6
 TG_CHAT_META_MAGIC = 0x46434754
 TG_CHAT_META_VERSION = 1
 
@@ -136,6 +141,11 @@ class TGWriter:
             if dtype == DT_FP16:
                 data = flat.astype(np.float16).tobytes()
                 dt = DT_FP16
+            elif dtype == DT_BF16:
+                # bf16 = fp32 的高 16 位（截断，与产线 V2.7 的 bf16 .TG 一致）
+                bits = np.ascontiguousarray(flat, dtype=np.float32).view(np.uint32)
+                data = (bits >> 16).astype(np.uint16).tobytes()
+                dt = DT_BF16
             else:
                 data = flat.astype(np.float32).tobytes()
                 dt = DT_FP32
