@@ -470,3 +470,31 @@ arch_type=0 num_kv_heads=0 modality_flags=1(TEXT) extension_off=4294966890
 
 ⇒ **这是两种互不兼容的容器**。生产文件 = 引擎容器（v3 头 + BF16）。
 `tg4.py` 的 "v4" 引擎不认识；而 format.h 里说的 "v4" 指 **BF16/Q4K 数据类型**，不是新容器。
+## 21. ★ v3→v4 升级已验证（容器 A：只改 version 字段，2026-11-09）
+
+用户选择 **C：两个都支持，引擎优先 A**。A 的现实是：v4 与 v3 **同容器**，差别只有 `version` 字段
+（以及允许 BF16/Q4K 权重，生产文件本来就是 BF16）。
+
+### 实测（`tools/upgrade_v3_to_v4.py --verify`）
+
+```
+原: version=3  tok_off=128 tok_len=296520  wt_off=296648 wt_cnt=982  wd_off=347712 wd_len=6,057,748,928
+新: version=4  其余字段完全相同
+文件大小：原=新=6,058,097,046
+头部差异字节数 = 1
+TOK段      逐位一致=True  (befd0eb3dc482abb…)
+权重索引    逐位一致=True  (80454b066c3fd2d4…)
+WGT段      逐位一致=True  (d7a710295ee5ff87…)   ← 6.06 GB 权重区
+```
+
+产物：`D:\TGAI\models\V2.7\TGAI_NB_V2.7_v4.tg`（原 v3 文件与其备份都保留未动）。
+
+### 引擎侧已改（本地副本，**尚未编译/上线**）
+
+* `tgai_format.h`：新增 `TG_VERSION_V4 = 4u`、`TG4_MAGIC = 0x00344754u`（`TG4\0`）
+* `tgai_engine.c`：版本校验接受 v4（`v1/v3/v4`），v4 与 v3 走同一套纯文本/多模态校验
+
+待办（下轮）：
+1. 在**源码副本**上编译引擎（不覆盖产线 DLL），跑通 v3/v4 双格式加载；
+2. 双格式输出比对（同一 prompt 逐字一致）后，再谈把产线切到 v4；
+3. 支持容器 B（`TG4\0` + 分区表 + JSON NAM）：在 `tg_load` 里加 magic 分支解析。
