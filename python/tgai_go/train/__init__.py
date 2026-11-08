@@ -3849,7 +3849,7 @@ class MoE(Module):
         Expert:   h = silu(x @ gate.T) * (x @ up.T);  out = h @ down.T
     """
 
-    def __init__(self, d_model, d_ff, n_experts, top_k=2, gate="softmax"):
+    def __init__(self, d_model, d_ff, n_experts, top_k=2, gate="softmax", qb_bias=None):
         super().__init__()
         d_model = int(d_model)
         d_ff = int(d_ff)
@@ -3861,13 +3861,17 @@ class MoE(Module):
             raise ValueError("MoE 至少要 1 个专家" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if top_k < 1 or top_k > n_experts:
             raise ValueError("top_k=%d 必须落在 [1, %d]" % (top_k, n_experts) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
-        if gate not in ("softmax", "sigmoid"):
+        #: V2.7（quantile balancing）用 "softmax_topk"：**只对选中的 k 个**做 softmax
+        #: 依据 tgai_cuda.cu:301-307「softmax 仅对选中的 k 个做」
+        if gate not in ("softmax", "sigmoid", "softmax_topk"):
             raise ValueError("gate 只接受 softmax / sigmoid，收到 %r" % (gate,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         self.d_model = d_model
         self.d_ff = d_ff
         self.n_experts = n_experts
         self.top_k = top_k
         self.gate = gate
+        #: V2.7 的负载均衡偏置 [n_experts]；前向里**加在 top-k 之前**（tgai_engine.c:1120）
+        self.qb_bias = None if qb_bias is None else _as_tensor(qb_bias)
         self.router = Linear(d_model, n_experts, bias=False)
         self.experts = _ExpertList([
             _MoEExpert(d_model, d_ff) for _ in range(n_experts)
@@ -3896,6 +3900,9 @@ class MoE(Module):
 
     def _forward_flat(self, x):
         logits = x @ self.router.weight.T
+        if getattr(self, "qb_bias", None) is not None:
+            # 依据 tgai_engine.c:1120「router logits 先加本偏置，再做 top-k」
+            logits = logits + self.qb_bias
         if getattr(x, "device", "cpu") == "cuda":
             return self._combine_cuda(x, logits)
         return self._combine_cpu(x, logits)
@@ -3906,6 +3913,9 @@ class MoE(Module):
         cols = np.asarray(idx, dtype=np.int64)
         if self.gate == "sigmoid":
             return _sigmoid_tensor(logits[rows, cols])
+        if self.gate == "softmax_topk":
+            # 只对选中的 k 个归一化（与产线一致）
+            return functional.softmax(logits[rows, cols], axis=-1)
         return functional.softmax(logits, axis=-1)[rows, cols]
 
     def _combine_cpu(self, x, logits):
