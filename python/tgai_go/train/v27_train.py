@@ -19,6 +19,7 @@ import math
 import numpy as np
 
 import tgai_go.train as T
+from tgai_go.train import _cuda
 from tgai_go.train import Linear, MoE, RMSNorm
 
 
@@ -59,6 +60,12 @@ class V27Trainer(object):
             L["o"].append(Linear(DH, D, bias=False))
         L["moe"] = MoE(D, FF, E, top_k=K, gate="softmax_topk",
                        qb_bias=np.zeros(E, np.float32))
+        for m in [L["ln1"], L["ln2"], L["moe"]] + L["q"] + L["k"] + L["v"] + L["o"]:
+            for prm in m.parameters():
+                if getattr(prm, "device", "cpu") == "cuda":
+                    prm.data = None
+        if getattr(L["moe"].qb_bias, "device", "cpu") == "cuda":
+            L["moe"].qb_bias.data = None
         return L
 
     # ---------- 装载 ----------
@@ -87,15 +94,16 @@ class V27Trainer(object):
                 iter([("weight", np.ascontiguousarray(ow[:, sl]))]))
         del qw, kw, vw, ow
 
-        moe_items = [("router.weight", _as_np(sd[p + "moe.router.weight"]))]
-        for e in range(self.E):
-            moe_items.append(("experts.%d.gate.weight" % e,
-                              _as_np(sd[p + "moe.experts.%d.w1.weight" % e])))
-            moe_items.append(("experts.%d.up.weight" % e,
-                              _as_np(sd[p + "moe.experts.%d.w2.weight" % e])))
-            moe_items.append(("experts.%d.down.weight" % e,
-                              _as_np(sd[p + "moe.experts.%d.w3.weight" % e])))
-        L["moe"].load_state_dict_stream(iter(moe_items))
+        def moe_items():
+            yield "router.weight", _as_np(sd[p + "moe.router.weight"])
+            for e in range(self.E):
+                yield ("experts.%d.gate.weight" % e,
+                       _as_np(sd[p + "moe.experts.%d.w1.weight" % e]))
+                yield ("experts.%d.up.weight" % e,
+                       _as_np(sd[p + "moe.experts.%d.w2.weight" % e]))
+                yield ("experts.%d.down.weight" % e,
+                       _as_np(sd[p + "moe.experts.%d.w3.weight" % e]))
+        L["moe"].load_state_dict_stream(moe_items())
         qb = _as_np(sd[p + "moe._qb_bias"]) if (p + "moe._qb_bias") in sd else None
         if qb is not None:
             L["moe"].qb_bias = T.tensor(qb)
@@ -107,6 +115,10 @@ class V27Trainer(object):
     def load_all(self, sd, on_layer=None):
         for i in range(self.NL):
             self.load_layer(i, sd)
+            # 每层装完把池里的旧块真正归还驱动：流式装载会替换每个参数的 _gpu，
+            # 旧块进池但不会被复用（尺寸不同），不回收就会把 3B 权重放大 3 倍。
+            if getattr(self.layers[0]["ln1"].weight, "device", "cpu") == "cuda":
+                _cuda().empty_cache()
             if on_layer:
                 on_layer(i)
         return self
