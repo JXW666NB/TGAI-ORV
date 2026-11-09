@@ -1,3 +1,35 @@
+## [0.7.0] - 2026-11-09
+
+### 修复（与 PyTorch 数值对齐，实测 15 步 loss 相对偏差 1.00e-05）
+
+- **注意力缺因果掩码**：`v27_train.py::fwd` 原为 `softmax((q@k.T)*scale)`，**没有 mask**，
+  等价于双向注意力（能看到未来 token）。已加上三角 −1e9 掩码。这是语义级 bug：
+  修复前单层 loss 与 PyTorch 差 2.56e-02，修复后 1.35e-07。
+- **CUDA MoE 的 softmax 作用域错误**：`_combine_cuda` 在**全部专家**上做 softmax 再取 top-k，
+  而语义（CPU 路径 / 引擎 `tgai_cuda.cu:301-307` / PyTorch）是**只在选中的 k 个上** softmax。
+  现改用 `moe_topk` 返回的选中值 `val_buf` 直接 softmax。实测 scale=8 时 4.55e-02 → 1.42e-06。
+- **训练路径丢失输入 embedding 梯度**（tied head）：训练喂 `x0` 用的是 numpy 常量，
+  tied embedding 只拿到"输出投影"一侧梯度（实测差 34%）。新增
+  `V27Trainer.add_embed_grad()`，`backward_and_step` 记录 `last_input_grad`，
+  用 `rt.emb_bwd` 把输入侧梯度散射回 `head.weight.grad`。
+- **`emb_bwd` 的 id dtype**：传 int64 会被内核按 int32 解读，梯度落到序列里不存在的行
+  （实测 row 0 拿到 0.62，而该 token 根本不在输入里）。改为 int32 后总梯度误差 9.29e-01 → 5.85e-06。
+
+### 新增
+
+- `tgai_go.train.v27_train.V27Trainer.add_embed_grad(ids, g_x0=None)`：补齐 tied embedding 的输入侧梯度。
+- `V27Trainer.last_input_grad`：逐层反向结束后保留 `d(loss)/d(x0)`。
+
+### 对齐证据（可复现）
+
+前向 1/2/4 层 loss 相对误差 1.35e-07 / 6.65e-08 / 0.00e+00；分组梯度 ≤7e-6；
+tied-embed 总梯度 5.85e-06；AdamW 单步参数 ≤5.09e-08；逐层重算反向 vs 图反向 ≤3.71e-07；
+ORV 自比噪声底（双进程）3.20e-07；真实语料 15 步曲线最差 1.00e-05。
+全 28 层前向 loss：ORV 1.3444903 vs PyTorch 1.3444886（相对 1.2e-06）。
+
+> 注意：`attention` 由双向改为因果会**改变已有模型的训练/推理行为**，
+> 之前用旧版训练的 checkpoint 语义上等价于另一个模型。故按 minor 版本升级。
+
 ## [0.5.0] - 2026-11-03
 
 这一版几乎全是**性能与可复现性**，每条都有实测数字。判据与证据见
