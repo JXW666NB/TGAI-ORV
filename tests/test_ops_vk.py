@@ -19,6 +19,10 @@ from tgai_go.train import ops_vk as OPS_VK  # noqa: E402
 
 def _child(code):
     full = "import sys, json; sys.path.insert(0, %r)\n%s" % (os.path.join(REPO, "python"), code)
+    # 打完结果 flush 后立刻 _exit(0)：AMD 驱动的 Vulkan teardown 会在**解释器退出**时
+    # access violation（0xC0000005）。实测与业务代码无关——把全部改动 stash 掉仍然复现。
+    # 必须先 flush：_exit 不会走 Python 的 io 清理，否则父进程读不到输出。
+    full = full + "\nimport sys as _sys, os as _os\n_sys.stdout.flush()\n_os._exit(0)\n"
     r = subprocess.run([sys.executable, "-X", "utf8", "-c", full],
                        capture_output=True, text=True,
                        env=dict(os.environ, PYTHONIOENCODING="utf-8"))
