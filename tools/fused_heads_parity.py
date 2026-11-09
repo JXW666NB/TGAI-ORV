@@ -47,6 +47,9 @@ def main():
     ang = np.repeat(np.arange(SEQ, dtype=np.float32)[:, None] * (THETA ** (-j))[None, :], 2, axis=1)
     cos = T.tensor(np.cos(ang).astype(np.float32))
     sin = T.tensor(np.sin(ang).astype(np.float32))
+    # 保留 numpy 版本：CUDA 张量没有可用的主机镜像，不能用 .data 取数组
+    cos_np = np.cos(ang).astype(np.float32)
+    sin_np = np.sin(ang).astype(np.float32)
 
     counts = Counter()
     rt = T._cuda()
@@ -72,8 +75,8 @@ def main():
         hh = L["ln1"](x)
         inv = 1.0 / np.sqrt(tr.DH)
         if getattr(tr, "fused_heads", False):
-            cos_t = T.tensor(np.tile(np.asarray(cos.data, np.float32), (1, tr.NH)))
-            sin_t = T.tensor(np.tile(np.asarray(sin.data, np.float32), (1, tr.NH)))
+            cos_t = T.tensor(np.tile(cos_np, (1, tr.NH)))
+            sin_t = T.tensor(np.tile(sin_np, (1, tr.NH)))
             q_all = T._rope_composed(L["q"][0](hh), cos_t, sin_t)
             k_all = T._rope_composed(L["k"][0](hh), cos_t, sin_t)
             v_all = L["v"][0](hh)
