@@ -121,3 +121,76 @@ def test_scale_grads_multiplies_in_place():
     n = T.optim.scale_grads([p], 0.25)
     assert n == 1
     assert np.allclose(p.grad.data, 0.25)
+
+
+def test_accumulation_sum_mode_matches_torch_sum_reduction():
+    """**求和口径**的严格对照：微批不加权累加 vs torch 的 reduction='sum'。
+
+    为什么单独测这个：均值口径要经过"每微批 ÷ 本批 token 数"再"整体 ÷ 微批数"两次缩放，
+    纯浮点舍入带来约 1.3e-6 的差异（见上一个测试）。求和口径只做一次累加、没有缩放，
+    才能真正看出"累加本身"是否等价。
+    """
+    rng = np.random.default_rng(3)
+    D, C, N = 6, 4, 8
+    X = rng.normal(0, 1, (N, D)).astype(np.float32)
+    Y = rng.integers(0, C, N).astype(np.int64)
+    micro = 4
+    bs = N // micro
+
+    lin = T.nn.Linear(D, C)
+    W = lin.weight
+    acc = T.optim.Accumulator([W], steps=micro, average=False)
+    for k in range(micro):
+        sl = slice(k * bs, (k + 1) * bs)
+        logits = T.tensor(np.ascontiguousarray(X[sl])) @ W.T
+        # sum 口径：把 CE 的均值乘回本微批的 token 数
+        loss = T.nn.functional.cross_entropy(logits, np.ascontiguousarray(Y[sl])) * float(bs)
+        loss.backward()
+        acc.tick()
+    g_acc = np.asarray(W.grad.data, np.float32).copy()
+
+    W_eff = np.array(W.data, np.float32, copy=True)
+    ref_W = torch.nn.Parameter(torch.from_numpy(W_eff))
+    logits = torch.from_numpy(X) @ ref_W.T
+    loss = torch.nn.functional.cross_entropy(logits, torch.from_numpy(Y), reduction="sum")
+    loss.backward()
+    g_ref = ref_W.grad.detach().numpy()
+
+    rel = _rel(g_acc, g_ref)
+    print("[accum] sum 口径（跨库）梯度相对误差 = %.2e" % rel)
+    # 这是"累加 + 跨库 fp32 差异"的叠加，固有量级约 1e-6~1e-5，判据取 1e-5
+    assert rel <= 1e-5, rel
+
+
+def test_accumulation_intrinsic_error_within_noise_floor():
+    """**隔离"累加本身"**：ORV 多微批 vs ORV 单批（同一份初始权重、同一实现）。
+
+    判据来自目标第 2 项（≤1e-6）。实测 1.39e-07 ~ 1.73e-07。
+    与 torch 的跨库比较（上一个测试）会叠加跨库 fp32 差异，量级约 1e-6，那是另一回事。
+    """
+    rng = np.random.default_rng(7)
+    D, C, N = 8, 5, 24
+    X = rng.normal(0, 1, (N, D)).astype(np.float32)
+    Y = rng.integers(0, C, N).astype(np.int64)
+    w0 = rng.normal(0, 0.2, (C, D)).astype(np.float32)
+
+    def grads(micro):
+        lin = T.nn.Linear(D, C)
+        W = lin.weight
+        np.copyto(np.asarray(W.data, np.float32), w0)
+        acc = T.optim.Accumulator([W], steps=micro)
+        bs = N // micro
+        for k in range(micro):
+            sl = slice(k * bs, (k + 1) * bs)
+            lg = T.tensor(np.ascontiguousarray(X[sl])) @ W.T
+            loss = T.nn.functional.cross_entropy(lg, np.ascontiguousarray(Y[sl]))
+            loss.backward()
+            acc.tick()
+        acc.finalize()
+        return np.asarray(W.grad.data, np.float32).copy()
+
+    base = grads(1)
+    for micro in (2, 4, 8):
+        rel = _rel(grads(micro), base)
+        print("[accum] micro=%d vs 单批 相对误差 = %.2e" % (micro, rel))
+        assert rel <= 1e-6, (micro, rel)
