@@ -17,6 +17,7 @@ DPO（Rafailov et al. 2023）：
 import numpy as np
 
 from . import Tensor, _as_tensor, functional
+from .indexing import gather_flat as _gather_flat, scatter_flat as _scatter_flat
 
 __all__ = ["logsigmoid", "seq_logprob", "dpo_pair_loss", "dpo_batch_loss",
            "group_advantages", "token_logprobs", "grpo_loss"]
@@ -111,19 +112,20 @@ def group_advantages(rewards, eps=1e-4):
 def token_logprobs(logits, labels, ignore_index=-100):
     """**逐 token** 的 logπ（[T]，被忽略位置为 0），保持可微。
 
-    没有 gather 算子，只能 `log_softmax` 后与 one-hot 相乘再对词表维求和。
-    代价：会额外持有一份 [T, V] 的 one-hot（V 大时不小）；等后端补上 gather 可换掉。
+    实现：`log_softmax` 后按「扁平下标 = t*V + label」做 **gather**，再 scatter 回 [T]。
+    这样不再需要一份 [T, V] 的 one-hot（原先每步要多分配并遍历一个满词表张量）。
     """
     lab = np.asarray(labels, np.int64)
     Tlen = int(lab.shape[0])
     V = int(logits.shape[-1])
     lp = functional.log_softmax(logits, axis=-1)                 # [T, V]
-    oh = np.zeros((Tlen, V), np.float32)
     valid = (lab != ignore_index)
-    oh[np.nonzero(valid)[0], lab[valid]] = 1.0
-    sel = (lp * _as_tensor(oh)).sum(axis=-1)                     # [T]
-    mask = valid.astype(np.float32)
-    return sel * _as_tensor(mask)
+    pos = np.nonzero(valid)[0]
+    if pos.size == 0:
+        return _as_tensor(np.zeros(Tlen, np.float32))
+    flat = pos.astype(np.int64) * V + lab[pos]
+    picked = _gather_flat(lp, flat)                              # [n_valid]
+    return _scatter_flat(picked, pos, Tlen)                      # [T]，非法位置为 0
 
 
 def grpo_loss(policy_logps, old_logps, ref_logps, advantages, masks,

@@ -4454,6 +4454,7 @@ from .opt_extra import (SGD as _SGDImpl, Lion as _LionImpl,        # noqa: E402
                        Accumulator as _Accumulator, scale_grads as _scale_grads)
 from .nn_ops import clip_grad_norm_ as _clip_grad_norm_impl         # noqa: E402
 from . import align as _align_impl                                  # noqa: E402
+from . import indexing as _indexing_impl                            # noqa: E402
 from . import sched as _sched_impl                                 # noqa: E402
 
 
@@ -4495,6 +4496,9 @@ logsigmoid = _align_impl.logsigmoid
 seq_logprob = _align_impl.seq_logprob
 dpo_pair_loss = _align_impl.dpo_pair_loss
 dpo_batch_loss = _align_impl.dpo_batch_loss
+index_select = _indexing_impl.index_select
+gather_flat = _indexing_impl.gather_flat
+scatter_flat = _indexing_impl.scatter_flat
 group_advantages = _align_impl.group_advantages
 token_logprobs = _align_impl.token_logprobs
 grpo_loss = _align_impl.grpo_loss

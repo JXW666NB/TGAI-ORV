@@ -1146,3 +1146,51 @@ seq=512  0.229 s   28.6 ms/层   ← token 数 ×4，时间只涨 10%
 2. `add_embed_grad` 把 `dw` D2H 后与 `w.grad` 相加再 H2D
 
 这两处用 **gather 算子（阶段 B）+ 设备端累加** 就能消掉，预计还能再省 0.2~0.4 s。
+## 36. 阶段 B：gather / index_select（2026-11-09）
+
+### 36.1 新增内核（`_CAT_KERNELS`）
+
+| 内核 | 作用 |
+| --- | --- |
+| `gather_rows` / `scatter_add_rows` | 行 gather 及其 atomicAdd 反向 |
+| `gather_flat` / `scatter_add_flat` | 逐元素 gather（扁平下标）及其反向 |
+
+Runtime 侧对应 `rt.gather_rows / scatter_add_rows / gather_flat / scatter_add_flat`。
+Python 侧 `tgai_go.train.indexing` 导出 **`T.index_select`**、**`T.gather_flat`**、**`T.scatter_flat`**，
+三者都可微（CPU 走 numpy，CUDA 走新内核）。
+
+### 36.2 实测（判据 ≤1e-6）
+
+CPU：`tests/test_indexing.py` 7 项全过（含重复索引的累加反向、dim=1、越界报错）。
+
+GPU（`tools/gather_gpu_check.py`，对 torch）：
+
+```
+index_select   前向 0.00e+00   反向 0.00e+00
+index_select(dim=1) 前向 0.00e+00
+gather_flat    前向 0.00e+00   反向 0.00e+00
+token_logprobs 前向 0.00e+00   反向 8.16e-09
+log_softmax    前向 9.84e-08   反向 1.58e-07
+```
+
+⇒ 前向/反向都**逐位一致或 1e-9 量级**，优于判据。
+
+### 36.3 B3：`token_logprobs` 去掉 [T, V] one-hot
+
+改成「`log_softmax` → 扁平下标 gather → scatter 回 [T]」，不再分配满词表 one-hot。
+DPO/GRPO 的既有 16 项对照测试全绿。
+
+### 36.4 顺手修掉一个**潜伏的崩溃**
+
+`log_softmax_lastdim` / `log_softmax_lastdim_bwd` 调用了 `self._warp_row_grid(...)`，
+但**整个文件没有这个方法的定义** —— CPU 测试走 numpy、V27 训练只用 `softmax`，
+所以一直没被触发，直到本轮在 GPU 上第一次调用 `log_softmax` 才炸。
+按内核实际布局（warp-per-row，8 warp/block）补上实现，并新增**静态自检**
+`tests/test_cuda_selfcheck.py`：扫描 `cuda.py` 里每个 `self.xxx(...)` 必须有定义，
+另查同名方法重复定义（后者静默覆盖前者）。这类 bug 以后不需要 GPU 就能查出来。
+
+### 36.5 过程失误（记录）
+
+我曾把本地 `cuda.py` 直接 scp 覆盖远端，而远端不是 git 仓库、没有历史可回滚。
+本次核对：本地与远端 sha256 一致、备份里也没有该函数 ⇒ 缺失是**原来就存在**的，
+不是覆盖造成。但教训成立：**远端目录不是版本库，覆盖前必须先备份**。

@@ -1627,6 +1627,50 @@ extern "C" __global__ void cat_extract(
     long long si = (((long long)o * src_axis + (long long)src_off + d_i) * inner) + inner_i;
     dst[i] = src[si];
 }
+
+/* ---- 任意索引 gather（torch.index_select / torch.gather 的底座）----
+ * gather_rows : out[r, :] = src[idx[r], :]，row_size = 每行元素数（内层连续）
+ * gather_flat : out[i]     = src[idx[i]]，idx 是**已算好**的扁平下标（用于逐元素 gather）
+ * 反向都用 atomicAdd 散射回去（scatter_add_rows / scatter_add_flat）。
+ * 与 cat 系列一样显式用 __fadd_rn 保证确定性语义（atomicAdd 的浮点加法顺序由硬件决定，
+ * 同一输入下可复现，但与串行顺序相加可能差最后几位——测试里按容差比较）。 */
+extern "C" __global__ void gather_rows(
+    const float* __restrict__ src, const int* __restrict__ idx, float* __restrict__ dst,
+    int n_rows, int row_size) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)n_rows * row_size;
+    if (i >= total) return;
+    int r = (int)(i / row_size);
+    int c = (int)(i - (long long)r * row_size);
+    int sidx = idx[r];
+    dst[i] = __ldg(src + (long long)sidx * row_size + c);
+}
+
+extern "C" __global__ void scatter_add_rows(
+    const float* __restrict__ g, const int* __restrict__ idx, float* __restrict__ out,
+    int n_rows, int row_size) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)n_rows * row_size;
+    if (i >= total) return;
+    int r = (int)(i / row_size);
+    int c = (int)(i - (long long)r * row_size);
+    int sidx = idx[r];
+    atomicAdd(out + (long long)sidx * row_size + c, g[i]);
+}
+
+extern "C" __global__ void gather_flat(
+    const float* __restrict__ src, const int* __restrict__ idx, float* __restrict__ dst, int n) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __ldg(src + idx[i]);
+}
+
+extern "C" __global__ void scatter_add_flat(
+    const float* __restrict__ g, const int* __restrict__ idx, float* __restrict__ out, int n) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    atomicAdd(out + idx[i], g[i]);
+}
 """
 
 
@@ -3946,6 +3990,63 @@ class CudaRuntime:
             grad, full, n, base, out_shape, divs, strides))
         return full
 
+    def gather_rows(self, src, idx, n_src_rows, row_size, n_rows):
+        """行 gather：out[r, :] = src[idx[r], :]。idx 是设备上的 **int32** 缓冲。
+
+        `n_src_rows` / `row_size` 必须与 src 的连续布局一致（src 视为 [n_src_rows, row_size]）。
+        """
+        n_rows = int(n_rows)
+        row_size = int(row_size)
+        out = self.empty((n_rows, row_size), dtype=np.float32)
+        total = n_rows * row_size
+        if total:
+            if total > 2147483647:
+                raise CudaError("gather_rows 元素数 %d 超过 int32" % total + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            grid, block = self._ewise_grid(total)
+            self.launch("gather_rows", grid, block, [
+                self._ptr(src), self._ptr(idx), self._ptr(out),
+                (n_rows, ctypes.c_int), (row_size, ctypes.c_int)])
+        return out
+
+    def scatter_add_rows(self, g, idx, n_src_rows, row_size, n_rows):
+        """行 gather 的反向：先清零 [n_src_rows, row_size]，再把 g 的行按 idx atomicAdd 回去。"""
+        n_rows = int(n_rows)
+        row_size = int(row_size)
+        out = self.zeros((int(n_src_rows), row_size), dtype=np.float32)
+        total = n_rows * row_size
+        if total:
+            if total > 2147483647:
+                raise CudaError("scatter_add_rows 元素数 %d 超过 int32" % total + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            grid, block = self._ewise_grid(total)
+            self.launch("scatter_add_rows", grid, block, [
+                self._ptr(g), self._ptr(idx), self._ptr(out),
+                (n_rows, ctypes.c_int), (row_size, ctypes.c_int)])
+        return out
+
+    def gather_flat(self, src, idx, n):
+        """逐元素 gather：out[i] = src[idx[i]]（idx 是已算好的 int32 扁平下标）。"""
+        n = int(n)
+        out = self.empty((n,), dtype=np.float32)
+        if n:
+            if n > 2147483647:
+                raise CudaError("gather_flat 元素数 %d 超过 int32" % n + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            grid, block = self._ewise_grid(n)
+            self.launch("gather_flat", grid, block, [
+                self._ptr(src), self._ptr(idx), self._ptr(out), (n, ctypes.c_int)])
+        return out
+
+    def scatter_add_flat(self, g, idx, n_src, n):
+        """逐元素 gather 的反向：zeros(n_src) 后按 idx atomicAdd。"""
+        n = int(n)
+        out = self.zeros((int(n_src),), dtype=np.float32)
+        if n:
+            if n > 2147483647:
+                raise CudaError("scatter_add_flat 元素数 %d 超过 int32" % n + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            grid, block = self._ewise_grid(n)
+            self.launch("scatter_add_flat", grid, block, [
+                self._ptr(g), self._ptr(idx), self._ptr(out), (n, ctypes.c_int)])
+        return out
+
     def _cat_geom(self, shape, axis):
         """行主序连续缓冲沿 axis 拆成 outer × span × inner。"""
         shape = tuple(int(s) for s in shape)
@@ -4255,6 +4356,15 @@ class CudaRuntime:
         return self._bmm_op(CUDA_OP_N, CUDA_OP_T, A.ptr, M, int(K * M),
                             B.ptr, N, int(K * N), C, batch, M, N, K)
 
+
+    def _warp_row_grid(self, rows):
+        """一行一个 warp（与 `_row_grid` 同语义）：block 256 线程 = 8 warp，grid = ceil(rows / 8)。
+
+        `log_softmax_lastdim` / `log_softmax_lastdim_bwd` 的内核都是 warp-per-row
+        （32 lane 并行归约），所以这里必须是 8 warp/block 的布局。
+        """
+        wpp = 8
+        return ((int(rows) + wpp - 1) // wpp, 1, 1), (256, 1, 1)
 
     def _row_grid(self, rows):
         """一行一个 warp：block 256 线程（8 warp），grid = ceil(rows / 8)。"""
