@@ -1,3 +1,36 @@
+## [0.9.0] - 2026-11-09
+
+阶段二：对齐训练形态（DPO / GRPO）。torch 核心不含这些损失，参考实现按论文公式手写并逐项对照。
+
+### 新增（`tgai_go.train.align`，导出为 `T.align.*` 与顶层函数）
+
+- `logsigmoid(x)`：数值稳定（`−softplus(−x)` 形式）
+- `seq_logprob(logits, labels, ignore_index)`：回答段 logπ **之和**，保持可微
+- `dpo_pair_loss(pw, pl, rw, rl, beta)` / `dpo_batch_loss(...)`：DPO
+- `group_advantages(rewards, eps)`：GRPO 组内归一化优势（总体标准差）
+- `token_logprobs(logits, labels, ignore_index)`：**逐 token** logπ（可微）
+- `grpo_loss(policy_logps, old_logps, ref_logps, advantages, masks, clip_eps, beta, kl)`：
+  token 级 PPO 裁剪 + KL（k1 / k3），返回 (loss, stats)
+
+### 实测对照（手写 torch 参考，独立实现同一公式）
+
+| 项 | 判据 | 实测 |
+| --- | --- | --- |
+| `logsigmoid`（含 ±40）| 1e-6 | ≤1e-6 |
+| `seq_logprob`（含 ignore_index）| 1e-5 | ≤1e-5 |
+| DPO 单对 loss / 对两侧 logits 的梯度 | 1e-5 | ≤1e-5 |
+| DPO batch 平均（beta ∈ {0.01,0.1,0.5}）| 1e-5 | ≤1e-5 |
+| `token_logprobs` | 1e-5 | ≤1e-5 |
+| GRPO loss / 梯度（beta=0 / 0.1·k3 / 0.1·k1）| 1e-5 | ≤1e-5 |
+| GRPO 裁剪触发统计 | — | ratio 远离 1 时 clip_frac>0 |
+
+### 已知限制（写进 docstring，未隐藏）
+
+后端没有 gather 算子，因此：
+- `seq_logprob` 逐序列调用（batch 内多几次 kernel）；
+- `token_logprobs` 需要一份 [T, V] 的 one-hot，词表大时显存开销明显。
+
+两处都留了"等 gather 就绪再向量化"的说明，接口不需要变。
 ## [0.8.0] - 2026-11-09
 
 阶段一：训练基础设施对齐 PyTorch（每项都有与 torch 的数值对照测试）。

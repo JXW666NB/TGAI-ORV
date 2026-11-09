@@ -4495,6 +4495,9 @@ logsigmoid = _align_impl.logsigmoid
 seq_logprob = _align_impl.seq_logprob
 dpo_pair_loss = _align_impl.dpo_pair_loss
 dpo_batch_loss = _align_impl.dpo_batch_loss
+group_advantages = _align_impl.group_advantages
+token_logprobs = _align_impl.token_logprobs
+grpo_loss = _align_impl.grpo_loss
 
 def permute(input, dims):
     """对应 torch.permute(input, dims)。dims 是轴的排列。"""

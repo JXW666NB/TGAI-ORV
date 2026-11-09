@@ -18,7 +18,8 @@ import numpy as np
 
 from . import Tensor, _as_tensor, functional
 
-__all__ = ["logsigmoid", "seq_logprob", "dpo_pair_loss", "dpo_batch_loss"]
+__all__ = ["logsigmoid", "seq_logprob", "dpo_pair_loss", "dpo_batch_loss",
+           "group_advantages", "token_logprobs", "grpo_loss"]
 
 
 def _scalar(t):
@@ -89,3 +90,96 @@ def dpo_batch_loss(policy_logits_w, labels_w, policy_logits_l, labels_l,
         total = li if total is None else total + li
         margins.append(_scalar(marg))
     return total * (1.0 / float(n)), margins
+
+
+# ───────────────────────────── GRPO / GPRO ─────────────────────────────
+
+def group_advantages(rewards, eps=1e-4):
+    """组内归一化优势 A_i = (r_i − mean(r)) / (std(r) + eps)。
+
+    rewards 是一个 prompt 下 G 个采样回答的奖励（numpy / list）。
+    std 用**组内总体标准差**（ddof=0），与 GRPO 论文与主流实现一致。
+    """
+    r = np.asarray(rewards, np.float64)
+    if r.ndim != 1 or r.size < 2:
+        raise ValueError("group_advantages 需要同一 prompt 下 >=2 个奖励。"
+                         "修法：每个 prompt 采样至少 2 条，或对单条改用监督训练")
+    adv = (r - r.mean()) / (r.std() + float(eps))
+    return adv.astype(np.float32)
+
+
+def token_logprobs(logits, labels, ignore_index=-100):
+    """**逐 token** 的 logπ（[T]，被忽略位置为 0），保持可微。
+
+    没有 gather 算子，只能 `log_softmax` 后与 one-hot 相乘再对词表维求和。
+    代价：会额外持有一份 [T, V] 的 one-hot（V 大时不小）；等后端补上 gather 可换掉。
+    """
+    lab = np.asarray(labels, np.int64)
+    Tlen = int(lab.shape[0])
+    V = int(logits.shape[-1])
+    lp = functional.log_softmax(logits, axis=-1)                 # [T, V]
+    oh = np.zeros((Tlen, V), np.float32)
+    valid = (lab != ignore_index)
+    oh[np.nonzero(valid)[0], lab[valid]] = 1.0
+    sel = (lp * _as_tensor(oh)).sum(axis=-1)                     # [T]
+    mask = valid.astype(np.float32)
+    return sel * _as_tensor(mask)
+
+
+def grpo_loss(policy_logps, old_logps, ref_logps, advantages, masks,
+              clip_eps=0.2, beta=0.0, kl="k3"):
+    """GRPO 损失（token 级 PPO 裁剪 + 可选 KL），返回 (loss, 统计)。
+
+    参数
+      policy_logps : 长度为 G 的 list，每项是 [T] 的**可微**逐 token logπ
+      old_logps    : 采样时策略的逐 token logπ（常量，冻结）
+      ref_logps    : 参考模型的逐 token logπ（常量，冻结）
+      advantages   : [G] 组内归一化优势（`group_advantages` 的输出）
+      masks        : 长度 G 的 list，每项 [T]，1 表示要计入损失
+      clip_eps     : PPO 裁剪范围
+      beta         : KL 系数（0 表示不加 KL）
+      kl           : "k3"（exp(d)−d−1，无偏且非负）或 "k1"（d，其中 d=ref−policy）
+
+    loss = mean_t[ −min(r_t·A, clip(r_t,1−ε,1+ε)·A) ] + β·mean_t[KL_t]
+    其中 r_t = exp(policy_t − old_t)，同一回答内所有 token 共用该回答的 A。
+    """
+    e = float(clip_eps)
+    if e <= 0:
+        raise ValueError("grpo 的 clip_eps 必须为正。修法：传 0.2 之类的正数")
+    n = len(policy_logps)
+    if not (len(old_logps) == len(ref_logps) == len(advantages) == len(masks) == n):
+        raise ValueError("grpo_loss: 各入参长度不一致（G 条回答要一一对应）。"
+                         "修法：检查 advantages / masks / logp 列表长度")
+    total = None
+    ntok = 0.0
+    clip_frac_num = 0.0
+    ratios_all = []
+    for i in range(n):
+        p = _as_tensor(policy_logps[i])
+        old = _as_tensor(np.asarray(old_logps[i], np.float32))
+        ref = _as_tensor(np.asarray(ref_logps[i], np.float32))
+        m = _as_tensor(np.asarray(masks[i], np.float32))
+        adv = float(advantages[i])
+        ratio = (p - old).exp()
+        s1 = ratio * adv
+        s2 = ratio.clamp(1.0 - e, 1.0 + e) * adv
+        # min(s1, s2) = −max(−s1, −s2)
+        neg_min = ((s1 * -1.0).maximum(s2 * -1.0)) * -1.0
+        per = ((neg_min * m).sum()) * -1.0
+        if beta:
+            diff = ref - p
+            kl_t = (diff.exp() - diff - 1.0) if kl == "k3" else diff
+            per = per + ((kl_t * m).sum()) * float(beta)
+        total = per if total is None else total + per
+        mv = np.asarray(m.data if hasattr(m, "data") else m, np.float32)
+        ntok += float(mv.sum())
+        rv = np.asarray(ratio.data if hasattr(ratio, "data") else ratio, np.float32)
+        ratios_all.append(rv)
+        hit = np.abs(rv - 1.0) > e
+        clip_frac_num += float((hit * (mv > 0)).sum())
+    if ntok <= 0:
+        raise ValueError("grpo_loss: 所有 mask 都是 0，没有可训练的 token。修法：检查 masks")
+    loss = total * (1.0 / ntok)
+    stats = {"tokens": ntok, "clip_frac": clip_frac_num / max(ntok, 1.0),
+             "ratio_mean": float(np.mean([r.mean() for r in ratios_all]))}
+    return loss, stats

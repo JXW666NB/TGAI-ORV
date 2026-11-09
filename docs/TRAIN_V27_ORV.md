@@ -939,3 +939,42 @@ Adafactor(row/col)：公式  0.021 GB  GPU 增量 < 1 MiB（走了已预留的�
 `tests/test_ops_vk.py` 的子进程枚举 Vulkan 后，AMD 驱动在**解释器退出**时 access violation
 （0xC0000005）。用 `git stash` 把全部改动清掉后仍复现 ⇒ 与本次改动无关。处理方式：子进程
 打印结果后 `flush` + `os._exit(0)`，测试仍校验输出 JSON。
+## 32. 阶段二：训练形态 DPO / GRPO（0.9.0，2026-11-09）
+
+torch 核心没有 DPO/GRPO，参考实现按论文公式**手写**，与本库逐项对照（loss 与**梯度**都要对）。
+
+### 32.1 实测对照
+
+| 项 | 判据 | 实测 |
+| --- | --- | --- |
+| `logsigmoid`（含 ±40）| 1e-6 | ≤1e-6 |
+| `seq_logprob`（含 ignore_index 的 prompt 段）| 1e-5 | ≤1e-5 |
+| DPO 单对 loss / 对两侧 logits 的梯度 | 1e-5 | ≤1e-5 |
+| DPO batch 平均（beta ∈ {0.01, 0.1, 0.5}）| 1e-5 | ≤1e-5 |
+| `token_logprobs` | 1e-5 | ≤1e-5 |
+| GRPO loss / 梯度（beta=0、0.1·k3、0.1·k1）| 1e-5 | ≤1e-5 |
+| GRPO 裁剪触发（ratio 远离 1）| — | clip_frac > 0 |
+
+测试文件：`tests/test_dpo.py`、`tests/test_grpo.py`。
+
+### 32.2 实现要点
+
+- DPO：`L = −log σ(β[(logπ_w − logπ_ref,w) − (logπ_l − logπ_ref,l)])`，
+  logπ 是**回答段** token log-prob 之和（prompt/padding 用 ignore_index 排除）。
+- GRPO：`loss = mean_t[−min(r_t·A, clip(r_t,1±ε)·A)] + β·mean_t[KL_t]`，
+  `A = (r − mean)/std`（组内，总体标准差），KL 支持 k3（`e^d − d − 1`）与 k1（`d`）。
+- `GPRO` 在本库按**同一组内归一化优势 + 裁剪 + KL** 的口径实现（即 GRPO 的框架）；
+  若你要的是别的口径（例如过程奖励/逐 step 奖励），需要再明确公式，我不会自己编。
+
+### 32.3 已知限制（写进 docstring，不隐藏）
+
+后端没有 gather 算子，因此：
+- `seq_logprob` 逐序列调用（batch 内多几个 kernel，DPO 批次通常很小）；
+- `token_logprobs` 需要一份 [T, V] 的 one-hot，**词表大时显存开销明显**。
+
+两处都留了"等 gather 就绪再向量化"的说明，接口不变。
+
+### 32.4 一次自我纠错
+
+第一版 `seq_logprob` 为了拼 batch 走了 numpy（`float(...)` 再重建张量），会**静默切断梯度**——
+DPO 就变成"只算 loss 不训练"。改成逐序列标量 + 图上累加，并把**梯度**也纳入对照判据。
