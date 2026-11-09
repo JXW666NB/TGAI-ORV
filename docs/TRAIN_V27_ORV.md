@@ -675,3 +675,15 @@ WGT       逐位一致 = True
 | 训练**写** v4 | ✅ | **TOK/索引/WGT 三段与产线逐位一致** |
 
 ⇒ 「V4 既是推理格式也是训练格式」在**文件层面**已成立。
+### 26.1 闭环最后一环：**训练产物被 GPU 引擎接管**（2026-11-09 09:17）
+
+```
+训练产物 trained_v4.tg（5.64 GB，由 3 步训练后的权重导出）
+加载前显存 10 MiB
+加载训练产物：OK err=0  33.1 s；显存 10 → 13,711 MiB（增量 13,701）
+GPU 接管判定：增量 > 10000 MiB ⇒ 是
+[CUDA-BRIDGE] TAKEN OVER (GPU forward; model resident in VRAM)
+[tg_load] GPU forward: TAKEN OVER
+```
+
+⇒ 完整闭环证据链：**v4 文件 → 读到训练器 → 全参训练（loss 2.10→1.68）→ 导出 v4（5.64 GB / 61 s）→ GPU 引擎接管（13.7 GB 驻显存）**。
