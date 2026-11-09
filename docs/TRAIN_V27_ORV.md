@@ -815,3 +815,78 @@ final_norm          idx=816  eps=1e-3  解析 -2.417773e-02  数值 -2.431870e-0
 **结论**：在数值分辨率内，ORV 的解析梯度与数值梯度一致（多个点 1e-4~3e-3）；
 现有"❌"项全部可归因于上述两条，**没有证据表明反向公式有错**。
 若要把这项检查做成严格门禁，需要 fp64 loss 或对路由做平滑近似 —— 目前未做。
+## 30. ORV ↔ PyTorch 训练对齐（2026-11-09 完成）
+
+### 30.1 最终实测（真实语料，4 层，seq=128，AdamW betas=(0.9,0.999) eps=1e-8 wd=0 lr=1e-5）
+
+```
+step   ORV loss    PyTorch loss     |Δ|        相对
+   0   7.209811     7.209809     1.91e-06   2.65e-07
+   7   4.470557     4.470541     1.67e-05   3.73e-06
+  14   2.467704     2.467679     2.48e-05   1.00e-05
+最差相对偏差 1.00e-05   （判据 <1e-4 → 通过；15/15 步全部 ≤1e-5）
+```
+
+对照证据链（全部实测）：
+
+| 环节 | 实测 |
+| --- | --- |
+| 前向（1/2/4 层 loss）| 1.35e-07 / 6.65e-08 / **0.00e+00** |
+| 梯度（除 tied-embed）| ≤7e-6 |
+| tied-embed 总梯度（输出+输入）| **5.85e-06**（修复前 9.29e-01）|
+| AdamW 单步参数（同梯度）| **≤5.09e-08** |
+| 逐层重算反向 vs 图反向 | ≤3.71e-07 |
+| ORV 自比噪声底（图 vs 逐层，15 步）| **3.20e-07** |
+| 单步参数一致度（ln1 / embed）| **0.00e+00** / 3.87e-07 |
+
+### 30.2 查出并修掉的 4 个真 BUG
+
+1. **注意力缺因果掩码**（`v27_train.py::fwd`）
+   原 `pr = softmax((qh @ kh.T) * inv)` 没有任何 mask ⇒ ORV 是**双向全注意力**，
+   而产线与 PyTorch 都是因果注意力。后果：单层 loss 差 2.56e-02，且"能看到未来 token"。
+   修：上三角 −1e9 掩码（张量级验证：加法逐元素 max|Δ|=0，掩码 softmax 与 numpy 差 3.0e-08）。
+
+2. **CUDA MoE 的 softmax 作用域错误**（`train/__init__.py::_combine_cuda`）
+   实现在**全部 n_experts** 上 softmax 再取 top-k，而语义（CPU 路径 / 产线
+   `tgai_cuda.cu:301-307` / PyTorch）是**只在选中的 k 个上** softmax。
+   只在某个专家占优时两者接近，logits 幅值一大就分叉（scale=8 实测 4.55e-02）。
+   修：用 `moe_topk` 返回的选中值 `val_buf` 直接 softmax。修复后 scale=8 → 1.42e-06。
+
+3. **训练路径丢失输入 embedding 梯度**（训练循环 + `v27_train.py`）
+   `x0` 是从 numpy 拿的常量，tied embedding 只拿到"输出投影"一侧梯度（差 34%）。
+   修：`backward_and_step` 保存 `last_input_grad`；新增 `add_embed_grad()` 用 `rt.emb_bwd`
+   散射回 `head.weight.grad`；训练循环顺序改为"先逐层反传 → 补 embedding 梯度 → step head"。
+
+4. **`emb_bwd` 的 id dtype 错配**（`add_embed_grad`）
+   传 int64 让内核按 int32 读索引，梯度落到序列里根本没出现的 row 0（ORV 0.62 vs torch 5e-05）。
+   修：改 `int32`。修复后总梯度相对误差 9.29e-01 → 5.85e-06。
+
+### 30.3 测量方法上的两个陷阱（都踩过，写下来）
+
+- **不能用随机 token id 做对齐验收**：随机 id 下 loss≈23，地形极陡，1e-6 级差异会被放大到
+  3e-04（实测 2.88e-04）。真实文本（loss≈7）同一设置只有 1.00e-05。
+- **同进程"改权重再复位"不可靠**：ORV 有 bf16 影子缓存，`load_all` 复位后权重并未回到初始
+  （曾出现第 0 步 loss 2.44 vs 7.21 的假象）。噪声底实验改成**双进程冷启动**后干净
+  （首步 loss 逐位相同，最差 3.20e-07）。
+
+### 30.4 复现命令（V100 机器，需独占 GPU）
+
+```powershell
+C:\Python311\python.exe -X utf8 D:\tgai_orv\stop.py                 # 先停产线
+C:\Python311\python.exe -X utf8 D:\tgai_orv\pytorch_loss_curve.py   # 15 步曲线对照（验收）
+C:\Python311\python.exe -X utf8 D:\tgai_orv\align_scale.py          # 单步/lr/15 步缩放
+C:\Python311\python.exe -X utf8 D:\tgai_orv\align_grad.py           # 分组梯度对照
+C:\Python311\python.exe -X utf8 D:\tgai_orv\align_embed_grad.py     # tied-embed 梯度
+C:\Python311\python.exe -X utf8 D:\tgai_orv\align_adamw.py          # 纯优化器对照
+C:\Python311\python.exe -X utf8 D:\tgai_orv\nf_path.py --path graph --out D:\tgai_orv\nf_g.json
+C:\Python311\python.exe -X utf8 D:\tgai_orv\nf_path.py --path layerwise --out D:\tgai_orv\nf_l.json
+C:\Python311\python.exe -X utf8 D:\tgai_orv\nf_cmp.py D:\tgai_orv\nf_g.json D:\tgai_orv\nf_l.json
+C:\Python311\python.exe -X utf8 D:\tgai_orv\rs3.py                  # 恢复产线
+```
+
+### 30.5 判定
+
+**ORV 的全参训练与 PyTorch 数值对齐成立**：15 步 loss 相对偏差 ≤1.00e-05（判据 1e-4），
+单步参数一致度到 0.00e+00 ~ 3.87e-07，优化器 ≤5.09e-08，噪声底 3.20e-07。
+剩余的 1e-5 级差来自 fp32 求和顺序（ORV 逐头 matmul vs PyTorch 融合 SDPA），不可完全消除，
+但比判据小一个数量级。

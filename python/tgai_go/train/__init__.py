@@ -4033,6 +4033,22 @@ class MoE(Module):
 
             sel._backward = bw_sel
             w = _sigmoid_tensor(sel)
+        elif self.gate == "softmax_topk":
+            # ★ 修复（2026-11-09 实测定位）：这里原先是
+            #     w = softmax(logits 全部 n_exp 个) 再取 top-k
+            #   而语义（CPU 路径 / 产线 tgai_cuda.cu:301-307 / PyTorch 参考）都是
+            #   **只在选中的 k 个上做 softmax**。两者仅当某个专家占优时数值接近，
+            #   一旦 logits 幅值变大就分叉（实测 scale=8 差 4.55e-02）。
+            #   现在直接用 moe_topk 返回的选中值 val_buf 做 softmax（形状 [n,k]）。
+            sel = Tensor._from_gpu(
+                val_buf, requires_grad=logits.requires_grad, _parents=(logits,))
+
+            def bw_sel_topk(g, grads, _idx=idx_buf, _rt=rt, _logits=logits):
+                if _logits.requires_grad:
+                    _acc(grads, _logits, _rt.moe_scatter_pairs(g, _idx, n, n_exp, k))
+
+            sel._backward = bw_sel_topk
+            w = functional.softmax(sel, axis=-1)
         else:
             w = _moe_take_cuda(functional.softmax(logits, axis=-1), idx_buf, n, n_exp, k)
         off_buf, tok_buf, slot_buf = rt.moe_compact(idx_buf, n, n_exp, k)

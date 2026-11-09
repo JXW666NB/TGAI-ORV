@@ -148,6 +148,23 @@ class V27Trainer(object):
         return [T.optim.AdamW(self.params_of(i), lr=lr, **kw) for i in range(self.NL)]
 
     # ---------- 前向 ----------
+    def _causal_mask(self, n):
+        """因果掩码（上三角 -1e9）。
+
+        **这是一个真实 bug 的修复**（2026-11-09 实测定位）：
+        原实现 `softmax((qh @ kh.T) * inv)` 没有任何掩码 ⇒ ORV 是**双向全注意力**，
+        而产线引擎与 PyTorch 参考都是**因果注意力**。
+        后果：单层就能让 loss 与 PyTorch 差 9.6e-3，15 步后差 5.8e-2；
+        更严重的是"能看到未来 token"，训练/评测口径都不对。
+        """
+        cache = getattr(self, "_mask_cache", None)
+        if cache is not None and cache[0] == n:
+            return cache[1]
+        a = np.triu(np.full((n, n), -1e9, np.float32), k=1)
+        t = T.tensor(a)
+        self._mask_cache = (n, t)
+        return t
+
     def fwd(self, x, i, cos, sin):
         L = self.layers[i]
         h = L["ln1"](x)
@@ -157,11 +174,42 @@ class V27Trainer(object):
             qh = T._rope_composed(L["q"][hh](h), cos, sin)
             kh = T._rope_composed(L["k"][hh](h), cos, sin)
             vh = L["v"][hh](h)
-            pr = T.functional.softmax((qh @ kh.T) * inv, axis=-1)
+            sc = (qh @ kh.T) * inv
+            pr = T.functional.softmax(sc + self._causal_mask(sc.shape[0]), axis=-1)
             part = L["o"][hh](pr @ vh)
             acc = part if acc is None else acc + part
         y = x + acc
         return y + L["moe"](L["ln2"](y))
+
+    def add_embed_grad(self, ids, g_x0=None):
+        """把 `d(loss)/d(x0)` 散射回 tied 的 `head.weight.grad`（输入 embedding 那条路）。
+
+        为什么需要（2026-11-09 实测）：训练循环里 `x0` 是从 numpy 拿的常量，
+        tied embedding 只拿到"输出投影"一侧的梯度，**输入查表那一侧被整体丢掉**，
+        实测 `head.weight.grad` 与 PyTorch 差 **34%**，也让 loss 曲线每步都偏。
+
+        实现：`rt.emb_bwd` 做 scatter-add 得到 `dw[V, D]`，与现有 head 梯度相加。
+        代价：每步一次 `[V,D]` 的 D2H/H2D（3.0B 模型约 134 MB）。先保证正确，再谈优化。
+        """
+        rt = T._cuda()
+        g = self.last_input_grad if g_x0 is None else np.asarray(g_x0, np.float32)
+        if g is None:
+            return False
+        ids = np.asarray(ids, np.int64)
+        w = self.head.weight
+        V, D = int(w.shape[0]), int(w.shape[1])
+        # rt.emb_bwd 需要**设备缓冲**（numpy 传进去会 AttributeError: no attribute 'ptr'）
+        g_buf = rt.h2d(np.ascontiguousarray(g, np.float32))
+        # 内核按 int32 读 id（实测：传 int64 会把索引读错，梯度落到序列里没出现的 row 0）
+        id_buf = rt.h2d(ids.astype(np.int32), dtype=np.int32)
+        dw = np.asarray(rt.d2h(rt.emb_bwd(g_buf, id_buf, int(ids.size), D, (V, D))), np.float32)
+        cur = getattr(w, "grad", None)
+        if cur is None:
+            w.grad = T.tensor(dw)
+        else:
+            prev = np.asarray(cur.to_numpy() if hasattr(cur, "to_numpy") else cur, np.float32)
+            w.grad = T.tensor(prev + dw)
+        return True
 
     def forward_all(self, x0, cos, sin, keep=None):
         """不建图地跑完所有层，缓存每层输入。`keep=lambda i,x: None` 可用于逐步落盘。"""
@@ -187,6 +235,10 @@ class V27Trainer(object):
             n_grad = sum(1 for p in self.params_of(i) if getattr(p, "grad", None) is not None)
             if x_in.grad is not None:
                 g = np.asarray(_np(x_in.grad), np.float32)
+                # i 走到 0 时，g 就是 d(loss)/d(x0)（对输入 embedding 的梯度）。
+                # 存下来供 `add_embed_grad` 散射回 tied 的 head.weight.grad —— 之前训练
+                # 因为 x0 是 numpy 常量，这条梯度被整体丢掉（实测 embed 梯度差 34%）。
+                self.last_input_grad = g
             if opts is not None:
                 opts[i].step()
                 opts[i].zero_grad()
