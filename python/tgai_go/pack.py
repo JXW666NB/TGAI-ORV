@@ -60,6 +60,7 @@ class TGWriter:
         self.merges = []
         self.specials = [0] * 16
         self.chat_meta = {}        # {type: bytes}
+        self.dtype_overrides = {}  # 逐张量 dtype 覆盖（{name: TGDtype}）
 
     # ---------- 内容 ----------
     def add_weight(self, name, arr):
@@ -195,7 +196,19 @@ class TGWriter:
                 f.write(meta)
         return dict(path=path, size=128 + len(tok) + 52 * len(entries) + len(blob) + len(meta),
                     n_weights=len(entries), tokenizer_len=len(tok), has_meta=bool(meta))
-    def write_stream(self, path, items, version=None):
+    def dtype_for(self, name):
+        """逐张量 dtype —— 实测产线 `{bf16: 869, fp32: 113}`：
+
+        113 = 28×2 个 `attn.rope.cos/sin`（56）+ 28×2 个 `ln1/ln2`（56）+ `final_norm`（1）。
+        即 **rope 表与所有 norm 权重用 fp32**，其余 bf16。写错会让 WGT 与产线差 116,736 字节（实测）。
+        """
+        if name.endswith(("rope.cos", "rope.sin")):
+            return DT_FP32
+        if name.endswith(("ln1.weight", "ln2.weight")) or name == "final_norm.weight":
+            return DT_FP32
+        return self.dtype_overrides.get(name, self.cfg["weight_dtype"])
+
+    def write_stream(self, path, items, version=None, tok_blob=None):
         """**流式**写 .TG：items 是 (name, ndarray) 的迭代器，写一个释放一个。
 
         为什么需要：3B 权重 fp32 约 12 GB，write() 会把全部数据攒在 lob 里
@@ -205,9 +218,8 @@ class TGWriter:
         峰值内存 = 单张量；额外磁盘 = 一倍文件大小。
         """
         import os, tempfile
-        tok = self._tokenizer_bytes()
+        tok = tok_blob if tok_blob is not None else self._tokenizer_bytes()
         meta = self._chat_meta_bytes()
-        dtype = self.cfg["weight_dtype"]
         entries = []
         fd, tmp = tempfile.mkstemp(suffix=".wgt", dir=os.path.dirname(os.path.abspath(path)))
         os.close(fd)
@@ -215,6 +227,7 @@ class TGWriter:
         try:
             with open(tmp, "wb") as f:
                 for name, arr in items:
+                    dtype = self.dtype_for(name)
                     flat = np.ascontiguousarray(arr).reshape(-1)
                     if dtype == DT_FP16:
                         data = flat.astype(np.float16).tobytes(); dt = DT_FP16
