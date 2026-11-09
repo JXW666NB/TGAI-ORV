@@ -1,3 +1,36 @@
+## [0.9.7] - 2026-11-09
+
+阶段 D：数据加载抽象。
+
+### 新增（`tgai_go.train.loader`，导出为 `T.DataLoader` 等，并挂到 `T.data.*`）
+
+- `Dataset` / `IterableDataset` / `Sampler` / `SequentialSampler` / `RandomSampler` / `BatchSampler`
+- `default_collate`：numpy 数组堆叠、标量转数组、dict/list 递归，字符串原样保留
+- `DataLoader(dataset, batch_size, shuffle, sampler, drop_last, collate_fn, num_workers, seed)`
+
+### 实测（`tests/test_loader.py`，对 `torch.utils.data.DataLoader`）
+
+| 项 | 结果 |
+| --- | --- |
+| 顺序批次（bs=1/2/3 × drop_last True/False）| 内容与顺序**逐元素相同** |
+| 显式索引分组 | 与 torch 的 `batch_sampler` **完全一致** |
+| `len()`（bs=1/2/3/7/10 × drop_last）| 与 torch 相同 |
+| `shuffle=True` | 是合法排列（不重不漏）、同 seed 可复现、不同 seed 不同 |
+| `num_workers=4` vs `0` | 批次完全相同 |
+| `default_collate`（dict + ndarray + 标量）| 与 torch 一致 |
+| 空数据集 / 流式数据集 / 错误提示 | 覆盖（报错含"修法"）|
+
+### 与 torch 的差异（如实标注）
+
+- `shuffle=True` 用本库自己的 `np.random.Generator`，**同一 seed 下的顺序不等于 torch**；
+  需要严格复现 torch 顺序时请传 `sampler=`。文档与模块说明都写明了。
+- `num_workers>0` 用**线程**而非进程（受 GIL 限制，纯 Python 预处理不会真并行）；
+  好处是零拷贝、无序列化、顺序天然稳定。
+
+### 过程记录
+
+本轮我先用 `SimpleNamespace` 覆盖了 `T.data`，而它原本是「数据规范化」模块，直接打挂 12 个
+数据层测试；已改为把加载 API **挂到同一个模块对象上**，`T.data` 原有函数保持不变。
 ## [0.9.6] - 2026-11-09
 
 阶段 C：卷积算子（CPU）。

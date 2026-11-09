@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # 若被占名，改这一行即可（import 名始终是 tgai_go，不受影响）。
 [project]
 name = "tgai-orv"
-version = "0.9.6"
+version = "0.9.7"
 description = "PyTorch-free LLM engine: train and infer with one codebase. 训推一体，不依赖 PyTorch。"
 readme = "README.md"
 requires-python = ">=3.9"

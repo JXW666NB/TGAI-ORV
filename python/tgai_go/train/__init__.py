@@ -4504,6 +4504,16 @@ conv2d = _conv_impl.conv2d
 conv1d = _conv_impl.conv1d
 Conv2d = _conv_impl.Conv2d
 Conv1d = _conv_impl.Conv1d
+from . import loader as _loader_impl                                 # noqa: E402
+# 注意：data 已经是「数据规范化」模块，这里把加载 API **挂到同一个模块对象上**，
+# 绝不能覆盖它（之前用 SimpleNamespace 覆盖过一次，直接打挂了 12 个数据层测试）。
+from . import data as _data_mod                                     # noqa: E402
+for _n in ("Dataset", "IterableDataset", "Sampler", "SequentialSampler",
+           "RandomSampler", "BatchSampler", "default_collate", "DataLoader"):
+    setattr(_data_mod, _n, getattr(_loader_impl, _n))
+DataLoader = _loader_impl.DataLoader
+Dataset = _loader_impl.Dataset
+IterableDataset = _loader_impl.IterableDataset
 group_advantages = _align_impl.group_advantages
 token_logprobs = _align_impl.token_logprobs
 grpo_loss = _align_impl.grpo_loss

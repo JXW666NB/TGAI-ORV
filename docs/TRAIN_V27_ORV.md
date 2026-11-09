@@ -1214,3 +1214,31 @@ stride 1/2、padding 1、dilation 2、groups 2、bias=False、Conv1d ——
 当前 CUDA 张量会得到 `NotImplementedError`（含修法），并有测试守住"明确报错而不是算错"。
 所以目标 C2 中「GPU 也测」这一条**没做到**，只做到 CPU。
 性能上主机 im2col 明显慢于 cuDNN，docs 与 docstring 都写明了。
+
+
+## 38. 阶段 D：DataLoader（0.9.7，2026-11-09）
+
+### 38.1 API
+
+`tgai_go.train.loader`：`Dataset`、`IterableDataset`、`Sampler`、`SequentialSampler`、
+`RandomSampler`、`BatchSampler`、`default_collate`、`DataLoader`。
+导出为 `T.DataLoader` / `T.Dataset` / `T.IterableDataset`，并挂到 `T.data.*`（不覆盖原数据模块）。
+
+### 38.2 实测（`tests/test_loader.py`，14 项全过）
+
+- 顺序批次：bs=1/2/3 × drop_last True/False，与 torch **逐元素相同**（内容与顺序）
+- 显式索引分组：与 torch `batch_sampler` 一致
+- `len()`：与 torch 相同（5 种 bs × 2 种 drop_last）
+- `shuffle=True`：合法排列、同 seed 可复现、不同 seed 不同
+- `num_workers=4` 与 `0` 结果相同；`default_collate` 与 torch 一致
+- 空数据集、流式数据集、错误提示（含"修法"）均覆盖
+
+### 38.3 差异与代价（写入 docstring，不隐藏）
+
+- `shuffle=True` 用本库 RNG，**同 seed 顺序 ≠ torch**；要严格复现请传 `sampler=`。
+- `num_workers>0` 是**线程池**：受 GIL 限制，纯 Python 预处理不会真并行；换来零拷贝与稳定顺序。
+
+### 38.4 一个自己踩的坑
+
+我先用 `SimpleNamespace` 覆盖 `T.data`，而 `T.data` 本是「数据规范化」模块 ⇒ 12 个数据层测试
+立刻挂掉。已改成把加载 API 挂到**同一个模块对象**上，`T.data.normalize_*` 等原有接口不变。
