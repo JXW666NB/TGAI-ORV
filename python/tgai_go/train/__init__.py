@@ -4450,6 +4450,7 @@ optim = _OptimModule()
 # ── 补齐 torch 常用优化器与学习率调度器（0.8.0）────────────────────────────
 # 放在文件末尾导入：opt_extra / sched 依赖本模块的 _Optim/_cuda 等，此时已定义完毕。
 from .opt_extra import (SGD as _SGDImpl, Lion as _LionImpl,        # noqa: E402
+                       Adafactor as _AdafactorImpl,
                        Accumulator as _Accumulator, scale_grads as _scale_grads)
 from .nn_ops import clip_grad_norm_ as _clip_grad_norm_impl         # noqa: E402
 from . import sched as _sched_impl                                 # noqa: E402
@@ -4470,8 +4471,10 @@ _OptimModule.Lion = _LionImpl
 _OptimModule.lr_scheduler = _LRSchedulerModule()
 _OptimModule.Accumulator = _Accumulator
 _OptimModule.scale_grads = staticmethod(_scale_grads)
+_OptimModule.Adafactor = _AdafactorImpl
 optim.SGD = _SGDImpl
 optim.Lion = _LionImpl
+optim.Adafactor = _AdafactorImpl
 optim.Accumulator = _Accumulator
 optim.scale_grads = staticmethod(_scale_grads)
 optim.lr_scheduler = _OptimModule.lr_scheduler

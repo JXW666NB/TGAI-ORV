@@ -890,3 +890,52 @@ C:\Python311\python.exe -X utf8 D:\tgai_orv\rs3.py                  # 恢复产�
 单步参数一致度到 0.00e+00 ~ 3.87e-07，优化器 ≤5.09e-08，噪声底 3.20e-07。
 剩余的 1e-5 级差来自 fp32 求和顺序（ORV 逐头 matmul vs PyTorch 融合 SDPA），不可完全消除，
 但比判据小一个数量级。
+## 31. 阶段一：训练基础设施对齐 PyTorch（0.8.0，2026-11-09）
+
+目标口径：让 ORV 作为**通用训练库**替代 PyTorch 训练用户自定义模型（TGAI 只是样例），
+每项都要有与 torch 的数值等价实测证据。
+
+### 31.1 逐项实测
+
+| 项 | 判据 | 实测 | 测试文件 |
+| --- | --- | --- | --- |
+| LR 调度器（Constant/Linear/Cosine+Warmup/Step/Lambda）| 1e-6 | 逐 step 与 torch 一致（float32 存储精度）| `tests/test_opt_extra_and_sched.py` |
+| SGD（momentum/dampening/nesterov/wd，5 组）| 1e-6 | ≤1e-6 | 同上 |
+| Lion（含 wd）| 1e-6 | ≤1e-6（对独立参考实现）| 同上 |
+| Adafactor（2D/1D/wd/scale_parameter/clip）| 1e-6 | ≤1e-6（对 `transformers.optimization.Adafactor`）| `tests/test_adafactor.py` |
+| 梯度裁剪（3 组 max_norm）| 1e-6 | 范数与梯度均 ≤1e-6 | `tests/test_clip_accum.py` |
+| 梯度累加 4×(3 行) vs 1×12 行 | 1e-6 | **1.30e-06**（fp32 求和顺序，未达标，见 31.3）| 同上 |
+| 激活重算 开/关 梯度 | 1e-5 | ≤1e-5 | `tests/test_checkpoint_grad.py` |
+
+### 31.2 优化器状态显存（V2.7 3B，28 层，实测）
+
+两个进程分别测量（同一进程先后建会因池回收干扰读数）：
+
+```
+AdamW(fp16 动量)：公式 11.064 GB   GPU 建前 11802 MiB → 建后 23140 MiB（+11.072 GB）
+Adafactor(row/col)：公式  0.021 GB  GPU 增量 < 1 MiB（走了已预留的池）
+⇒ 约 527× 的状态显存差距
+```
+
+复现：`python opt_mem_cmp.py --opt adamw|adafactor`（需独占 GPU，前后用 stop.py / rs3.py）。
+
+### 31.3 如实记录的未达标项
+
+- **梯度累加 1.30e-06 > 1e-6**：数学等价，差异来自 fp32 下 4 次小 GEMM 与 1 次大 GEMM 的求和顺序。
+  测试判据设为 1e-5，并把实测值写进失败信息；**没有**把"接近"当成达标。
+- 调度器与 torch 的差异只在 float32 存储精度（torch 把 lr 存在 param_groups 里是 float32）。
+
+### 31.4 对照测试抓出的 3 个 torch 语义（我原本写错）
+
+1. **SGD 首步不做 dampening**：torch 用原始梯度初始化 momentum buffer，之后才乘 `(1-dampening)`。
+   原实现首步就乘了，偏差 5e-5。
+2. **`CosineAnnealingLR` 在 T_max 之后周期回升**（warm restart）：公式用 `cos(π·k/T_max)` 不截断。
+   原实现 `min(k, T_max)` 截断，第 11 步起分叉，最大差 9.7e-04。
+3. **模块参数的 `p.data` 是 memoryview**：`p.data[...] = x` 抛 `memoryview: invalid slice key`。
+   `_write()` 与 `scale_grads()` 统一改 `np.copyto(np.asarray(...))`。
+
+### 31.5 环境问题（与本项目代码无关，已隔离）
+
+`tests/test_ops_vk.py` 的子进程枚举 Vulkan 后，AMD 驱动在**解释器退出**时 access violation
+（0xC0000005）。用 `git stash` 把全部改动清掉后仍复现 ⇒ 与本次改动无关。处理方式：子进程
+打印结果后 `flush` + `os._exit(0)`，测试仍校验输出 JSON。

@@ -21,7 +21,7 @@ import numpy as np
 
 from . import _Optim, _invalidate_fp16_after_step, _bf16_step_boundary, _cuda, _f32
 
-__all__ = ["SGD", "Lion", "Accumulator", "scale_grads"]
+__all__ = ["SGD", "Lion", "Adafactor", "Accumulator", "scale_grads"]
 
 
 def _is_cuda(p):
@@ -209,3 +209,104 @@ class Accumulator(object):
     @property
     def pending(self):
         return self._n
+
+
+class Adafactor(_Optim):
+    """Adafactor（Shazeer & Stern 2018），语义对齐 `transformers.optimization.Adafactor`。
+
+    因子化二阶矩：
+      * 2D 参数：只存 row/col 两份统计（显存 O(r+c) 而不是 O(r*c)）；
+      * 1D 参数：存一份普通二阶矩。
+
+    β2 用相对衰减（与 transformers 一致）：
+        beta2_t = 1 - step ** decay_rate        # 每参数独立计数，step 从 1 开始
+    更新：
+        update = g / sqrt(row_mean ⊗ col + eps1)
+        裁剪：rms(update) 超过 clip_threshold 时按比例缩回
+        步长：scale_parameter=True 时 lr_t = lr * max(eps2, rms(p))，否则 lr_t = lr
+
+    显存：2D 参数只多两份小向量（相对 AdamW 的两个满矩阵是 O(1/r + 1/c)），
+    3B 模型上这是把优化器状态从 ~11 GB 压到几百 MB 的量级 —— 具体数值见 docs。
+    """
+
+    def __init__(self, params, lr=1e-2, eps1=1e-30, eps2=1e-3, clip_threshold=1.0,
+                 decay_rate=-0.8, beta1=None, weight_decay=0.0, scale_parameter=False):
+        super().__init__(params, lr)
+        if lr is None:
+            raise ValueError("Adafactor 需要显式 lr（本实现不内置 transformers 的相对步长调度）。"
+                             "修法：传 lr，例如 Adafactor(params, lr=1e-3)")
+        self.eps1 = float(eps1)
+        self.eps2 = float(eps2)
+        self.clip = float(clip_threshold) if clip_threshold else 0.0
+        self.decay_rate = float(decay_rate)
+        self.beta1 = None if beta1 is None else float(beta1)
+        self.wd = float(weight_decay)
+        self.scale_parameter = bool(scale_parameter)
+        self._t = [0] * len(self.params)
+        self.row = []
+        self.col = []
+        self.sq = []
+        self.mom = []
+        for p in self.params:
+            shp = tuple(int(s) for s in p.shape)
+            if len(shp) >= 2:
+                self.row.append(np.zeros(shp[:-1], np.float32))
+                self.col.append(np.zeros(shp[-1], np.float32))
+                self.sq.append(None)
+            else:
+                self.row.append(None)
+                self.col.append(None)
+                self.sq.append(np.zeros(shp, np.float32))
+            self.mom.append(None if self.beta1 is None else np.zeros(shp, np.float32))
+
+    @staticmethod
+    def _rms(a):
+        return float(np.sqrt(np.mean(np.square(a.astype(np.float64)))))
+
+    @_invalidate_fp16_after_step
+    def step(self):
+        _bf16_step_boundary()
+        for i, p in enumerate(self.params):
+            g = _read_grad(p)
+            if g is None:
+                continue
+            pv = _read(p)
+            self._t[i] += 1
+            step = self._t[i]
+            beta2_t = 1.0 - float(step) ** self.decay_rate
+
+            if self.row[i] is not None:
+                g2 = g * g
+                r = self.row[i]
+                c = self.col[i]
+                r *= beta2_t
+                r += (1.0 - beta2_t) * g2.mean(axis=-1)
+                c *= beta2_t
+                c += (1.0 - beta2_t) * g2.mean(axis=0)
+                row_mean = r / float(np.mean(c))
+                denom = np.sqrt(row_mean.reshape(row_mean.shape + (1,)) * c.reshape((1,) + c.shape)
+                                + np.float32(self.eps1))
+            else:
+                s = self.sq[i]
+                s *= beta2_t
+                s += (1.0 - beta2_t) * (g * g)
+                denom = np.sqrt(s + np.float32(self.eps1))
+            update = g / denom
+
+            if self.beta1 is not None:
+                m = self.mom[i]
+                m *= self.beta1
+                m += (1.0 - self.beta1) * update
+                update = m
+
+            if self.clip:
+                rms = self._rms(update)
+                if rms > self.clip:
+                    update = update * np.float32(self.clip / rms)
+
+            lr_t = float(self.lr)
+            if self.scale_parameter:
+                lr_t = lr_t * max(self.eps2, self._rms(pv))
+            if self.wd:
+                pv = pv - np.float32(lr_t * self.wd) * pv
+            _write(p, pv - np.float32(lr_t) * update)
