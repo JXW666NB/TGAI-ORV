@@ -564,3 +564,45 @@ v4: load=OK err=0 耗时=1.2s  大小=5.64 GB
 3. 装 VS Build Tools（约 2–4 GB），让 vswhere 能发现。
 
 ⚠ 无论哪条，编译产物**只放 `D:\v4build\out_gpu`**，绝不覆盖 `D:\tgai\libtgai_engine_gpu.dll`。
+## 24. ★★ V4 GPU 支持达成（2026-11-09，实测）
+
+### 生产构建的真实形态（读源码得知，不是猜）
+
+* 产线 `D:\TGAI\libtgai_engine_gpu.dll` 是**单一自包含 DLL**：既导出 `tg_load/tg_forward`，也导出 `tg_cuda_*`
+* 真正的构建脚本是仓库根目录的 **`build_cuda_v100.bat`**（不是 `cuda\build_cuda_win.ps1`），关键点：
+  * 宏 **`-DTG_ENGINE_HAS_CUDA_BRIDGE`**（不是 `TG_LINK_GPU_SEPARATE`）
+  * **三段式**：nvcc 编 `tgai_cuda.cu` → cl 编 `src\tgai_engine.c` → cl 编 `cuda\tgai_cuda_bridge.c` → 链接 `cublas.lib cudart.lib`
+  * `-gencode arch=compute_70,code=sm_70` + PTX（V100 必须 sm_70）
+* **GPU 路径有独立版本校验**：`tgai_cuda.cu` 里 `_load_cuda_impl()` 检查 `version != 1/2/3` ⇒
+  只改 `tgai_engine.c` 不够，**必须同时改 `tgai_cuda.cu`**（这是本轮踩到的坑）
+
+### 本轮改动（都在 `D:\v4build` 副本，产线 DLL 未动）
+
+| 文件 | 改动 |
+| --- | --- |
+| `src\tgai_format.h` | `+ TG_VERSION_V4=4u`、`+ TG4_MAGIC` |
+| `src\tgai_engine.c` | 版本校验接受 v1/v3/v4；v4 与 v3 同分支 |
+| `cuda\tgai_cuda.cu` | `_load_cuda_impl` 接受 version 4（打印 1/2/3/4）|
+
+### 实测结果
+
+```
+[D] 工具链：VS Build Tools 装到 D:\v4build\vs；nvcc 12.4 + vcvarsall + --allow-unsupported-compiler
+[E] 编译：nvcc(tgai_cuda.cu) + cl(tgai_engine.c) + cl(tgai_cuda_bridge.c) → link cublas/cudart
+    → D:\v4build\out_gpu3\libtgai_engine_gpu.dll  GPU_BUILD_OK
+
+[F] v4 在 GPU 上加载（日志）：
+    [CUDA] loading 28 layers, d=1024, vocab=32779, heads=16
+    [CUDA] QB routing bias: loaded 28/28 layers [n_experts=8] -> applied before top-k
+    [CUDA] model loaded to GPU (16 KV slots available; weights shared)
+    [CUDA-BRIDGE] TAKEN OVER (GPU forward; model resident in VRAM)
+    [tg_load] GPU forward: TAKEN OVER
+```
+
+⇒ **v4 在 GPU 上真正接管**（不是 CPU 回退）；v3 同样 `TAKEN OVER`（上一轮已验）。
+
+### 遗留
+
+1. 双格式**生成结果逐字对比**（同一 prompt，v3 vs v4）尚未做；
+2. 把产线切到 v4 前需你确认（切前我会再问）；
+3. 产线期间被我多次停起，**每次都已恢复**（最近一次 11450/11451 均在监听）。
