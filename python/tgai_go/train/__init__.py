@@ -4447,6 +4447,29 @@ class _NNModule:
 nn = _NNModule()
 optim = _OptimModule()
 
+# ── 补齐 torch 常用优化器与学习率调度器（0.8.0）────────────────────────────
+# 放在文件末尾导入：opt_extra / sched 依赖本模块的 _Optim/_cuda 等，此时已定义完毕。
+from .opt_extra import SGD as _SGDImpl, Lion as _LionImpl          # noqa: E402
+from . import sched as _sched_impl                                 # noqa: E402
+
+
+class _LRSchedulerModule:
+    """对应 torch.optim.lr_scheduler。"""
+    ConstantLR = _sched_impl.ConstantLR
+    LinearLR = _sched_impl.LinearLR
+    CosineLR = _sched_impl.CosineLR
+    StepLR = _sched_impl.StepLR
+    LambdaLR = _sched_impl.LambdaLR
+    make_scheduler = staticmethod(_sched_impl.make_scheduler)
+
+
+_OptimModule.SGD = _SGDImpl
+_OptimModule.Lion = _LionImpl
+_OptimModule.lr_scheduler = _LRSchedulerModule()
+optim.SGD = _SGDImpl
+optim.Lion = _LionImpl
+optim.lr_scheduler = _OptimModule.lr_scheduler
+
 def permute(input, dims):
     """对应 torch.permute(input, dims)。dims 是轴的排列。"""
     if not isinstance(dims, (tuple, list)):
