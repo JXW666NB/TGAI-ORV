@@ -42,7 +42,24 @@ python D:\tgai_orv\v27_train_run.py --model D:\TGAI\models\V2.7\TGAI_NB_V2.7_v4.
   w = TGWriter(...); w.write_stream(OUT, items(), version=4, tok_blob=<产线TOK>)
   ```
   关键规则：**rope 表与所有 norm 用 fp32，其余 bf16**；`tok_blob` 直接复用产线分词段。
-* **待补**：优化器状态（fp16 m/v）存盘 —— 未实现，长跑中断将无法精确续训。
+* **已实现（2026-11-09 实测往返通过）**：优化器状态存盘/续训
+  Fp16MomAdamW.state_dict() / load_state_dict() +
+  save_opt_states(opts, dir) / load_opt_states(opts, dir)（**每层一个 layer_XXX.npz**，逐层落盘）
+  实测：step → 存 → 清零 m/v 与步数 → 载回 ⇒ 	/m/v **全部一致**。
+  ⇒ 长跑中断可**精确续训**（权重用 write_stream 存 v4，动量用 npz）。
+
+### 3.1 磁盘规划（实测，2026-11-09）
+
+`
+D: 可用 61.6 GB
+单个完整检查点 = 权重 6.06 GB + fp16 动量 10.90 GB = 16.96 GB
+⇒ 最多存 2 个（还要留 20 GB 余量）
+`
+
+**开训前必须先清理**（待授权）：D:	gai_orv 下约 23 GB 测试产物
+（export_v4_full.tg / export_v4_full2.tg / 	rained_v4.tg / export_test.tg 各约 5.6 GB，llvm.tar.xz 0.9 GB —— 均可重新生成）。
+
+**建议策略**：轮转保存（权重 + 动量各留最新 2 份），并在每次存盘后检查剩余空间，低于 15 GB 就删最旧一份。
 
 ## 4. 产线切换（可选，独立于训练）
 
