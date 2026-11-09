@@ -127,6 +127,49 @@ return [L["ln1"], L["ln2"], L["moe"]] + L["q"] + L["k"] + L["v"] + L["o"]
 
 这样默认路径零风险，改造路径可以用一条 GPU 脚本对照验证后再考虑切换默认值。
 
+---
+
+# 附：A2 的实测结果与所需的运行时改动（2026-11-10）
+
+## 已实测（可信，分进程 + CUDA event）
+
+| 项目 | 数值 |
+| --- | --- |
+| attention 块 eager（seq=128）| 19.32 ms |
+| 同上，图重放 | **4.49 ms** |
+| 加速 | **4.3×**（另三次复现 2.88× / 3.55× / 3.8×）|
+| 梯度等价性 | **q/k/v/o 全部 0.00e+00（逐位相同）** |
+| 单层可省 | 14.83 ms ⇒ ×28 层 ≈ 415 ms/步（算术推演）|
+
+## 但**无法直接使用**：运行时只持有一张图
+
+`cuda.py` 里只有 `_graph` / `_graph_exec`，没有图列表（`_graphs`/`_graph_list` 均为 0），
+且 `graph_begin` 的注释写明"再捕获一次时丢掉上一张图"。
+
+因此"每层一张图、共 28 张"**当前做不到**。而"整步一张图"又被 MoE 的主机往返阻断
+（捕获窗口内禁止 D2H）。
+
+## 需要的最小改动（待授权）
+
+给 `CudaRuntime` 增加**多图支持**，保持现有单图 API 语义不变：
+
+```python
+# 新增（不改变现有 _graph/_graph_exec 的用法）
+def graph_launch_index(self, i):        # 按索引重放
+def graph_count(self):                  # 已捕获多少张
+# graph_begin() 追加到列表；graph_launch() 等价于 graph_launch_index(-1 或 0)
+```
+
+改动点：`_graphs: list`、`_graph_execs: list`，`graph_end()` 把新图 append 进去（而不是覆盖），
+`graph_launch()` 默认重放最近一张；`_graph_destroy()` 释放全部。风险可控：只影响图路径，
+非图路径逐算子执行完全不变。
+
+## 拿到授权后的实施顺序
+
+1. 多图支持 + 单元测试（同一进程捕获 2 张图、分别重放、各自结果与 eager 逐位相同）
+2. 训练循环：每层 attention 各捕获一张图，MoE 保持 eager；整步 loss 与现路径对照（预期逐位相同）
+3. CUDA event 测整步，验证是否落到 ~0.79 s；若达标 → 发 0.9.11
+
 
 
 `tests/test_slice_probe.py` 两项**均通过**（CPU）：
