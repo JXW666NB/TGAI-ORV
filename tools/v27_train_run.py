@@ -115,6 +115,7 @@ def restore():
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=PT, help=".pt 或 .tg（v3/v4 均可直读）")
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-5)
@@ -136,12 +137,27 @@ def main():
         from tgai_go.train.opt_fp16mv import Fp16MomAdamW
         from tgai_go.train.v27_train import V27Trainer
 
-        ck = torch.load(PT, map_location="cpu", mmap=True, weights_only=False)
-        mc, sd = ck["model_config"], ck["model_state_dict"]
-        cfg = dict(d_model=int(mc["d_model"]), n_heads=int(mc["n_heads"]),
-                   d_ff=int(mc["d_ff"]), n_experts=int(mc["n_experts"]),
-                   n_activated=int(mc["n_activated"]), n_layers=int(mc["n_layers"]),
-                   rope_theta=float(mc.get("rope_theta", 1e4)))
+        if str(args.model).lower().endswith(".tg"):
+            # 直接读产线格式（v3/v4 同容器）—— 推训一体，无需中间 .pt
+            from tgai_go.train.v27_train import TGState
+            from tgai_go.read_tg import read_tg, close_tg
+            _info = read_tg(args.model)
+            _h = _info["header"]
+            close_tg(_info)
+            cfg = dict(d_model=int(_h["d_model"]), n_heads=int(_h["n_heads"]),
+                       d_ff=int(_h["d_ff"]), n_experts=int(_h["n_experts"]),
+                       n_activated=int(_h["n_activated"]), n_layers=int(_h["n_layers"]),
+                       rope_theta=float(_h["rope_theta"]))
+            sd = TGState(args.model)
+            log("模型来源：%s（.tg 直读，version=%s）"
+                % (args.model, _h.get("version", _h.get("ver"))))
+        else:
+            ck = torch.load(args.model, map_location="cpu", mmap=True, weights_only=False)
+            mc, sd = ck["model_config"], ck["model_state_dict"]
+            cfg = dict(d_model=int(mc["d_model"]), n_heads=int(mc["n_heads"]),
+                       d_ff=int(mc["d_ff"]), n_experts=int(mc["n_experts"]),
+                       n_activated=int(mc["n_activated"]), n_layers=int(mc["n_layers"]),
+                       rope_theta=float(mc.get("rope_theta", 1e4)))
         NL = cfg["n_layers"]
 
         t0 = time.time()
