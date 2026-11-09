@@ -91,6 +91,7 @@ def main():
     clear_grads(); y = step(); torch.cuda.synchronize()
     out_eager = np.asarray(y.to_numpy(), np.float32).copy()
     g_eager = grads_np()
+    ptr_before = int(L["q"][0].weight.grad._gpu.ptr)
     tray = []
     for _ in range(REP):
         clear_grads(); torch.cuda.synchronize(); t0 = time.time()
@@ -134,6 +135,38 @@ def main():
     log("梯度（逐算子 vs 图重放）：最差 %.2e（判据 1e-6）" % worst)
     log("耗时：逐算子 %.2f ms → 图重放 %.2f ms（%.2fx）"
         % (t_eager * 1000, t_graph * 1000, t_eager / max(t_graph, 1e-9)))
+    # 等价性：重放是**累加**到同一缓冲的，所以用"重放一次前后之差"与逐算子结果比较
+    g0 = grads_np()
+    rt.graph_launch(); torch.cuda.synchronize()
+    g1 = grads_np()
+    worst = 0.0
+    for key in ("q", "k", "v", "o"):
+        single = g1[key] - g0[key]
+        r = float(np.abs(single - g_eager[key]).max() /
+                  max(1e-9, float(np.abs(g_eager[key]).max())))
+        worst = max(worst, r)
+        log("  单次重放增量 vs 逐算子  %s：%.2e" % (key, r))
+    log("单次重放等价性：最差 %.2e（判据 1e-6）" % worst)
+    try:
+        ptr_after = int(L["q"][0].weight.grad._gpu.ptr)
+        log("q[0].grad 缓冲地址（重放后）= 0x%x，捕获前记录=0x%x" % (ptr_after, ptr_before))
+    except Exception as e:
+        log("取 grad 地址失败：%s" % type(e).__name__)
+    # CUDA event 计时（不依赖 Python 时钟）
+    e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
+    INNER = 10
+    e0.record()
+    for _ in range(INNER):
+        rt.graph_launch()
+    e1.record()
+    e1.synchronize()
+    log("event 计时：图重放 %.2f ms/次" % (e0.elapsed_time(e1) / INNER))
+    e0.record()
+    for _ in range(INNER):
+        step()
+    e1.record()
+    e1.synchronize()
+    log("event 计时：逐算子 %.2f ms/次" % (e0.elapsed_time(e1) / INNER))
     st.close(); rt.empty_cache()
     log("结论：%s" % ("PASS（图可用且一致）" if worst <= 1e-6 else "FAIL（不一致）"))
     return 0 if worst <= 1e-6 else 1
