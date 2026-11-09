@@ -73,7 +73,41 @@ for hh in range(self.NH):              # 16 个头，每头约 10 次发射
 （a）切片取值与 concat 的逆操作一致；（b）梯度能穿过切片回到原张量。
 通过 ⇒ 第 1 步就只是投影改动；不通过 ⇒ 第 1 步实际需要"切片 + batched matmul"两件。
 
-### 第 0.5 步结果（实测，2026-11-09）
+## 重大更正：检查点本来就是全宽（2026-11-09，读 `load_layer` 得到）
+
+`v27_train.py:82-105` 显示：`.tg` 里存的是**全宽**投影权重
+
+```
+blocks.%d.attn.q_proj.weight    形状 [D, D]
+blocks.%d.attn.k_proj.weight    形状 [D, D]
+blocks.%d.attn.v_proj.weight    形状 [D, D]
+blocks.%d.attn.out_proj.weight  形状 [D, D]
+```
+
+而加载器**主动切成了 per-head**：
+
+```python
+for h in range(NH):
+    sl = slice(h * DH, (h + 1) * DH)
+    L["q"][h].load_state_dict_stream(... ("weight", qw[sl]))
+    L["o"][h].load_state_dict_stream(... ("weight", ow[:, sl]))
+```
+
+**这推翻了计划里"加载时 concat、保存时 split"的设计**：
+
+- 不需要 concat —— 全宽矩阵已经在 `sd` 里，直接建成一个 `Linear(D, D)` 即可；
+- 不需要 split —— 保存时写回 `q_proj.weight` 就是那个全宽矩阵，`.tg` 布局**完全不变**；
+- 产线引擎读的是 `.*_proj.weight`，与训练侧表示无关 ⇒ **风险比原估计低得多**。
+
+因此第 1 步简化为：
+1. `_build_layer()` 里把 `L["q"]/["k"]/["v"]` 各建成一个 `Linear(D, D)`（`L["o"]` 也是 `Linear(D, D)`），
+   而不是 16 个 `Linear(DH, D)`；
+2. `load_layer` 直接用 `sd[p + "attn.q_proj.weight"]` 整张装载，不再切片；
+3. `fwd` 里用一次 GEMM + 切片取头视图（切片已验证可用）；
+4. `params_of` 自动跟着变（`modules_of` 已包含它们，只是列表变短）。
+
+唯一要留意的：`load_layer` 目前对 `L["o"][h]` 用 `ow[:, sl]`（列切片），改成全宽后就是 `ow` 本身。
+
 
 `tests/test_slice_probe.py` 两项**均通过**（CPU）：
 
