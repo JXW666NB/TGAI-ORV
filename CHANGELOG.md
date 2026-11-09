@@ -1,3 +1,26 @@
+## [0.10.0] - 2026-11-09
+
+阶段三：证明"能用 ORV 训**用户自己的模型**"（不依赖 `.tg`，TGAI 只是样例）。
+
+### 新增
+
+- `examples/custom_model_quickstart.py`：纯 CPU、秒级可跑的自定义 Transformer 训练示例，
+  演示 `AdamW + CosineLR(warmup) + Accumulator + clip_grad_norm_` 的组合用法。
+- `docs/QUICKSTART_CUSTOM_MODEL.md`：安装、建模型、训练循环、一致性与能力边界。
+
+### 实测（同模型、同初始化、同超参）
+
+```
+ORV vs PyTorch 各训练 8 步：逐 step loss 最差相对误差 = 1.44e-07   （判据 1e-4）
+```
+
+测试：`tests/test_custom_model_parity.py`。
+
+### 能力边界（写进 QUICKSTART，未隐藏）
+
+- 已支持：autograd、7 种优化器、5 种调度器、梯度累加/裁剪/激活重算、预训练/SFT/DPO/GRPO、
+  单卡 32 GB 训 3B 全参 AdamW（torch 同卡 OOM）。
+- 未支持：多卡；conv 与 gather 等通用算子；内置 DataLoader；与 `torch.nn.Module` 互操作。
 ## [0.9.0] - 2026-11-09
 
 阶段二：对齐训练形态（DPO / GRPO）。torch 核心不含这些损失，参考实现按论文公式手写并逐项对照。

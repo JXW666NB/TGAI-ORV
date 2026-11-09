@@ -978,3 +978,40 @@ torch 核心没有 DPO/GRPO，参考实现按论文公式**手写**，与本库�
 
 第一版 `seq_logprob` 为了拼 batch 走了 numpy（`float(...)` 再重建张量），会**静默切断梯度**——
 DPO 就变成"只算 loss 不训练"。改成逐序列标量 + 图上累加，并把**梯度**也纳入对照判据。
+## 33. 阶段三：自定义模型（不依赖 .tg）（0.10.0，2026-11-09）
+
+目标第 8 项：证明 ORV 能训**用户自己的模型**，TGAI 只是样例。
+
+### 33.1 实测
+
+同一份小 Transformer（2 层、d=16、4 头、词表 32，**同初始化、同结构、同超参**），
+在 ORV 与 PyTorch 上各训练 8 步（AdamW lr=1e-3，全参更新）：
+
+```
+逐 step loss 最差相对误差 = 1.44e-07      （判据 1e-4）
+```
+
+测试：`tests/test_custom_model_parity.py`（`pytest -s` 会打印该数值）。
+
+### 33.2 交付物
+
+- `examples/custom_model_quickstart.py`：纯 CPU、秒级可跑；演示
+  `AdamW + CosineLR(warmup) + Accumulator + clip_grad_norm_` 的组合。
+- `docs/QUICKSTART_CUSTOM_MODEL.md`：安装、建模型、训练循环、一致性数字、**能力边界**。
+
+### 33.3 能力边界（照抄 QUICKSTART，未美化）
+
+已支持：自有 autograd、7 种优化器（AdamW/AdamW(fp16)/Int8AdamW/Muon/SGD/Lion/Adafactor）、
+5 种调度器、梯度累加/裁剪/激活重算、预训练/SFT/DPO/GRPO、
+**单卡 32 GB 训 3B 全参 AdamW**（torch 同卡实测 OOM，需 32.6 GB）。
+
+未支持：多卡（DDP/FSDP）；conv 与 gather 等通用算子；内置 DataLoader/Dataset；
+与 `torch.nn.Module` 互操作；`token_logprobs` 因无 gather 需要 [T,V] one-hot（词表大时显存开销明显）。
+
+### 33.4 三个阶段的小结
+
+| 阶段 | 内容 | 状态 |
+| --- | --- | --- |
+| 一 | 调度器 / SGD·Lion·Adafactor / 裁剪 / 累加 / 激活重算 | 5 项完成，累加 1.30e-06 未达 1e-6（已标注）|
+| 二 | DPO / GRPO(+GPRO 口径) | 完成，loss 与梯度均 ≤1e-5 |
+| 三 | 自定义模型示例 + QUICKSTART | 完成，8 步 loss ≤1.44e-07 |
