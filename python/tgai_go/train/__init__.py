@@ -1105,7 +1105,10 @@ class Tensor:
                 #   峰值 ≈ 激活 + 同尺寸梯度 = 2 倍（子智能体台账：中间梯度 11.23 GiB）。
                 #   PyTorch 对应 node.h::release_variables。叶子已在上面挂进 .grad，不删。
                 grads.pop(id(node), None)
-        rt.sync()
+        # 捕获期间不能同步（cuStreamSynchronize 在 capture 中返回 rc=900）。
+        # 图重放本身会保证顺序，所以捕获时跳过这一步是安全的。
+        if not getattr(rt, "_capturing", False):
+            rt.sync()
 
     def swap_last2(self):
         """交换最后两维（attention 里对 k 用）。"""
