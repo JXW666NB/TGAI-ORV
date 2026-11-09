@@ -1242,3 +1242,29 @@ stride 1/2、padding 1、dilation 2、groups 2、bias=False、Conv1d ——
 
 我先用 `SimpleNamespace` 覆盖 `T.data`，而 `T.data` 本是「数据规范化」模块 ⇒ 12 个数据层测试
 立刻挂掉。已改成把加载 API 挂到**同一个模块对象**上，`T.data.normalize_*` 等原有接口不变。
+
+
+## 39. 阶段 E：torch 权重互操作（0.9.8，2026-11-09）
+
+### 39.1 API
+
+`tgai_go.train.interop`：`from_torch` / `to_torch` / `state_dict_from_torch` /
+`state_dict_to_torch` / `OrvSequential` / `InteropError`，均已导出到 `T.*`。
+
+支持层：`nn.Linear`、`nn.Embedding`、`nn.RMSNorm`、`nn.Conv2d`（本库 `T.Conv2d`）。
+
+### 39.2 实测（`tests/test_interop.py`，7 项全过）
+
+```
+Sequential(Linear, RMSNorm, Linear) 同输入 logits  ≤1e-5
+Embedding / Conv2d 单层 logits                      ≤1e-5
+to_torch(from_torch(m)) 参数                        逐位相同
+state_dict 键名与值（0.weight/0.bias/…）            双向逐位相同
+自定义 Module / LayerNorm                           明确 InteropError（含修法）
+```
+
+### 39.3 明确边界
+
+- 只做**权重级**互转；不做运行期算子互操作（ORV 图里不能直接调 torch 层，也不共享 autograd）。
+- 容器仅 `nn.Sequential` / `nn.ModuleList`；自定义 forward 不复现。
+- **`nn.LayerNorm` 不支持**（ORV 还没有 LayerNorm 实现），有测试守住"明确报错而非算错"。

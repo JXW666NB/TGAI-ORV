@@ -4514,6 +4514,13 @@ for _n in ("Dataset", "IterableDataset", "Sampler", "SequentialSampler",
 DataLoader = _loader_impl.DataLoader
 Dataset = _loader_impl.Dataset
 IterableDataset = _loader_impl.IterableDataset
+from . import interop as _interop_impl                             # noqa: E402
+from_torch = _interop_impl.from_torch
+to_torch = _interop_impl.to_torch
+state_dict_from_torch = _interop_impl.state_dict_from_torch
+state_dict_to_torch = _interop_impl.state_dict_to_torch
+OrvSequential = _interop_impl.OrvSequential
+InteropError = _interop_impl.InteropError
 group_advantages = _align_impl.group_advantages
 token_logprobs = _align_impl.token_logprobs
 grpo_loss = _align_impl.grpo_loss

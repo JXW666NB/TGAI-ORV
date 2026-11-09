@@ -1,3 +1,32 @@
+## [0.9.8] - 2026-11-09
+
+阶段 E：与 `torch.nn` 的**权重级**互操作。
+
+### 新增（`tgai_go.train.interop`，导出为 `T.*`）
+
+- `T.from_torch(module)`：torch 层/`nn.Sequential` → ORV 等价层（参数逐位复制）
+- `T.to_torch(module)`：反向转换
+- `T.state_dict_from_torch(m)` / `T.state_dict_to_torch(o)`：名字**原样保留**的 state_dict 互转
+- `T.OrvSequential`：顺序容器；`T.InteropError`：不支持类型的明确报错
+
+支持层：`nn.Linear`、`nn.Embedding`、`nn.RMSNorm`、`nn.Conv2d`。
+
+### 实测（`tests/test_interop.py`，7 项全过）
+
+| 项 | 结果 |
+| --- | --- |
+| Sequential(Linear, RMSNorm, Linear) 同输入 logits | ≤1e-5 |
+| Embedding / Conv2d 单层 logits | ≤1e-5 |
+| `to_torch(from_torch(m))` 参数 | **逐位相同** |
+| state_dict 键名（`0.weight`/`0.bias`/…）| 双向保持，值逐位相同 |
+| 自定义 Module、LayerNorm | 明确 `InteropError`（含"修法"）|
+
+### 已知缺口（不掩饰）
+
+- **`nn.LayerNorm` 不支持**：ORV 目前没有 LayerNorm 实现。遇到会抛 `InteropError`，
+  并有测试守住这条路径。这是与 PyT 对齐的**真实缺口**，下一轮补。
+- 容器只支持 `nn.Sequential`/`nn.ModuleList`；自定义 `nn.Module` 子类的 forward 无法自动复现。
+- 这是**权重级**互操作：不能在 ORV 图里直接调用 torch 层，也不共享 autograd。
 ## [0.9.7] - 2026-11-09
 
 阶段 D：数据加载抽象。
