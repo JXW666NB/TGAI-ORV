@@ -241,6 +241,24 @@ class V27Trainer(object):
             w.grad = T.Tensor._from_gpu(rt.add(cur._gpu, dw_buf), requires_grad=False)
         return True
 
+    def forward_all_dev(self, x0_buf, cos, sin, keep=None):
+        """与 `forward_all` 相同，但第一层直接吃**设备缓冲**（省掉 x0 的 H2D）。
+
+        `forward_all` 会把 x0 先 `np.asarray`（对设备缓冲无效），所以单独开这条路径。
+        """
+        rt = T._cuda()
+        xs = [x0_buf]
+        for i in range(self.NL):
+            if i == 0:
+                x = T.Tensor._from_gpu(xs[0], requires_grad=False)
+            else:
+                x = T.tensor(xs[-1])
+            y = self.fwd(x, i, cos, sin)
+            if keep is not None:
+                keep(i, y)
+            xs.append(rt.d2h(y._gpu) if getattr(y, "device", "cpu") == "cuda" else _np(y))
+        return xs
+
     def forward_all(self, x0, cos, sin, keep=None):
         """不建图地跑完所有层，缓存每层输入。`keep=lambda i,x: None` 可用于逐步落盘。"""
         xs = [np.asarray(x0, np.float32) if not isinstance(x0, np.ndarray) else x0]
