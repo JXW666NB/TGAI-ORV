@@ -4453,6 +4453,7 @@ from .opt_extra import (SGD as _SGDImpl, Lion as _LionImpl,        # noqa: E402
                        Adafactor as _AdafactorImpl,
                        Accumulator as _Accumulator, scale_grads as _scale_grads)
 from .nn_ops import clip_grad_norm_ as _clip_grad_norm_impl         # noqa: E402
+from . import align as _align_impl                                  # noqa: E402
 from . import sched as _sched_impl                                 # noqa: E402
 
 
@@ -4489,6 +4490,11 @@ class _NNUtils:
 _NNModule.utils = _NNUtils()
 nn.utils = _NNModule.utils
 clip_grad_norm_ = _clip_grad_norm_impl
+align = _align_impl
+logsigmoid = _align_impl.logsigmoid
+seq_logprob = _align_impl.seq_logprob
+dpo_pair_loss = _align_impl.dpo_pair_loss
+dpo_batch_loss = _align_impl.dpo_batch_loss
 
 def permute(input, dims):
     """对应 torch.permute(input, dims)。dims 是轴的排列。"""
