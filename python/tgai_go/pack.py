@@ -189,3 +189,58 @@ class TGWriter:
                 f.write(meta)
         return dict(path=path, size=128 + len(tok) + 52 * len(entries) + len(blob) + len(meta),
                     n_weights=len(entries), tokenizer_len=len(tok), has_meta=bool(meta))
+    def write_stream(self, path, items, version=None):
+        """**流式**写 .TG：items 是 (name, ndarray) 的迭代器，写一个释放一个。
+
+        为什么需要：3B 权重 fp32 约 12 GB，write() 会把全部数据攒在 lob 里
+        （实测会把 32 GB 机器拖死）。这里改成：权重先流到临时文件，记录偏移，
+        最后把「头 + 分词表 + 权重表 + 数据 + chat meta」拼成最终文件。
+
+        峰值内存 = 单张量；额外磁盘 = 一倍文件大小。
+        """
+        import os, tempfile
+        tok = self._tokenizer_bytes()
+        meta = self._chat_meta_bytes()
+        dtype = self.cfg["weight_dtype"]
+        entries = []
+        fd, tmp = tempfile.mkstemp(suffix=".wgt", dir=os.path.dirname(os.path.abspath(path)))
+        os.close(fd)
+        off = 0
+        try:
+            with open(tmp, "wb") as f:
+                for name, arr in items:
+                    flat = np.ascontiguousarray(arr).reshape(-1)
+                    if dtype == DT_FP16:
+                        data = flat.astype(np.float16).tobytes(); dt = DT_FP16
+                    elif dtype == DT_BF16:
+                        u = np.ascontiguousarray(flat, dtype=np.float32).view(np.uint32).astype(np.uint64)
+                        u = (u + 0x7FFF + ((u >> 16) & 1)) >> 16
+                        data = u.astype(np.uint16).tobytes(); dt = DT_BF16
+                    else:
+                        data = flat.astype(np.float32).tobytes(); dt = DT_FP32
+                    f.write(data)
+                    shape = list(np.shape(arr))[:4] + [1] * max(0, 4 - len(np.shape(arr)))
+                    entries.append((fnv1a64(name), off, len(data), dt, min(len(np.shape(arr)), 4), shape, 0))
+                    off += len(data)
+                    del data
+            tok_off = 128
+            wt_off = tok_off + len(tok)
+            wd_off = wt_off + 52 * len(entries)
+            meta_off = wd_off + off
+            table = bytearray()
+            for (h, o, ln, dt, nd, shape, sc) in entries:
+                table += struct.pack("<QQQII4II", h, o, ln, dt, nd, *shape, sc)
+            hdr = self._header(tok_off, len(tok), wt_off, len(entries), wd_off, off,
+                               bool(meta), version=version)
+            with open(path, "wb") as out:
+                out.write(hdr); out.write(tok); out.write(bytes(table))
+                with open(tmp, "rb") as src:
+                    while True:
+                        b = src.read(1 << 22)
+                        if not b: break
+                        out.write(b)
+                if meta: out.write(meta)
+        finally:
+            try: os.remove(tmp)
+            except Exception: pass
+        return path
