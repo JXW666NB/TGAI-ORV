@@ -6486,7 +6486,11 @@ class CudaRuntime:
         return "rc=%d%s" % (int(rc), extra)
 
     def _graph_destroy(self):
-        self.release_capture_arena()
+        # 多图支持（apply_multigraph.py）：只要还有 slot 引用已捕获的图，就**不能**释放
+        # arena 或 exec —— 否则重放会访问已释放显存（实测 cuGraphLaunch 访问违例）。
+        slots = getattr(self, "_graph_slots", []) or []
+        if not slots:
+            self.release_capture_arena()
         cu = self.cu
         nodes = self._adamw_nodes
         self._adamw_nodes = []
@@ -6496,7 +6500,7 @@ class CudaRuntime:
         self._graph = None
         if cu is None:
             return
-        if exec_:
+        if exec_ and not any(e is exec_ for _g, e in slots):
             try:
                 cu.cuGraphExecDestroy(exec_)
             except Exception:
@@ -6725,6 +6729,10 @@ class CudaRuntime:
                 raise CudaError("cuStreamEndCapture 没有返回图" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             self._graph = graph
             self._graph_exec = self._instantiate_graph(graph)
+            # 多图支持（应用 apply_multigraph.py 后存在）：保留一份引用，供逐层重放
+            if not hasattr(self, "_graph_slots"):
+                self._graph_slots = []
+            self._graph_slots.append((graph, self._graph_exec))
             nodes = self._graph_node_list(graph)
             self._graph_nodes = len(nodes)
             self._collect_adamw(graph)
@@ -6734,6 +6742,43 @@ class CudaRuntime:
         except Exception as ex:
             self._graph_disable(ex)
             return False
+
+    def graph_count(self):
+        """已捕获并保留的图数量（多图支持）。"""
+        return len(getattr(self, "_graph_slots", []) or [])
+
+    def graph_release_all(self):
+        """释放所有已捕获的图与捕获 arena（多图支持）。用完必须调用，否则显存不回收。"""
+        slots = getattr(self, "_graph_slots", []) or []
+        self._graph_slots = []
+        self._graph = None
+        self._graph_exec = None
+        cu = self.cu
+        for graph, exec_ in slots:
+            try:
+                if exec_ and cu is not None:
+                    cu.cuGraphExecDestroy(exec_)
+            except Exception:
+                pass
+            try:
+                if graph and cu is not None:
+                    cu.cuGraphDestroy(graph)
+            except Exception:
+                pass
+        self.release_capture_arena()
+        return len(slots)
+
+    def graph_launch_slot(self, i):
+        """重放第 i 张已捕获的图（不影响 graph_launch 的"最近一张"语义）。"""
+        slots = getattr(self, "_graph_slots", None) or []
+        if not slots or i < 0 or i >= len(slots):
+            return False
+        _graph, exec_ = slots[i]
+        if self._graph_dead or not exec_:
+            return False
+        self._activate()
+        self._chk(self.cu.cuGraphLaunch(exec_, self._stream), "cuGraphLaunch(slot)")
+        return True
 
     def graph_launch(self, bc1=None, bc2=None):
         """重放已实例化的图。给出 bc1/bc2 时先改写全部 adamw 节点的偏差校正。"""
