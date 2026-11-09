@@ -20,7 +20,7 @@ _spec.loader.exec_module(RUN)
 log = RUN.log
 
 MODEL_TG = r"D:\tgai\models\V2.7\TGAI_NB_V2.7_v4.tg"
-SEQ = 64
+SEQ = 512
 REP = 5
 
 
@@ -118,10 +118,12 @@ def main():
         grads = collect_grads(tr, L)
         # 计时（同一 trainer，串行，无额外分配）
         tray = []
+        INNER = 10
         for _ in range(REP):
-            rt.sync(); t0 = time.time()
-            block(tr, L, False)
-            rt.sync(); tray.append(time.time() - t0)
+            torch.cuda.synchronize(); t0 = time.time()
+            for _ in range(INNER):
+                block(tr, L, False)
+            torch.cuda.synchronize(); tray.append((time.time() - t0) / INNER)
         st.close()
         rt.empty_cache()
         torch.cuda.synchronize()
