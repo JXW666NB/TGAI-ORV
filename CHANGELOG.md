@@ -1,3 +1,39 @@
+## [0.9.11] - 2026-11-10
+
+CUDA Graph 多图支持（逐层捕获/重放），以及 `V27Trainer` 前向拆分。
+
+### 新增（图路径）
+
+- `CudaRuntime.graph_count()` / `graph_launch_slot(i)` / `graph_release_all()`：可同时持有并重放**多张**图。
+- 捕获期分配**只走 arena**、不再从池取（`_alloc`），`free()` 跳过 arena 指针（`_in_arena`）：
+  否则图节点引用的缓冲会被后续捕获/复用/`empty_cache` 改写或释放（实测表现为第二张图结果不对、
+  或 `cuMemCtxSynchronize rc=700`）。
+- `reserve_capture_arena()` 支持**多块 arena 堆叠**（一图一块），`release_capture_arena()` 统一回收。
+- `_graph_destroy()` 在有 slot 引用时不再释放 arena / exec。
+
+### 新增（模型）
+
+- `V27Trainer.fwd_attn(x, i, cos, sin)`：`ln1 + 16 头注意力 + 残差`，**不含 MoE**（无 D2H，可捕获）。
+- `V27Trainer.moe_part(y, i)`：`ln2 + MoE + 残差`（保持逐算子）。
+- `fwd()` 现在是 `moe_part(fwd_attn(x))`，算术不变。
+
+### 实测（V2.7，seq=128，单卡 V100）
+
+| 项目 | 数值 |
+| --- | --- |
+| 单层 attention 图重放 vs 逐算子 | 19.32 ms → **4.49 ms（4.3×）** |
+| 28 层 attention 图重放 | 1016.3 ms → **140.5 ms（7.24×）**，梯度合计 **0.00e+00** |
+| **真实 28 层反向阶段**（含每步梯度写回） | 952.6 ms → **159.8 ms（5.96×，省 793 ms）**，梯度 **0.00e+00** |
+| 每图 arena 占用 | 约 116.5 MiB（256 MiB 预留足够） |
+
+### 边界与未完成（如实）
+
+- 图重放**逐位一致**的前提是：同一图、同一缓冲地址；上游梯度每步用 `cuMemcpyHtoD` 写入固定缓冲，
+  已验证"换缓冲后结果随之改变、且与 eager 逐位相同"。
+- **训练循环尚未接线**：`v27_train_run.py` 目前仍全逐算子。接线做法已写成
+  `tools/graph_28_backward.py`（前向 eager、反向逐层重放），整步 loss 对照与 event 计时待做。
+- 图路径**默认不启用**；不启用时行为与 0.9.10 完全一致。
+
 ## [0.9.10] - 2026-11-09
 
 embedding 路径设备化（省 160 ms/步，loss 逐位一致），以及若干测量工具。
