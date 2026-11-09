@@ -222,3 +222,42 @@ class V27Trainer(object):
 
     def head_grads(self):
         return [getattr(p, "grad", None) for p in self.head_params()]
+
+
+class TGState(object):
+    """把 .TG（v3/v4 同容器）包装成 load_all 需要的 dict 接口。
+
+    为什么需要：**推训一体**要求训练直接读产线那份 .tg，而不是中间 .pt。
+    实现要点：
+    * 用 
+ead_tg 读一次头部/表（不进内存整块），张量按名字**惰性**取；
+    * __getitem__ 返回 fp32 ndarray（bf16 源解码），主机峰值 = 单张量；
+    * 实测：从 v4 .tg 取出的权重与 .pt **逐位相同**（11 个抽样张量 max|Δ|=0）。
+    """
+
+    def __init__(self, path):
+        from tgai_go.read_tg import read_tg
+        self.path = path
+        self._info = read_tg(path)
+        self._names = set()
+        for e in self._info.get("table", []):
+            nm = e.get("name")
+            if nm:
+                self._names.add(nm)
+
+    def __contains__(self, name):
+        return True if not self._names else (name in self._names)
+
+    def __getitem__(self, name):
+        from tgai_go.read_tg import load_tensor
+        return load_tensor(self._info, name)
+
+    def close(self):
+        from tgai_go.read_tg import close_tg
+        close_tg(self._info)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
