@@ -103,7 +103,8 @@ def main():
     log("总图数: %d（期望 %d）" % (rt.graph_count(), NL))
     ok_all = True
     for i in range(NL):
-        zero(i)
+        # 注意：**不能在重放前 zero(i)** —— 那会替换 .grad 对象，图仍写捕获期的旧缓冲，
+        # 读到的就成了新零张量（这就是之前 1.44/1.71 的来源）。
         if not rt.graph_launch_slot(i):
             log("第 %d 层重放失败" % i); ok_all = False; continue
         rt.sync()

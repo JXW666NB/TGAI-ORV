@@ -3244,10 +3244,24 @@ class CudaRuntime:
         return None
 
     def reserve_capture_arena(self, nbytes):
-        """捕获前预留一块显存，供 `_capturing` 期间 bump 分配（不调 cuMemAlloc）。"""
+        """捕获前预留一块显存，供 `_capturing` 期间 bump 分配（不调 cuMemAlloc）。
+
+        多图支持：若已有一块 arena，则把它**压栈保留**（不释放）再申请新的，
+        这样每张图都有独立的中间缓冲 —— 否则后捕获的图会覆盖先捕获图的缓冲
+        （实测：两张图共用 arena 时重放梯度差 1.4e+00）。
+        """
         nbytes = int(nbytes)
-        if nbytes <= 0 or self._arena_base:
+        if nbytes <= 0:
             return
+        if self._arena_base:
+            stack = getattr(self, "_arena_stack", None)
+            if stack is None:
+                stack = []
+                self._arena_stack = stack
+            stack.append((self._arena_base, self._arena_size))
+            self._arena_base = 0
+            self._arena_size = 0
+            self._arena_off = 0
         self._activate()
         raw = ctypes.c_uint64()
         rc = self.cu.cuMemAlloc(ctypes.byref(raw), ctypes.c_size_t(nbytes))
@@ -3274,11 +3288,23 @@ class CudaRuntime:
         return ptr
 
     def release_capture_arena(self):
-        """归还 arena（图销毁后调用；arena 里的地址此时已不再被引用）。"""
+        """归还 arena（图销毁后调用；arena 里的地址此时已不再被引用）。
+
+        多图支持：一并释放压栈保留的历史 arena。
+        """
+        stack = getattr(self, "_arena_stack", None) or []
+        self._arena_stack = []
         base = int(getattr(self, "_arena_base", 0) or 0)
         self._arena_base = 0
         self._arena_size = 0
         self._arena_off = 0
+        for item in stack:
+            old = int(item[0]) if isinstance(item, (tuple, list)) else int(item)
+            if old and self.cu is not None:
+                try:
+                    self.cu.cuMemFree(ctypes.c_uint64(old))
+                except Exception:
+                    pass
         if base and self.cu is not None:
             try:
                 self.cu.cuMemFree(ctypes.c_uint64(base))
@@ -6594,6 +6620,11 @@ class CudaRuntime:
             if self._graph_exec is not None or self._graph is not None:
                 # 再捕获一次时丢掉上一张图，否则池会被冻住。
                 self._graph_destroy()
+            # 多图：为本次捕获换一块独立 arena（旧的原样保留，供已捕获的图继续用）
+            slots = getattr(self, "_graph_slots", None) or []
+            if slots and self._arena_base:
+                prev = self._arena_size
+                self.reserve_capture_arena(prev)
             if not self._stream_ready and not self.graph_arm():
                 return False
             if not self._bind_graph_api():
