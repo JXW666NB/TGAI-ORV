@@ -90,7 +90,7 @@ def main():
         eager[i] = grads(i)
 
     # 逐层捕获（每层一张图）
-    rt.reserve_capture_arena(4 * 1024 ** 3)
+    rt.reserve_capture_arena(6 * 1024 ** 3)
     for i in range(NL):
         zero(i)
         if not (rt.graph_arm() and rt.graph_begin()):

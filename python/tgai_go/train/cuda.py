@@ -2923,6 +2923,8 @@ class CudaRuntime:
         不能再无条件复用。
         """
         try:
+            if self._in_arena(ptr):
+                return                      # arena 内存不归池管，直接跳过
             self._pool_release(int(ptr or 0), token)
         except Exception:
             if token is None:
@@ -3273,6 +3275,24 @@ class CudaRuntime:
         self._arena_size = nbytes
         self._arena_off = 0
 
+    def _in_arena(self, ptr):
+        """指针是否落在（当前或历史）捕获 arena 内。arena 内存不走池，free 时必须跳过。"""
+        p = int(ptr or 0)
+        if not p:
+            return False
+        b = int(getattr(self, "_arena_base", 0) or 0)
+        sz = int(getattr(self, "_arena_size", 0) or 0)
+        if b and b <= p < b + sz:
+            return True
+        for item in getattr(self, "_arena_stack", None) or []:
+            if isinstance(item, (tuple, list)):
+                ob, osz = int(item[0]), int(item[1] if len(item) > 1 else 0)
+            else:
+                ob, osz = int(item), 0
+            if ob and ob <= p < ob + osz:
+                return True
+        return False
+
     def _arena_alloc(self, nbytes):
         """从 arena 切一块（16B 对齐）。不够就抛错并说明差多少。"""
         if not self._arena_base:
@@ -3321,6 +3341,13 @@ class CudaRuntime:
             if bucket < nbytes:
                 raise CudaError("内部分桶 %d 小于请求 %d" % (bucket, nbytes) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
             self._bucket[nbytes] = bucket
+        # 捕获期：**只从 arena 分配**，绝不碰池。
+        # 理由（实测）：图节点会引用分配到的缓冲；若来自池，后续捕获/复用/empty_cache 会让
+        # 前一张图的缓冲被改写或释放，表现为"第二张图重放结果不对"或 rc=700 非法访存。
+        if getattr(self, "_capturing", False) and getattr(self, "_arena_base", 0):
+            ap = self._arena_alloc(bucket)
+            if ap:
+                return ap
         ptr = self._pool_take(bucket)
         if not ptr and not getattr(self, "_alloc_retry", False) and not self._capturing:
             # ★ 这里原来的判据是**硬编码 12.2 GiB**：一旦 live+cached 超过它就
