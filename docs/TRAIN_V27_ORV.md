@@ -1042,3 +1042,16 @@ sum 口径（跨库）：2.86e-07
 
 对应产物：`publish_ready/tgai_orv-0.9.5-py3-none-any.whl`
 sha256=264ad23fbea75025821c6f9344e346b881942faeaa488f52b62b5fbe24ce6b44
+### 33.6 已发布到 PyPI（0.9.5，2026-11-09）
+
+```
+https://pypi.org/project/tgai-orv/0.9.5/
+pip install tgai-orv==0.9.5
+```
+
+**发布后回读校验**：从 PyPI 重新 `pip download tgai-orv==0.9.5`，得到的 wheel
+sha256 = `49f451a716d868ece6fa9fc72e8506f0d44036550105ce7c07f764b4b099edcc`，
+与本地 `publish_ready/` 中构建并跑过测试的产物**逐字节一致**。
+
+发布工具：`tools/publish_pypi.py`（token 存 `%USERPROFILE%\.pypi_token`，仅本人可读；
+以后一条命令即可发版，不必再每次 set 环境变量）。
