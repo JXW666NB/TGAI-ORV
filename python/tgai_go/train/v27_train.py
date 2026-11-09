@@ -211,6 +211,36 @@ class V27Trainer(object):
             w.grad = T.tensor(prev + dw)
         return True
 
+    def x0_from_ids(self, ids):
+        """设备侧构造 `x0 = head.weight[ids]`（gather_rows），**不做 D2H**。
+
+        返回 (x0_buf, id_buf)：id_buf 可复用给 `add_embed_grad_device`。
+        原先训练循环用 `emb[ids]`（numpy 索引）再 h2d，每步一次 134 MB 级主机往返。
+        """
+        rt = T._cuda()
+        w = self.head.weight
+        V, D = int(w.shape[0]), int(w.shape[1])
+        id_buf = rt.h2d(np.ascontiguousarray(np.asarray(ids, np.int32)), dtype=np.int32)
+        x0 = rt.gather_rows(w._gpu, id_buf, V, D, int(len(ids)))
+        return x0, id_buf
+
+    def add_embed_grad_device(self, id_buf, g_buf):
+        """设备版输入 embedding 梯度：`emb_bwd` 后与 `head.weight.grad` 在设备上相加。
+
+        与 `add_embed_grad` 数学等价（同一个 scatter-add 内核），但**不 D2H/H2D**：
+        原来每步要把 [V,D]（约 134 MB）拉回主机相加再传回去。
+        """
+        rt = T._cuda()
+        w = self.head.weight
+        V, D = int(w.shape[0]), int(w.shape[1])
+        dw_buf = rt.emb_bwd(g_buf, id_buf, int(id_buf.n), D, (V, D))
+        cur = getattr(w, "grad", None)
+        if cur is None:
+            w.grad = T.Tensor._from_gpu(dw_buf, requires_grad=False)
+        else:
+            w.grad = T.Tensor._from_gpu(rt.add(cur._gpu, dw_buf), requires_grad=False)
+        return True
+
     def forward_all(self, x0, cos, sin, keep=None):
         """不建图地跑完所有层，缓存每层输入。`keep=lambda i,x: None` 可用于逐步落盘。"""
         xs = [np.asarray(x0, np.float32) if not isinstance(x0, np.ndarray) else x0]
