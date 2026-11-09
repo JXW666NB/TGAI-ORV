@@ -178,7 +178,10 @@ def main():
     e1.record()
     e1.synchronize()
     log("event 计时：逐算子 %.2f ms/次" % (e0.elapsed_time(e1) / INNER))
-    st.close(); rt.empty_cache()
+    try:                                  # arena 存活时 empty_cache 会崩（运行时缺陷），不让它盖住结果
+        st.close(); rt.empty_cache()
+    except Exception as e:
+        log("清理阶段异常（不影响上面的结论）：%s: %s" % (type(e).__name__, str(e)[:90]))
     log("结论：%s" % ("PASS（图可用且一致）" if worst <= 1e-6 else "FAIL（不一致）"))
     return 0 if worst <= 1e-6 else 1
 
