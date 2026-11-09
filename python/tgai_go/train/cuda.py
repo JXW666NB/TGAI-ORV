@@ -1710,6 +1710,47 @@ extern "C" __global__ void cast_bf16_to_f32(const unsigned short* __restrict__ s
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __uint_as_float((unsigned int)src[i] << 16);
 }
+
+/* ---- 多张量 AdamW（**fp16 动量**）----
+ * 动量以 half 位模式常驻显存，内核里用上面两个 helper 转 float 计算、再写回 half。
+ * 算术序列与「cast_f16_to_f32 → adamw_update_multi → cast_f32_to_f16_into」逐条相同
+ * （同 helper、同 __f*_rn 内建、同 sqrtf），因此与逐张量路径**逐位一致**。
+ * 目的：把每步 2550 个张量 × 5 次发射压成 **1 次**发射。 */
+extern "C" __global__ void adamw_update_multi_f16(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* ms, const unsigned long long* vs,
+    const int* offs, int ntensors, int total,
+    float b1, float omb1, float b2, float omb2,
+    float lr, float wd_lr, float eps, float bc1, float bc2, int do_wd) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= total) return;
+    int lo = 0;
+    int hi = ntensors - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (offs[mid] <= i) lo = mid; else hi = mid - 1;
+    }
+    int j = i - offs[lo];
+    float* p = (float*)(unsigned long long)ps[lo];
+    const float* g = (const float*)(unsigned long long)gs[lo];
+    unsigned short* m = (unsigned short*)(unsigned long long)ms[lo];
+    unsigned short* v = (unsigned short*)(unsigned long long)vs[lo];
+    float gi = g[j];
+    float pi = p[j];
+    if (do_wd) pi = __fsub_rn(pi, __fmul_rn(wd_lr, pi));
+    float mj = tg_f16_bits_to_f32((unsigned int)m[j]);
+    float vj = tg_f16_bits_to_f32((unsigned int)v[j]);
+    float mi = __fadd_rn(__fmul_rn(b1, mj), __fmul_rn(omb1, gi));
+    float g2 = __fmul_rn(gi, gi);
+    float vi = __fadd_rn(__fmul_rn(b2, vj), __fmul_rn(omb2, g2));
+    m[j] = (unsigned short)tg_f32_to_f16_bits(mi);
+    v[j] = (unsigned short)tg_f32_to_f16_bits(vi);
+    float mh = __fdiv_rn(mi, bc1);
+    float vh = __fdiv_rn(vi, bc2);
+    float denom = __fadd_rn(sqrtf(vh), eps);
+    float step = __fdiv_rn(__fmul_rn(lr, mh), denom);
+    p[j] = __fsub_rn(pi, step);
+}
 """
 
 
@@ -5743,6 +5784,54 @@ class CudaRuntime:
         _, ps, gs, ms, vs, of, ntensors, total = tb
         grid, block = self._ewise_grid(total)
         self.launch("adamw_update_multi", grid, block, [
+            self._ptr(ps), self._ptr(gs), self._ptr(ms), self._ptr(vs), self._ptr(of),
+            (int(ntensors), ctypes.c_int), (int(total), ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (float(eps), ctypes.c_float),
+            (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+            (1 if do_wd else 0, ctypes.c_int),
+        ])
+
+    def adamw_multi_f16(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):
+        """一次发射更新全部参数，**动量是 fp16（uint16 位模式）**。
+
+        entries = [(p, g, m16, v16), ...] 全是 GpuBuf。与 `adamw_multi` 的差别只有动量类型：
+        内核里 half→float→half，算术序列与「cast→fp32 adamw_update_multi→cast」逐条相同，
+        所以结果与逐张量路径**逐位一致**，但发射次数从 5×N 降到 1。
+        指针表按 id 缓存（训练中地址不变），换模型/换参数量时才重建。
+        """
+        if not entries:
+            return
+        for p, g, m, v in entries:
+            self._split_forget_ptr(p)
+            self._split_forget_ptr(m)
+            self._split_forget_ptr(v)
+        key = tuple(id(x) for ent in entries for x in ent)
+        tb = getattr(self, "_adamw_table_f16", None)
+        if tb is None or tb[0] != key:
+            sizes = [int(ent[0].n) for ent in entries]
+            offs = [0]
+            for n in sizes:
+                offs.append(offs[-1] + n)
+            total = offs[-1]
+            if total > 2147483647:
+                raise CudaError("fused AdamW(fp16) 元素总数 %d 超过 int32" % total + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            ps = self.h2d(np.array([int(ent[0].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            gs = self.h2d(np.array([int(ent[1].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            ms = self.h2d(np.array([int(ent[2].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            vs = self.h2d(np.array([int(ent[3].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            of = self.h2d(np.array(offs[:-1], np.int32), dtype=np.int32)
+            tb = (key, ps, gs, ms, vs, of, len(entries), total)
+            self._adamw_table_f16 = tb
+        _, ps, gs, ms, vs, of, ntensors, total = tb
+        grid, block = self._ewise_grid(total)
+        self.launch("adamw_update_multi_f16", grid, block, [
             self._ptr(ps), self._ptr(gs), self._ptr(ms), self._ptr(vs), self._ptr(of),
             (int(ntensors), ctypes.c_int), (int(total), ctypes.c_int),
             (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
