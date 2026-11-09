@@ -1,3 +1,35 @@
+## [0.9.10] - 2026-11-09
+
+embedding 路径设备化（省 160 ms/步，loss 逐位一致），以及若干测量工具。
+
+### 新增 API
+
+- `V27Trainer.x0_from_ids(ids)`：用 `gather_rows` 在设备上构造 `x0`，不再把整张 `[T,D]` 传一遍主机。
+- `V27Trainer.add_embed_grad_device(id_buf, g_buf)`：`emb_bwd` 后与 `head.weight.grad` 在设备上相加，
+  不再把 `[V,D]`（V2.7 下 128 MB）D2H 相加再 H2D。
+- `V27Trainer.forward_all_dev(x0_buf, cos, sin)`：从设备缓冲起步的逐层前向。
+
+### 实测（同一 28 层 3B、seq=128、其余条件完全相同）
+
+```
+loss      numpy 路径 14.45316887   设备路径 14.45316887   相对差 0.00e+00
+单步时间   numpy 1.158 s            设备 0.998 s           省 160 ms（13.8%）
+```
+
+省下的时间与校准对照自洽：旧路径有三次 ~128 MB pageable 传输（约 4 GB/s、每次约 40 ms）。
+
+### 工具（诊断用，非库 API）
+
+- `tools/kernel_count.py`：按内核名统计一层前向/反向的发射次数
+  （实测 208 + 334，×28 = 15,176 次/步；elementwise 家族占前向 140/208、反向 261/334）。
+- `tools/moe_d2h_cost.py`：MoE 主机往返成本（实测 0.062 ms/层、1.7 ms/步）。
+- `tools/zeros_check.py`：校准 memset / h2d / 清零语义（用于判断计时是否可信）。
+- `tools/full_step_embed.py`、`tools/embed_timing2.py`、`tools/graph_probe.py`、`tools/graph_layer_test.py`。
+
+### 未完成（与 0.9.9 相同）
+
+A2 图捕获（阻断点：MoE 的 D2H）、GPU conv、单步 ≤1.0 s（当前约 1.20 s）。
+
 ## [未发布] - 阶段 A/B/C/E 的后续工作
 
 ### 已完成并有实测证据
