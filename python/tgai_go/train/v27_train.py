@@ -179,27 +179,18 @@ class V27Trainer(object):
         self._mask_cache = (n, t)
         return t
 
-    def fwd(self, x, i, cos, sin):
+    def fwd_attn(self, x, i, cos, sin):
+        """层的前半段：`x + attention(ln1(x))`，**不含 MoE**。
+
+        为什么要拆（2026-11-10 实测）：MoE 的 `_combine_cuda` 有一次主机往返（D2H），
+        捕获窗口内禁止 D2H，所以"整层一张图"不可能；而 attention 段没有 D2H，可以逐层
+        捕获成图（28 层 attention：逐算子 966.7 ms → 图重放 140.5 ms，梯度逐位一致）。
+        拆分只是把同一批算子分成两个方法，算术不变。
+        """
         L = self.layers[i]
         h = L["ln1"](x)
         acc = None
         inv = 1.0 / math.sqrt(self.DH)
-        if getattr(self, "fused_heads", False):
-            # 一次全宽 GEMM，再按头切片（切片与反向已由 test_slice_probe.py 验证）
-            q_all = T._rope_composed(L["q"][0](h), T.tensor(np.tile(_np(cos), (1, self.NH))),
-                                     T.tensor(np.tile(_np(sin), (1, self.NH))))
-            k_all = T._rope_composed(L["k"][0](h), T.tensor(np.tile(_np(cos), (1, self.NH))),
-                                     T.tensor(np.tile(_np(sin), (1, self.NH))))
-            v_all = L["v"][0](h)
-            for hh in range(self.NH):
-                sl = slice(hh * self.DH, (hh + 1) * self.DH)
-                pr = T.functional.softmax(
-                    (q_all[:, sl] @ k_all[:, sl].T) * inv + self._causal_mask(q_all.shape[0]),
-                    axis=-1)
-                part = (pr @ v_all[:, sl]) @ L["o"][0].weight[:, sl].T
-                acc = part if acc is None else acc + part
-            y = x + acc
-            return y + L["moe"](L["ln2"](y))
         for hh in range(self.NH):
             qh = T._rope_composed(L["q"][hh](h), cos, sin)
             kh = T._rope_composed(L["k"][hh](h), cos, sin)
@@ -208,8 +199,15 @@ class V27Trainer(object):
             pr = T.functional.softmax(sc + self._causal_mask(sc.shape[0]), axis=-1)
             part = L["o"][hh](pr @ vh)
             acc = part if acc is None else acc + part
-        y = x + acc
+        return x + acc
+
+    def moe_part(self, y, i):
+        """层的后半段：`y + MoE(ln2(y))`（保持逐算子，不参与图捕获）。"""
+        L = self.layers[i]
         return y + L["moe"](L["ln2"](y))
+
+    def fwd(self, x, i, cos, sin):
+        return self.moe_part(self.fwd_attn(x, i, cos, sin), i)
 
     def add_embed_grad(self, ids, g_x0=None):
         """把 `d(loss)/d(x0)` 散射回 tied 的 `head.weight.grad`（输入 embedding 那条路）。
