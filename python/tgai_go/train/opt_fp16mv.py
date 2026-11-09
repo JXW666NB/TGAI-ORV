@@ -65,3 +65,50 @@ class Fp16MomAdamW(object):
             if not self.fp32_state:
                 rt.cast_f32_to_f16_into(m32, self.m16[i])
                 rt.cast_f32_to_f16_into(v32, self.v16[i])
+    # ---------- 检查点：优化器状态（fp16 m/v + 步数） ----------
+    def state_dict(self):
+        """取出 m/v 与步数（逐张量 D2H，主机峰值 = 单张量）。"""
+        rt = _rt()
+        m = [np.asarray(rt.d2h(x)) for x in self.m16]
+        v = [np.asarray(rt.d2h(x)) for x in self.v16]
+        return {"t": int(self.t), "m": m, "v": v}
+
+    def load_state_dict(self, sd):
+        """恢复 m/v 与步数；形状/长度不符直接报错（防止静默错配）。"""
+        rt = _rt()
+        m, v = sd["m"], sd["v"]
+        if len(m) != len(self.params) or len(v) != len(self.params):
+            raise ValueError("优化器状态长度不符：文件 %d/%d，当前参数 %d。修法：确认是同一模型"
+                             % (len(m), len(v), len(self.params)))
+        self.m16, self.v16 = [], []
+        for a, b in zip(m, v):
+            self.m16.append(rt.h2d(np.ascontiguousarray(a)))
+            self.v16.append(rt.h2d(np.ascontiguousarray(b)))
+        self.t = int(sd.get("t", 0))
+        return self
+
+
+def save_opt_states(opts, path):
+    """把每层优化器状态存成一个 .npz（逐层落盘，避免整体驻留内存）。"""
+    out = {}
+    for i, opt in enumerate(opts):
+        sd = opt.state_dict()
+        f = "%s/layer_%03d.npz" % (path, i)
+        np.savez(f, t=np.int64(sd["t"]),
+                 **{("m_%d" % k): a for k, a in enumerate(sd["m"])},
+                 **{("v_%d" % k): a for k, a in enumerate(sd["v"])})
+        out[i] = f
+    return out
+
+
+def load_opt_states(opts, path):
+    """从目录恢复每层优化器状态。"""
+    for i, opt in enumerate(opts):
+        f = "%s/layer_%03d.npz" % (path, i)
+        z = np.load(f, allow_pickle=False)
+        n = len(opt.params)
+        sd = {"t": int(z["t"]),
+              "m": [z["m_%d" % k] for k in range(n)],
+              "v": [z["v_%d" % k] for k in range(n)]}
+        opt.load_state_dict(sd)
+    return opts
