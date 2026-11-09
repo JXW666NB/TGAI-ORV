@@ -115,6 +115,10 @@ def main():
     # 捕获期的那次执行是真实的，用它做等价性对比（重放只测时间：
     # 重放前若清空 p.grad，Python 侧就没有对象可读，而图里烘焙的是捕获时的缓冲）
     g_cap = grads_np()
+    log("graph_stats: %s" % (rt.graph_stats(),))
+    ok_l = rt.graph_launch()
+    log("graph_launch 返回: %s" % ok_l)
+    torch.cuda.synchronize()
     tray = []
     for _ in range(REP):
         torch.cuda.synchronize(); t0 = time.time()
