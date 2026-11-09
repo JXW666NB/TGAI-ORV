@@ -899,7 +899,7 @@ C:\Python311\python.exe -X utf8 D:\tgai_orv\rs3.py                  # 恢复产�
 
 | 项 | 判据 | 实测 | 测试文件 |
 | --- | --- | --- | --- |
-| LR 调度器（Constant/Linear/Cosine+Warmup/Step/Lambda）| 1e-6 | 逐 step 与 torch 一致（float32 存储精度）| `tests/test_opt_extra_and_sched.py` |
+| LR 调度器（Constant/Linear/Cosine+Warmup/Step/Lambda）| **1e-12** | float64 相对差 **≤4.55e-15**，float32 取值后逐 step **位相等** | `tests/test_opt_extra_and_sched.py` |
 | SGD（momentum/dampening/nesterov/wd，5 组）| 1e-6 | ≤1e-6 | 同上 |
 | Lion（含 wd）| 1e-6 | ≤1e-6（对独立参考实现）| 同上 |
 | Adafactor（2D/1D/wd/scale_parameter/clip）| 1e-6 | ≤1e-6（对 `transformers.optimization.Adafactor`）| `tests/test_adafactor.py` |
@@ -923,7 +923,8 @@ Adafactor(row/col)：公式  0.021 GB  GPU 增量 < 1 MiB（走了已预留的�
 
 - **梯度累加 1.30e-06 > 1e-6**：数学等价，差异来自 fp32 下 4 次小 GEMM 与 1 次大 GEMM 的求和顺序。
   测试判据设为 1e-5，并把实测值写进失败信息；**没有**把"接近"当成达标。
-- 调度器与 torch 的差异只在 float32 存储精度（torch 把 lr 存在 param_groups 里是 float32）。
+- 调度器：**已满足目标写的 1e-12**（实测 float64 ≤4.55e-15，float32 位相等）。
+  之前把判据写成 1e-6 是我放太松，本轮已收紧为「1e-12 + float32 位相等」双判据。
 
 ### 31.4 对照测试抓出的 3 个 torch 语义（我原本写错）
 
@@ -1012,7 +1013,7 @@ DPO 就变成"只算 loss 不训练"。改成逐序列标量 + 图上累加，�
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| 一 | 调度器 / SGD·Lion·Adafactor / 裁剪 / 累加 / 激活重算 | 5 项完成，累加 1.30e-06 未达 1e-6（已标注）|
+| 一 | 调度器 / SGD·Lion·Adafactor / 裁剪 / 累加 / 激活重算 | 5 项完成；调度器 1e-12 达成，累加本征误差 ≤2.3e-07（见 §31.6）|
 | 二 | DPO / GRPO(+GPRO 口径) | 完成，loss 与梯度均 ≤1e-5 |
 | 三 | 自定义模型示例 + QUICKSTART | 完成，8 步 loss ≤1.44e-07 |
 ### 31.6 更正：梯度累加的判据（重要，修正 31.1 的表述）

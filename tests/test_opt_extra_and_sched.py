@@ -63,32 +63,57 @@ def _ours_seq(kind, steps, **kw):
 def test_scheduler_linear_matches_torch():
     a = _ours_seq("linear", 12, start_factor=0.25, end_factor=1.0, total_iters=5)
     b = _torch_seq("linear", 12, start_factor=0.25, end_factor=1.0, total_iters=5)
-    assert np.allclose(a, b, rtol=1e-6, atol=0), (a, b)   # torch 的 lr 以 float32 存储
+    # 严判据（目标写的是 1e-12）：
+    #   1) float64 相对差 <= 1e-12（实测 <=4.6e-15）
+    #   2) 双方按 float32 取值后逐 step **位相等**（torch 把 lr 存 float32，这是最终生效值）
+    aa, bb = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    assert np.abs(aa - bb).max() / max(1e-12, np.abs(bb).max()) <= 1e-12, (a, b)
+    assert np.array_equal(aa.astype(np.float32), bb.astype(np.float32)), (a, b)
 
 
 def test_scheduler_cosine_matches_torch():
     a = _ours_seq("cosine", 20, T_max=10, eta_min=1e-5)
     b = _torch_seq("cosine", 20, T_max=10, eta_min=1e-5)
-    assert np.allclose(a, b, rtol=1e-6, atol=0), (a, b)   # torch 的 lr 以 float32 存储
+    # 严判据（目标写的是 1e-12）：
+    #   1) float64 相对差 <= 1e-12（实测 <=4.6e-15）
+    #   2) 双方按 float32 取值后逐 step **位相等**（torch 把 lr 存 float32，这是最终生效值）
+    aa, bb = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    assert np.abs(aa - bb).max() / max(1e-12, np.abs(bb).max()) <= 1e-12, (a, b)
+    assert np.array_equal(aa.astype(np.float32), bb.astype(np.float32)), (a, b)
 
 
 def test_scheduler_step_matches_torch():
     a = _ours_seq("step", 10, step_size=3, gamma=0.1)
     b = _torch_seq("step", 10, step_size=3, gamma=0.1)
-    assert np.allclose(a, b, rtol=1e-6, atol=0), (a, b)   # torch 的 lr 以 float32 存储
+    # 严判据（目标写的是 1e-12）：
+    #   1) float64 相对差 <= 1e-12（实测 <=4.6e-15）
+    #   2) 双方按 float32 取值后逐 step **位相等**（torch 把 lr 存 float32，这是最终生效值）
+    aa, bb = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    assert np.abs(aa - bb).max() / max(1e-12, np.abs(bb).max()) <= 1e-12, (a, b)
+    assert np.array_equal(aa.astype(np.float32), bb.astype(np.float32)), (a, b)
 
 
 def test_scheduler_constant_matches_torch():
     a = _ours_seq("constant", 8, factor=0.3, total_iters=3)
     b = _torch_seq("constant", 8, factor=0.3, total_iters=3)
-    assert np.allclose(a, b, rtol=1e-6, atol=0), (a, b)   # torch 的 lr 以 float32 存储
+    # 严判据（目标写的是 1e-12）：
+    #   1) float64 相对差 <= 1e-12（实测 <=4.6e-15）
+    #   2) 双方按 float32 取值后逐 step **位相等**（torch 把 lr 存 float32，这是最终生效值）
+    aa, bb = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    assert np.abs(aa - bb).max() / max(1e-12, np.abs(bb).max()) <= 1e-12, (a, b)
+    assert np.array_equal(aa.astype(np.float32), bb.astype(np.float32)), (a, b)
 
 
 def test_scheduler_lambda_matches_torch():
     fn = lambda n: 1.0 / (1.0 + n)          # noqa: E731
     a = _ours_seq("lambda", 9, fn=fn)
     b = _torch_seq("lambda", 9, lr_lambda=fn)
-    assert np.allclose(a, b, rtol=1e-6, atol=0), (a, b)   # torch 的 lr 以 float32 存储
+    # 严判据（目标写的是 1e-12）：
+    #   1) float64 相对差 <= 1e-12（实测 <=4.6e-15）
+    #   2) 双方按 float32 取值后逐 step **位相等**（torch 把 lr 存 float32，这是最终生效值）
+    aa, bb = np.asarray(a, np.float64), np.asarray(b, np.float64)
+    assert np.abs(aa - bb).max() / max(1e-12, np.abs(bb).max()) <= 1e-12, (a, b)
+    assert np.array_equal(aa.astype(np.float32), bb.astype(np.float32)), (a, b)
 
 
 def test_cosine_warmup_is_monotonic_and_lands_on_base():
