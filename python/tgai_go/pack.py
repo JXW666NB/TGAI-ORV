@@ -128,6 +128,27 @@ class TGWriter:
             out += struct.pack("<II", int(t), len(data)) + data
         return bytes(out)
 
+    def _header(self, tok_off, tok_len, wt_off, wt_cnt, wd_off, wd_len,
+                has_meta=False, version=None):
+        """打包 128B 头。>2 GB 时 extension_off 用**负偏移**（相对文件尾），与产线一致：
+        产线 V2.7 实测为 4294966890 == int32(-406) == EOF-406。"""
+        dtype = self.cfg["weight_dtype"]
+        ext = 0
+        if has_meta:
+            meta_off = wd_off + wd_len
+            ext = meta_off & 0xFFFFFFFF if meta_off < 0x80000000 else (meta_off - (1 << 32)) & 0xFFFFFFFF
+        hdr = struct.pack(
+            "<16I6Q4I",
+            TG_MAGIC, (TG_VERSION if version is None else int(version)), dtype,
+            self.cfg["n_layers"], self.cfg["d_model"], self.cfg["n_heads"],
+            self.cfg["d_ff"], self.cfg["vocab"], self.cfg["max_seq"],
+            self.cfg["n_experts"], self.cfg["n_activated"], self.cfg["rope_theta"],
+            self.cfg["pad"], self.cfg["bos"], self.cfg["eos"], self.cfg["unk"],
+            tok_off, tok_len, wt_off, wt_cnt, wd_off, wd_len,
+            self.cfg["arch"], self.cfg["n_kv_heads"], 0, ext)
+        assert len(hdr) == 128, "header 长度 %d != 128" % len(hdr)
+        return hdr
+
     def write(self, path):
         tok = self._tokenizer_bytes()
         meta = self._chat_meta_bytes()
@@ -160,22 +181,7 @@ class TGWriter:
         wt_off = tok_off + len(tok)
         wd_off = wt_off + 52 * len(entries)
         meta_off = wd_off + len(blob)
-        ext_off = meta_off if meta else 0
-        if ext_off >= 0x80000000:
-            raise ValueError("文件过大，extension_off 需要负数编码（本项目暂不支持 >2GB）")
-
-        hdr = struct.pack(
-            "<16I6Q4I",
-            TG_MAGIC, TG_VERSION, dtype,
-            self.cfg["n_layers"], self.cfg["d_model"], self.cfg["n_heads"],
-            self.cfg["d_ff"], self.cfg["vocab"], self.cfg["max_seq"],
-            self.cfg["n_experts"], self.cfg["n_activated"], self.cfg["rope_theta"],
-            self.cfg["pad"], self.cfg["bos"], self.cfg["eos"], self.cfg["unk"],
-            tok_off, len(tok),
-            wt_off, len(entries),
-            wd_off, len(blob),
-            self.cfg["arch"], self.cfg["n_kv_heads"], 0, ext_off)
-        assert len(hdr) == 128, "header 长度 %d != 128" % len(hdr)
+        hdr = self._header(tok_off, len(tok), wt_off, len(entries), wd_off, len(blob), bool(meta))
 
         with open(path, "wb") as f:
             f.write(hdr)
