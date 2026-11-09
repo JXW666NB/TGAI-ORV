@@ -4521,6 +4521,9 @@ state_dict_from_torch = _interop_impl.state_dict_from_torch
 state_dict_to_torch = _interop_impl.state_dict_to_torch
 OrvSequential = _interop_impl.OrvSequential
 InteropError = _interop_impl.InteropError
+from . import norms as _norms_impl                                    # noqa: E402
+LayerNorm = _norms_impl.LayerNorm
+_NNModule.LayerNorm = _norms_impl.LayerNorm
 group_advantages = _align_impl.group_advantages
 token_logprobs = _align_impl.token_logprobs
 grpo_loss = _align_impl.grpo_loss

@@ -90,7 +90,11 @@ def test_unsupported_module_raises_with_hint():
         T.from_torch(Custom())
 
 
-def test_layernorm_is_explicitly_unsupported():
-    """LayerNorm 是已知缺口：必须明确报错，不能悄悄算错。"""
-    with pytest.raises(T.InteropError, match="修法"):
-        T.from_torch(tn.LayerNorm(8))
+def test_layernorm_is_now_supported():
+    """LayerNorm 缺口已补：应当能转换且数值一致（不再是报错路径）。"""
+    torch.manual_seed(9)
+    m = tn.LayerNorm(8, eps=1e-5)
+    ours = T.from_torch(m)
+    x = np.random.default_rng(3).normal(0, 1, (3, 8)).astype(np.float32)
+    assert _rel(np.asarray(ours(T.tensor(x)).data, np.float32),
+                m(torch.from_numpy(x)).detach().numpy()) <= 1e-5

@@ -79,6 +79,15 @@ def from_torch(module):
         out = T.nn.Embedding(int(module.num_embeddings), int(module.embedding_dim))
         _set_param(out.weight, _np(module.weight))
         return out
+    if name == "LayerNorm":
+        ns = module.normalized_shape
+        dim = int(ns) if isinstance(ns, int) else int(ns[-1])
+        out = T.nn.LayerNorm(dim, eps=float(module.eps),
+                             elementwise_affine=bool(module.elementwise_affine))
+        if getattr(module, "weight", None) is not None:
+            _set_param(out.weight, _np(module.weight))
+            _set_param(out.bias, _np(module.bias))
+        return out
     if name == "RMSNorm":
         out = T.nn.RMSNorm(int(module.normalized_shape) if isinstance(module.normalized_shape, int)
                            else int(module.normalized_shape[0]),
@@ -134,6 +143,15 @@ def to_torch(module):
         m = tn.Embedding(int(module.weight.shape[0]), int(module.weight.shape[1]))
         with torch.no_grad():
             m.weight.copy_(torch.from_numpy(np.asarray(module.weight.data, np.float32)))
+        return m
+    if cls == "LayerNorm":
+        dim = int(module.normalized_shape[0])
+        m = tn.LayerNorm(dim, eps=float(module.eps),
+                         elementwise_affine=bool(module.elementwise_affine))
+        with torch.no_grad():
+            if module.weight is not None:
+                m.weight.copy_(torch.from_numpy(np.asarray(module.weight.data, np.float32)))
+                m.bias.copy_(torch.from_numpy(np.asarray(module.bias.data, np.float32)))
         return m
     if cls == "RMSNorm":
         dim = int(module.weight.shape[-1]) if getattr(module, "weight", None) is not None else 1
