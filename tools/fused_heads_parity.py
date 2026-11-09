@@ -75,8 +75,11 @@ def main():
         hh = L["ln1"](x)
         inv = 1.0 / np.sqrt(tr.DH)
         if getattr(tr, "fused_heads", False):
-            cos_t = T.tensor(np.tile(cos_np, (1, tr.NH)))
-            sin_t = T.tensor(np.tile(sin_np, (1, tr.NH)))
+            # 平铺表每个 trainer 只建一次：循环内反复分配会和池/free 交互，可能读到已释放的块
+            if not hasattr(tr, "_cos_t"):
+                tr._cos_t = T.tensor(np.tile(cos_np, (1, tr.NH)))
+                tr._sin_t = T.tensor(np.tile(sin_np, (1, tr.NH)))
+            cos_t, sin_t = tr._cos_t, tr._sin_t
             q_all = T._rope_composed(L["q"][0](hh), cos_t, sin_t)
             k_all = T._rope_composed(L["k"][0](hh), cos_t, sin_t)
             v_all = L["v"][0](hh)
