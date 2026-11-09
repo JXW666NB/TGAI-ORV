@@ -687,3 +687,41 @@ GPU 接管判定：增量 > 10000 MiB ⇒ 是
 ```
 
 ⇒ 完整闭环证据链：**v4 文件 → 读到训练器 → 全参训练（loss 2.10→1.68）→ 导出 v4（5.64 GB / 61 s）→ GPU 引擎接管（13.7 GB 驻显存）**。
+## 27. 产线升级 V4 完成（2026-11-09 11:24，含一次失败与自动回滚设计）
+
+### 结果
+
+```
+DLL   libtgai_engine_gpu.dll  182,784 B (sha 4f51f7c9…) → 193,536 B (sha 6a38f215…)
+模型  两个 launcher 的 MDL → D:\TGAI\models\V2.7\TGAI_NB_V2.7_v4.tg
+服务  11450=True (GPU 13,711 MiB)  11451=True (GPU 27,981 MiB)
+冒烟  短问答 16 tok：'<回答>\n你好，有什么事吗？'
+      代码生成 74 tok / 0.6 s / ``` 围栏闭合
+```
+
+### ★ 关键教训：**只改模型不改引擎 DLL ⇒ 服务起不来**
+
+第一次只把 launcher 的 `MDL` 指向 v4，11450 直接崩：
+
+```
+OSError: exception: access violation writing 0x0000000000000024
+  _engine.py:377  self.lib.tg_load(...)
+```
+
+原因：旧 DLL（2026-10-19 构建）不认识 `version=4`，CUDA 加载路径按 v3 布局取数越界。
+⇒ **模型升 v4 必须同时部署支持 v4 的引擎 DLL**。
+
+### 工具
+
+* `tools/deploy_v4_engine.py`（新）：备份 DLL+launcher → 替换 → 停服务 → 等显存回落
+  → 先起 11450 → 冒烟 → 再起 11451；**任何一步失败自动回滚**（DLL+launcher+服务）。
+  `--dry-run` / `--apply` / `--rollback`。
+* `tools/switch_v4.py`：只切模型（**单独使用不安全**，见上面的教训）。
+
+### 回滚
+
+```
+python deploy_v4_engine.py --rollback
+```
+DLL 备份：`D:\TGAI\libtgai_engine_gpu.dll.bak_v3_20261109_112422`
+launcher 备份：`launch11450.py.bak_before_v4` / `launch11451.py.bak_before_v4`

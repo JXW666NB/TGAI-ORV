@@ -77,3 +77,14 @@ python D:\tgai_orv\switch_v4.py --rollback  :: 回滚到 v3
 | 产线切 v4 | 需用户确认（服务短暂中断） |
 | 优化器状态存盘 | 未实现（长跑必须） |
 | DPO / GRPO | 用户明确要求"回来再讨论" |
+## 4.1 ★ 产线切 v4（已执行，2026-11-09）
+
+**必须连引擎 DLL 一起换**（实测：只改模型 ⇒ `access violation writing 0x24`）。
+
+```bat
+python D:\tgai_orv\deploy_v4_engine.py --dry-run    :: 先看
+python D:\tgai_orv\deploy_v4_engine.py --apply --dll D:\v4build\out_gpu3\libtgai_engine_gpu.dll
+python D:\tgai_orv\deploy_v4_engine.py --rollback   :: 万一要回退
+```
+
+验收（实测通过）：`11450/11451` 监听、`/v1/models` 返回 `tgai`、短问答与代码生成冒烟正常。
