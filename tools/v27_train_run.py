@@ -121,6 +121,11 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-5)
     ap.add_argument("--log-every", type=int, default=10)
     ap.add_argument("--no-restore", action="store_true", help="不恢复产线（调试用，危险）")
+    ap.add_argument("--ckpt-dir", default="", help="检查点根目录（默认 <模型目录>/_runs）")
+    ap.add_argument("--ckpt-every", type=int, default=0, help="每 N 步存一次（0=不存）")
+    ap.add_argument("--keep", type=int, default=2, help="保留最近几个检查点")
+    ap.add_argument("--resume", default="", help="从某个检查点目录续训")
+    ap.add_argument("--no-save-final", dest="save_final", action="store_false", help="结束时不再存一个")
     args = ap.parse_args()
 
     open(LOG, "w").close()
@@ -147,7 +152,15 @@ def main():
             cfg = dict(d_model=int(_h["d_model"]), n_heads=int(_h["n_heads"]),
                        d_ff=int(_h["d_ff"]), n_experts=int(_h["n_experts"]),
                        n_activated=int(_h["n_activated"]), n_layers=int(_h["n_layers"]),
-                       rope_theta=float(_h["rope_theta"]))
+                       rope_theta=float(_h["rope_theta"]),
+                       # 写检查点（v4）需要这些字段，缺一不可
+                       vocab=int(_h["vocab"]), max_seq=int(_h["max_seq"]),
+                       pad=int(_h.get("pad_token_id", _h.get("pad", 0))),
+                       bos=int(_h.get("bos_token_id", _h.get("bos", 2))),
+                       eos=int(_h.get("eos_token_id", _h.get("eos", 3))),
+                       unk=int(_h.get("unk_token_id", _h.get("unk", 1))),
+                       n_kv_heads=int(_h.get("n_kv_heads", 0)),
+                       arch=int(_h.get("arch_type", 0)))
             sd = TGState(args.model)
             log("模型来源：%s（.tg 直读，version=%s）"
                 % (args.model, _h.get("version", _h.get("ver"))))
@@ -184,6 +197,42 @@ def main():
 
         losses = []
         t1 = time.time()
+        # ---- 检查点：权重(v4) + 逐层动量(npz) + meta，带轮转与续训 ----
+        ckpt_root = args.ckpt_dir or os.path.join(os.path.dirname(os.path.abspath(args.model)), "_runs")
+        start_step = 0
+        if args.resume:
+            from tgai_go.train.ckpt import CKPT_WEIGHTS, load_checkpoint
+            _meta = load_checkpoint(args.resume, opts, head_opt)
+            start_step = int(_meta.get("step", 0))
+            log("续训：从 %s 恢复（step=%d）" % (args.resume, start_step))
+        _names = None
+        if args.ckpt_every > 0 or args.save_final:
+            from tgai_go.train.ckpt import read_names_sidecar
+            _names = read_names_sidecar(args.model)
+            if not _names:
+                log("!! 找不到 %s.names.json，检查点将跳过（修法：从产线复制同名的 names.json）"
+                    % os.path.basename(args.model))
+
+        _saved_steps = set()
+
+        def _save(step_no):
+            if step_no in _saved_steps:      # 末步与周期撞车时不要重复写（实测会白写 16.7 GB）
+                return
+            from tgai_go.train.ckpt import checkpoint_dir, rotate, save_checkpoint
+            d = checkpoint_dir(ckpt_root, start_step + step_no)
+            t_sv = time.time()
+            save_checkpoint(d, tr, sd, opts, head_opt, _names, args.model,
+                            start_step + step_no, cfg,
+                            meta={"loss": losses[-1] if losses else None, "lr": args.lr})
+            _saved_steps.add(step_no)
+            gone = rotate(ckpt_root, keep=args.keep)
+            log("检查点 %s（%.1f GB，%.0fs）%s"
+                % (os.path.basename(d),
+                   sum(os.path.getsize(os.path.join(dp, f))
+                       for dp, _dn, fn in os.walk(d) for f in fn) / 2**30,
+                   time.time() - t_sv,
+                   ("；轮转删除 %d 个旧检查点" % len(gone)) if gone else ""))
+
         for step in range(args.steps):
             xs = tr.forward_all(x0, cos, sin)
             loss, g = tr.loss_and_head_backward(xs[-1], targets, cos, sin)
@@ -199,7 +248,11 @@ def main():
             if step % args.log_every == 0 or step == args.steps - 1:
                 log("step %4d  loss=%.4f  显存 %d MiB  %.2fs"
                     % (step, lv, vram(), time.time() - t1))
+            if _names and args.ckpt_every > 0 and (step + 1) % args.ckpt_every == 0:
+                _save(step + 1)
         el = time.time() - t1
+        if _names and args.save_final:
+            _save(args.steps)
         log("完成：loss %.4f → %.4f（降 %.1f%%），%d 步 %.1fs，均值 %.2fs/步"
             % (losses[0], losses[-1], (1 - losses[-1] / losses[0]) * 100,
                args.steps, el, el / args.steps))
