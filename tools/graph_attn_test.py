@@ -156,7 +156,9 @@ def main():
         r = float(np.abs(single - g_eager[key]).max() /
                   max(1e-9, float(np.abs(g_eager[key]).max())))
         worst = max(worst, r)
-        log("  单次重放增量 vs 逐算子  %s：%.2e" % (key, r))
+        log("  %s  增量vs eager %.2e | max|g0|=%.4g max|eager|=%.4g | 零个数 g0=%d eager=%d"
+            % (key, r, float(np.abs(g0[key]).max()), float(np.abs(g_eager[key]).max()),
+               int((g0[key] == 0).sum()), int((g_eager[key] == 0).sum())))
     log("单次重放等价性：最差 %.2e（判据 1e-6）" % worst)
     try:
         ptr_after = int(L["q"][0].weight.grad._gpu.ptr)
