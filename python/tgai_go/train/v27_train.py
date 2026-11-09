@@ -53,11 +53,18 @@ class V27Trainer(object):
     def _build_layer(self):
         D, NH, DH, FF, E, K = self.D, self.NH, self.DH, self.FF, self.E, self.K
         L = dict(ln1=RMSNorm(D), ln2=RMSNorm(D), q=[], k=[], v=[], o=[])
-        for _ in range(NH):
-            L["q"].append(Linear(D, DH, bias=False))
-            L["k"].append(Linear(D, DH, bias=False))
-            L["v"].append(Linear(D, DH, bias=False))
-            L["o"].append(Linear(DH, D, bias=False))
+        if getattr(self, "fused_heads", False):
+            # 全宽投影：列表长度 1，modules_of/params_of 不用改（见 docs/PLAN_FUSED_ATTN.md）
+            L["q"].append(Linear(D, D, bias=False))
+            L["k"].append(Linear(D, D, bias=False))
+            L["v"].append(Linear(D, D, bias=False))
+            L["o"].append(Linear(D, D, bias=False))
+        else:
+            for _ in range(NH):
+                L["q"].append(Linear(D, DH, bias=False))
+                L["k"].append(Linear(D, DH, bias=False))
+                L["v"].append(Linear(D, DH, bias=False))
+                L["o"].append(Linear(DH, D, bias=False))
         L["moe"] = MoE(D, FF, E, top_k=K, gate="softmax_topk",
                        qb_bias=np.zeros(E, np.float32))
         # 构造期分配的随机权重在 GPU 上会占满一份（MoE 每层 384 MB）；
@@ -95,13 +102,20 @@ class V27Trainer(object):
         kw = _as_np(sd[p + "attn.k_proj.weight"])
         vw = _as_np(sd[p + "attn.v_proj.weight"])
         ow = _as_np(sd[p + "attn.out_proj.weight"])
-        for h in range(NH):
-            sl = slice(h * DH, (h + 1) * DH)
-            L["q"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(qw[sl]))]))
-            L["k"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(kw[sl]))]))
-            L["v"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(vw[sl]))]))
-            L["o"][h].load_state_dict_stream(
-                iter([("weight", np.ascontiguousarray(ow[:, sl]))]))
+        if getattr(self, "fused_heads", False):
+            # 检查点本来就是全宽 [D, D]（见 load_layer 上方说明），整张装载即可
+            L["q"][0].load_state_dict_stream(iter([("weight", np.ascontiguousarray(qw))]))
+            L["k"][0].load_state_dict_stream(iter([("weight", np.ascontiguousarray(kw))]))
+            L["v"][0].load_state_dict_stream(iter([("weight", np.ascontiguousarray(vw))]))
+            L["o"][0].load_state_dict_stream(iter([("weight", np.ascontiguousarray(ow))]))
+        else:
+            for h in range(NH):
+                sl = slice(h * DH, (h + 1) * DH)
+                L["q"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(qw[sl]))]))
+                L["k"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(kw[sl]))]))
+                L["v"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(vw[sl]))]))
+                L["o"][h].load_state_dict_stream(
+                    iter([("weight", np.ascontiguousarray(ow[:, sl]))]))
         del qw, kw, vw, ow
 
         def moe_items():
@@ -170,6 +184,22 @@ class V27Trainer(object):
         h = L["ln1"](x)
         acc = None
         inv = 1.0 / math.sqrt(self.DH)
+        if getattr(self, "fused_heads", False):
+            # 一次全宽 GEMM，再按头切片（切片与反向已由 test_slice_probe.py 验证）
+            q_all = T._rope_composed(L["q"][0](h), T.tensor(np.tile(_np(cos), (1, self.NH))),
+                                     T.tensor(np.tile(_np(sin), (1, self.NH))))
+            k_all = T._rope_composed(L["k"][0](h), T.tensor(np.tile(_np(cos), (1, self.NH))),
+                                     T.tensor(np.tile(_np(sin), (1, self.NH))))
+            v_all = L["v"][0](h)
+            for hh in range(self.NH):
+                sl = slice(hh * self.DH, (hh + 1) * self.DH)
+                pr = T.functional.softmax(
+                    (q_all[:, sl] @ k_all[:, sl].T) * inv + self._causal_mask(q_all.shape[0]),
+                    axis=-1)
+                part = (pr @ v_all[:, sl]) @ L["o"][0].weight[:, sl].T
+                acc = part if acc is None else acc + part
+            y = x + acc
+            return y + L["moe"](L["ln2"](y))
         for hh in range(self.NH):
             qh = T._rope_composed(L["q"][hh](h), cos, sin)
             kh = T._rope_composed(L["k"][hh](h), cos, sin)
