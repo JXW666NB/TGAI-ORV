@@ -98,8 +98,19 @@ def main():
         step(); torch.cuda.synchronize(); tray.append(time.time() - t0)
     t_eager = min(tray)
 
-    # 图捕获
-    clear_grads()
+    # 图捕获：起始梯度必须是**确定值**（置零缓冲），不能是 None ——
+    # 否则图烘焙的是捕获窗口内新建的缓冲，里面是垃圾（上一轮 1.62e+01 的来源）
+    def zero_grads():
+        for k in ("q", "k", "v", "o"):
+            for m in L[k]:
+                shp = tuple(int(x) for x in m.weight.shape)
+                m.weight.grad = T.tensor(np.zeros(shp, np.float32))
+
+    zero_grads()
+    # 运行时要求捕获前预留 arena（否则池未命中就回退）
+    if hasattr(rt, "reserve_capture_arena"):
+        rt.reserve_capture_arena(2 * 1024 ** 3)
+        log("已预留捕获 arena 2 GiB")
     ok = rt.graph_arm() and rt.graph_begin()
     log("graph_begin=%s" % ok)
     if not ok:
