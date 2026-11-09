@@ -4499,6 +4499,11 @@ dpo_batch_loss = _align_impl.dpo_batch_loss
 index_select = _indexing_impl.index_select
 gather_flat = _indexing_impl.gather_flat
 scatter_flat = _indexing_impl.scatter_flat
+from . import conv as _conv_impl                                       # noqa: E402
+conv2d = _conv_impl.conv2d
+conv1d = _conv_impl.conv1d
+Conv2d = _conv_impl.Conv2d
+Conv1d = _conv_impl.Conv1d
 group_advantages = _align_impl.group_advantages
 token_logprobs = _align_impl.token_logprobs
 grpo_loss = _align_impl.grpo_loss

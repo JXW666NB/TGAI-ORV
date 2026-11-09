@@ -1194,3 +1194,23 @@ DPO/GRPO 的既有 16 项对照测试全绿。
 我曾把本地 `cuda.py` 直接 scp 覆盖远端，而远端不是 git 仓库、没有历史可回滚。
 本次核对：本地与远端 sha256 一致、备份里也没有该函数 ⇒ 缺失是**原来就存在**的，
 不是覆盖造成。但教训成立：**远端目录不是版本库，覆盖前必须先备份**。
+
+## 37. 阶段 C：Conv1d / Conv2d（0.9.6，2026-11-09）
+
+### 37.1 实现
+
+`tgai_go.train.conv`：主机端 im2col + matmul，反向手写（dW = gᵀ·cols、dcols = g·W、dx = col2im）。
+`Conv1d` 通过**可微 reshape 视图**（`[N,C,L] → [N,C,1,L]`）复用 2D 路径，梯度自动回传。
+模块 `T.Conv2d` / `T.Conv1d` 的参数命名与 torch 一致。
+
+### 37.2 实测（`tests/test_conv.py`，判据 1e-5）
+
+stride 1/2、padding 1、dilation 2、groups 2、bias=False、Conv1d ——
+**前向与 dx/dw/db 全部 ≤1e-5**（9 项参数化测试全过）。
+
+### 37.3 未达成项（不掩盖）
+
+**GPU 卷积未实现**。im2col 在主机侧构造，要让 GPU 用上必须新写 im2col/col2im 内核；
+当前 CUDA 张量会得到 `NotImplementedError`（含修法），并有测试守住"明确报错而不是算错"。
+所以目标 C2 中「GPU 也测」这一条**没做到**，只做到 CPU。
+性能上主机 im2col 明显慢于 cuDNN，docs 与 docstring 都写明了。

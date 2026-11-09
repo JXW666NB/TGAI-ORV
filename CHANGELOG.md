@@ -1,3 +1,32 @@
+## [0.9.6] - 2026-11-09
+
+阶段 C：卷积算子（CPU）。
+
+### 新增
+
+- `T.conv2d(x, weight, bias, stride, padding, dilation, groups)` / `T.conv1d(...)`，含反向
+  （对输入、权重、偏置都正确）。
+- `T.Conv2d` / `T.Conv1d` 模块（参数名与 torch 一致：weight/bias）。
+- 实现方式：**主机端 im2col + matmul**；`Conv1d` 用可微 reshape 视图委托给 2D 路径。
+
+### 实测（对 torch.nn.functional）
+
+| 配置 | 前向 | dx | dw | db |
+| --- | --- | --- | --- | --- |
+| stride=1 / 2 | ≤1e-5 | ≤1e-5 | ≤1e-5 | ≤1e-5 |
+| padding=1（配合 stride 1/2）| ≤1e-5 | ≤1e-5 | ≤1e-5 | ≤1e-5 |
+| dilation=2 | ≤1e-5 | ≤1e-5 | ≤1e-5 | ≤1e-5 |
+| groups=2 | ≤1e-5 | ≤1e-5 | ≤1e-5 | ≤1e-5 |
+| bias=False | ≤1e-5 | ≤1e-5 | ≤1e-5 | — |
+| Conv1d | ≤1e-5 | ≤1e-5 | ≤1e-5 | ≤1e-5 |
+
+### 未完成（如实标注）
+
+- **CUDA 卷积未实现**：im2col 在主机侧构造，GPU 路径需要新的 im2col/col2im 内核。
+  当前传 CUDA 张量会抛 `NotImplementedError`（含"修法"），**不会静默算错**；
+  测试覆盖了这条报错路径。因此目标 C2 的"GPU 也测"一条**未达成**。
+- 性能：主机 im2col 比 cuDNN 慢，大 batch/大 kernel 时差距更明显。
+- `groups` 走逐组循环实现（正确但非融合）。
 ## [0.9.5] - 2026-11-09
 
 阶段三：证明"能用 ORV 训**用户自己的模型**"（不依赖 `.tg`，TGAI 只是样例）。
