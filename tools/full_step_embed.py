@@ -49,7 +49,8 @@ def main():
 
     seq = SEQ
     rng = np.random.default_rng(0)
-    ids = rng.integers(0, int(h["vocab_size"]) if "vocab_size" in h else 30000, seq, dtype=np.int64)
+    ids = rng.integers(0, int(h["vocab_size"]) if "vocab_size" in h else 30000, seq + 1,
+                       dtype=np.int64)   # seq+1：前向吃 ids[:-1]，targets 用 ids[1:]
     j = np.arange(0, DH, 2, dtype=np.float32) / DH
     ang = np.repeat(np.arange(seq, dtype=np.float32)[:, None] * (THETA ** (-j))[None, :], 2, axis=1)
     cos = T.tensor(np.cos(ang).astype(np.float32))
@@ -66,6 +67,8 @@ def main():
         zero_grads()
         if device_embed:
             xs = tr.forward_all_dev(x0_buf, cos, sin)
+            # 反向循环要用 numpy 形态的 x0（0.5 MB，与 128 MB 的主机传输无关）
+            xs[0] = np.asarray(rt.d2h(xs[0]), np.float32)
         else:
             xs = tr.forward_all(x0_np, cos, sin)
         loss, g = tr.loss_and_head_backward(xs[-1], ids[1:], cos, sin)
@@ -83,10 +86,10 @@ def main():
         return float(np.asarray(loss.to_numpy() if hasattr(loss, "to_numpy") else loss))
 
     # 旧路径
-    x0_np = np.ascontiguousarray(np.asarray(emb[ids], np.float32))
+    x0_np = np.ascontiguousarray(np.asarray(emb[ids[:-1]], np.float32))
     l_old = run_step(False, x0_np=x0_np)
     # 新路径
-    x0_buf, id_buf = tr.x0_from_ids(ids)
+    x0_buf, id_buf = tr.x0_from_ids(ids[:-1])
     l_new = run_step(True, x0_buf=x0_buf, id_buf=id_buf)
     rel = abs(l_old - l_new) / max(1e-9, abs(l_old))
     log("loss: numpy 路径 %.8f   设备路径 %.8f   相对差 %.2e" % (l_old, l_new, rel))
