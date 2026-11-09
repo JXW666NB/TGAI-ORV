@@ -133,6 +133,22 @@ def main():
 
     g = grads()
     np.savez(dst, **g)
+    # CUDA event 计时（同一进程内只做本模式，避免上一轮的污染）
+    import torch
+    e0, e1 = torch.cuda.Event(True), torch.cuda.Event(True)
+    INNER = 5
+    if args.mode == "graph":
+        e0.record()
+        for _ in range(INNER):
+            rt.graph_launch()
+        e1.record(); e1.synchronize()
+        log("event 计时（graph）：%.2f ms/次" % (e0.elapsed_time(e1) / INNER))
+    else:
+        e0.record()
+        for _ in range(INNER):
+            step()
+        e1.record(); e1.synchronize()
+        log("event 计时（eager）：%.2f ms/次" % (e0.elapsed_time(e1) / INNER))
     log("已保存 %s：%s" % (os.path.basename(dst),
                           {k: (v.shape, float(np.abs(v).max())) for k, v in g.items()}))
     try:
