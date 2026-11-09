@@ -4480,6 +4480,7 @@ optim.lr_scheduler = _OptimModule.lr_scheduler
 class _NNUtils:
     """对应 torch.nn.utils。"""
     clip_grad_norm_ = staticmethod(_clip_grad_norm_impl)
+    checkpoint = staticmethod(checkpoint)
 
 
 _NNModule.utils = _NNUtils()
