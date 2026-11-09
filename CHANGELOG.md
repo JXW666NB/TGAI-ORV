@@ -1,3 +1,35 @@
+## [0.9.9] - 2026-11-09
+
+补齐 LayerNorm，并为 CUDA Graph（阶段 A2）做前置修复与诊断。
+
+### 新增
+
+- `T.nn.LayerNorm(normalized_shape, eps=1e-5, elementwise_affine=True)`：用现有可微算子**纯组合**
+  实现（无新内核）；CPU 与 CUDA 均已实测。
+- `T.from_torch` / `T.to_torch` 支持 `nn.LayerNorm`（weight/bias/eps/elementwise_affine）。
+
+### 实测
+
+| 路径 | 前向 | 反向 |
+| --- | --- | --- |
+| CPU（对 `torch.nn.LayerNorm`）| ≤1e-5 | 对输入/γ/β 均 ≤1e-5 |
+| **CUDA（V100）** | **4.38e-08** | **9.29e-07** |
+
+互操作往返（含 LayerNorm 的 Sequential）参数**逐位相同**。
+
+### 修复与诊断（为 A2 铺路）
+
+- `Tensor.backward()` 结尾的 `rt.sync()` 在**图捕获期间**跳过（捕获中同步非法，rc=900）。
+- 新增 `tools/graph_probe.py`：捕获期间一旦发生 `sync`/`d2h` 就打印调用栈。
+  用它定位到 A2 的真正阻断点：**MoE 的 `_combine_cuda` 把每专家偏移量 D2H 回主机**
+  （`train/__init__.py:4059`）以驱动 Python 侧的按专家循环。
+- 结论（如实）：**逐层图捕获当前不可行**，因为 MoE 的算子是数据相关的（每专家行数不同，
+  启动形状要靠主机侧偏移量）。可行方向是把 MoE 改成容量因子（capacity factor）+ 掩码的定形计算，
+  或只对稠密部分做图捕获。仓库里 `graph_train.GraphStep` 对**稠密模型**已有 1.71× 实测先例。
+
+### 版本策略
+
+1.0 之前一律 `0.9.N` 递增；`1.0.0` 留给"单卡可替代 PyT 训练自定义模型"的里程碑。
 ## [0.9.8] - 2026-11-09
 
 阶段 E：与 `torch.nn` 的**权重级**互操作。

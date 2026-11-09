@@ -1268,3 +1268,30 @@ state_dict 键名与值（0.weight/0.bias/…）            双向逐位相同
 - 只做**权重级**互转；不做运行期算子互操作（ORV 图里不能直接调 torch 层，也不共享 autograd）。
 - 容器仅 `nn.Sequential` / `nn.ModuleList`；自定义 forward 不复现。
 - **`nn.LayerNorm` 不支持**（ORV 还没有 LayerNorm 实现），有测试守住"明确报错而非算错"。
+
+
+## 40. LayerNorm 与图捕获诊断（0.9.9，2026-11-09）
+
+### 40.1 LayerNorm
+
+`T.nn.LayerNorm` 用现有算子纯组合：`mu=mean(x,-1)` → 中心化 → `var` → `1/sqrt(var+eps)` → `*γ+β`。
+实测：CPU 前向/梯度（对 x/γ/β）≤1e-5；**CUDA 前向 4.38e-08、反向 9.29e-07**。
+互操作（含 LayerNorm 的 Sequential）往返参数逐位相同。
+
+### 40.2 A2（CUDA Graph）诊断结论
+
+- 驱动与运行时管线可用：`graph_available / graph_arm / graph_begin` 全为 True。
+- `Tensor.backward()` 结尾的 sync 在捕获期间已跳过（必需）。
+- **真正阻断点**：`MoE._combine_cuda` 把每专家偏移量 D2H 回主机（`train/__init__.py:4059`），
+  为了用 Python 循环按专家分组。捕获期间任何 D2H/同步都非法。
+- 结构性原因：MoE 每个专家的行数**依赖输入**，启动形状必须由主机侧偏移量决定 ⇒
+  逐层捕获不可行，除非改成容量因子 + 掩码的定形计算（会改变显存/数值口径，需要单独评估）。
+- 这条 D2H 同时是**每步每层一次主机往返**（28 层/步），本身就是性能项，值得单独优化。
+
+### 40.3 可复现
+
+```
+python tools/graph_probe.py      # 捕获期间探针，打印 sync/d2h 调用栈
+python tools/graph_layer_test.py # 逐层捕获尝试（当前会 abort）
+python tools/layernorm_gpu_check.py
+```
