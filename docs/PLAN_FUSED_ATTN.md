@@ -106,7 +106,27 @@ for h in range(NH):
 3. `fwd` 里用一次 GEMM + 切片取头视图（切片已验证可用）；
 4. `params_of` 自动跟着变（`modules_of` 已包含它们，只是列表变短）。
 
-唯一要留意的：`load_layer` 目前对 `L["o"][h]` 用 `ow[:, sl]`（列切片），改成全宽后就是 `ow` 本身。
+### 最小改造形态（读 `_build_layer` / `modules_of` 后确定，2026-11-09）
+
+`_build_layer`（`v27_train.py:49-54`）把 q/k/v/o 建成**列表**（各 16 个 `Linear`），
+而 `modules_of` / `params_of` 依赖列表拼接：
+
+```python
+return [L["ln1"], L["ln2"], L["moe"]] + L["q"] + L["k"] + L["v"] + L["o"]
+```
+
+**因此最小改造 = 保持"列表"形态，只让列表长度变成 1**：
+
+- `_build_layer`：`fused_heads=True` 时 `L["q"] = [Linear(D, D, bias=False)]`（k/v 同），
+  `L["o"] = [Linear(D, D, bias=False)]`；
+- `load_layer`：`fused_heads=True` 时整张装载 `sd["blocks.i.attn.q_proj.weight"]`，
+  不再切片（`ow[:, sl]` 那两行只在旧路径执行）；
+- `fwd`：`fused_heads=True` 时走"一次 GEMM + 切片取头视图"，否则保持现有 16 次循环；
+- `__init__` 增加 `fused_heads=False`（**默认关闭**，现有行为逐位不变）；
+- `modules_of` / `params_of` **不需要改**（列表长度为 1 时它们自然可用）。
+
+这样默认路径零风险，改造路径可以用一条 GPU 脚本对照验证后再考虑切换默认值。
+
 
 
 `tests/test_slice_probe.py` 两项**均通过**（CPU）：
