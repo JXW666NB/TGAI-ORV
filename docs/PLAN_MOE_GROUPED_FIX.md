@@ -117,3 +117,37 @@ Ex 版才支持逐组 `m/n/k`，签名是
 所以方案 B 在这台机器上不可用。
 
 **在 rc=7 调通之前，MoE 反向仍是逐专家循环，不做任何性能宣称。**
+
+## 8. 2026-11-11 更新（二）：放弃 cublasSgemmGroupedBatched，改走 strided-batched
+
+	ools/grouped_rc7_probe.py 试了四组参数组合，结果：
+
+| 用例 | 返回 |
+| --- | --- |
+| (T,N) 多组（当前用法） | rc=7，**parameter number 2** |
+| (N,N) 多组 | rc=7，**parameter number 1**（即 handle 位置） |
+| (T,N) 单组 | rc=7，parameter number 1 |
+| (N,N) 单组 | rc=7，parameter number 1 |
+
+**连 handle（第 1 个参数）都被判非法**，说明问题不是某个取值，而是这本 libcublas 里
+这个符号的**参数布局与公开文档完全不同**（或者该符号并非 cublas 的公开 API）。
+
+**结论：不再尝试这条路。** 继续逐个试参数是低效的，且无论试成什么样都依赖未文档化的行为。
+
+### 替代方案：cublasSgemmStridedBatched（成熟 API，行为确定）
+
+思路：
+1. 每层把 8 个专家的权重**堆叠**成连续缓冲 [G, N, K]（每个专家一份，一次拷贝，可缓存复用）；
+2. 把 gather 出来的行**pad 到统一的 M_max** 放进连续缓冲 [G, M_max, K]；
+3. 一次 cublasSgemmStridedBatched 算完 8 个专家；
+4. 从 [G, M_max, N] 里按各自 count 取回。
+
+代价：每层需要额外拷贝（权重堆叠 ~134 MB/层，行 pad）；
+收益：24 次小 GEMM → 3 次 strided batched 调用。
+
+### 决策
+
+- 先把**目标 2（Muon 层合并正交化）提前**做——它的收益明确（62.9 s/步 → 可用区间），
+  且不需要跟未文档化的 cublas 行为搏斗；
+- MoE 融合按上面的 strided-batched 方案重做，作为后续；
+- 当前 cuda.py 的分组路径已改成**失败即安全回退**，不影响正确性，可以留在原地。
