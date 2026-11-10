@@ -69,9 +69,13 @@ CUBLAS_GEMM_DEFAULT = -1
 _FP16_ENV = "TG_FP16"
 # 输出元素数小于这个数就别转 fp16 了（cast 比省下的 GEMM 时间还贵）。
 _FP16_MIN_OUTPUT = 262144
-_FP16_MAX_K = 1280          # K 超过这个就用 fp32（长累加 + 对消，精度掉得快）
+# K 的默认上限。**0.9.19 起从 1280 放开到大数**：原来担心"长累加 + 对消"掉精度，
+# 但 compute type 固定 `CUBLAS_COMPUTE_32F`，累加本身是 fp32，误差只来自**输入**被舍成 fp16
+# （标准 AMP 做法）。旧阈值把 tensor core 最有用的大形状全挡回 fp32，实测（V100）：
+#   2048x2048x6144: 3.86 → 0.60 ms；2048x4096x11008: 13.89 → 1.93 ms（约 6-7×）。
+_FP16_MAX_K = int(os.environ.get("TG_FP16_MAX_K", 1 << 30))
 # 门槛可用环境变量覆盖（V100 实测：全部 GEMM 走 fp16 也是 45.2 ms / loss 0.0891，
-# 与 K<=1280 相同，说明小 GEMM 无关紧要；要更激进可设 TG_FP16_MAX_K=1000000000）。
+# （K 上限已放开到 1<<30；如需更保守可用 TG_FP16_MAX_K=1280 还原旧行为）。
 try:
     _FP16_MAX_K = int(os.environ.get("TG_FP16_MAX_K", _FP16_MAX_K))
     _FP16_MIN_OUTPUT = int(os.environ.get("TG_FP16_MIN_OUTPUT", _FP16_MIN_OUTPUT))
@@ -4884,7 +4888,7 @@ class CudaRuntime:
         key = (int(src_ptr), int(count))
         hit = cache.get(key)
         if hit is not None:
-            return hit[0]
+            return hit
         buf = self._cast_flat_ptr(src_ptr, count, True)
         cache[key] = buf
         return buf
