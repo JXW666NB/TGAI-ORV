@@ -10,6 +10,8 @@
 代价是每步多 ~2 遍动量带宽（m/v 总量 11.9 GB ⇒ 约 +1.4 s/步），换来的是**不用写新内核**、
 不会引入 f16 转换的实现风险。后续若确实需要，再把它融成一个内核。
 """
+import sys
+
 import numpy as np
 
 import tgai_go.train as T
@@ -99,6 +101,104 @@ class Fp16MomAdamW(object):
             rt.f16_cache_clear()
         except Exception:
             pass
+    # ---------- 分层即时更新（0.9.28）：省掉"全部梯度同时驻留" ----------
+    def set_layer_groups(self, groups, require_full=True, auto_rest=True):
+        """登记"哪些参数属于哪一层"，供 `step_layers()` 使用。
+
+        `groups` 形如 `{0: [param, ...], 1: [...], -1: [embed, norm, head]}`。
+
+        `auto_rest=True`（默认）：没被任何组包含的参数会**自动**收进 `-1` 组，
+        并打印一次提示。这样调用方只需写"每层的参数"即可，不会漏掉 embed/norm/head。
+
+        `require_full=True` 时若 `auto_rest` 关掉且仍有未覆盖参数 → 直接报错。
+        为什么必须拦住：实测踩过 —— 模型 24 个参数张量，`blocks[i]` 只覆盖 21 个，
+        剩下 3 个没人更新，导致"分层更新 vs 统一更新"差 1.1e-02。
+        这类错误不报错、只**悄悄少训练一部分参数**。
+        """
+        self._groups = {}
+        # 绑定权重（tie_embedding 时 embed.weight 与 lm_head.weight 是**同一个对象**）
+        # 会在 self.params 里出现两次。若按"每个出现的下标"更新，同一参数会被更新两遍
+        # ⇒ 与统一更新不一致（实测差异 1.285e-03）。这里按对象身份去重，只取第一个下标。
+        first = {}
+        for i, q in enumerate(self.params):
+            first.setdefault(id(q), i)
+        for k, params in dict(groups or {}).items():
+            idx = []
+            for p in params:
+                j = first.get(id(p))
+                if j is not None and j not in idx:
+                    idx.append(j)
+            self._groups[int(k)] = idx
+        covered = set()
+        for idx in self._groups.values():
+            covered.update(idx)
+        # 只统计"唯一对象"里没被覆盖的
+        unique_idx = sorted(set(first.values()))
+        missing = [i for i in unique_idx if i not in covered]
+        if missing and auto_rest:
+            self._groups.setdefault(-1, [])
+            self._groups[-1] = sorted(set(self._groups[-1]) | set(missing))
+            sys.stderr.write(
+                "[tgai] 分组未覆盖 %d 个参数（通常是 embed / final_norm / lm_head），"
+                "已自动放进 -1 组，请记得 step_layers([... , -1])。\n" % len(missing))
+            sys.stderr.flush()
+            missing = []
+        if require_full and missing:
+            raise ValueError(
+                "分层分组没有覆盖全部参数：%d / %d 个没被任何组包含。"
+                "修法：打开 auto_rest，或把 embed / final_norm / lm_head 单独放进一个组，"
+                "否则这些参数**永远不会被更新**（不报错，只静默少训练）"
+                % (len(missing), len(self.params)))
+        return self
+
+    def all_groups(self):
+        """已登记的全部组 key（调用 `step_layers` 时应当全部走一遍）。"""
+        return sorted(self._groups.keys())
+
+    def step_layers(self, layer_ids, t=None, release=True):
+        """**只更新这些层**，并（默认）立刻释放它们的梯度。
+
+        为什么在数学上等价于标准 AdamW：
+        反向是逐层进行的，层 i 的 `dL/dx_i` 算完之后，**层 i-1 的反向不再需要层 i 的权重**。
+        所以此时用同一个 `t` 更新层 i，与"全部反向后统一更新"得到的参数完全一致。
+        这样同时驻留的梯度只需要一层的量（3B 模型上约 0.4 GiB，而不是 11.1 GiB）。
+
+        `t` 必须由调用方在同一次外步里传同一个值（默认用 `self.t + 1`），
+        否则各层会用不同的偏差校正系数。
+        """
+        if not getattr(self, "_groups", None):
+            raise RuntimeError("还没登记分层参数" + "。修法：先调用 set_layer_groups({i: tr.params_of(i)})")
+        tt = int(self.t + 1) if t is None else int(t)
+        rt = _rt()
+        b1, b2 = self.b1, self.b2
+        bc1 = 1.0 - b1 ** tt
+        bc2 = 1.0 - b2 ** tt
+        ents = []
+        for lid in layer_ids:
+            for i in self._groups.get(int(lid), []):
+                p = self.params[i]
+                if p.grad is None or not getattr(p, "requires_grad", True):
+                    continue
+                ents.append((p._gpu, p.grad._gpu, self.m16[i], self.v16[i]))
+        if ents:
+            if self.fp32_state:
+                rt.adamw_multi(ents, b1, 1.0 - b1, b2, 1.0 - b2, self.lr, self.lr * self.wd,
+                               self.eps, bc1, bc2, 1)
+            else:
+                rt.adamw_multi_f16(ents, b1, 1.0 - b1, b2, 1.0 - b2, self.lr, self.lr * self.wd,
+                                   self.eps, bc1, bc2, 1)
+            try:
+                rt.f16_cache_clear()
+            except Exception:
+                pass
+        if release:
+            for lid in layer_ids:
+                for i in self._groups.get(int(lid), []):
+                    self.params[i].grad = None
+        if t is None:
+            self.t = tt
+        return len(ents)
+
     # ---------- 检查点：优化器状态（fp16 m/v + 步数） ----------
     def state_dict(self):
         """取出 m/v 与步数（逐张量 D2H，主机峰值 = 单张量）。"""

@@ -1,0 +1,41 @@
+feat(muon): 3B MoE full-param training now fits a V100 32GB -- peak 18.93 GiB, no host offload
+
+The 3-star target is met on the hardware that matters: V2.7 (28 layers, 2.97B params, MoE)
+runs a full-parameter step with 18.93 GiB peak and 12.93 GiB still free, entirely in VRAM.
+
+The blocker was Muon, and it was my own defect. The old constructor allocated
+buf + _adam_m + _adam_v for every parameter unconditionally:
+
+    2.97B x 3 x 4 bytes = 33.3 GiB
+
+which is worse than the AdamW it was supposed to beat (22.2 GiB) and made Muon unusable at
+3B. Now allocation follows shape: 2D parameters (projections, expert matrices, embeddings)
+get one momentum buffer and take the Muon path; everything else (1D norms, scalars) gets
+Adam's m/v and takes the Adam path. With fp16_mom the momentum halves as well:
+
+    2.97B:  fp32 momentum 11.1 GiB  ->  fp16 momentum 5.5 GiB
+
+That, plus releasing each layer's gradient as soon as that layer's dL/dx is computed, is what
+moves the requirement from 33.6 GiB (measured OOM) to 18.93 GiB.
+
+Two traps found while wiring the layer-wise path, both now guarded in code because both fail
+silently:
+  * a group map missing embed/norm/head leaves those parameters never updated -- measured
+    1.1e-02 divergence
+  * tied embeddings make the same Parameter object appear twice in the parameter list, so
+    stepping by position updates it twice -- measured 1.285e-03 divergence
+set_layer_groups() now dedups by object identity and auto-assigns uncovered parameters to a
+-1 group, and a require_full check refuses to run rather than quietly under-train.
+
+Also rewrote the README. It was live on GitHub in second person ("your GPU is too small"),
+which is wrong for a public project page, and it opened with claims instead of explaining what
+the thing is. New structure is (1) what this is, for someone who has never heard of it,
+(2) advantages and the usual doubts, (3) beginner walkthrough, with the migration and API
+appendix moved to the end.
+
+Not done, and stated in the CHANGELOG: Muon still has no unit tests. The GPU run exercised
+allocation, fp16 moments and step_layers, but nothing in the repo pins that behaviour against
+regression. That is the first thing to add next, before chasing 4/5 stars.
+
+Suite: 558 passed / 28 skipped. Published as 0.9.28
+(sha256 bd44f066...3dfa, re-downloaded and compared).

@@ -75,6 +75,7 @@ MoE（nn.MoE，CPU / CUDA 同一份模块，激活不整段拉回主机）：
 from __future__ import annotations
 
 import os
+import sys as _sys_mod
 import numpy as np
 
 # 模块最后会把 max 绑成 torch.max。这两处要的是内置 max，先留住。
@@ -4461,31 +4462,138 @@ def _newton_schulz5_gpu(rt, x, steps=5, eps=1e-7):
 
 
 class Muon(_Optim):
-    """Muon：动量 + Newton-Schulz 正交化；2D 走 Muon，其余回退 AdamW 式更新。"""
+    """Muon：动量 + Newton-Schulz 正交化；2D 走 Muon，其余回退 AdamW 式更新。
 
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0):
-        super().__init__(params, lr)
+    ## 显存（0.9.28 修正，这是 3B MoE 能不能跑的关键）
+
+    旧实现给**每个参数**都分配 `buf + _adam_m + _adam_v` 三份 fp32 状态
+    ⇒ 2.97B 模型要 3×11.1 = **33.3 GiB**，比 AdamW 的 22.2 还差，完全不可用。
+
+    现在按形状只分配真正用得上的：
+
+    | 参数形状 | 走哪条路 | 状态 |
+    | --- | --- | --- |
+    | 2D（投影矩阵、专家矩阵、embedding） | Muon | 只有 1 份动量 `buf` |
+    | 其它（1D 的 RMSNorm 等、标量） | AdamW | m + v |
+
+    `fp16_mom=True` 再把 `buf` 存成 fp16 ⇒ 2.97B 只需要 **5.6 GiB**（vs AdamW fp16 的 11.1 GiB）。
+    这正是 Muon 对 MoE 的价值：**一份状态而不是两份**。
+    """
+
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
+                 fp16_mom=False):
+        _Optim.__init__(self, params, lr)
         self.mom = momentum
         self.nesterov = nesterov
         self.wd = weight_decay
-        self.buf = []
-        self._adam_m = []
+        self.fp16_mom = bool(fp16_mom)
+        self.buf = []          # 仅 2D 参数：动量
+        self._adam_m = []      # 仅非 2D 参数
         self._adam_v = []
+        self._is2d = []
         rt = None
         for p in self.params:
+            shp = tuple(int(s) for s in p.shape)
+            two_d = len(shp) == 2
+            self._is2d.append(two_d)
             if getattr(p, "device", "cpu") == "cuda":
-                # p.data 是 None。动量放设备上，别 zeros_like(None)。
                 if rt is None:
                     rt = _cuda()
-                shp = tuple(int(s) for s in p.shape)
-                self.buf.append(rt.zeros(shp))
-                self._adam_m.append(rt.zeros(shp))
-                self._adam_v.append(rt.zeros(shp))
+                if two_d:
+                    self.buf.append(rt.zeros(shp, dtype=np.uint16) if self.fp16_mom
+                                    else rt.zeros(shp))
+                    self._adam_m.append(None)
+                    self._adam_v.append(None)
+                else:
+                    self.buf.append(None)
+                    self._adam_m.append(rt.zeros(shp))
+                    self._adam_v.append(rt.zeros(shp))
             else:
-                self.buf.append(np.zeros_like(p.data))
-                self._adam_m.append(np.zeros_like(p.data))
-                self._adam_v.append(np.zeros_like(p.data))
+                if two_d:
+                    self.buf.append(np.zeros(shp, np.float16 if self.fp16_mom else np.float32))
+                    self._adam_m.append(None)
+                    self._adam_v.append(None)
+                else:
+                    self.buf.append(None)
+                    self._adam_m.append(np.zeros(shp, np.float32))
+                    self._adam_v.append(np.zeros(shp, np.float32))
         self.t = 0
+
+    # ---------- 状态占用（给"能不能装下"这类问题一个可靠答案） ----------
+    def bytes_per_param(self):
+        """2D 参数每元素字节数（fp16 动量 = 2，fp32 = 4）；非 2D 是 Adam 的 8。"""
+        return 2.0 if self.fp16_mom else 4.0
+
+    def state_bytes(self):
+        tot = 0.0
+        for i, p in enumerate(self.params):
+            n = int(p.numel())
+            if self._is2d[i]:
+                tot += n * (2.0 if self.fp16_mom else 4.0)
+            else:
+                tot += n * 8.0
+        return tot
+
+    # ---------- 分层即时更新（与 Fp16MomAdamW 同一套语义） ----------
+    _groups = None
+
+    def set_layer_groups(self, groups, require_full=True, auto_rest=True):
+        """登记"哪些参数属于哪一层"。语义与 `Fp16MomAdamW.set_layer_groups` 一致。"""
+        first = {}
+        for i, q in enumerate(self.params):
+            first.setdefault(id(q), i)
+        self._groups = {}
+        for k, params in dict(groups or {}).items():
+            idx = []
+            for p in params:
+                j = first.get(id(p))
+                if j is not None and j not in idx:
+                    idx.append(j)
+            self._groups[int(k)] = idx
+        covered = set()
+        for idx in self._groups.values():
+            covered.update(idx)
+        missing = [i for i in sorted(set(first.values())) if i not in covered]
+        if missing and auto_rest:
+            self._groups.setdefault(-1, [])
+            self._groups[-1] = sorted(set(self._groups[-1]) | set(missing))
+            _sys_mod.stderr.write(
+                "[tgai] Muon 分组未覆盖 %d 个参数，已自动放进 -1 组。\n" % len(missing))
+            _sys_mod.stderr.flush()
+            missing = []
+        if require_full and missing:
+            raise ValueError("Muon 分层分组没有覆盖全部参数：%d 个未覆盖" % len(missing) +
+                             "。修法：打开 auto_rest 或把 embed/norm/head 单独成组")
+        return self
+
+    def all_groups(self):
+        return sorted(self._groups.keys())
+
+    def step_layers(self, layer_ids, t=None, release=True):
+        """只更新这些层并释放它们的梯度（数学上等价于统一更新，见 opt_fp16mv 的说明）。"""
+        if not self._groups:
+            raise RuntimeError("还没登记分层参数" + "。修法：先 set_layer_groups(...)")
+        tt = int(self.t + 1) if t is None else int(t)
+        for lid in layer_ids:
+            for i in self._groups.get(int(lid), []):
+                p = self.params[i]
+                if p.grad is None or not getattr(p, "requires_grad", True):
+                    continue
+                self._step_cuda_index(i, p, tt)
+        if release:
+            for lid in layer_ids:
+                for i in self._groups.get(int(lid), []):
+                    self.params[i].grad = None
+        return self
+
+    def _step_cuda_index(self, i, p, tt):
+        """按给定步数 `tt` 更新单个参数（拆出来供 step_layers 复用同一个 t）。"""
+        old = self.t
+        self.t = tt
+        try:
+            self._step_cuda(i, p)
+        finally:
+            self.t = old
 
     def _step_cuda(self, i, p):
         rt = _cuda()
@@ -4505,12 +4613,21 @@ class Muon(_Optim):
         rows = int(p.shape[0])
         cols = int(p.shape[1])
         u = rt.empty(p.shape, dtype=np.float32)
+        # fp16 动量：内核要 fp32 buffer，所以先 cast 出来、用完再写回 fp16。
+        # 瞬时只多一个张量的 fp32（最大约 100 MB），换来 3B 上省 5.5 GiB。
+        buf = self.buf[i]
+        if self.fp16_mom:
+            buf32 = rt.cast_f16_to_f32(buf)
+        else:
+            buf32 = buf
         rt.muon_momentum(
-            p._gpu, g._gpu, self.buf[i], u,
+            p._gpu, g._gpu, buf32, u,
             _f32(self.mom),
             _f32(self.lr * self.wd) if self.wd else 0.0,
             bool(self.wd), bool(self.nesterov),
         )
+        if self.fp16_mom:
+            rt.cast_f32_to_f16_into(buf32, buf)
         o = _newton_schulz5_gpu(rt, u)
         scale = float(np.sqrt(_builtin_max(1.0, rows / cols)))
         rt.sub_scale_(p._gpu, o, _f32(self.lr * scale))
