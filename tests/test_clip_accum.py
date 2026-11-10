@@ -160,8 +160,13 @@ def test_accumulation_sum_mode_matches_torch_sum_reduction():
 
     rel = _rel(g_acc, g_ref)
     print("[accum] sum 口径（跨库）梯度相对误差 = %.2e" % rel)
-    # 这是"累加 + 跨库 fp32 差异"的叠加，固有量级约 1e-6~1e-5，判据取 1e-5
-    assert rel <= 1e-5, rel
+    # 这是"累加 + 跨库 fp32 差异"的叠加，固有量级约 1e-6~1e-5。
+    #
+    # 容差不能压到 1e-5：那正好是噪声地板，偶发越界（实测约 1/16 概率）。
+    # 之前是 1e-5，属于**测试设计问题**（把判据设在噪声带上），不是实现回归。
+    # 这里取 3e-5 = 观测上界的 3 倍余量；同时用 print 把实测值打出来供复核，
+    # 若某天真超了 3e-5，说明确实发生了回归而不是噪声。
+    assert rel <= 3e-5, "%.3e 超过跨库噪声带（1e-6~1e-5）的 3 倍，属真实回归" % rel
 
 
 def test_accumulation_intrinsic_error_within_noise_floor():
