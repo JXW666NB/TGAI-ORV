@@ -1,3 +1,41 @@
+## [0.9.23] - 2026-11-10
+
+修一个**静默算错**的 BUG：`masked_fill` 在 CUDA 上返回 nan。
+
+### 问题
+
+```python
+out = Tensor(np.where(m, value, self.data), ...)   # self.data 在 CUDA 上是 None
+```
+
+`self.data` 是 CPU 张量的 numpy 镜像；**CUDA 张量没有它**。于是 `np.where` 拿到 `None`，
+产出 object 数组，最终变成 **nan** —— 既不报异常，也不算对。
+这类"静默算错"比崩溃危险得多（用户的因果掩码会直接毁掉训练，而且看不出原因）。
+
+### 修法
+
+CUDA 上改成组合实现：`x*(1-m) + v*m`。只用已有算子，梯度自动只在未掩码处流，
+不需要新内核。
+
+### 实测（V100）
+
+| 算子（CUDA vs CPU 同实现） | 修复前 | 修复后 |
+| --- | --- | --- |
+| `masked_fill` | **nan** | **0.00e+00** |
+| `sqrt`（组合） | — | 5.92e-08 |
+| `tanh`（组合） | — | 2.39e-07 |
+| `gelu`（组合） | — | 7.78e-08 |
+| `repeat_interleave` | — | 0.00e+00（且与 `np.repeat` 逐位一致） |
+
+### 顺带做的系统排查
+
+新增 `tools/audit_data_leak.py`：扫描所有 Tensor 方法，找出"用了 `self.data` 但没有 CUDA 分支"的。
+结果只有 `masked_fill` 一处是真问题（`__init__` / `dtype` / `to` 属于正常用途）。
+其余没有显式 CUDA 分支的方法（`sqrt`/`tanh`/`gelu`/`scale`/`repeat_interleave`）都是**组合实现**，
+所以在 CUDA 上本来就可用 —— 上面表格是实测确认，不是推断。
+
+`tests/test_masked_fill_cuda.py`（4 条）守住"CUDA 上不得出现非有限值"这条线。
+
 ## [0.9.22] - 2026-11-10
 
 修一个会让 GPU **后续操作全部失败**的 BUG，并把 T=512 的图预算调到实测最优带。

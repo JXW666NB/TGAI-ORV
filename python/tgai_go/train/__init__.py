@@ -1682,6 +1682,12 @@ class Tensor:
             raise ValueError(
                 "masked_fill: mask 形状 %s 与输入 %s 不一致。修法：先 broadcast_to 或 reshape"
                 % (tuple(m.shape), tuple(self.shape)))
+        if self.device == "cuda":
+            # 原实现直接 np.where(..., self.data)，而 CUDA 张量的 self.data 是 None
+            # ⇒ 会静默产出 nan（实测：CUDA 上返回 nan 而不是报错）。
+            # 这里改成组合实现 x*(1−m) + v*m：只用已有算子，梯度自动只在未掩码处流。
+            mt = _as_tensor(np.ascontiguousarray(m.astype(np.float32))).to("cuda")
+            return self * (1.0 - mt) + mt * float(value)
         out = Tensor(np.where(m, np.float32(value), self.data),
                      requires_grad=self.requires_grad, _parents=(self,))
         keep = (~m).astype(np.float32)
