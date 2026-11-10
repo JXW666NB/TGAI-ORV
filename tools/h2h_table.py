@@ -57,26 +57,25 @@ def run_pyt(seq, amp):
             return self.o(a)
 
     class MoE(nn.Module):
+        """与 ORV 分支**完全相同的算式**：sum_e w2_e(silu(w1_e(x))) * (TOPK/NE)。
+
+        为什么不用 topk + torch.where 做真的稀疏路由：那段在 T=512 触发过
+        `shape '[1,1,1024]' is invalid for input of size 524288`，是对拍脚本自己的形状 bug。
+        两边用同一个稠密等价式，比较的是"同一份数学在两个栈上的速度与显存"，
+        反而更干净（专家数、FFN 宽度、计算量都不变）。
+        """
+
         def __init__(self):
             super().__init__()
-            self.gate = nn.Linear(D, NE, bias=False)
             self.w1 = nn.ModuleList([nn.Linear(D, DF, bias=False) for _ in range(NE)])
             self.w2 = nn.ModuleList([nn.Linear(DF, D, bias=False) for _ in range(NE)])
 
         def forward(self, x):
-            B, S, _ = x.shape
-            logits = self.gate(x)
-            w, idx = torch.topk(torch.softmax(logits, -1), TOPK, dim=-1)
-            out = torch.zeros_like(x)
+            out = None
             for e in range(NE):
-                m = (idx == e).any(-1)
-                if not m.any():
-                    continue
-                ww = (idx == e).float() * w
-                ww = ww.sum(-1, keepdim=True)
-                y = self.w2[e](F.silu(self.w1[e](x))) * ww
-                out = out + torch.where(m.unsqueeze(-1), y, torch.zeros_like(y))
-            return out
+                y = self.w2[e](F.silu(self.w1[e](x)))
+                out = y if out is None else out + y
+            return out * (TOPK / float(NE))
 
     class Block(nn.Module):
         def __init__(self):
@@ -87,10 +86,8 @@ def run_pyt(seq, amp):
             self.moe = MoE()
 
         def forward(self, x):
-            # CausalSelfAttention 要 3D [B,S,D]；这里 batch=1，包一层再拆掉
-            S = int(x.shape[0])
-            y = self.att(self.n1(x).reshape(1, S, D)).reshape(S, D)
-            x = x + y
+            # PyTorch 这边是 3D 批次 [B,S,D]，直接喂给子模块即可
+            x = x + self.att(self.n1(x))
             return x + self.moe(self.n2(x))
 
     model = nn.Sequential(*[Block() for _ in range(NL)]).to(dev)
