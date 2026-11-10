@@ -4623,3 +4623,12 @@ for _layer_name in ("Dropout", "MaxPool1d", "MaxPool2d", "AvgPool1d", "AvgPool2d
     setattr(nn, _layer_name, getattr(_layers_extra, _layer_name))
 del _layer_name
 
+# ═══════════════════════════════════════════════════════════
+# 归约算子（0.9.15）：max / min / var / std / norm 挂到 Tensor 上
+# ═══════════════════════════════════════════════════════════
+from . import redux_extra as _redux_extra                            # noqa: E402
+
+for _red_name in ("max", "min", "var", "std", "norm"):
+    setattr(Tensor, _red_name, getattr(_redux_extra, _red_name))
+del _red_name
+
