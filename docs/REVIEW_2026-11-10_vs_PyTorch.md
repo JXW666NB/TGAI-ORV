@@ -79,7 +79,7 @@
 | CUDA 上的 `abs/relu/clamp/log` | ✅ **0.9.16 沉到 C 端**（新增 7 个内核），`_cpu_only` 调用点 **4 → 0** |
 | `Tensor.to/cuda/cpu`、`minimum` | ✅ **0.9.16 已补**（`maximum` 的 CUDA 分支也修了）|
 | 高层 DPO / GRPO 训练器 | ✅ **0.9.16 已补**（GPU smoke 通过）|
-| CUDA `conv` `groups>1` | ⛔ 未实现（明确抛 `NotImplementedError` 并给修法，不静默算错） |
+| CUDA `conv` `groups>1` | ✅ **0.9.17 已补**（按组切片 + 单组路径 + 通道拼接）：groups=2/4 × stride 1/2 的 fwd/dx/dw/db 均 ≤2.39e-07 |
 | PPO / RLHF | ⛔ 未实现 |
 | 多卡（DDP/FSDP/流水线） | 不在本阶段范围 |
 | `torch.compile` 类图优化 | 未做（CUDA Graph 覆盖逐层反向，非通用编译） |
