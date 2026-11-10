@@ -94,14 +94,16 @@ def test_accumulation_equals_big_batch():
     acc.finalize()
     g_acc = [np.asarray(W.grad.data, np.float32).copy()]
 
-    # 参考侧**不用 nn.Linear**：它有随机 bias，会改变 logits（实测造成 5.4% 假差异）。
-    # 这里只用裸权重 W，与 ORV 侧 `X @ W.T` 完全对应。
+    # 参考侧**用同一个库**（ORV/numpy）跑一次全 batch：
+    # 之前用 torch 做 GEMM，两侧规约顺序不同，误差落在 1e-6~1e-5 边界，且受 BLAS 线程调度影响，
+    # 实测出现过间歇超容差（全量跑 red、单独跑 green）。跨库一致性由 test_linear / test_ce 覆盖，
+    # 本测试只负责"微批累加 == 大批量"，因此同库参照才准确。
     W_eff = np.array(W.data, np.float32, copy=True)
-    ref_W = torch.nn.Parameter(torch.from_numpy(W_eff))
-    logits = torch.from_numpy(X) @ ref_W.T
-    loss = torch.nn.functional.cross_entropy(logits, torch.from_numpy(Y))
-    loss.backward()
-    g_ref = [ref_W.grad.detach().numpy()]
+    W_ref = T.tensor(W_eff.copy(), requires_grad=True)
+    logits_full = T.tensor(np.ascontiguousarray(X)) @ W_ref.T
+    loss_full = T.nn.functional.cross_entropy(logits_full, np.ascontiguousarray(Y))
+    loss_full.backward()
+    g_ref = [np.asarray(W_ref.grad.data, np.float32).copy()]
 
     # 数学上完全等价；差异只来自 fp32 求和顺序（4 次 3 行 GEMM vs 1 次 12 行 GEMM）。
     # 实测 1.30e-06，因此判据取 1e-5 并把实测值写进失败信息。
