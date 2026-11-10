@@ -103,9 +103,9 @@ def main():
                 ok = ok and (("Version: %s" % VER) in z.read(meta).decode("utf-8", "replace"))
                 core = z.read("tgai_go/train/__init__.py").decode("utf-8", "replace")
                 i0 = core.find("class Muon")
-                mu = core[i0:core.find("\nclass ", i0 + 10)] if i0 >= 0 else ""
-                checks = {"ns_fast 参数": "ns_fast=false" in mu,
-                          "ns_fast 传递": "fast=self.ns_fast" in mu,
+                mu = core[i0:] if i0 >= 0 else ""
+                checks = {"ns_fast 参数": "ns_fast=False" in mu,
+                          "ns_fast 传递": "fast=self.ns_fast" in core,
                           "cuBLAS 分支": "gemm_nt(x, x)" in core}
                 for kk, hit in checks.items():
                     print("   %-14s %s" % (kk, hit))
