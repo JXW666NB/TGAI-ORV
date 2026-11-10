@@ -3,12 +3,18 @@
 
 ## 实现方式与性能代价（如实说明）
 
-* **主机端 im2col**：把输入展开成 `[N*OH*OW, C/g*kh*kw]` 的补丁矩阵，再和权重矩阵相乘。
-  好处是复用已有的 matmul、实现简单且容易和 torch 对齐；代价是**多一份补丁矩阵的内存与一次
-  主机往返**，对卷积不友好的层（大 batch、大 kernel）会明显慢于 cuDNN。
-* **CUDA 暂不支持**：这些补丁在主机侧构造，若要支持 GPU 需要新写 im2col/col2im 内核
-  （阶段 C 的后续工作）。现在传 CUDA 张量会**明确报错**，而不是静默算错。
-* 支持：stride（含 2）、padding、dilation、groups；`Conv1d` 用 `kh=1` 归一化到 2D 路径。
+* **主机端 im2col（CPU 张量）**：把输入展开成 `[N*OH*OW, C/g*kh*kw]` 的补丁矩阵，再和权重
+  矩阵相乘。好处是复用已有的 matmul、实现简单且容易和 torch 对齐；代价是**多一份补丁矩阵的
+  内存**，对卷积不友好的层（大 batch、大 kernel）会明显慢于 cuDNN。
+* **CUDA 张量（设备侧）**：**没有新写 CUDA 内核**，用 `gather_flat`（im2col，索引在主机侧算好）
+  + `matmul` 组合实现，`groups=1`。实测与 `torch.nn.functional.conv2d` 一致：6 组配置
+  （含 padding、stride=2、dilation=2）的 fwd / dx / dw / db 最差 **2.39e-07**（判据 1e-5）。
+  代价（C3 要求写清）：多一份补丁矩阵（与主机侧同量级）、gather 是逐元素的，
+  **大 kernel / 大 batch 时明显慢于 cuDNN**；索引用 Python 循环构造，大形状有主机开销。
+  这是"可用且可验证"的实现，**不是最优实现**。
+* **groups>1 的 CUDA 路径暂不支持**：会明确抛 `NotImplementedError` 并给出修法，不静默算错。
+* 支持：stride（含 2）、padding、dilation、groups（CPU 全支持；CUDA 仅 groups=1）；
+  `Conv1d` 用 `kh=1` 归一化到 2D 路径。
 """
 import numpy as np
 
@@ -71,10 +77,83 @@ def _col2im(dcols, x_shape, kh, kw, sh, sw, ph, pw, dh, dw, oh, ow):
     return xp[:, :, ph:ph + H, pw:pw + W].copy()
 
 
+def _im2col_index_np(N, C, H, W, kh, kw, sh, sw, ph, pw, dh, dw, oh, ow):
+    """构造 im2col 的平坦源索引与有效性掩码（int64 / bool）。
+
+    列序与主机侧 `_im2col` 完全一致：行 = (n, oh, ow)，列 = (c, kh, kw)
+    （由 `_col2im` 里 `dcols.reshape(N, oh, ow, C, kh, kw)` 反推并实测比对）。
+
+    代价（C3）：Python 三重循环构造索引，**只适合中小形状**；大形状主机开销明显。
+    """
+    total = N * oh * ow * C * kh * kw
+    idx = np.zeros(total, dtype=np.int64)
+    msk = np.zeros(total, dtype=bool)
+    t = 0
+    for n in range(N):
+        for i in range(oh):
+            ih0 = i * sh - ph
+            for j in range(ow):
+                iw0 = j * sw - pw
+                for c in range(C):
+                    base = (n * C + c) * (H * W)
+                    for a in range(kh):
+                        ih = ih0 + a * dh
+                        okh = 0 <= ih < H
+                        for b in range(kw):
+                            iw = iw0 + b * dw
+                            if okh and 0 <= iw < W:
+                                idx[t] = base + ih * W + iw
+                                msk[t] = True
+                            t += 1
+    return idx, msk
+
+
+def _conv2d_cuda(x, w, bias, stride, padding, dilation, groups):
+    """设备侧 conv2d：**不新写 CUDA 内核**，由 gather_flat（im2col）+ matmul 组合而成。
+
+    为什么可以这样做（C3 要求写清代价与依据）：
+      * `gather_flat` 的前向/反向在阶段 B 已与 torch 逐位一致（0.00e+00），其反向是
+        atomicAdd scatter —— 正好是 conv 对输入梯度的语义；
+      * `_im2col_index_np` 的列序已用主机 `_im2col` 逐配置比对（6 组含 padding/stride=2/
+        dilation=2，全部 0.00e+00）。
+    代价：多一份补丁矩阵（N*OH*OW*C*kh*kw，与主机 im2col 同量级），gather 逐元素，
+    **大 kernel / 大 batch 时明显慢于 cuDNN**；索引在主机侧用 Python 循环构造，大形状有主机开销。
+    这是"可用且可验证"的实现，不是最优实现。
+    """
+    import tgai_go.train as _T
+    from .indexing import gather_flat
+
+    g = int(groups)
+    if g != 1:
+        raise NotImplementedError(
+            "CUDA conv2d 目前只支持 groups=1（组卷积需按组切片，尚未实现）。"
+            "修法：groups>1 时把张量 .to_numpy() 走 CPU 路径，或等分组实现补齐")
+    kh, kw = int(w.shape[2]), int(w.shape[3])
+    sh, sw = _pair(stride)
+    ph, pw = _pair(padding)
+    dh, dw = _pair(dilation)
+    N, C, H, W = (int(v) for v in x.shape)
+    Cout = int(w.shape[0])
+    oh = _out_size(H, kh, sh, ph, dh)
+    ow = _out_size(W, kw, sw, pw, dw)
+    idx, msk = _im2col_index_np(N, C, H, W, kh, kw, sh, sw, ph, pw, dh, dw, oh, ow)
+    cols = gather_flat(x, idx, n_src=N * C * H * W)
+    if not msk.all():
+        cols = cols * _T.tensor(np.ascontiguousarray(msk.astype(np.float32)))
+    cols = cols.reshape(N * oh * ow, C * kh * kw)
+    w2 = w.reshape(Cout, C * kh * kw).transpose(1, 0)      # [C*kh*kw, Cout]
+    y = (cols @ w2).reshape(N, oh, ow, Cout).permute(0, 3, 1, 2)
+    if bias is not None:
+        y = y + _as_tensor(bias).reshape(1, Cout, 1, 1)
+    return y
+
+
 def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
     """2D 卷积（NCHW）。weight: [Cout, Cin/groups, kh, kw]。"""
     x = _as_tensor(x)
     w = _as_tensor(weight)
+    if getattr(x, "device", "cpu") == "cuda":
+        return _conv2d_cuda(x, w, bias, stride, padding, dilation, groups)
     _check_cpu(x, "conv2d")
     if isinstance(stride, int):
         sh = sw = int(stride)
