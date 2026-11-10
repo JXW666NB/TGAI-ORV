@@ -4787,4 +4787,10 @@ GradScaler = _amp_api.GradScaler
 # ═══════════════════════════════════════════════════════════
 from . import preset as preset                                        # noqa: E402
 from .preset import tokens, fit                                       # noqa: E402
+# "从零开始"四步里第 1~2 步：读语料 → 训分词表（新手不该去记子模块路径）
+from .preset import train_tokenizer, load_corpus, Tokenizer           # noqa: E402
+from .data import read_jsonl, train_eval_split as split_dataset        # noqa: E402
+# SFT 数据集与 PPO 子模块：README 里直接写 T.SftDataset / T.ppo.gae，必须真的能点出来
+from .sft_data import SftDataset, iter_jsonl_texts                     # noqa: E402
+from . import ppo as ppo                                              # noqa: E402
 

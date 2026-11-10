@@ -201,6 +201,78 @@ def tokens(ids, seq=128):
     return _TokenBlocks(ids, seq=seq)
 
 
+class Tokenizer(object):
+    """极简 BPE 分词器（`train_tokenizer()` 的返回值）。
+
+    只为"从零开始训自己的模型"这条链路存在：给一段文本就能造词表、能 encode，
+    不需要外部 tokenizer 文件。词表规模建议 2000~8000（太小会把词切得很碎，太大在
+    小语料上会过拟合）。真正的工程实践里应当换成成熟的分词器 —— 这个只保证可用、可复现。
+    """
+
+    def __init__(self, vocab, merges):
+        self.vocab = list(vocab)
+        self.merges = list(merges)
+        self.stoi = {c: i for i, c in enumerate(self.vocab)}
+        self.rank = {p: r for r, p in enumerate(self.merges)}
+        self.merged = {}
+        for (a, b) in self.merges:
+            self.merged[(a, b)] = self.stoi[self.vocab[a] + self.vocab[b]]
+
+    @property
+    def vocab_size(self):
+        return len(self.vocab)
+
+    def encode(self, text):
+        """文本 → id 列表；规则与训练时一致（反复合并 rank 最小的相邻对）。"""
+        from .bpe import encode_ref
+        return encode_ref(text, self.vocab, self.merges)
+
+    def __repr__(self):
+        return "Tokenizer(vocab_size=%d, merges=%d)" % (self.vocab_size, len(self.merges))
+
+
+def train_tokenizer(text, vocab_size=4000):
+    """`T.train_tokenizer(text, vocab_size)` —— 从**你自己的语料**训一个分词表。
+
+    这是"新手四步"里的第 2 步。返回的对象有 `.vocab_size` 与 `.encode(text)`。
+    """
+    from .bpe import train_bpe
+    if not isinstance(text, str) or not text:
+        raise ValueError("train_tokenizer 需要非空字符串（先用 "
+                         "open(path, encoding='utf-8').read() 读入语料）" +
+                         "。修法：检查语料路径与编码")
+    vocab, merges = train_bpe(text, int(vocab_size))
+    return Tokenizer(vocab, merges)
+
+
+def load_corpus(path, encoding="utf-8"):
+    """`T.load_corpus(path)` —— 读纯文本语料（第 1 步）。
+
+    也接受 `.jsonl`：每行的 `text` 字段会被拼起来（与 `T.data.read_jsonl` 的约定一致）。
+    """
+    import io as _io
+    import json as _json
+    with _io.open(path, "r", encoding=encoding, errors="replace") as f:
+        raw = f.read()
+    if path.lower().endswith(".jsonl"):
+        parts = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = _json.loads(line)
+            except ValueError:
+                parts.append(line)
+                continue
+            if isinstance(obj, dict):
+                parts.append(str(obj.get("text") or obj.get("content") or ""))
+            else:
+                parts.append(str(obj))
+        return "\n".join(parts)
+    return raw
+
+
 # ═══════════════════════════════════════════════════════════
 # 训练循环：一行把模型练起来
 # ═══════════════════════════════════════════════════════════
