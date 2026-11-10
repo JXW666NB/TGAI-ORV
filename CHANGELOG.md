@@ -1,3 +1,50 @@
+## [0.9.32] - 2026-11-11
+
+修掉分组 GEMM 的**必然崩溃**，并把它改成**失败即安全回退**。性能收益尚未拿到，如实记录。
+
+### 修了什么
+
+`cuda.py::_grouped_ready()` 加载的是**非 Ex** 版 `cublasSgemmGroupedBatched`，但 `argtypes`
+按 Ex 版声明成了指针数组：
+
+```
+真签名：... int m, int n, int k, alpha, A[], lda, B[], ldb, beta, C[], ldc, batchCount, groupSize[]
+旧声明：... int* m, int* n, int* k, alpha, ...
+```
+
+驱动把指针低 32 位当 `m` 读 ⇒ 天文数字 ⇒ **必然非法访存（rc=700）**。
+旧注释把它归因为"某专家行数 >64 越界"，是误判 —— 只要分组路径被走到就必崩。
+
+现在：
+- `argtypes` 改为正确的标量版；
+- `_grouped_sgemm` 先检查**所有组 m/n/k 是否一致**（非 Ex 版的硬要求），不一致就安全回退；
+- 任何非 0 返回码都**静默回退**到逐次 `sgemm`，只提示一次，绝不抛异常。
+
+### 实测（`tools/grouped_fix_check.py`）
+
+| 场景 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 形状一致，走分组 | **rc=700 崩溃** | rc=7（参数校验不过）⇒ 自动回退 |
+| 形状不一致 | **rc=700 崩溃** | 回退，**0.00e+00 逐位一致** |
+| 库的可靠性 | 一调就崩 | **永不崩、结果永远正确** |
+
+### 未达成的目标（如实）
+
+**MoE 反向 332 ms → ≤200 ms 这一条没做到。** 分组路径现在返回 `rc=7
+"parameter number 2 had an illegal value"`（第 2 个参数，即 `transa` 位置），
+说明这个 libcublas 版本的非 Ex 版符号**参数布局与文档不一致**，还需要进一步定位
+（怀疑：该版本要求 `m/n/k` 在 `transa/transb` 之前，或 `alpha/beta` 需设备指针）。
+
+在调通之前，性能仍是逐专家循环的老路径，**不做任何性能宣称**。
+
+### 顺带确认的事实
+
+- 运行时 libcublas **只有** `cublasSgemmGroupedBatched`，没有 `cublasGemmGroupedBatchedEx`
+  与 `cublasSgemmGroupedBatchedEx`（`tools/grouped_ex_probe.py` 实测），所以方案 B（Ex 版）
+  在这台机器上不可用。
+
+套件：**567 passed / 28 skipped**。
+
 ## [0.9.31] - 2026-11-10
 
 文档收尾：把核心卖点从算术变成实测。

@@ -93,3 +93,27 @@ Ex 版才支持逐组 `m/n/k`，签名是
 - 改这一段必须**先备份** `cuda.py`（时间戳），因为它是所有 GEMM 的公共路径；
 - 分组路径要保留 `TGAI_MOE_GROUPED` 开关，出问题能立刻退回逐专家；
 - 关闭时的行为与现在**完全一致**，不能改变现有数值。
+
+## 7. 2026-11-11 更新：签名已修正，但分组调用仍返回 rc=7
+
+已实施：把 rgtypes 改成正确的标量版、_grouped_sgemm 加一致性检查、非 0 返回码**静默回退**。
+	ools/grouped_fix_check.py 实测：
+
+| 场景 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 形状一致，走分组 | rc=700 崩溃 | **rc=7**（参数校验不过）⇒ 自动回退 |
+| 形状不一致 | rc=700 崩溃 | 回退，**0.00e+00 逐位一致** |
+| 库可靠性 | 一调就崩 | 永不崩、结果永远正确 |
+
+**rc=7 的信息是「parameter number 2 had an illegal value」**，第 2 个参数即 	ransa 位置
+（我们传 CUBLAS_OP_T=1）。据此推测该 libcublas 版本的非 Ex 版符号**参数布局与公开文档不一致**，
+下一步应验证的两个假设：
+
+1. 该版本把 m, n, k 放在 	ransa, transb **之前**；
+2. lpha/beta 需要**设备**指针（cublasSetPointerMode(DEVICE)）而非主机指针。
+
+另外已确认：运行时 libcublas **只有** cublasSgemmGroupedBatched，
+没有 cublasGemmGroupedBatchedEx / cublasSgemmGroupedBatchedEx（	ools/grouped_ex_probe.py），
+所以方案 B 在这台机器上不可用。
+
+**在 rc=7 调通之前，MoE 反向仍是逐专家循环，不做任何性能宣称。**

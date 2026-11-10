@@ -5439,39 +5439,73 @@ class CudaRuntime:
             self._grouped_missing = True
             return None
         fn.restype = ctypes.c_int
-        # 指针数组在主机上，元素是设备地址。c_void_p 会把高位地址变成负数。
+        # ★ 2026-11-11 修正：这里是 **非 Ex** 版 `cublasSgemmGroupedBatched`，
+        # 签名要求 m/n/k 是**标量 int**、alpha/beta 是**单个主机标量指针**，
+        # 且顺序是 `alpha, A[], lda, B[], ldb, beta, C[], ldc`（beta 在 B 之后）。
+        #
+        # 旧实现按 Ex 版声明成 `int*` 并传了指针数组 —— 驱动会把指针低 32 位当成 `m` 读，
+        # 得到一个天文数字，于是必然非法访存（实测 rc=700）。旧注释把它归因为
+        # "某专家行数 >64 越界"，是误判：只要分组路径被走到就必崩。
+        #
+        # 非 Ex 版还要求**所有组共享 m/n/k**，所以 `_grouped_sgemm` 现在会先检查一致性，
+        # 不一致就安全回退到逐次 sgemm（不再崩溃）。
+        # 指针数组在主机上，元素是设备地址；用 c_uint64 避免高位地址被当成负数。
         fn.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int),
-            ctypes.POINTER(ctypes.c_float),
-            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_int),
-            ctypes.c_int, ctypes.POINTER(ctypes.c_int),
+            ctypes.c_void_p,          # handle
+            ctypes.c_int,             # transa
+            ctypes.c_int,             # transb
+            ctypes.c_int,             # m
+            ctypes.c_int,             # n
+            ctypes.c_int,             # k
+            ctypes.POINTER(ctypes.c_float),      # alpha（单个主机标量）
+            ctypes.POINTER(ctypes.c_uint64),     # A 指针数组
+            ctypes.c_int,                        # lda
+            ctypes.POINTER(ctypes.c_uint64),     # B 指针数组
+            ctypes.c_int,                        # ldb
+            ctypes.POINTER(ctypes.c_float),      # beta（单个主机标量）
+            ctypes.POINTER(ctypes.c_uint64),     # C 指针数组
+            ctypes.c_int,                        # ldc
+            ctypes.c_int,                        # batchCount
+            ctypes.POINTER(ctypes.c_int),        # groupSize 数组
         ]
         self._grouped_fn = fn
         return fn
 
+    def _grouped_fail_note(self, rc):
+        """分组 GEMM 失败只提示一次，之后不再重复刷屏。"""
+        if getattr(self, "_grouped_noted", False):
+            return
+        self._grouped_noted = True
+        try:
+            sys.stderr.write(
+                "[tgai] 分组 GEMM（cublasSgemmGroupedBatched）返回 rc=%d，"
+                "已自动退回逐次 sgemm（结果正确，只是没有融合）。\n" % int(rc))
+            sys.stderr.flush()
+        except Exception:
+            pass
+
     def _grouped_sgemm(self, specs):
-        """一批不同形状的 sgemm，一次 cublasSgemmGroupedBatched。
+        """一批 sgemm，一次 `cublasSgemmGroupedBatched`。
+
+        **非 Ex 版要求所有组共享 m/n/k**（`int m, int n, int k` 是标量）。
+        各组形状不一致时**安全回退**到逐次 `_sgemm`（结果相同，只是不融合）——
+        旧实现没有这个检查，且按 Ex 版签名调用，导致必然 rc=700。
 
         specs: (transa, transb, m, n, k, A, lda, B, ldb, C, ldc)，指针是 int。
-        每组 group_size=1，所以专家 token 数不必 pad。m/n/k 为 0 的项跳过。
-        beta=0，C 不必先清零。主机参数数组挂在返回值上，避免调用返回后被收掉。
         """
         specs = [s for s in specs if int(s[2]) > 0 and int(s[3]) > 0 and int(s[4]) > 0]
         if not specs:
             return None
+        # 一致性检查：非 Ex 版只能接受"所有组 m/n/k 相同"
+        m0, n0, k0 = int(specs[0][2]), int(specs[0][3]), int(specs[0][4])
+        uniform = all(int(s[2]) == m0 and int(s[3]) == n0 and int(s[4]) == k0
+                      for s in specs)
+        fn = None if not uniform else self._grouped_ready()
+        if fn is None:
+            for s in specs:
+                self._sgemm(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10])
+            return None
         g = len(specs)
-        transa = (ctypes.c_int * g)()
-        transb = (ctypes.c_int * g)()
-        ma = (ctypes.c_int * g)()
-        na = (ctypes.c_int * g)()
-        ka = (ctypes.c_int * g)()
-        alpha = (ctypes.c_float * g)()
-        beta = (ctypes.c_float * g)()
         aa = (ctypes.c_uint64 * g)()
         lda = (ctypes.c_int * g)()
         ba = (ctypes.c_uint64 * g)()
@@ -5480,13 +5514,6 @@ class CudaRuntime:
         ldc = (ctypes.c_int * g)()
         gsize = (ctypes.c_int * g)()
         for i, s in enumerate(specs):
-            transa[i] = int(s[0])
-            transb[i] = int(s[1])
-            ma[i] = int(s[2])
-            na[i] = int(s[3])
-            ka[i] = int(s[4])
-            alpha[i] = 1.0
-            beta[i] = 0.0
             aa[i] = ctypes.c_uint64(int(s[5]))
             lda[i] = int(s[6])
             ba[i] = ctypes.c_uint64(int(s[7]))
@@ -5498,16 +5525,30 @@ class CudaRuntime:
             self._mark_submitted(int(s[7]))
             self._mark_submitted(int(s[9]))
         self._activate()
-        fn = self._grouped_ready()
-        if fn is None:
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        try:
+            rc = fn(
+                self.handle,
+                int(specs[0][0]), int(specs[0][1]),
+                m0, n0, k0,
+                ctypes.byref(alpha),
+                aa, lda[0], ba, ldb[0],
+                ctypes.byref(beta),
+                ca, ldc[0],
+                int(g), gsize,
+            )
+        except Exception:
+            rc = -1
+        # ★ 失败即回退，绝不抛异常：分组路径目前仍返回 rc=7（参数校验不过），
+        # 在彻底调通之前，任何失败都必须静默退回逐次 sgemm，保证结果正确、库不崩。
+        if int(rc) != 0:
             for s in specs:
                 self._sgemm(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10])
+            self._grouped_fail_note(int(rc))
             return None
-        self._chk_blas(fn(
-            self.handle, transa, transb, ma, na, ka, alpha,
-            aa, lda, ba, ldb, beta, ca, ldc, int(g), gsize,
-        ), "cublasSgemmGroupedBatched")
-        return (transa, transb, ma, na, ka, alpha, beta, aa, lda, ba, ldb, ca, ldc, gsize)
+        # 主机数组要活到内核真正跑完
+        return (aa, lda, ba, ldb, ca, ldc, gsize, alpha, beta)
 
     def grouped_nt(self, As, Bs):
         """每个 C[M,N] = A[M,K] @ B[N,K]^T。M 可以各不相同，K/N 按各对自己的形状。"""
