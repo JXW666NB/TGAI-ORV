@@ -95,3 +95,28 @@ Tensor._from_gpu(...) 把 buffer 包成 Tensor 跑 bmm，再拆回各参数缓�
 代价是每组多一份 [G,M,K] 的批量缓冲 —— Muon 路线峰值 19.17 GiB 尚有 12.7 GiB 余量，够用。
 
 **状态：方案确定、可行性已验证、尚未实现。**
+
+
+### 实现所需的原语（已核实存在）
+
+| 原语 | 用途 | 限制 |
+| --- | --- | --- |
+| 
+t.cat_place(src, dst, axis, dst_off) | 把每个参数的 u 抄进 [G,M,K] 批量缓冲 | **仅 float32** |
+| 
+t.cat_extract(src, axis, src_off, span, dst_shape) | 从批量结果里切回单参数 | **仅 float32** |
+| Tensor @ Tensor（3D@3D） | 批量 Newton-Schulz 的核心 | CPU 已验证；CUDA 未验证 |
+| Tensor.permute(0,2,1) | x @ x^T 需要转置 | 已有 permute 内核 |
+
+### 注意：fp16 动量不能直接批量
+
+cat_place/extract 只支持 float32，而 p16_mom=True 时动量是 uint16。
+所以批量路径要么先 cast_f16_to_f32（多一遍带宽），要么只在 p16_mom=False 时启用。
+**下一步需要先测 CUDA 上 3D@3D 是否正确**，再决定批量粒度（按形状分组的大小）。
+
+### 预计收益（按算子数估算）
+
+单组 G=8：批量后 NS 从 30×G = 240 次算子降到 30 + 2G = 46 次，约 **5×**。
+672 个同形张量按 8 个一组 → 84 组，总算子数从 7.6 万降到约 1.5 万级。
+若线性换算，35.0 s → 约 7 s 量级 —— **仍然不够快**，但已进入可讨论区间；
+要再降需要融合 NS 的 6 个算子为更少的内核。
