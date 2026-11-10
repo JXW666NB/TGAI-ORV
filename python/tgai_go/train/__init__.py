@@ -4773,3 +4773,9 @@ amp_state = _amp_api.amp_state
 amp_invalidate = _amp_api.amp_invalidate
 GradScaler = _amp_api.GradScaler
 
+# ═══════════════════════════════════════════════════════════
+# 开箱即用层（0.9.21）：T.preset.transformer / T.tokens / T.fit
+# ═══════════════════════════════════════════════════════════
+from . import preset as preset                                        # noqa: E402
+from .preset import tokens, fit                                       # noqa: E402
+

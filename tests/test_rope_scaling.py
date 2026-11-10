@@ -16,9 +16,18 @@ import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
-# 本文件用 transformers 的 LlamaForCausalLM 当参照物；
-# 没装就跳过（CI 现在装了，所以这条路是真跑的）
-pytest.importorskip("transformers")
+# 本文件用 transformers 的 LlamaForCausalLM 当参照物；没装就跳过（CI 现在装了，所以这条路是真跑的）。
+#
+# 注意：**不能**只用 `pytest.importorskip("transformers")`。它只捕获 ImportError，
+# 而 transformers 懒加载 scipy 时，在本机（Windows + scipy 的 .libs）会抛
+#   FileNotFoundError: [WinError 206] 文件名或扩展名太长: '...\\scipy.libs'
+# 这种"环境坏了"的情况会让整条测试**失败**而不是跳过，把真正要测的 RoPE 逻辑淹没掉。
+# 所以这里显式接住任何异常并 skip，同时把原因写进 skip 消息（不是静默吞掉）。
+try:
+    import transformers  # noqa: F401
+except Exception as _exc:  # pragma: no cover - 取决于机器环境
+    pytest.skip("transformers 不可用（环境问题，非本库缺陷）：%s: %s"
+                % (type(_exc).__name__, str(_exc)[:160]), allow_module_level=True)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "python"))
@@ -54,7 +63,14 @@ OURS_TO_HF_LAYER = [
 
 
 def _build_hf(w, cfg):
-    from transformers import LlamaConfig, LlamaForCausalLM
+    # 这里是 transformers 真正加载模型的地方，也是本机 scipy `.libs` 那个
+    # FileNotFoundError(WinError 206) 的触发点。环境问题应**跳过并说明原因**，
+    # 而不是让 RoPE 对照测试失败（那会把"环境坏了"误报成"实现错了"）。
+    try:
+        from transformers import LlamaConfig, LlamaForCausalLM
+    except Exception as exc:  # pragma: no cover - 取决于机器环境
+        pytest.skip("transformers/scipy 在本机不可用（环境问题，非本库缺陷）：%s: %s"
+                    % (type(exc).__name__, str(exc)[:160]))
     c = LlamaConfig(
         vocab_size=cfg["V"], hidden_size=cfg["D"], num_hidden_layers=cfg["L"],
         num_attention_heads=cfg["NH"], num_key_value_heads=cfg["KV"],

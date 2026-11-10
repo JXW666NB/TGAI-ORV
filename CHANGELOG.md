@@ -1,3 +1,57 @@
+## [0.9.21] - 2026-11-10
+
+**开箱即用层**：10 行以内开始训练自己的模型；同时扩宽 PyT 迁移面、修掉两处误导性文案。
+
+### 新增：`T.preset` / `T.tokens` / `T.fit`
+
+```python
+import numpy as np
+import tgai_go.train as T
+ids   = np.resize(np.array([1, 5, 9, 13, 17, 21, 25]), 4000)
+data  = T.tokens(ids, seq=32)
+model = T.preset.transformer(vocab=32, d_model=32, n_layers=2, n_heads=4)
+hist  = T.fit(model, data, steps=80, lr=3e-3)
+```
+
+- `T.preset.transformer(...)`：pre-LN 的 decoder-only Transformer（RMSNorm/LayerNorm 可选、
+  SwiGLU FFN、GQA 未启用、词嵌入与 lm_head 可共享），是**普通 `nn.Module`**，随时可拆开改。
+- `T.tokens(ids, seq)`：最小数据入口（定长切块，label 为右移一位）。
+- `T.fit(model, data, steps, lr)`：内含 AdamW + cosine(warmup) + 梯度裁剪 + 可选 AMP，返回 loss 历史。
+- `examples/ten_lines.py` 就是这条路径：**loss 3.4698 → 0.0264（80 步）**。
+
+### 新增：可编程 AMP
+
+`with T.amp():`、`T.amp_on/amp_off/amp_state/amp_invalidate`、`T.GradScaler`。
+`T.amp` 同时保留旧的 bf16 工具语义（可调用 + 属性代理），旧代码不破。
+
+| 项 | 结果 |
+| --- | --- |
+| GEMM 2048×2048×6144 | fp32 4.33 ms → amp **0.67 ms（6.47×）** |
+| 真实 8 层步 | loss 4219.40 → 4219.45（1.25e-05） |
+| 退出上下文 | 状态复原 |
+
+### 修复：PyT 迁移面
+
+- `T.nn` 之前**没有** `Conv1d`/`Conv2d`（只在顶层），PyT 代码 `nn.Conv2d(...)` 直接 AttributeError。
+  现补进 `nn`，且与顶层是同一对象。
+- `from_torch` 新增：`Conv1d`、`Dropout`、`BatchNorm1d/2d`（带 running 统计与 affine 权重）、
+  `MaxPool1d/2d`、`AvgPool1d/2d`。
+- 修掉两处**误导性文案**：interop 文档与报错都曾写"LayerNorm 不支持，因为 ORV 没有 LayerNorm"，
+  这是过时信息（`from_torch` 一直在转 LayerNorm）。报错现在会列出已支持类型。
+
+### 测试
+
+`tests/test_preset_quickstart.py`（7 条，含"loss 必须降到 70% 以下"与"实质代码 ≤10 行"两条硬判据）、
+`tests/test_interop_migration.py`（9 条）、`tests/test_amp_api.py`（7 条）。
+
+套件：**531 passed / 24 skipped**。
+
+### 已知环境问题（不是本库缺陷）
+
+`tests/test_rope_scaling.py` 在**全量**运行时会因本机 `transformers → scipy` 的
+`FileNotFoundError(WinError 206, scipy.libs)` 而失败（单跑该文件 4 passed）。已改为**显式跳过并打印原因**，
+避免把"机器环境坏了"误报成"RoPE 实现错了"。该 scipy 交互未根因定位。
+
 ## [0.9.20] - 2026-11-10
 
 把 `TG_FP16` 环境变量升级成**可编程 AMP**：`with T.amp():`，不用再重启进程。
