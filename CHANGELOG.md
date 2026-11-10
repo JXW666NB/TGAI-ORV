@@ -1,3 +1,34 @@
+## [0.9.14] - 2026-11-10
+
+补齐自定义模型常用层：Dropout、MaxPool/AvgPool（1d/2d）、BatchNorm（1d/2d），以及
+`Module.train()/eval()`。另附 `docs/REVIEW_2026-11-10_vs_PyTorch.md` 全面审查。
+
+### 新增
+
+- `nn.Dropout(p)`：inverted dropout，训练按 `1/(1-p)` 缩放；CUDA 走 `h2d + _from_gpu` 落同设备。
+- `nn.MaxPool1d/2d`、`nn.AvgPool1d/2d`：用 `gather_flat`（前反向已在阶段 B 与 torch 逐位一致）实现，
+  **CPU 与 CUDA 同一路径**；`AvgPool` 等价 `count_include_pad=True`（torch 默认）。
+- `nn.BatchNorm1d/2d`：两遍法（均值→中心化后方差），只用已有 `mean/mul/add`，CPU/CUDA 通用；
+  训练更新 running 统计，`eval()` 用 running 统计。
+- `Module.train(mode=True)` / `Module.eval()`：递归到子模块，`self.training` 默认 True。
+
+### 实测（V100，与 torch 对照）
+
+| 项 | 相对差 |
+| --- | --- |
+| MaxPool2d 前向（CUDA vs CPU / vs torch）与反向 | **0.00e+00** |
+| AvgPool2d 前向 / 反向 | 4.76e-08 / 9.69e-08 |
+| BatchNorm2d 前向（CUDA vs CPU）与 running 统计 | **0.00e+00** |
+| Dropout（CUDA） | 训练均值 0.9990、零比例 0.301、eval 恒等 ✓ |
+| CPU 侧 13 条 pytest（含 BN 反向、1d 变体、坏参数拒绝） | 全绿 |
+
+### 已知边界（不隐瞒）
+
+- `AvgPool` 只支持 `count_include_pad=True`；`MaxPool` 在 CUDA 上要一次 `to_numpy()` 取 argmax
+  （**主机往返**），并列最大值取第一个。
+- `BatchNorm` 只支持 `track_running_stats=True`；`affine=False` 可用。
+- CUDA 池化索引用 Python 循环按形状构造，大形状有主机开销；不是融合实现。
+
 ## [0.9.13] - 2026-11-10
 
 CUDA 上的卷积（阶段 C2 收口）：**没有新写 CUDA 内核**，用 `gather_flat` + matmul 组合实现。

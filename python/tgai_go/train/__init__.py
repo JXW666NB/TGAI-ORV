@@ -3061,6 +3061,18 @@ class Module:
     def __init__(self):
         object.__setattr__(self, "_params", {})
         object.__setattr__(self, "_mods", {})
+        # 训练/推理模式：Dropout、BatchNorm 依赖它（与 torch.nn.Module 对齐）
+        object.__setattr__(self, "training", True)
+
+    def train(self, mode=True):
+        """切换训练/推理模式，并递归到子模块。返回 self（可链式）。"""
+        object.__setattr__(self, "training", bool(mode))
+        for m in self._mods.values():
+            m.train(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
 
     def __setattr__(self, name, value):
         if name in ("_params", "_mods"):
@@ -4598,4 +4610,16 @@ tensor = Tensor            # torch.tensor(...) -> Tensor(...)
 # torch.set_default_device('cuda') 的同义实现
 def set_default_device(device):
     return set_device(device)
+
+
+# ═══════════════════════════════════════════════════════════
+# 补充层（0.9.14）：Dropout / MaxPool / AvgPool / BatchNorm（1d/2d）
+# 放在文件末尾导入：layers_extra 依赖本模块已定义的 Tensor/Module/Parameter/indexing
+# ═══════════════════════════════════════════════════════════
+from . import layers_extra as _layers_extra                          # noqa: E402
+
+for _layer_name in ("Dropout", "MaxPool1d", "MaxPool2d", "AvgPool1d", "AvgPool2d",
+                    "BatchNorm1d", "BatchNorm2d"):
+    setattr(nn, _layer_name, getattr(_layers_extra, _layer_name))
+del _layer_name
 
