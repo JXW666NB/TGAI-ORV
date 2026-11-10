@@ -158,9 +158,11 @@ def grpo_loss(policy_logps, old_logps, ref_logps, advantages, masks,
     ratios_all = []
     for i in range(n):
         p = _as_tensor(policy_logps[i])
-        old = _as_tensor(np.asarray(old_logps[i], np.float32))
-        ref = _as_tensor(np.asarray(ref_logps[i], np.float32))
-        m = _as_tensor(np.asarray(masks[i], np.float32))
+        dev = getattr(p, "device", "cpu")
+        # 常量必须与策略同设备：混设备在 CUDA 上不会报错，而是算出 nan（实测踩过）。
+        old = _as_tensor(np.asarray(old_logps[i], np.float32)).to(dev)
+        ref = _as_tensor(np.asarray(ref_logps[i], np.float32)).to(dev)
+        m = _as_tensor(np.asarray(masks[i], np.float32)).to(dev)
         adv = float(advantages[i])
         ratio = (p - old).exp()
         s1 = ratio * adv
@@ -173,9 +175,9 @@ def grpo_loss(policy_logps, old_logps, ref_logps, advantages, masks,
             kl_t = (diff.exp() - diff - 1.0) if kl == "k3" else diff
             per = per + ((kl_t * m).sum()) * float(beta)
         total = per if total is None else total + per
-        mv = np.asarray(m.data if hasattr(m, "data") else m, np.float32)
+        mv = np.asarray(m.to_numpy() if hasattr(m, "to_numpy") else m, np.float32)
         ntok += float(mv.sum())
-        rv = np.asarray(ratio.data if hasattr(ratio, "data") else ratio, np.float32)
+        rv = np.asarray(ratio.to_numpy() if hasattr(ratio, "to_numpy") else ratio, np.float32)
         ratios_all.append(rv)
         hit = np.abs(rv - 1.0) > e
         clip_frac_num += float((hit * (mv > 0)).sum())

@@ -19,9 +19,9 @@
 | --- | --- | --- |
 | 预训练 | ✅ | `tests/test_api_pretrain.py::test_pretrain_tiny_end_to_end_runs`；3B MoE 单卡整步实测 |
 | SFT | ✅ 数据+训练 | `sft_data`（JSONL→打包）、`tests/test_qwen_sft_smoke.py` |
-| DPO | ⚠️ 只有零件 | `align.dpo_pair_loss/dpo_batch_loss/seq_logprob` 与 torch 对照通过（`tests/test_dpo.py`）；**高层 API 明确 raise**（`test_dpo_and_grpo_still_raise`） |
-| GRPO | ⚠️ 只有零件 | `align.grpo_loss/group_advantages/token_logprobs` 对照通过（`tests/test_grpo.py`）；高层 API raise |
-| RLHF / PPO | ❌ 未实现 | 无 value model、无 PPO trainer |
+| DPO | ✅ 可训 | `DPOTrainer`（0.9.16）：GPU 20 步 loss 0.688→**0.213**、margin 0.0995→**14.398**；数学件 `align.dpo_pair_loss` 与 torch 对照通过 |
+| GRPO | ✅ 可训 | `GRPOTrainer`（0.9.16）：GPU 一步 loss 有限、裁剪范数 0.367；`grpo_loss` 原先在 CUDA 上出 nan（常量未对齐设备 + 用 `.data` 统计），0.9.16 已修 |
+| RLHF / PPO | ❌ 未实现 | 无 value model、无 PPO trainer（DPO/GRPO 属偏好优化，不是完整 RLHF） |
 
 ## 2. 质量（与 torch 同类实现对照）
 
@@ -75,9 +75,11 @@
 | --- | --- |
 | Dropout / MaxPool / AvgPool / BatchNorm（1d/2d） | ✅ **0.9.14 已补**，torch 对照通过 |
 | `Module.train()` / `eval()` | ✅ **0.9.14 已补**（递归到子模块） |
+| `Tensor.max/min/var/std/norm` | ✅ **0.9.15 已补**（max/min 用 one-hot mask，梯度只落到 argmax）|
+| CUDA 上的 `abs/relu/clamp/log` | ✅ **0.9.16 沉到 C 端**（新增 7 个内核），`_cpu_only` 调用点 **4 → 0** |
+| `Tensor.to/cuda/cpu`、`minimum` | ✅ **0.9.16 已补**（`maximum` 的 CUDA 分支也修了）|
+| 高层 DPO / GRPO 训练器 | ✅ **0.9.16 已补**（GPU smoke 通过）|
 | CUDA `conv` `groups>1` | ⛔ 未实现（明确抛 `NotImplementedError` 并给修法，不静默算错） |
-| `Tensor.max/min/var` 方法 | ⛔ 未实现（池化用 gather+argmax 绕过；BN 用两遍法绕过） |
-| 高层 DPO/GRPO trainer | ⛔ 未实现（loss 已就绪） |
 | PPO / RLHF | ⛔ 未实现 |
 | 多卡（DDP/FSDP/流水线） | 不在本阶段范围 |
 | `torch.compile` 类图优化 | 未做（CUDA Graph 覆盖逐层反向，非通用编译） |

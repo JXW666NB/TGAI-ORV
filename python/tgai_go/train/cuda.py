@@ -462,6 +462,50 @@ extern "C" __global__ void ewise_recip(const float* a, float* c, int n) {
     if (i < n) c[i] = __fdiv_rn(1.f, a[i]);
 }
 
+/* ---- 0.9.16：把原来的 CPU-only 算子沉到 C 端（abs / relu / clamp / 逐元素除）---- */
+extern "C" __global__ void ewise_abs(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = fabsf(a[i]);
+}
+
+/* d|x|/dx = sign(x)；x==0 处按 0 处理（与 numpy 一致） */
+extern "C" __global__ void ewise_abs_bwd(const float* a, const float* g, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = (a[i] > 0.f) ? g[i] : ((a[i] < 0.f) ? -g[i] : 0.f);
+}
+
+extern "C" __global__ void ewise_relu(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = (a[i] > 0.f) ? a[i] : 0.f;
+}
+
+extern "C" __global__ void ewise_relu_bwd(const float* a, const float* g, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = (a[i] > 0.f) ? g[i] : 0.f;
+}
+
+/* clamp：lo/hi 用 CUDART_INF 表示"该侧不夹"（由 Python 侧换算） */
+extern "C" __global__ void ewise_clamp(const float* a, float lo, float hi, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = a[i];
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        c[i] = v;
+    }
+}
+
+extern "C" __global__ void ewise_clamp_bwd(const float* a, const float* g, float lo, float hi,
+                                           float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = (a[i] >= lo && a[i] <= hi) ? g[i] : 0.f;
+}
+
+extern "C" __global__ void ewise_div(const float* a, const float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = __fdiv_rn(a[i], b[i]);
+}
+
 /* 标量指数。GPT-2 的 sigmoid / LayerNorm 用 x**(-1) 和 x**(-0.5)。 */
 extern "C" __global__ void ewise_pow(const float* a, float p, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4520,6 +4564,73 @@ class CudaRuntime:
             grid, block = self._ewise_grid(a.n)
             self.launch("ewise_log", grid, block, [
                 self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    # ---- 0.9.16：abs / relu / clamp / div 的 C 端入口 ----
+    def abs(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_abs", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def abs_bwd(self, a, g):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_abs_bwd", grid, block, [
+                self._ptr(a), self._ptr(g), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def relu(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_relu", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def relu_bwd(self, a, g):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_relu_bwd", grid, block, [
+                self._ptr(a), self._ptr(g), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def clamp(self, a, lo, hi):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_clamp", grid, block, [
+                self._ptr(a), (float(lo), ctypes.c_float), (float(hi), ctypes.c_float),
+                self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def clamp_bwd(self, a, g, lo, hi):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_clamp_bwd", grid, block, [
+                self._ptr(a), self._ptr(g), (float(lo), ctypes.c_float),
+                (float(hi), ctypes.c_float), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def div(self, a, b):
+        """逐元素相除（要求形状一致或已广播）。"""
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_div", grid, block, [
+                self._ptr(a), self._ptr(b), self._ptr(out), (int(a.n), ctypes.c_int),
             ])
         return out
 

@@ -101,11 +101,33 @@ def test_masked_fill_shape_mismatch_names_fix():
     assert "masked_fill" in msg and "修法" in msg
 
 
-def test_relu_on_cuda_is_refused_loudly():
-    """relu 当前是 numpy 实现：CUDA 上必须**明确报错**，不能静默算错。"""
+def test_cuda_ops_require_a_cuda_device():
+    """relu / abs / clamp / log 在 CUDA 上已走 C 端内核（0.9.16）。
+
+    在没有 CUDA 的机器上，强行把张量标成 cuda 必须**明确报错**（不是静默算错），
+    且报错信息要能让人看出是 CUDA/驱动问题。
+    """
+    assert hasattr(x_tensor_cls(), "_relu_cuda"), "relu 的 CUDA 分支应已接上内核"
     x = _x(requires_grad=False)
     x.device = "cuda"                                   # 只在属性上伪装，不碰真设备
     with pytest.raises(Exception) as ei:
         x.relu()
-    msg = str(ei.value)
-    assert "relu" in msg
+    msg = str(ei.value).lower()
+    assert ("cuda" in msg) or ("nvcuda" in msg) or ("驱动" in msg) or ("gpu" in msg), msg
+
+
+def x_tensor_cls():
+    """拿 Tensor 类本身（避免在测试里再 import 一堆名字）。"""
+    return type(_x())
+
+
+def test_cpu_only_list_is_empty():
+    """守住"没有残留的 CPU-only 算子"这条线：源码里不应再有 _cpu_only 调用。"""
+    import io
+    import os
+    import re
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = io.open(os.path.join(here, "python", "tgai_go", "train", "__init__.py"),
+                  encoding="utf-8").read()
+    leftovers = sorted(set(re.findall(r'_cpu_only\("([^"]+)"\)', src)))
+    assert leftovers == [], "还有 CUDA 上只能走 CPU 的算子：%s" % (leftovers,)

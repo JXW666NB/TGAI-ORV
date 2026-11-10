@@ -1194,9 +1194,60 @@ class Tensor:
         out._backward = bw
         return out
 
+    # ---- 0.9.16：把原本 CPU-only 的算子接到 C 端内核 ----
+    def _abs_cuda(self):
+        rt = _cuda()
+        x = self._gpu
+        buf = rt.abs(x)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, rt.abs_bwd(x, g))
+        out._backward = bw
+        return out
+
+    def _relu_cuda(self):
+        rt = _cuda()
+        x = self._gpu
+        buf = rt.relu(x)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, rt.relu_bwd(x, g))
+        out._backward = bw
+        return out
+
+    def _clamp_cuda(self, lo, hi):
+        rt = _cuda()
+        x = self._gpu
+        lo = float("-inf") if lo is None else float(lo)
+        hi = float("inf") if hi is None else float(hi)
+        buf = rt.clamp(x, lo, hi)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, rt.clamp_bwd(x, g, lo, hi))
+        out._backward = bw
+        return out
+
+    def _log_cuda(self):
+        rt = _cuda()
+        x = self._gpu
+        buf = rt.log(x)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, rt.div(g, x))
+        out._backward = bw
+        return out
+
     def log(self):
         if self.device == "cuda":
-            self._cpu_only("log")
+            return self._log_cuda()
         out = Tensor(np.log(self.data), requires_grad=self.requires_grad, _parents=(self,))
 
         def bw(g, grads):
@@ -1434,9 +1485,31 @@ class Tensor:
     def dim(self):
         return int(self.ndim)
 
+    def to(self, device):
+        """把张量搬到指定设备（`"cpu"` / `"cuda"`）。
+
+        注意：这是**叶子级**搬迁，不保留 autograd 链路 —— 用于常量、输入、参考模型的 logp 等；
+        不要把需要梯度的中间量 `.to()` 后继续反传。
+        """
+        dev = str(device)
+        if dev == self.device:
+            return self
+        if dev == "cpu":
+            return Tensor(np.asarray(self.to_numpy(), np.float32),
+                          requires_grad=self.requires_grad)
+        rt = _cuda()
+        buf = rt.h2d(np.asarray(self.data, np.float32))
+        return Tensor._from_gpu(buf, requires_grad=self.requires_grad)
+
+    def cuda(self):
+        return self.to("cuda")
+
+    def cpu(self):
+        return self.to("cpu")
+
     def abs(self):
         if self.device == "cuda":
-            self._cpu_only("abs")
+            return self._abs_cuda()
         out = Tensor(np.abs(self.data), requires_grad=self.requires_grad, _parents=(self,))
         sign = np.sign(self.data).astype(np.float32)
 
@@ -1451,7 +1524,7 @@ class Tensor:
 
     def clamp(self, min=None, max=None):
         if self.device == "cuda":
-            self._cpu_only("clamp")
+            return self._clamp_cuda(min, max)
         lo = _scalar_or_none(min, "clamp.min")
         hi = _scalar_or_none(max, "clamp.max")
         y = self.data
@@ -1540,6 +1613,11 @@ class Tensor:
 
     def maximum(self, other):
         other = _as_tensor(other)
+        if self.device == "cuda" or other.device == "cuda":
+            # CUDA 上不能用 .data 做掩码（CUDA 张量没有主机镜像）。
+            # 用 0.5*((x+y) + |x−y|) 组合实现；并列时梯度各 0.5（与 torch 的并列约定略有差异，
+            # 已在 docs/REVIEW 里注明）。NaN 输入会自然传播为 NaN。
+            return (self + other + (self - other).abs()) * 0.5
         mask = (self.data > other.data).astype(np.float32)
         out = Tensor(np.maximum(self.data, other.data),
                      requires_grad=(self.requires_grad or other.requires_grad),
@@ -1553,7 +1631,23 @@ class Tensor:
         out._backward = bw
         return out
 
-    # ---- 日常表达式（补齐 PyTorch 里最常用的那几个） ----
+    def minimum(self, other):
+        """对应 `torch.minimum`。CPU 用掩码；CUDA 用 0.5*((x+y) − |x−y|)。"""
+        other = _as_tensor(other)
+        if self.device == "cuda" or other.device == "cuda":
+            return (self + other - (self - other).abs()) * 0.5
+        mask = (self.data < other.data).astype(np.float32)
+        out = Tensor(np.minimum(self.data, other.data),
+                     requires_grad=(self.requires_grad or other.requires_grad),
+                     _parents=(self, other))
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, _unbroadcast(g * mask, self.shape))
+            if other.requires_grad:
+                _acc(grads, other, _unbroadcast(g * (1.0 - mask), other.shape))
+        out._backward = bw
+        return out
     def __rtruediv__(self, other):
         """`2.0 / x` —— 之前直接 TypeError。用已有的除法反传，不新增内核。"""
         num = Tensor(np.full(tuple(self.shape), float(other), np.float32))
@@ -1610,7 +1704,7 @@ class Tensor:
     def relu(self):
         """max(x,0)。当前是 numpy 实现 ⇒ CUDA 上明确报错（不静默算错）。"""
         if self.device == "cuda":
-            self._cpu_only("relu")
+            return self._relu_cuda()
         out = Tensor(np.maximum(self.data, np.float32(0.0)),
                      requires_grad=self.requires_grad, _parents=(self,))
         keep = (self.data > 0).astype(np.float32)
@@ -4631,4 +4725,9 @@ from . import redux_extra as _redux_extra                            # noqa: E40
 for _red_name in ("max", "min", "var", "std", "norm"):
     setattr(Tensor, _red_name, getattr(_redux_extra, _red_name))
 del _red_name
+
+# ═══════════════════════════════════════════════════════════
+# 高层偏好训练器（0.9.16）：DPOTrainer / GRPOTrainer
+# ═══════════════════════════════════════════════════════════
+from .rl_trainer import DPOTrainer, GRPOTrainer                       # noqa: E402
 

@@ -1,3 +1,37 @@
+## [0.9.16] - 2026-11-10
+
+把最后 4 个"CUDA 上只能走 CPU"的算子沉到 C 端，并补高层偏好训练器。
+
+### C 端内核（新增 7 个）
+
+- `ewise_abs` / `ewise_abs_bwd`、`ewise_relu` / `ewise_relu_bwd`、
+  `ewise_clamp` / `ewise_clamp_bwd`、`ewise_div`。
+- 结果：`_cpu_only` 调用点从 4 个降到 **0**，源码里不再有"CUDA 上偷偷回退 CPU"的算子。
+- 实测（V100 vs torch）：abs / relu / clamp 的**前向与反向均 0.00e+00**；log 前向 7.50e-08、反向 0.00e+00。
+
+### 新增 API
+
+- `Tensor.to(device)` / `.cuda()` / `.cpu()`：叶子级设备搬运（用于常量、输入、参考 logp）。
+- `Tensor.minimum(other)`：此前**完全没有**；CUDA 上用 `0.5*((x+y)−|x−y|)`。
+- `Tensor.maximum(other)` 的 CUDA 分支同样改为组合实现（原来走 `.data`，CUDA 上直接崩）。
+- `DPOTrainer` / `GRPOTrainer`：高层训练器，负责冻结参考、清零、反向、裁剪、步进、统计。
+  用户只提供 `(ids, mask) -> logπ`。
+
+### 修复
+
+- `align.grpo_loss` 在 CUDA 上会算出 **nan**：常量（old/ref/mask）没有对齐设备，且统计用了
+  `.data`（CUDA 无主机镜像）。现在常量 `.to(p.device)`、统计走 `to_numpy()`。
+  实测修复后 GPU 上 GRPO 一步 loss 有限、梯度范数 0.367。
+
+### 实测（V100 smoke）
+
+| 项 | 结果 |
+| --- | --- |
+| DPO 20 步（GPU） | loss 0.688 → **0.213**，margin 0.0995 → **14.398** |
+| GRPO 一步（GPU） | loss 有限、adv 正确、裁剪范数 0.367 |
+| abs/relu/clamp 前反向 | **0.00e+00** |
+| CPU 侧 pytest | 508 passed / 20 skipped |
+
 ## [0.9.15] - 2026-11-10
 
 补齐 PyTorch 常用归约：`Tensor.max / min / var / std / norm`（前向 + 反向，CPU 与 CUDA）。
