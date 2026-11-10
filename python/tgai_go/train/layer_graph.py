@@ -110,6 +110,18 @@ class LayerGraphBackward(object):
         out.reverse()
         return [g for _i, g in out]
 
+    def replay_layer(self, i, gw):
+        """只重放第 i 层：写入该层 `dL/dy_attn`，返回 `dL/dx_i`（numpy）。
+
+        训练循环必须**逐层交错**：MoE 反传得到 `dL/dy_attn` → 本层重放 → 拿到 `dL/dx_i`
+        再喂给上一层。所以要这个方法，而不是一次性 replay 全部。
+        """
+        if not self._ready:
+            raise RuntimeError("尚未 capture" + "。修法：先调用 capture(xs)")
+        self._h2d_into(self._gw_bufs[i], gw)
+        self.rt.graph_launch_slot(i)
+        return np.asarray(self._x_refs[i].grad.to_numpy(), np.float32)
+
     def grads_numpy(self):
         """捕获期 `.grad` 对象当前内容的列表（重放后即该层的参数梯度）。"""
         return [[np.asarray(t.to_numpy(), np.float32) for t in layer] for layer in self._grad_refs]
