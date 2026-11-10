@@ -4442,16 +4442,16 @@ def _newton_schulz5(g, steps=5, eps=1e-7):
     return np.asarray(x, np.float32)
 
 
-def _newton_schulz5_gpu(rt, x, steps=5, eps=1e-7):
+def _newton_schulz5_gpu(rt, x, steps=5, eps=1e-7, fast=False):
     """与 _newton_schulz5 同一公式，值留在显存。
 
-    X@X.T、(X@X.T) 的平方、Y@X 走设备上的顺序 FMA（sgemm_mode 1）。
-    这和 NumPy 1.26 / OpenBLAS 的 float32 `@` 在这些形状上逐位相同。
-    cublasSgemm_v2 即使开了 PEDANTIC，单次也有约 3e-8 的相对误差，
-    五轮多项式迭代后参数对不上 1e-7，所以这里不用 cuBLAS。
-    行数大于列数时先 transpose2d，迭代完再转回去。
-    ||X||^2 在设备上按地址顺序累加，只把这一个标量降回主机做 float32 sqrt，
-    再把除数送回设备做真除法。不把矩阵本身拉回主机。
+    `fast=False`（默认）：X@X.T 等走设备上的**顺序 FMA** 内核（`sgemm_mode` 1）。
+    这与 NumPy 1.26 / OpenBLAS 的 float32 `@` 在这些形状上逐位相同。
+    cublasSgemm_v2 单次有约 3e-8 的相对误差，五轮迭代后参数对不上 1e-7，所以默认不用 cuBLAS。
+
+    `fast=True`：改用 cuBLAS（`gemm_nt`/`gemm_nn`）。**放弃与 OpenBLAS 的逐位一致**，
+    换来数量级的速度提升 —— 3B 模型有 2550 个张量要逐个正交化，顺序 FMA 实测 62.9 秒/步，
+    完全不可用（见 docs 实测）。代价是每步多约 1e-7 量级的差异，属 fp32 正常范围。
     """
     transposed = False
     if int(x.shape[0]) > int(x.shape[1]):
@@ -4464,12 +4464,22 @@ def _newton_schulz5_gpu(rt, x, steps=5, eps=1e-7):
     a = _f32(3.4445)
     b = _f32(-4.7750)
     c = _f32(2.0315)
-    for _ in range(int(steps)):
-        # X @ X.T：先把 X 转成连续的 X.T，再做顺序 FMA 的普通乘。
-        s = rt.sgemm_mode(x, rt.transpose2d(x), 1)
-        ss = rt.sgemm_mode(s, s, 1)
-        y = rt.add(rt.scale(s, b), rt.scale(ss, c))
-        x = rt.add(rt.scale(x, a), rt.sgemm_mode(y, x, 1))
+    if fast:
+        # cuBLAS 路径：同样的 5 步迭代，只是矩阵乘换成 cuBLAS（运行时只有 gemm_nt）。
+        # 利用对称性：s = x x^T 与 ss = s s 都是对称矩阵，所以 s@s == s@s^T；
+        # y@x 则用 gemm_nt(y, x^T) —— 多一次 transpose 拷贝，远小于 GEMM 本身。
+        for _ in range(int(steps)):
+            s = rt.gemm_nt(x, x)                     # x @ x^T（对称）
+            ss = rt.gemm_nt(s, s)                    # s @ s^T == s @ s（对称）
+            y = rt.add(rt.scale(s, b), rt.scale(ss, c))
+            x = rt.add(rt.scale(x, a), rt.gemm_nt(y, rt.transpose2d(x)))
+    else:
+        for _ in range(int(steps)):
+            # X @ X.T：先把 X 转成连续的 X.T，再做顺序 FMA 的普通乘。
+            s = rt.sgemm_mode(x, rt.transpose2d(x), 1)
+            ss = rt.sgemm_mode(s, s, 1)
+            y = rt.add(rt.scale(s, b), rt.scale(ss, c))
+            x = rt.add(rt.scale(x, a), rt.sgemm_mode(y, x, 1))
     if transposed:
         x = rt.transpose2d(x)
     return x
@@ -4495,8 +4505,14 @@ class Muon(_Optim):
     """
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
-                 fp16_mom=False):
+                 fp16_mom=False, ns_fast=False, ns_steps=5):
         _Optim.__init__(self, params, lr)
+        #: Newton-Schulz 是否用 cuBLAS（`ns_fast=True`）。
+        #: 默认 False = 顺序 FMA 内核，与 OpenBLAS 逐位一致但**很慢**
+        #: （3B 有 2550 个张量要逐个正交化，实测 62.9 秒/步）。
+        #: 大模型请设 ns_fast=True：快一个数量级，代价是约 1e-7 量级的数值差异。
+        self.ns_fast = bool(ns_fast)
+        self.ns_steps = int(ns_steps)
         self.mom = momentum
         self.nesterov = nesterov
         self.wd = weight_decay
@@ -4668,7 +4684,7 @@ class Muon(_Optim):
         )
         if self.fp16_mom:
             rt.cast_f32_to_f16_into(buf32, buf)
-        o = _newton_schulz5_gpu(rt, u)
+        o = _newton_schulz5_gpu(rt, u, steps=self.ns_steps, fast=self.ns_fast)
         scale = float(np.sqrt(_builtin_max(1.0, rows / cols)))
         rt.sub_scale_(p._gpu, o, _f32(self.lr * scale))
 
