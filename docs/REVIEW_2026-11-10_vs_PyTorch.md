@@ -151,6 +151,27 @@ loss 13.20335388 vs 13.20335865（相对差 3.6e-07，fp32 求和顺序差异，
 
 ### 3.3 显存（核心卖点）
 
+#### 3.3.0 直接实测：PyTorch + 真 AdamW 在这张卡上 OOM
+
+`tools/pyt_adamw_oom.py`：**纯 PyTorch 进程**（不加载任何 ORV 代码/权重），28 层 MoE、
+T=512、fp32、开 gradient checkpointing、`torch.optim.AdamW`。
+
+```
+参数量 1.997 B（权重 7.44 GiB）
+① 仅 fwd+bwd 峰值        14.96 GiB
+② 建 AdamW（m/v 需 14.88 GiB）后走一整步
+   ⇒ OutOfMemoryError: 31.40 GiB allocated, 14 MiB free
+```
+
+**结论**：PyTorch 用真 AdamW 训练这个 MoE 时，**连 1.997B（比 V2.7 的 2.97B 还小）都装不下**。
+不是"接近上限"，是直接 OOM。
+
+对照：ORV 在**更大**的 2.97B 上跑完了完整一步，**峰值 24.78 GiB、709 ms**。
+
+差距不是"实现快慢"，而是**能不能跑**：PyT 的 fp32 动量需要 2× 参数量的显存
+（1.997B ⇒ 14.88 GiB），加上 fp32 梯度和权重就超了；ORV 用 fp16 动量（减半）
++ 逐层即时释放梯度才腾出空间。
+
 | 方案 | 真 AdamW 需求 | 32 GB 可跑？ |
 | --- | --- | --- |
 | PyTorch 3B fp32 | 权重 12.1 + 梯度 12.1 + 两个 fp32 状态 24.2 ≈ **48 GB** | ❌ 实测 31.34 GB 处 OOM，只能退 Adafactor |

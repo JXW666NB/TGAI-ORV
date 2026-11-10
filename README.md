@@ -183,6 +183,18 @@ LLaMA 结构（RMSNorm+RoPE+SwiGLU+GQA）20 步训练与 PyTorch 孪生 loss 相
 
 ### 显存实测（3B MoE 全参训练，V100 32GB）
 
+**先看这条直接实测**（纯 PyTorch 进程，不含任何 ORV 代码）：
+
+```
+28 层 MoE（1.997B，比 V2.7 更小）、T=512、fp32、开 gradient checkpointing、真 AdamW
+① 仅 fwd+bwd 峰值  14.96 GiB
+② 加 AdamW 走一整步 ⇒ OutOfMemoryError（31.40 GiB 已分配，剩 14 MiB）
+```
+
+**PyTorch 用真 AdamW 连 1.997B 都装不下，而 ORV 在 2.97B 上跑完了完整一步。**
+
+ORV 侧的对照实测：
+
 | 配置 | 优化器状态 | 峰值显存 | 整步耗时 | 结果 |
 | --- | --- | --- | --- | --- |
 | AdamW，fp32 动量 | 22.1 GiB | ≥46 GiB 需求 | — | 不可行 |
