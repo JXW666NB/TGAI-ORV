@@ -40,7 +40,12 @@ class Fp16MomAdamW(object):
                 self.v16.append(rt.zeros((n,), dtype=np.uint16))
 
     def bytes_per_param(self):
-        return 4.0
+        return 4.0 if self.fp32_state else 2.0
+
+    def state_bytes(self):
+        """优化器状态总占用（字节）。3B 上用来判断"装不装得下"。"""
+        n = sum(int(p.numel()) for p in self.params)
+        return float(n) * (8.0 if self.fp32_state else 2.0) * 1.0
 
     def zero_grad(self):
         for p in self.params:

@@ -3198,7 +3198,21 @@ class Module:
             yield from m.named_parameters(prefix + k + ".")
 
     def parameters(self):
-        return [p for _, p in self.named_parameters()]
+        """所有参数（**按对象身份去重**，与 PyTorch 一致）。
+
+        为什么必须去重：绑定词嵌入（`tie_embedding`，GPT 类模型的常见做法）会让
+        `embed.weight` 与 `lm_head.weight` 指向**同一个 Parameter**，它在 `named_parameters()`
+        里会出现两次。若 `parameters()` 原样返回两份，优化器就会**每步把它更新两遍**
+        ——实测导致与分层更新相差 7.2e-03，而且不报错。
+        PyTorch 的 `parameters()` 同样会去掉重复参数，所以这里对齐它的语义。
+        """
+        out, seen = [], set()
+        for _, p in self.named_parameters():
+            if id(p) in seen:
+                continue
+            seen.add(id(p))
+            out.append(p)
+        return out
 
     def state_dict(self, prefix=""):
         out = {}
@@ -4579,21 +4593,47 @@ class Muon(_Optim):
                 p = self.params[i]
                 if p.grad is None or not getattr(p, "requires_grad", True):
                     continue
-                self._step_cuda_index(i, p, tt)
+                self._step_one(i, p, tt)
         if release:
             for lid in layer_ids:
                 for i in self._groups.get(int(lid), []):
                     self.params[i].grad = None
         return self
 
-    def _step_cuda_index(self, i, p, tt):
-        """按给定步数 `tt` 更新单个参数（拆出来供 step_layers 复用同一个 t）。"""
+    def _step_one(self, i, p, tt):
+        """按给定步数 `tt` 更新单个参数（CPU/CUDA 自动分派，供 step 与 step_layers 复用）。"""
         old = self.t
         self.t = tt
         try:
-            self._step_cuda(i, p)
+            if getattr(p, "device", "cpu") == "cuda":
+                self._step_cuda(i, p)
+            else:
+                self._step_cpu(i, p)
         finally:
             self.t = old
+
+    def _step_cpu(self, i, p):
+        """CPU 版单参数更新（与 `step()` 里的逻辑逐行相同，抽出来供分层更新复用）。"""
+        g = p.grad
+        # CPU 上 backward 后 .grad 是 numpy；若调用方硬塞了 Tensor，这里统一取成 numpy，
+        # 否则 _newton_schulz5 会在 Tensor 上 float() 失败（实测就是这么炸的）。
+        if hasattr(g, "to_numpy"):
+            g = np.asarray(g.to_numpy(), np.float32)
+        if p.data.ndim == 2:
+            if self.wd:
+                p.data = p.data - self.lr * self.wd * p.data
+            self.buf[i] = self.mom * self.buf[i] + g
+            u = g + self.mom * self.buf[i] if self.nesterov else self.buf[i]
+            o = _newton_schulz5(np.asarray(u, np.float32))
+            scale = np.sqrt(_builtin_max(1.0, p.data.shape[0] / p.data.shape[1]))
+            p.data = p.data - self.lr * scale * o
+        else:
+            b1, b2 = 0.9, 0.999
+            self._adam_m[i] = b1 * self._adam_m[i] + (1 - b1) * g
+            self._adam_v[i] = b2 * self._adam_v[i] + (1 - b2) * (g * g)
+            mh = self._adam_m[i] / (1 - b1 ** self.t)
+            vh = self._adam_v[i] / (1 - b2 ** self.t)
+            p.data = p.data - self.lr * mh / (np.sqrt(vh) + 1e-8)
 
     def _step_cuda(self, i, p):
         rt = _cuda()
@@ -4639,25 +4679,7 @@ class Muon(_Optim):
         for i, p in enumerate(self.params):
             if p.grad is None:
                 continue
-            if getattr(p, "device", "cpu") == "cuda":
-                self._step_cuda(i, p)
-                continue
-            g = p.grad
-            if p.data.ndim == 2:
-                if self.wd:
-                    p.data = p.data - self.lr * self.wd * p.data
-                self.buf[i] = self.mom * self.buf[i] + g
-                u = g + self.mom * self.buf[i] if self.nesterov else self.buf[i]
-                o = _newton_schulz5(u)
-                scale = np.sqrt(_builtin_max(1.0, p.data.shape[0] / p.data.shape[1]))
-                p.data = p.data - self.lr * scale * o
-            else:
-                b1, b2 = 0.9, 0.999
-                self._adam_m[i] = b1 * self._adam_m[i] + (1 - b1) * g
-                self._adam_v[i] = b2 * self._adam_v[i] + (1 - b2) * (g * g)
-                mh = self._adam_m[i] / (1 - b1 ** self.t)
-                vh = self._adam_v[i] / (1 - b2 ** self.t)
-                p.data = p.data - self.lr * mh / (np.sqrt(vh) + 1e-8)
+            self._step_one(i, p, self.t)
 
 
 class _OptimModule:

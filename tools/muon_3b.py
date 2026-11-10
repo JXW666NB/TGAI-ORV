@@ -73,8 +73,13 @@ def main(mode="fp16"):
     log("参数 %d 张量 / %.3f B" % (len(all_params), n_par / 1e9))
 
     try:
-        opt = T.optim.Muon(all_params, lr=2e-4, momentum=0.95, weight_decay=0.0,
-                           fp16_mom=(mode == "fp16"))
+        if mode.startswith("adamw"):
+            from tgai_go.train.opt_fp16mv import Fp16MomAdamW
+            opt = Fp16MomAdamW(all_params, lr=2e-4, weight_decay=0.1,
+                               fp32_state=(mode == "adamw-fp32"))
+        else:
+            opt = T.optim.Muon(all_params, lr=2e-4, momentum=0.95, weight_decay=0.0,
+                               fp16_mom=(mode != "muon-fp32"))
         log("Muon 状态大小（按形状算）：%.2f GiB（每 2D 参数 %.0f 字节）"
             % (opt.state_bytes() / GIB, opt.bytes_per_param()))
         opt.set_layer_groups(groups)
