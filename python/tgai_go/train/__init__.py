@@ -3678,14 +3678,17 @@ class CausalSelfAttention(Module):
         H, Dh = self.n_heads, self.d_head
 
         def split(t):
-            # [B,S,D] -> [B*H, S, Dh]
-            return t.reshape(B, S, H, Dh).reshape(B * H, S, Dh)
+            # [B,S,D] -> [B,S,H,Dh] -> permute -> [B,H,S,Dh] -> [B*H, S, Dh]
+            #
+            # **必须 permute**：从 [B,S,H,Dh] 直接 reshape 到 [B*H,S,Dh] 会把 head 与 seq
+            # 两个轴混在一起（实测与逐头参照相差 9.6e-01，等于完全算错，而且不报错）。
+            return t.reshape(B, S, H, Dh).permute(0, 2, 1, 3).reshape(B * H, S, Dh)
 
         q = split(self.q_proj(x.reshape(B * S, D)))
         k = split(self.k_proj(x.reshape(B * S, D)))
         v = split(self.v_proj(x.reshape(B * S, D)))
         o = _Functional.scaled_dot_product_attention(q, k, v, causal=True)
-        o = o.reshape(B, H, S, Dh).reshape(B, S, H * Dh)
+        o = o.reshape(B, H, S, Dh).permute(0, 2, 1, 3).reshape(B, S, H * Dh)
         return self.out_proj(o.reshape(B * S, D)).reshape(B, S, D)
 
 
