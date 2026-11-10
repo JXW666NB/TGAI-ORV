@@ -182,10 +182,19 @@ class V27Trainer(object):
     def fwd_attn(self, x, i, cos, sin):
         """层的前半段：`x + attention(ln1(x))`，**不含 MoE**。
 
-        为什么要拆（2026-11-10 实测）：MoE 的 `_combine_cuda` 有一次主机往返（D2H），
-        捕获窗口内禁止 D2H，所以"整层一张图"不可能；而 attention 段没有 D2H，可以逐层
-        捕获成图（28 层 attention：逐算子 966.7 ms → 图重放 140.5 ms，梯度逐位一致）。
-        拆分只是把同一批算子分成两个方法，算术不变。
+        默认走堆叠实现（`attn_impl="stacked"`，实测单层前向快 3.66×）；
+        `attn_impl="loop"` 可切回原来的逐头循环，用于对照与回退。
+        """
+        if getattr(self, "attn_impl", "stacked") == "loop":
+            return self.fwd_attn_loop(x, i, cos, sin)
+        return self.fwd_attn_stacked(x, i, cos, sin)
+
+    def fwd_attn_loop(self, x, i, cos, sin):
+        """**逐头循环**版（原始实现，保留做对照与回退）。
+
+        为什么要拆出 attention 段（2026-11-10 实测）：MoE 的 `_combine_cuda` 有一次主机往返
+        （D2H），捕获窗口内禁止 D2H，所以"整层一张图"不可能；而 attention 段没有 D2H，可以
+        逐层捕获成图。拆分只是把同一批算子分成两个方法，算术不变。
         """
         L = self.layers[i]
         h = L["ln1"](x)
@@ -200,6 +209,40 @@ class V27Trainer(object):
             part = L["o"][hh](pr @ vh)
             acc = part if acc is None else acc + part
         return x + acc
+
+    def fwd_attn_stacked(self, x, i, cos, sin):
+        """`fwd_attn` 的**堆叠实现**：把 16 个 head 合并成少数几次大 GEMM + 一次 SDPA。
+
+        为什么快（根因）：逐头循环每层要 16 次 `Linear(D→DH)` + 16 次 `qh@kh.T` + 16 次 softmax
+        + 16 次 `pr@vh` + 16 次 `Linear(DH→D)` ≈ 80+ 次**小** kernel，每个都填不满 V100。
+        堆叠后每层变成 3 次大投影 GEMM + 1 次批量 SDPA + 1 次输出 GEMM。
+
+        权重合并方式：每层每次 forward 用 `cat` 把 16 个 `[D,DH]` 拼成 `[D,D]`（约 4 MB，可忽略），
+        这样反向会自动流回 16 个独立的 `Parameter`，**不需要改权重布局、不影响 .tg 加载**。
+
+        数学与 `fwd_attn` 等价：rope 逐头相同（广播），causal 掩码与 `1/sqrt(dh)` 缩放由 SDPA 负责。
+        """
+        L = self.layers[i]
+        h = L["ln1"](x)
+        S = int(h.shape[0])
+        NH, DH = self.NH, self.DH
+        # 拼权重（反向经 cat 回到原来的 16 个 Parameter）
+        # Linear(D→DH) 的权重是 [DH, D]：把 16 个按输出维拼起来得到 [NH*DH, D]，
+        # 再转置成 [D, NH*DH] 供 `h @ W` 使用（等价于一次全宽投影）。
+        Wq = T.cat([m.weight for m in L["q"]], dim=0).transpose(0, 1)
+        Wk = T.cat([m.weight for m in L["k"]], dim=0).transpose(0, 1)
+        Wv = T.cat([m.weight for m in L["v"]], dim=0).transpose(0, 1)
+        # Linear(DH→D) 的权重是 [D, DH]，转置成 [DH, D] 后按 head 拼成 [NH*DH, D]；
+        # `o_all @ Wo` 正好等于 16 个 head 各自 Linear 的**求和**。
+        Wo = T.cat([m.weight.transpose(0, 1) for m in L["o"]], dim=0)
+        q = (h @ Wq).reshape(S, NH, DH).permute(1, 0, 2)
+        k = (h @ Wk).reshape(S, NH, DH).permute(1, 0, 2)
+        v = (h @ Wv).reshape(S, NH, DH).permute(1, 0, 2)
+        q = T._rope_composed(q, cos, sin)
+        k = T._rope_composed(k, cos, sin)
+        o = T.functional.scaled_dot_product_attention(q, k, v, causal=True)
+        o = o.permute(1, 0, 2).reshape(S, self.D)
+        return x + (o @ Wo)
 
     def moe_part(self, y, i):
         """层的后半段：`y + MoE(ln2(y))`（保持逐算子，不参与图捕获）。"""
