@@ -4717,6 +4717,12 @@ for _layer_name in ("Dropout", "MaxPool1d", "MaxPool2d", "AvgPool1d", "AvgPool2d
     setattr(nn, _layer_name, getattr(_layers_extra, _layer_name))
 del _layer_name
 
+# 0.9.21：PyT 用户在 `nn` 下找 Conv1d/Conv2d，这两个类原本只在顶层 ⇒ 补进 nn（同一对象，不是副本）
+for _layer_name in ("Conv1d", "Conv2d"):
+    if hasattr(nn, _layer_name) is False:
+        setattr(nn, _layer_name, globals()[_layer_name])
+del _layer_name
+
 # ═══════════════════════════════════════════════════════════
 # 归约算子（0.9.15）：max / min / var / std / norm 挂到 Tensor 上
 # ═══════════════════════════════════════════════════════════
@@ -4730,4 +4736,40 @@ del _red_name
 # 高层偏好训练器（0.9.16）：DPOTrainer / GRPOTrainer
 # ═══════════════════════════════════════════════════════════
 from .rl_trainer import DPOTrainer, GRPOTrainer                       # noqa: E402
+
+# ═══════════════════════════════════════════════════════════
+# 可编程 AMP（0.9.20）：T.amp() / amp_on / amp_off / GradScaler
+#
+# 注意 `T.amp` 这个名字**以前是 bf16 模块**（`T.amp.to_bf16_bits`、`T.amp.BF16_KERNELS`
+# 被测试与工具使用）。为了不破坏旧契约，这里做成"可调用 + 属性代理"的命名空间：
+#   with T.amp():            -> 新 API（fp16 GEMM + 权重影子缓存）
+#   T.amp.to_bf16_bits(...)  -> 旧 API（bf16 位转换工具）
+# ═══════════════════════════════════════════════════════════
+from . import amp_api as _amp_api                                     # noqa: E402
+from . import amp as _amp_module                                      # noqa: E402
+
+
+class _AmpNamespace(object):
+    """既是 AMP 上下文工厂，又是旧 bf16 模块的代理。"""
+
+    def __call__(self, *args, **kwargs):
+        return _amp_api.amp(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(_amp_module, name)
+
+    def __enter__(self):
+        self._ctx = _amp_api.amp()
+        return self._ctx.__enter__()
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._ctx.__exit__(exc_type, exc, tb)
+
+
+amp = _AmpNamespace()
+amp_on = _amp_api.amp_on
+amp_off = _amp_api.amp_off
+amp_state = _amp_api.amp_state
+amp_invalidate = _amp_api.amp_invalidate
+GradScaler = _amp_api.GradScaler
 

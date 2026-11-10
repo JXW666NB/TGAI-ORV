@@ -1,3 +1,41 @@
+## [0.9.20] - 2026-11-10
+
+把 `TG_FP16` 环境变量升级成**可编程 AMP**：`with T.amp():`，不用再重启进程。
+
+### 新增
+
+- `T.amp(enabled=True)` 上下文管理器；`T.amp_on() / T.amp_off() / T.amp_state()`；`T.amp_invalidate()`。
+- `T.GradScaler`：为 PyT 迁移代码保留（`scale_loss / unscale_ / step(opt) / update()`），
+  但 **ORV 默认 AMP 不需要它** —— 见下面的设计说明。
+- `T.amp` 同时保留旧语义：它以前是 bf16 工具模块（`T.amp.to_bf16_bits`、`T.amp.BF16_KERNELS`），
+  现做成"可调用 + 属性代理"的命名空间，**旧代码不破**（`tests/test_amp_bf16.py` 全绿）。
+
+### 设计与 PyT autocast 的差别
+
+| 项 | ORV | PyTorch autocast |
+| --- | --- | --- |
+| 参数 / 激活 / 梯度 | **全程 fp32** | 激活可为 fp16 |
+| GEMM 输入 | fp16（带权重影子缓存） | fp16 |
+| GEMM 累加 | fp32 | fp32 |
+| 需要 loss scaling | **不需要** | 需要 |
+
+因为梯度和激活始终 fp32，所以不存在下溢；`GradScaler` 只是兼容层。
+
+### 实测（V100）
+
+| 项 | 结果 |
+| --- | --- |
+| GEMM 2048×2048×6144 | fp32 **4.33 ms** → amp **0.67 ms（6.47×）** |
+| 真实 8 层训练步 | loss 4219.40 → **4219.45**（相对差 1.25e-05），梯度有限 |
+| 退出上下文 | 状态正确复原（`on=False`，缓存关闭） |
+| 数值（大 GEMM） | 相对 fp32 误差 2.78e-04~2.88e-04，与 torch AMP 同值 |
+
+### 边界
+
+- 只支持 fp16（V100 无 bf16；`_sgemm_bf16` 内核已在，接进 Tensor 层属于后续工作）。
+- `amp()` 是**全局开关**（GEMM 级），不是 PyT 的逐算子策略；conv/attention 走同一套 GEMM 路由。
+- 自定义优化器更新参数后要调 `T.amp_invalidate()`（内置 `Fp16MomAdamW` 已自动）。
+
 ## [0.9.19] - 2026-11-10
 
 修正 fp16 GEMM：**大形状真正用上 tensor core**（此前默认阈值把它们全挡回 fp32），并修掉影子缓存里

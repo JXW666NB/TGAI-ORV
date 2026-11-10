@@ -4,10 +4,13 @@
 边界（先说清楚，避免误会）
 * 这是**权重级**互转：把 torch 层的参数搬进等价的 ORV 层（或反过来），**不是**运行期互操作 ——
   不能在 ORV 的计算图里直接调用 torch 的层，也不共享 autograd。
-* 支持的层：`nn.Linear`、`nn.Embedding`、`nn.RMSNorm`、`Conv2d`（本库的 `T.Conv2d`）。
-  **`nn.LayerNorm` 暂不支持**，因为 ORV 目前没有 LayerNorm 实现（这是与 PyT 对齐的真实缺口）。
-* 容器只支持 `nn.Sequential`（顺序执行，语义可直接重放）。自定义 `nn.Module` 子类的 forward
-  无法自动复现，遇到会明确报错而不是猜。
+* 支持的层（0.9.21 起）：`nn.Linear`、`nn.Embedding`、`nn.LayerNorm`、`nn.RMSNorm`、
+  `nn.Conv1d`、`nn.Conv2d`、`nn.Dropout`、`nn.BatchNorm1d/2d`、`nn.MaxPool1d/2d`、
+  `nn.AvgPool1d/2d`；容器支持 `nn.Sequential` 与 `nn.ModuleList`。
+* **不支持**自定义 `Module` 子类：它的 `forward` 是任意 Python，无法自动翻译。
+  迁移时把它的 `forward` 用 ORV 的层重写一遍即可（两者数学逐算子对齐）。
+* 说明：本文档一度写着"LayerNorm 不支持，因为 ORV 没有 LayerNorm 实现"，那是**过时信息** ——
+  LayerNorm 早已实现，`from_torch` 也一直在转它；0.9.21 修正了这段文案与报错信息。
 """
 from __future__ import annotations
 
@@ -95,6 +98,40 @@ def from_torch(module):
         if getattr(module, "weight", None) is not None:
             _set_param(out.weight, _np(module.weight))
         return out
+    if name == "Conv1d":
+        out = T.Conv1d(int(module.in_channels), int(module.out_channels),
+                          int(module.kernel_size[0]),
+                          stride=int(module.stride[0]), padding=int(module.padding[0]),
+                          dilation=int(module.dilation[0]), groups=int(module.groups),
+                          bias=module.bias is not None)
+        _set_param(out.weight, _np(module.weight))
+        if module.bias is not None:
+            _set_param(out.bias, _np(module.bias))
+        return out
+    if name == "Dropout":
+        # 训练/推理行为由 Module.train() 控制，概率直接搬
+        return T.nn.Dropout(float(module.p))
+    if name in ("BatchNorm1d", "BatchNorm2d"):
+        dim = 1 if name == "BatchNorm1d" else 2
+        out = (T.nn.BatchNorm1d if dim == 1 else T.nn.BatchNorm2d)(
+            int(module.num_features), eps=float(module.eps), momentum=float(module.momentum),
+            affine=bool(module.affine))
+        if module.affine:
+            _set_param(out.weight, _np(module.weight))
+            _set_param(out.bias, _np(module.bias))
+        out.running_mean = _np(module.running_mean)
+        out.running_var = _np(module.running_var)
+        return out
+    if name in ("MaxPool1d", "MaxPool2d", "AvgPool1d", "AvgPool2d"):
+        k = module.kernel_size
+        kk = int(k) if isinstance(k, int) else int(k[0])
+        st = module.stride
+        ss = None if st is None else (int(st) if isinstance(st, int) else int(st[0]))
+        pd = module.padding
+        pp = int(pd) if isinstance(pd, int) else int(pd[0])
+        cls = {"MaxPool1d": T.nn.MaxPool1d, "MaxPool2d": T.nn.MaxPool2d,
+               "AvgPool1d": T.nn.AvgPool1d, "AvgPool2d": T.nn.AvgPool2d}[name]
+        return cls(kk, stride=ss, padding=pp)
     if name == "Conv2d":
         out = T.Conv2d(int(module.in_channels), int(module.out_channels),
                        (int(module.kernel_size[0]), int(module.kernel_size[1])),
@@ -107,9 +144,11 @@ def from_torch(module):
             _set_param(out.bias, _np(module.bias))
         return out
     raise InteropError(
-        "from_torch 不支持 %s。修法：只用 Linear/Embedding/RMSNorm/Conv2d 或 nn.Sequential；"
-        "LayerNorm 暂不支持（ORV 还没有 LayerNorm 实现），自定义 Module 的 forward 无法自动复现"
-        % name)
+        "from_torch 不支持 %s。已支持：Linear / Embedding / LayerNorm / RMSNorm / "
+        "Conv1d / Conv2d / Dropout / BatchNorm1d / BatchNorm2d / MaxPool1d / MaxPool2d / "
+        "AvgPool1d / AvgPool2d / Sequential / ModuleList。"
+        "修法：自定义 Module 的 forward 无法自动复现，请把它的 forward 用 ORV 的层重写一遍"
+        "（数学与 PyT 逐算子对齐，见 docs/REVIEW 的对照表）" % name)
 
 
 def to_torch(module):
