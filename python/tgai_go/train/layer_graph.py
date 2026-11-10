@@ -74,14 +74,23 @@ class LayerGraphBackward(object):
                 m.weight.grad = self.T.tensor(np.zeros(shp, np.float32))
 
     # ---------- 捕获 ----------
-    def max_affordable(self, n_layers, safety_bytes=2 * 1024 ** 3, fraction=0.5):
+    def max_affordable(self, n_layers, safety_bytes=2 * 1024 ** 3, fraction=0.65):
         """按**当前设备空闲显存**估算最多能捕获多少张图（每张 `arena_bytes`）。
 
-        为什么这么保守：实测 T=512、每张 480 MiB 时，
-          * 14 张（6.6 GiB）稳定通过，整步 2038.5 → 1187 ms（1.72×）；
-          * 28 张（13.1 GiB）重放后读梯度直接 `rc=700`（非法访存）。
-        说明瓶颈不只是 arena 本身，还包括随后前向链/MoE/梯度所需的工作集。因此这里取
-        "空闲×fraction − safety" 作为可用额度，宁可少捕几张也不要把卡挤爆。
+        实测边界（V2.7 28 层，T=512，每张 480 MiB，模型占 11.3 GiB）：
+
+        | 捕获张数 | arena 合计 | 整步 | 结果 |
+        | --- | --- | --- | --- |
+        | 4 | 1.9 GiB | 1296 ms | ✅ |
+        | 16 | 7.5 GiB | 1165 ms | ✅ |
+        | 20 | 9.4 GiB | 1140 ms | ✅ |
+        | **24** | **11.3 GiB** | **1058 ms** | ✅ 当前最优 |
+        | 26 | 12.2 GiB | 1311 ms | ⚠️ 反而变慢（分配器抖动） |
+        | 28 | 13.1 GiB | — | ❌ 读梯度 rc=700 |
+
+        所以不是"越多越好"：超过 ~24 张后剩余显存不足以支撑 MoE 反向的工作集，
+        分配器开始抖动，再往上直接非法访存。这里取 `空闲 × fraction − safety`，
+        fraction=0.65、safety=2 GiB 在 28 层/T=512 上正好落在 24 张那一档。
         """
         free = self.rt.free_device_bytes()
         if free is None:
@@ -108,15 +117,32 @@ class LayerGraphBackward(object):
         self._x_bufs = [rt.h2d(np.ascontiguousarray(x, np.float32)) for x in xs[:want]]
         self._gw_bufs = [rt.h2d(np.zeros((self.seq, tr.D), np.float32)) for _ in range(want)]
         rt.reserve_capture_arena(self.arena_bytes)
+        # 捕获失败必须 abort，否则流会一直停在"capture 中"状态，
+        # 之后任何 cuCtxSynchronize/empty_cache 都返回 rc=900
+        # ("operation not permitted when stream is capturing")，把整台机器后续操作全污染。
+        # 这是实测踩到的：arena 用尽一次之后，后续所有尝试都失败在 rc=900。
         for i in range(want):
             self._zero_layer(i)
-            if not (rt.graph_arm() and rt.graph_begin()):
-                raise RuntimeError("graph_begin 失败（第 %d 层）" % i + "。修法：确认 rt.graph_available() 为真")
-            xi = self.T.Tensor._from_gpu(self._x_bufs[i], requires_grad=True)
-            ya = tr.fwd_attn(xi, i, self.cos, self.sin)
-            (ya * self.T.Tensor._from_gpu(self._gw_bufs[i])).sum().backward()
-            if not rt.graph_end():
-                raise RuntimeError("graph_end 失败（第 %d 层）" % i + "。修法：看 TG_DEBUG=1 的驱动错误")
+            begun = False
+            try:
+                if not (rt.graph_arm() and rt.graph_begin()):
+                    raise RuntimeError("graph_begin 失败（第 %d 层）" % i +
+                                       "。修法：确认 rt.graph_available() 为真")
+                begun = True
+                xi = self.T.Tensor._from_gpu(self._x_bufs[i], requires_grad=True)
+                ya = tr.fwd_attn(xi, i, self.cos, self.sin)
+                (ya * self.T.Tensor._from_gpu(self._gw_bufs[i])).sum().backward()
+                if not rt.graph_end():
+                    raise RuntimeError("graph_end 失败（第 %d 层）" % i +
+                                       "。修法：看 TG_DEBUG=1 的驱动错误")
+                begun = False
+            except Exception:
+                if begun:
+                    try:
+                        rt.graph_abort()
+                    except Exception:
+                        pass
+                raise
             self._x_refs.append(xi)
             self._grad_refs.append([m.weight.grad for k in ("q", "k", "v", "o")
                                     for m in tr.layers[i][k]])

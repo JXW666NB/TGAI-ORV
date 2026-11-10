@@ -80,7 +80,7 @@ def main():
     NG = int(sys.argv[1]) if len(sys.argv) > 1 else None
     _, xs0 = fwd_chain()
     gb = LayerGraphBackward(tr, cos, sin, seq=SEQ, arena_bytes=480 * 1024 ** 2)
-    gb.capture(xs0[:NL]) if NG is None else gb.capture(xs0[:NG])
+    gb.capture(xs0[:NL]) if NG is None else gb.capture(xs0[:NG], max_graphs=NG)
     log("已捕获 %d 张（T=%d，总层 %d）" % (gb.count, SEQ, NL))
 
     def step():
