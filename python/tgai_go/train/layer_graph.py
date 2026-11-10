@@ -74,14 +74,41 @@ class LayerGraphBackward(object):
                 m.weight.grad = self.T.tensor(np.zeros(shp, np.float32))
 
     # ---------- 捕获 ----------
-    def capture(self, xs):
-        """按每层输入捕获图。`xs[i]` 是第 i 层输入（numpy，`[seq, D]`）。"""
+    def max_affordable(self, n_layers, safety_bytes=2 * 1024 ** 3, fraction=0.5):
+        """按**当前设备空闲显存**估算最多能捕获多少张图（每张 `arena_bytes`）。
+
+        为什么这么保守：实测 T=512、每张 480 MiB 时，
+          * 14 张（6.6 GiB）稳定通过，整步 2038.5 → 1187 ms（1.72×）；
+          * 28 张（13.1 GiB）重放后读梯度直接 `rc=700`（非法访存）。
+        说明瓶颈不只是 arena 本身，还包括随后前向链/MoE/梯度所需的工作集。因此这里取
+        "空闲×fraction − safety" 作为可用额度，宁可少捕几张也不要把卡挤爆。
+        """
+        free = self.rt.free_device_bytes()
+        if free is None:
+            return int(n_layers)
+        usable = max(0, int(int(free) * float(fraction)) - int(safety_bytes))
+        fit = usable // max(int(self.arena_bytes), 1)
+        return int(max(0, min(int(n_layers), fit)))
+
+    def capture(self, xs, max_graphs=None):
+        """按每层输入捕获图。
+
+        `xs[i]` 是第 i 层输入（numpy，`[seq, D]`）。`max_graphs=None` 时用
+        `max_affordable()` 自动截断（避免抢显存导致重放非法访存）。
+        """
         rt, tr = self.rt, self.tr
         NL = len(xs)
-        self._x_bufs = [rt.h2d(np.ascontiguousarray(x, np.float32)) for x in xs]
-        self._gw_bufs = [rt.h2d(np.zeros((self.seq, tr.D), np.float32)) for _ in range(NL)]
+        want = int(NL if max_graphs is None else max_graphs)
+        if max_graphs is None:
+            want = self.max_affordable(NL)
+        if want <= 0:
+            raise RuntimeError(
+                "按当前空闲显存连一张图都放不下（每张需 %.0f MiB）。修法：减小 arena_bytes、"
+                "减小 seq/层数，或先 empty_cache()" % (self.arena_bytes / 1024 ** 2))
+        self._x_bufs = [rt.h2d(np.ascontiguousarray(x, np.float32)) for x in xs[:want]]
+        self._gw_bufs = [rt.h2d(np.zeros((self.seq, tr.D), np.float32)) for _ in range(want)]
         rt.reserve_capture_arena(self.arena_bytes)
-        for i in range(NL):
+        for i in range(want):
             self._zero_layer(i)
             if not (rt.graph_arm() and rt.graph_begin()):
                 raise RuntimeError("graph_begin 失败（第 %d 层）" % i + "。修法：确认 rt.graph_available() 为真")
@@ -97,6 +124,15 @@ class LayerGraphBackward(object):
         return len(xs)
 
     # ---------- 重放 ----------
+    @property
+    def count(self):
+        """实际捕获到的图数量（可能因显存预算少于层数）。"""
+        return len(self._x_bufs)
+
+    def has(self, i):
+        """第 i 层是否有图可重放；没有就应由调用方走逐算子路径。"""
+        return 0 <= int(i) < len(self._x_bufs)
+
     def replay(self, gws):
         """`gws[i]` = 第 i 层的 `dL/dy_attn`（numpy）。返回每层 `dL/dx_i`（numpy 列表）。"""
         if not self._ready:

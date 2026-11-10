@@ -76,11 +76,12 @@ def main():
             x = T.tensor(xn)
         return ys, xs
 
-    # 1) 捕获（此时池里还没有大步的前向缓存）
+    # 1) 捕获。默认让 LayerGraphBackward 按显存预算自动截断（NG 可显式指定做诊断）。
+    NG = int(sys.argv[1]) if len(sys.argv) > 1 else None
     _, xs0 = fwd_chain()
     gb = LayerGraphBackward(tr, cos, sin, seq=SEQ, arena_bytes=480 * 1024 ** 2)
-    gb.capture(xs0[:NL])
-    log("已捕获 %d 张（T=%d）" % (NL, SEQ))
+    gb.capture(xs0[:NL]) if NG is None else gb.capture(xs0[:NG])
+    log("已捕获 %d 张（T=%d，总层 %d）" % (gb.count, SEQ, NL))
 
     def step():
         clear()
@@ -91,7 +92,14 @@ def main():
             y_t = T.tensor(ys[i], requires_grad=True)
             z = tr.moe_part(y_t, i)
             (z * T.tensor(gg)).sum().backward()
-            gg = gb.replay_layer(i, np.asarray(y_t.grad.to_numpy(), np.float32))
+            gw_i = np.asarray(y_t.grad.to_numpy(), np.float32)
+            if gb.has(i):
+                gg = gb.replay_layer(i, gw_i)
+            else:
+                xi = T.tensor(xs[i], requires_grad=True)
+                ya = tr.fwd_attn(xi, i, cos, sin)
+                (ya * T.tensor(gw_i)).sum().backward()
+                gg = np.asarray(xi.grad.to_numpy(), np.float32)
         tr.add_embed_grad_device(id_buf, T.tensor(gg)._gpu)
         return float(np.asarray(loss.to_numpy()))
 
