@@ -45,8 +45,15 @@ def _rt():
 
 
 def _set(on, dtype="fp16", weight_cache=True):
-    """底层开关：设置运行时 fp16 GEMM 状态与权重影子缓存。"""
+    """底层开关：按 dtype 设置 fp16 或 bf16 的 GEMM 路径。"""
     rt = _rt()
+    kind = str(dtype).lower()
+    if kind in ("bf16", "bfloat16"):
+        if not hasattr(rt, "_bf16_state"):
+            raise RuntimeError("该后端没有 bf16 GEMM 支持" + "。修法：用 dtype='fp16'")
+        st = rt._bf16_state()
+        st["on"] = bool(on)
+        return st
     if hasattr(rt, "_fp16_state") is False:
         raise RuntimeError("该后端没有 fp16 GEMM 支持（只有 CUDA 后端有）" +
                            "。修法：T.set_default_device('cuda') 后再用 amp")
@@ -63,9 +70,9 @@ def amp_on(dtype="fp16", weight_cache=True):
     return amp_state()
 
 
-def amp_off():
+def amp_off(dtype="fp16"):
     """关闭 AMP（回到全 fp32）。"""
-    _set(False)
+    _set(False, dtype)
     return amp_state()
 
 
@@ -75,10 +82,13 @@ def amp_state():
         rt = _rt()
     except Exception as exc:
         return {"on": False, "available": False, "reason": str(exc)[:120], "cache": {}}
-    st = rt._fp16_state() if hasattr(rt, "_fp16_state") else {"on": False}
+    f16 = rt._fp16_state() if hasattr(rt, "_fp16_state") else {"on": False}
+    b16 = rt._bf16_state() if hasattr(rt, "_bf16_state") else {"on": False}
     cache = rt.f16_cache_stats() if hasattr(rt, "f16_cache_stats") else {}
-    return {"on": bool(st.get("on")), "available": True,
-            "c32": bool(st.get("c32", False)), "cache": cache}
+    return {"on": bool(f16.get("on")) or bool(b16.get("on")),
+            "fp16": bool(f16.get("on")), "bf16": bool(b16.get("on")),
+            "available": True,
+            "c32": bool(f16.get("c32", False)), "cache": cache}
 
 
 def amp_invalidate():
@@ -90,26 +100,33 @@ def amp_invalidate():
 
 
 class amp(object):
-    """`with T.amp():` —— 打开 fp16 GEMM + 权重影子缓存，退出时恢复原状态。
+    """`with T.amp():` —— 打开低精度 GEMM，退出时恢复原状态。
 
-    `dtype` 目前只支持 `"fp16"`（V100 无 bf16；`_sgemm_bf16` 已有内核，接进来属于后续工作）。
+    `dtype`：
+      * `"fp16"`（默认）—— V100 也支持；带权重影子缓存。
+      * `"bf16"` —— A100/H100 起才算真正加速。**V100 没有 bf16 硬件**：内核仍在，
+        但 cuBLAS 会返回错误，运行时按设计**回退 fp32 并只警告一次**（不会算错）。
     """
 
     def __init__(self, enabled=True, dtype="fp16", weight_cache=True):
-        if str(dtype) not in ("fp16", "float16"):
-            raise NotImplementedError("amp 目前只支持 fp16（收到 %r）" % (dtype,) +
-                                      "。修法：V100 无 bf16；A100/H100 的 bf16 还没接到 Tensor 层")
+        kind = str(dtype).lower()
+        if kind not in ("fp16", "float16", "bf16", "bfloat16"):
+            raise NotImplementedError("amp 只支持 fp16 / bf16（收到 %r）" % (dtype,) +
+                                      "。修法：dtype='fp16' 或 dtype='bf16'")
+        self.dtype = "bf16" if kind in ("bf16", "bfloat16") else "fp16"
         self.enabled = bool(enabled)
         self.weight_cache = bool(weight_cache)
         self._prev = None
 
     def __enter__(self):
         self._prev = amp_state()
-        _set(self.enabled, "fp16", self.weight_cache)
+        _set(self.enabled, self.dtype, self.weight_cache)
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        _set(bool(self._prev.get("on")), "fp16", True)
+        # 恢复"进入前的状态"：原来开着的 dtype 重新打开，原来关着的就关掉
+        _set(bool(self._prev.get("fp16")), "fp16", True)
+        _set(bool(self._prev.get("bf16")), "bf16", True)
         return False
 
 

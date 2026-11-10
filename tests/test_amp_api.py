@@ -32,10 +32,11 @@ def test_amp_state_does_not_crash_without_cuda():
     assert isinstance(st, dict) and "on" in st
 
 
-def test_amp_rejects_bf16_for_now():
+def test_amp_accepts_bf16_and_rejects_garbage():
+    """bf16 现在是合法 dtype（V100 上运行期会回退 fp32 并警告，不是报错）。"""
+    assert T.amp(dtype="bf16").dtype == "bf16"
     with pytest.raises(NotImplementedError):
-        with T.amp(dtype="bf16"):
-            pass
+        T.amp(dtype="int4")
 
 
 def test_amp_context_is_a_context_manager():
