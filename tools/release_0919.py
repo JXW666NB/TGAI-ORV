@@ -98,10 +98,15 @@ def main():
                 meta = [n for n in z.namelist() if n.endswith("METADATA")][0]
                 ok = ok and (("Version: %s" % VER) in z.read(meta).decode("utf-8", "replace"))
                 cuda = z.read("tgai_go/train/cuda.py").decode("utf-8", "replace")
+                # 只查 _cast_f16_cached 的函数体：文件别处有无关的 hit[0]（token/指针缓存），
+                # 上一版用全文件 grep 造成误报，且 twine 已上传 —— 教训：校验要精确到函数体。
+                _a = cuda.find("def _cast_f16_cached")
+                _b = cuda.find("def _sgemm_f16")
+                cache_body = cuda[_a:_b] if (_a >= 0 and _b > _a) else ""
                 checks = {
                     "K 阈值 1<<30": "1 << 30" in cuda,
-                    "缓存 return hit": "return hit\n" in cuda.replace("\r\n", "\n"),
-                    "无 hit[0]": "hit[0]" not in cuda,
+                    "缓存 return hit": "return hit" in cache_body,
+                    "缓存体无 hit[0]": "hit[0]" not in cache_body,
                 }
                 for k, hit in checks.items():
                     print("   %-14s %s" % (k, hit))
