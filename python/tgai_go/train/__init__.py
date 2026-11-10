@@ -4744,7 +4744,7 @@ del _red_name
 # ═══════════════════════════════════════════════════════════
 # 高层偏好训练器（0.9.16）：DPOTrainer / GRPOTrainer
 # ═══════════════════════════════════════════════════════════
-from .rl_trainer import DPOTrainer, GRPOTrainer                       # noqa: E402
+from .rl_trainer import DPOTrainer, GRPOTrainer, PPOTrainer                       # noqa: E402
 
 # ═══════════════════════════════════════════════════════════
 # 可编程 AMP（0.9.20）：T.amp() / amp_on / amp_off / GradScaler

@@ -20,6 +20,10 @@ def _cpu():
     T.set_default_device("cpu")
 
 
+def _np(x):
+    return np.asarray(x.to_numpy() if hasattr(x, "to_numpy") else x, np.float32)
+
+
 def _learnable_corpus(n_tokens, vocab, seed=0):
     """造一个**有规律**的语料（周期序列），保证 loss 能明显下降。
 
@@ -74,6 +78,43 @@ def test_fit_actually_learns():
 def test_tokens_rejects_too_short_input():
     with pytest.raises(ValueError):
         T.tokens([1, 2, 3], seq=16)
+
+
+def test_preset_supports_batch():
+    """batch 维必须真支持，且**批次之间不能互相影响**。"""
+    m = T.preset.transformer(vocab=32, d_model=16, n_layers=2, n_heads=2)
+    ids = np.random.randint(0, 32, (3, 7))
+    out_b = m(ids)
+    assert tuple(int(v) for v in out_b.shape) == (3, 7, 32)
+
+    # 逐条单独跑，结果应与批量里对应位置一致
+    for b in range(3):
+        single = m(np.ascontiguousarray(ids[b]))
+        assert np.allclose(np.asarray(_np(single), np.float32),
+                           np.asarray(_np(out_b), np.float32)[b], atol=1e-5), \
+            "第 %d 条在批量与单独前向结果不一致（batch 维串了）" % b
+
+    # 带 targets 的 loss
+    tgt = np.random.randint(0, 32, (3, 7))
+    loss = m(ids, tgt)
+    v = float(_np(loss).reshape(-1)[0])
+    assert np.isfinite(v) and v > 0
+
+
+def test_preset_batch_changes_nothing_for_b1():
+    """1D 输入仍是旧行为（返回 [S, vocab] / 标量 loss）。"""
+    m = T.preset.transformer(vocab=32, d_model=16, n_layers=1, n_heads=2)
+    ids = np.random.randint(0, 32, 9)
+    out = m(ids)
+    assert tuple(int(v) for v in out.shape) == (9, 32)
+    loss = m(ids, np.random.randint(0, 32, 9))
+    assert np.isfinite(float(_np(loss).reshape(-1)[0]))
+
+
+def test_preset_rejects_bad_ndim():
+    m = T.preset.transformer(vocab=16, d_model=8, n_layers=1, n_heads=1)
+    with pytest.raises(ValueError):
+        m(np.zeros((2, 3, 4), np.int64))
 
 
 def test_ten_line_training_promise():

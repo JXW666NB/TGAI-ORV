@@ -167,8 +167,14 @@ def grpo_loss(policy_logps, old_logps, ref_logps, advantages, masks,
         ratio = (p - old).exp()
         s1 = ratio * adv
         s2 = ratio.clamp(1.0 - e, 1.0 + e) * adv
-        # min(s1, s2) = −max(−s1, −s2)
-        neg_min = ((s1 * -1.0).maximum(s2 * -1.0)) * -1.0
+        # min(s1, s2) —— **不要**用 maximum 组合实现。
+        # 旧写法 `-max(-s1,-s2)` 在 ratio==1（s1==s2 平局）时，梯度会整份给第二个参数，
+        # 导致代理损失梯度符号翻转、策略被推向反方向。用显式掩码挑较小者。
+        s1n = np.asarray(s1.to_numpy() if hasattr(s1, "to_numpy") else s1, np.float32)
+        s2n = np.asarray(s2.to_numpy() if hasattr(s2, "to_numpy") else s2, np.float32)
+        take1 = (s1n <= s2n).astype(np.float32)
+        m1 = _as_tensor(take1).to(dev)
+        neg_min = s1 * m1 + s2 * (1.0 - m1)
         per = ((neg_min * m).sum()) * -1.0
         if beta:
             diff = ref - p

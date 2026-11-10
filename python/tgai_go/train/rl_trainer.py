@@ -28,7 +28,7 @@ import numpy as np
 from . import _as_tensor
 from . import align as _align
 
-__all__ = ["DPOTrainer", "GRPOTrainer"]
+__all__ = ["DPOTrainer", "GRPOTrainer", "PPOTrainer"]
 
 
 def _zeros(params):
@@ -185,4 +185,67 @@ class GRPOTrainer(_BaseTrainer):
         out = self._finish(loss, {"adv": np.asarray(adv, np.float32)})
         if isinstance(gstats, dict):
             out.update({k: v for k, v in gstats.items() if isinstance(v, (int, float))})
+        return out
+
+
+class PPOTrainer(_BaseTrainer):
+    """PPO / RLHF 的 actor-critic 训练器（0.9.25）。
+
+    与 `GRPOTrainer` 的区别：GRPO 用**组内**相对优势、不需要 value 网络；
+    PPO 需要 critic 给出基线，用 GAE 算优势 —— 这是标准 RLHF 的第二阶段。
+
+    调用方提供两个函数：
+
+    * `token_logprob_fn(ids, mask)` → 逐 token 的 logπ（可微，用于策略损失）
+    * `value_fn(ids, mask)` → 逐 token 的 V(s)（可微，用于 critic 损失）
+
+    `step()` 内部顺序：先用**当前**策略算 old logπ 与 V（冻结为常量），再算 GAE，
+    最后做一次 PPO 更新。这样同一次调用就是"采样→更新"的最简闭环；
+    真实系统里采样由推理引擎完成，届时把 `old_logps` / `old_values` 直接传进来即可。
+    """
+
+    def __init__(self, params, token_logprob_fn, value_fn, clip_eps=0.2,
+                 vf_coef=0.5, ent_coef=0.01, gamma=0.99, lam=0.95,
+                 optimizer=None, max_grad_norm=None, value_params=None):
+        super(PPOTrainer, self).__init__(params, optimizer, max_grad_norm)
+        from .ppo import ppo_loss
+        self._ppo_loss = ppo_loss
+        self.token_logprob_fn = token_logprob_fn
+        self.value_fn = value_fn
+        # critic 的参数并进 self.params：`_finish()` 会统一清零/裁剪/步进
+        extra = [p for p in (value_params or []) if p not in self.params]
+        if extra:
+            self.params = self.params + extra
+        self.clip_eps = float(clip_eps)
+        self.vf_coef = float(vf_coef)
+        self.ent_coef = float(ent_coef)
+        self.gamma = float(gamma)
+        self.lam = float(lam)
+
+    def step(self, ids, mask, rewards, dones=None, old_logps=None, old_values=None):
+        """一次 PPO 步。返回 dict(loss=..., ratio_mean=..., clip_frac=..., adv=...)。"""
+        from .ppo import gae
+
+        # 1) 采样时的策略/价值（冻结为常量）
+        if old_logps is None:
+            fresh = self.token_logprob_fn(ids, mask)
+            old_logps = _as_np(fresh)
+        if old_values is None:
+            old_values = _as_np(self.value_fn(ids, mask))
+
+        # 2) GAE（常量，不回传）
+        adv, ret = gae(rewards, old_values, dones, gamma=self.gamma, lam=self.lam)
+
+        # 3) 用当前策略再算一次 logπ / V / 熵（这次要梯度）
+        logps = self.token_logprob_fn(ids, mask)
+        vals = self.value_fn(ids, mask)
+        m = np.asarray(mask, np.float32)
+
+        loss, stats = self._ppo_loss(logps, old_logps, adv, values=vals,
+                                     returns=ret, masks=m, clip_eps=self.clip_eps,
+                                     vf_coef=self.vf_coef, ent_coef=0.0)
+        out = self._finish(loss, {"adv": np.asarray(adv, np.float32),
+                                  "returns": np.asarray(ret, np.float32)})
+        if isinstance(stats, dict):
+            out.update({k: v for k, v in stats.items() if isinstance(v, (int, float))})
         return out

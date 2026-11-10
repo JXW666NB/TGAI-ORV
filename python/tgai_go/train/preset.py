@@ -79,21 +79,29 @@ class Transformer(Module):
         self.tie_embedding = bool(tie_embedding)
 
     def forward(self, idx, targets=None):
-        """`idx` 是 int 的 `[seq]`/`[batch, seq]`；给了 `targets` 就返回 (loss, logits) 之外的 loss。"""
+        """`idx` 是 int 的 `[seq]` / `[batch, seq]`；给了 `targets` 就返回标量 loss。
+
+        batch 维是**真支持**的：内部按 `[B*S, D]` 算，注意力按 `[B*H, S, Dh]` 分组。
+        """
         idx = np.asarray(idx)
-        if idx.ndim == 2:
-            if idx.shape[0] != 1:
-                raise NotImplementedError("预设 Transformer 的 batch 维目前只支持 1" +
-                                          "。修法：把序列拼起来，或自己写带 batch 的 forward")
-            idx = idx[0]
-        x = self.embed(idx)
+        squeeze = idx.ndim == 1
+        if squeeze:
+            idx = idx[None, :]
+        if idx.ndim != 2:
+            raise ValueError("预设 Transformer 只接受 [seq] 或 [batch, seq]，收到 %s" % (idx.shape,) +
+                             "。修法：把序列拼成 2D，或检查输入的 ndim")
+        B, S = int(idx.shape[0]), int(idx.shape[1])
+        x = self.embed(idx.reshape(B * S)).reshape(B, S, self.d_model)
         for blk in self.blocks:
-            x = blk(x)
-        x = self.norm_f(x)
-        logits = self.lm_head(x)
+            x = blk(x, B, S)
+        h = self.norm_f(x.reshape(B * S, self.d_model))
+        logits = self.lm_head(h).reshape(B, S, self.vocab)
         if targets is None:
-            return logits
-        loss = _F.cross_entropy(logits, np.asarray(targets))
+            return logits.reshape(S, self.vocab) if squeeze else logits
+        tgt = np.asarray(targets)
+        if squeeze:
+            tgt = tgt.reshape(1, -1)
+        loss = _F.cross_entropy(logits.reshape(B * S, self.vocab), tgt.reshape(B * S))
         return loss
 
     def n_params(self):
@@ -127,32 +135,36 @@ class _Block(Module):
         self.w2 = Linear(d_ff, d_model, bias=False)
         self.drop = _nn.Dropout(dropout) if dropout else None
 
-    def forward(self, x):
+    def forward(self, x, B=None, S=None):
+        """`x` 是 `[B,S,D]`；不给 `B/S` 时按 2D `[S,D]`（batch=1）处理。"""
         import tgai_go.train as _T
-        h = self.ln1(x)
-        S = int(h.shape[0])
-        qkv = self.qkv(h)
-        # [S, 3D] -> 三个 [S, D]（按最后一维切）
-        D = self.d_model
+        if B is None:
+            S = int(x.shape[0])
+            B = 1
+        D, H, Dh = self.d_model, self.n_heads, self.d_head
+        xf = x.reshape(B * S, D)
+        h = self.ln1(xf)
+        qkv = self.qkv(h)                                  # [B*S, 3D]
         q = qkv[:, 0:D]
         k = qkv[:, D:2 * D]
         v = qkv[:, 2 * D:3 * D]
-        # [S, D] -> [n_heads, S, d_head]
-        q = q.reshape(S, self.n_heads, self.d_head).permute(1, 0, 2)
-        k = k.reshape(S, self.n_heads, self.d_head).permute(1, 0, 2)
-        v = v.reshape(S, self.n_heads, self.d_head).permute(1, 0, 2)
+        # [B*S, D] -> [B, S, H, Dh] -> [B*H, S, Dh]
+        def heads(t):
+            return t.reshape(B, S, H, Dh).permute(0, 2, 1, 3).reshape(B * H, S, Dh)
+
+        q, k, v = heads(q), heads(k), heads(v)
         att = _F.scaled_dot_product_attention(q, k, v, causal=True)
-        att = att.permute(1, 0, 2).reshape(S, D)
-        y = x + self.o(att)
+        # [B*H,S,Dh] -> [B,S,H,Dh] -> [B*S, D]
+        att = att.reshape(B, H, S, Dh).permute(0, 2, 1, 3).reshape(B * S, D)
+        y = xf + self.o(att)
         if self.drop is not None:
             y = self.drop(y)
         h2 = self.ln2(y)
-        # SwiGLU
-        z = _F.silu(self.w1(h2)) * self.w3(h2)
+        z = _F.silu(self.w1(h2)) * self.w3(h2)             # SwiGLU
         y = y + self.w2(z)
         if self.drop is not None:
             y = self.drop(y)
-        return y
+        return y.reshape(B, S, D)
 
 
 def transformer(**kwargs):

@@ -1,3 +1,49 @@
+## [0.9.25] - 2026-11-10
+
+补齐 **PPO / RLHF**（此前只有 DPO/GRPO），修一个**会让策略往反方向学**的梯度 BUG，
+并让 `T.preset` 支持 batch>1。
+
+### 新增：PPO / RLHF
+
+- `T.ppo.gae(rewards, values, dones, gamma, lam)`：广义优势估计（含 done 的 bootstrap 终止）。
+- `T.ppo.ppo_loss(...)`：PPO 裁剪目标 + 可选的 value 损失与熵项。
+- `T.ppo.discounted_returns(...)`：没有 critic 时的最简基线。
+- `T.PPOTrainer`：actor-critic 训练器；`value_params` 会自动并进参数集合（否则 critic 静默不训练）。
+
+于是四种训练模式齐了：**预训练 / SFT / DPO / GRPO / PPO(RLHF)**。
+
+### 修复：min 平局导致梯度符号翻转（PPO 与 GRPO 都中招）
+
+`min(s1, s2)` 原先用 `-max(-s1, -s2)` 组合实现。当 `ratio == 1` 时 `s1 == s2` 是**平局**，
+`maximum` 把梯度**整份给第二个参数** ⇒ 代理损失对 logπ 的梯度符号翻转
+（优势为正的样本，logπ 反而被压下去）。
+
+实测（`tools/debug_ppo_grad.py`）：
+
+| 情形 | 修复前 | 修复后 |
+| --- | --- | --- |
+| adv=+1, ratio=1 | 梯度 +1（错） | **-1**（对） |
+| adv=-1, ratio=1 | 梯度 -1（错） | **+1**（对） |
+| adv=+1, ratio=2（应被 clip） | — | **0**（对） |
+
+现在改用**显式掩码**挑较小者（平局时两者相等，取哪边导数都正确）。
+`align.grpo_loss` 里同一处写法一并修掉。
+
+### preset 支持 batch>1
+
+`T.preset.transformer(...)` 现在接受 `[seq]` 与 `[batch, seq]`，内部按 `[B*S, D]` 算、
+注意力按 `[B*H, S, Dh]` 分组。测试里加了**批次独立性**断言：同一条序列在批量与单独前向中结果一致
+（若 batch 维串了会立刻失败）。
+
+### 测试
+
+- `tests/test_ppo.py`（9 条）：GAE 与手写递推一致、done 终止 bootstrap、与 torch 参考的损失与梯度、
+  clip 行为、value/熵项系数。
+- `tests/test_ppo_trainer.py`（4 条）：step 跑通、critic 真的进参数集合、可学任务上优势高样本的 logπ 上升。
+- `tests/test_preset_quickstart.py` 增 3 条批量用例。
+
+套件：**553 passed / 28 skipped**。
+
 ## [0.9.24] - 2026-11-10
 
 **T=512 整步 754 ms —— 达成 0.911 s 目标**（此前 1058–1098 ms）。根因是分头小 kernel。
