@@ -108,7 +108,6 @@ def main():
     gw_bufs = [rt.h2d(np.zeros((SEQ, D), np.float32)) for _ in range(NL)]
     x_refs = []
     grad_refs = []          # 捕获期的 .grad 对象（图写进这些缓冲，读它们才对）
-    rt.empty_cache()   # 释放 eager 那步的池缓存，腾出空间给 arena（捕获只走 arena，释放池是安全的）
     rt.reserve_capture_arena(ARENA)
     for i in range(NL):
         for k in ("q", "k", "v", "o"):
