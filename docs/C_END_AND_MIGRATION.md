@@ -58,3 +58,40 @@ Python → ORV 计算图 的**转译器 + 控制流分析**，而且一旦遇到
 | 全是 `nn.Linear/Embedding/Norm/Conv/Pool/BN/Dropout` + `Sequential` 的模型 | ✅ 能（权重逐位复制） |
 | 有自定义 `forward`（残差/门控/自定义 attention） | ⚠️ 需手写 forward，权重仍可 `from_torch` 搬 |
 | 用 `torch.compile` / 自定义 autograd.Function / DDP | ❌ 不适用（ORV 有自己的图路径与单卡定位） |
+
+
+---
+
+## 5. 2026-11-11 更新：Muon 大模型可用性的实测与下一步
+
+### 已测结论
+
+| 配置 | 3B 整步 | 峰值显存 |
+| --- | --- | --- |
+| Muon，
+s_fast=False（顺序 FMA，与 OpenBLAS 逐位一致） | 62.9 s | 18.93 GiB |
+| Muon，
+s_fast=True（Newton-Schulz 走 cuBLAS） | **35.0 s** | 19.17 GiB |
+| AdamW（fp16 动量 + 逐层即时更新） | **0.709 s** | 24.78 GiB |
+
+### 为什么换 cuBLAS 只快 1.8 倍
+
+3B 有 2550 个 2D 张量，每个跑 5 步 × 约 6 个算子 ≈ **7.6 万次算子调用**。
+按 0.4 ms/次估算正好 30 秒量级 —— **瓶颈是算子数量，不是单个 GEMM 的速度**。
+
+### 下一步方案（已验证可行）
+
+**按形状分组批量正交化**：
+
+1. 3B MoE 里同形张量高度重复 —— 每层 8 专家 × 3 矩阵 [4096,1024] = 24 个，
+   28 层共 **672 个同形张量**；
+2. 按形状分组，stack 成 [G, M, K]，用**批量矩阵乘**一次算完一组；
+3. 调用数从 7.6 万降到万级以下。
+
+**可行性已实测**：ORV 的 Tensor @ Tensor **支持 3D@3D（bmm）**，也支持 3D@2D。
+
+实现要点：_step_cuda 目前工作在 GpuBuf 层，批量正交化需要
+Tensor._from_gpu(...) 把 buffer 包成 Tensor 跑 bmm，再拆回各参数缓冲。
+代价是每组多一份 [G,M,K] 的批量缓冲 —— Muon 路线峰值 19.17 GiB 尚有 12.7 GiB 余量，够用。
+
+**状态：方案确定、可行性已验证、尚未实现。**
