@@ -48,7 +48,7 @@ def main():
     for i in range(NL):
         params += tr.params_of(i)
     params += list(tr.head_params())
-    opt = None  # 优化器占 11 GiB 显存，本测试只测步内工作（其 47 ms 已单独实测）
+    opt = Fp16MomAdamW(params, lr=1e-5)
 
     rng = np.random.default_rng(0)
     ids = rng.integers(0, 30000, SEQ + 1, dtype=np.int64)
@@ -90,12 +90,12 @@ def main():
             (z * T.tensor(gg)).sum().backward()
             gg = np.asarray(xi.grad.to_numpy(), np.float32)
         tr.add_embed_grad_device(id_buf, T.tensor(gg)._gpu)
-        if opt is not None: opt.step()
+        opt.step()
         return float(np.asarray(loss.to_numpy()))
 
     # 捕获图（需要一次前向来拿每层输入）
     ys0, xs0 = fwd_chain()
-    gb = LayerGraphBackward(tr, cos, sin, seq=SEQ)
+    gb = LayerGraphBackward(tr, cos, sin, seq=SEQ, arena_bytes=128 * 1024 ** 2)
     gb.capture(xs0[:NL])
     log("已捕获 %d 张图" % gb.count() if hasattr(gb, "count") else "已捕获图")
 
@@ -112,7 +112,7 @@ def main():
             gg = gb.replay_layer(i, np.asarray(y_t.grad.to_numpy(), np.float32))
         dx0 = gg
         tr.add_embed_grad_device(id_buf, T.tensor(dx0)._gpu)
-        if opt is not None: opt.step()
+        opt.step()
         return float(np.asarray(loss.to_numpy()))
 
     def timeit(fn):
