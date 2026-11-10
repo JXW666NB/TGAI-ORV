@@ -4870,6 +4870,45 @@ class CudaRuntime:
             ])
         return out
 
+    def _cast_f16_cached(self, src_ptr, count):
+        """带缓存的 fp32→fp16 cast（供 fp16 GEMM 复用权重影子）。
+
+        为什么要缓存：实测 nl=8/seq=512 时 `TG_FP16=1` 反而慢 31%（171.9 → 226.0 ms），
+        因为每次 GEMM 都把权重重新 cast 一遍。权重在一个 step 内不变，缓存后 cast 只发生一次。
+        **失效责任在调用方**：优化器更新参数后必须 `f16_cache_clear()`，否则会用到旧影子。
+        """
+        cache = getattr(self, "_f16_cache", None)
+        if cache is None:
+            cache = {}
+            self._f16_cache = cache
+        key = (int(src_ptr), int(count))
+        hit = cache.get(key)
+        if hit is not None:
+            return hit[0]
+        buf = self._cast_flat_ptr(src_ptr, count, True)
+        cache[key] = buf
+        return buf
+
+    def f16_cache_enable(self, on=True):
+        """打开/关闭 fp16 GEMM 的权重影子缓存。关闭时清空。"""
+        self._f16_cache_on = bool(on)
+        if not on:
+            self.f16_cache_clear()
+        return self._f16_cache_on
+
+    def f16_cache_clear(self):
+        """清空影子缓存。**参数被更新后必须调用**（优化器 step 已自动调用）。"""
+        n = len(getattr(self, "_f16_cache", None) or {})
+        self._f16_cache = {}
+        return n
+
+    def f16_cache_stats(self):
+        c = getattr(self, "_f16_cache", None) or {}
+        total = 0
+        for buf in c.values():
+            total += int(getattr(buf, "nbytes", 0) or 0)
+        return {"entries": len(c), "bytes": total, "on": bool(getattr(self, "_f16_cache_on", False))}
+
     def _sgemm_f16(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
         """列主序调用和 _sgemm 完全一致，只是 A/B 先转 fp16、按 fp32 累加。
 
@@ -4884,8 +4923,12 @@ class CudaRuntime:
         nc = int(ldc) * int(n)
         if max(na, nb, nc) > 2147483647:
             raise CudaError("fp16 GEMM 元素数超过 int32" + "。修法：确认 cuBLAS 版本与驱动匹配；可先用 TG_FP16=0 关掉 fp16 GEMM 排查")
-        a16 = self._cast_flat_ptr(A, na, True)
-        b16 = self._cast_flat_ptr(B, nb, True)
+        if getattr(self, "_f16_cache_on", False):
+            a16 = self._cast_f16_cached(A, na)
+            b16 = self._cast_f16_cached(B, nb)
+        else:
+            a16 = self._cast_flat_ptr(A, na, True)
+            b16 = self._cast_flat_ptr(B, nb, True)
         if st["c32"]:
             c16 = None
             cptr = int(C)

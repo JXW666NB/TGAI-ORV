@@ -68,6 +68,11 @@ class Fp16MomAdamW(object):
             ents.append((p._gpu, p.grad._gpu, self.m16[i], self.v16[i]))
         rt.adamw_multi_f16(ents, b1, 1.0 - b1, b2, 1.0 - b2, self.lr, self.lr * self.wd,
                            self.eps, bc1, bc2, 1)
+        # 参数已更新 ⇒ 旧的 fp16 权重影子作废（AMP 缓存，见 cuda.py f16_cache_*）
+        try:
+            rt.f16_cache_clear()
+        except Exception:
+            pass
 
     def _step_scalar(self):
         """逐张量更新（原实现，保留用于对照测试与 fp32_state）。"""
@@ -90,6 +95,10 @@ class Fp16MomAdamW(object):
             if not self.fp32_state:
                 rt.cast_f32_to_f16_into(m32, self.m16[i])
                 rt.cast_f32_to_f16_into(v32, self.v16[i])
+        try:
+            rt.f16_cache_clear()
+        except Exception:
+            pass
     # ---------- 检查点：优化器状态（fp16 m/v + 步数） ----------
     def state_dict(self):
         """取出 m/v 与步数（逐张量 D2H，主机峰值 = 单张量）。"""

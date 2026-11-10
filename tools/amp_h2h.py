@@ -17,7 +17,7 @@ import time as _time
 import numpy as np
 
 MODE = sys.argv[1] if len(sys.argv) > 1 else "orv_fp32"
-if MODE == "orv_fp16":
+if MODE in ("orv_fp16", "orv_fp16_cache"):
     os.environ["TG_FP16"] = "1"
 
 sys.path.insert(0, r"D:\tgai_orv\TGAI-ORV-main\python")
@@ -76,6 +76,9 @@ def run_orv(nl, seq):
                 p.grad = None
 
     l0 = step(); torch.cuda.synchronize()
+    if MODE == "orv_fp16_cache":
+        rt.f16_cache_enable(True)
+        log("fp16 权重影子缓存：开启（%s）" % (rt.f16_cache_stats(),))
     per = []
     for _ in range(REP):
         clear()
@@ -84,6 +87,8 @@ def run_orv(nl, seq):
         step()
         torch.cuda.synchronize()
         per.append((_time.time() - t0) * 1000.0)
+    if MODE == "orv_fp16_cache":
+        log("缓存统计（步后）：%s" % (rt.f16_cache_stats(),))
     try:
         st.close(); rt.empty_cache()
     except Exception:
