@@ -6,10 +6,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.28-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.9.49-blue" alt="version">
   <img src="https://img.shields.io/badge/python-3.9+-green" alt="python">
   <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
-  <img src="https://img.shields.io/badge/tests-558%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-656%20passed-brightgreen" alt="tests">
   <img src="https://img.shields.io/badge/CUDA%20kernels-101-blueviolet" alt="kernels">
 </p>
 
@@ -336,6 +336,27 @@ ORV 侧的对照实测：
 
 # 第三部分：新手入门
 
+## 第 0 步：装好它
+
+```bash
+pip install tgai-orv
+```
+
+**要求**：Windows / Linux，Python 3.9+。
+有 NVIDIA 卡时驱动需支持 CUDA 12（运行时由驱动提供，**不用装 CUDA Toolkit**）；
+**纯 CPU 也能跑**，只是慢 —— 下面四步脚本不依赖 GPU。
+
+装完先验一下：
+
+```python
+import tgai_go.train as T
+print(T.__version__)          # 0.9.49
+print(T.amp_state())          # 看 CUDA 是否可用；全 False 表示只能用 CPU
+```
+
+> 想让 GPU 跑起来但 `amp_state()` 里没有 cuda：先 `nvidia-smi` 确认驱动正常，
+> 再看 `docs/OP_COVERAGE.md`。装不上或报错，把完整错误与 GPU 型号一起反馈。
+
 ## 四步完成从语料到训练
 
 完整可运行脚本见 `examples/beginner_pipeline.py`（**不依赖 GPU**）：
@@ -405,7 +426,67 @@ loss: 5.5404 -> 3.4252（降到原来的 62%）
 
 ---
 
-# 附录：迁移与 API 对齐
+# 第四部分：从 PyTorch 迁移过来
+
+## 四步迁移法
+
+不要一上来就改全部代码。按这个顺序，**每一步都能停下来验证**。
+
+### 第 1 步：换 import，只换这一行
+
+```python
+# import torch as T
+import tgai_go.train as T
+```
+
+`Tensor` / autograd / `nn.Module` / `nn.Linear` / `optim.AdamW` / `functional` /
+`DataLoader` / `state_dict` —— 名称与语义保持一致，**这一步通常能让纯 torch 写法直接跑起来**。
+
+### 第 2 步：把权重搬过来（不要重新训练）
+
+```python
+model = T.from_torch(torch_model)       # 读 torch 的 state_dict，搬成 ORV 参数
+```
+
+或者按名字逐个搬：
+
+```python
+mine.load_state_dict(T.from_torch_state_dict(torch_sd))
+```
+
+搬完**必须对拍一次前向**，确认数值一致再往下走：
+
+```python
+y_torch = torch_model(x).detach().numpy()
+y_orv   = mine(T.tensor(x)).to_numpy()
+print(abs(y_orv - y_torch).max() / max(abs(y_torch).max(), 1e-9))   # 应在 1e-5 量级
+```
+
+### 第 3 步：改自定义 `forward`
+
+这是**唯一无法自动迁移**的部分。ORV 不会猜你的 `forward` 语义（猜错会静默算错），
+所以 `from_torch` 遇到自定义模块会报错并列出支持的类型。
+
+处理方式：用 ORV 的层重写 `forward`，通常 **10~40 行**。
+改完同样要对拍一次前向，确认一致。
+
+### 第 4 步：接上训练循环
+
+```python
+opt   = T.optim.AdamW(model.parameters(), lr=3e-4)
+hist  = T.fit(model, loader, steps=2000, lr=3e-4, amp=True)
+```
+
+`T.fit` 已经包住梯度累积、梯度裁剪、AMP、checkpoint、日志 —— 通常比手写 `torch` 循环更短。
+
+## 迁移检查清单
+
+- [ ] 只换了 import，就能跑通前向
+- [ ] 权重搬过来了，且**前向对拍 ≤1e-5**
+- [ ] 自定义 `forward` 改写完，**再次对拍 ≤1e-5**
+- [ ] 反向也对拍过（`dL/dx` 与权重梯度，容差可放到 1e-4）
+- [ ] 优化器 state 从零开始（**不建议搬 torch 的优化器 state**，动量含义可能不同）
+- [ ] 单步耗时与显存**实测过**，没有拿 PyT 的数字外推
 
 ## 替换一行 import
 
