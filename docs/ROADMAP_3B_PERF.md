@@ -130,3 +130,38 @@ AMP 的数值代价已实测：输出相对差 **4.31e-04** —— 是 fp16 正�
 | `tools/split_512.py` | 28 层整步分段耗时 |
 | `tools/step_time_3b.py` | 3B 整步耗时 + 峰值显存（admw/muon/muon-fast） |
 | `tools/pyt_adamw_oom.py` | 纯 PyTorch + 真 AdamW 的 OOM 证据 |
+
+## 8. 2026-11-11 补充：tensor core 这条路也排除了（实测）
+
+曾怀疑 ORV 全局的 `cublasSetMathMode(PEDANTIC)` 在压制 tensor core
+（PEDANTIC 为逐位可复现而存在），若放开就能拿到 2× 以上。
+
+`tools/tensorcore_probe.py` 在 MoE gate 投影真实形状（8 专家 × [128,1024] @ [4096,1024]）实测：
+
+| 用例 | 时间 | 实测算力 |
+| --- | --- | --- |
+| **fp32 @ PEDANTIC（现状）** | **0.410 ms** | **20.9 TFLOP/s** |
+| fp32 @ DEFAULT | 1.026 ms | 8.4 TFLOP/s |
+| fp16 @ PEDANTIC | 0.809 ms | 10.6 TFLOP/s |
+| fp16 @ DEFAULT | 0.601 ms | 14.3 TFLOP/s |
+
+**关键判读：fp32 达到 20.9 TFLOP/s，超过 V100 标称 fp32 峰值 15.7
+⇒ tensor core 本来就在用**，不存在"被 PEDANTIC 压住"的余量。
+
+附带两点反常但可复现：
+- DEFAULT 比 PEDANTIC **更慢**（1.026 vs 0.410 ms），说明 math mode 影响的是算法选择启发式；
+- fp16 比 fp32 **更慢**（0.809 vs 0.410 ms），多出来的应是每次调用的转换开销。
+
+### 结论
+
+tensor core 不是缺失的 40%。加上此前四条路径，MoE 加速的可能空间已全部枚举并实测：
+
+| 候选 | 上限 |
+| --- | --- |
+| GEMM 融合 | −4~8% |
+| 去 d2h 同步 | ≈0 |
+| 小算子融合 | −4~8% |
+| AMP / fp16 GEMM | −13.6% |
+| **tensor core（放开 PEDANTIC）** | **≈0（已在用）** |
+
+需要 −40%，以上全部加起来仍不够。**只能改模型结构或换硬件。**
