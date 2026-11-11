@@ -387,6 +387,7 @@ print(T.amp_state())        # 检查 CUDA 是否可用
 ## 文档
 
 - [与 PyTorch 的完整对照与差距](docs/REVIEW_2026-11-10_vs_PyTorch.md)
+- [3B MoE 训练性能：实测结论与后续路线](docs/ROADMAP_3B_PERF.md) —— 哪些优化已证明走不通、为什么
 - [算子覆盖矩阵](docs/OP_COVERAGE.md)
 - [C 端下沉清单 & 迁移边界](docs/C_END_AND_MIGRATION.md)
 - [更新日志](CHANGELOG.md)
