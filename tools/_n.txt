@@ -1,0 +1,29 @@
+feat(plugins): native C plugins first, and a design for portable kernels
+
+The user's correction was that plugins should prioritise the C side, with Python second. Worth restating
+what was actually wrong before: .py was never on the hot path -- it runs once at load to register and bind.
+The real limitation was that .py forced the *implementation* to also be Python. So the fix is to let the
+implementation be native while Python stays an optional outer shell.
+
+Four channels now, ordered by how native they are. load_manifest(json) is the most native: compile a
+library with your own toolchain, describe the symbols and argument mapping in JSON, and no Python is
+involved at all. op_c binds a C ABI export from a prebuilt library. op_native takes CUDA C source and has
+ORV compile it with NVRTC. op(fn) remains the compositional path.
+
+Verified on the V100 rather than asserted: an axpy kernel from source matches numpy to 4.39e-08 at n=1000
+and 6.94e-08 at n=1M, compiles once, and runs 1M elements in 0.0192 ms.
+
+Three real bugs surfaced only on hardware. _compile takes str source, not bytes. It takes an arch string
+("sm_70"), not an int -- passing 70 made NVRTC reject the architecture outright. And want_cubin=True
+returns cubin bytes, not a CUmodule, so it needs cuModuleLoadData before launch or the handle is invalid
+(rc=400). Separately, launch() wants (value, ctype) pairs, not bare values.
+
+Then the harder problem the user raised: a native plugin is inherently bound to one backend. CUDA C cannot
+run on Vulkan or a domestic accelerator, and no amount of API design changes that. docs/PLUGIN_DSL.md sets
+out three portability tiers -- compositional, a declarative kernel DSL that ORV lowers to each backend's
+language, and hand-written per-backend code -- with the rule that a tier-C plugin must also ship an A or B
+fallback so other backends see it as absent rather than wrong. The DSL is staged S1-S5 and S1 has not
+started; only the CUDA and CPU code generators could be verified on this machine, and the doc says so.
+
+Suite: 649 passed / 33 skipped. Published as 0.9.46
+(sha256 728c7303...f4da, re-downloaded and compared).

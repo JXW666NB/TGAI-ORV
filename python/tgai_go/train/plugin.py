@@ -171,6 +171,238 @@ def op_numpy(name, forward, backward, *, kind="functional", doc="", replace=Fals
                                replace=replace)
 
 
+#: 原生内核插件的编译缓存：(name, arch) -> module
+_NATIVE = {}
+#: 已登记的原生内核（元信息，供 native_info）
+_NATIVE_OPS = {}
+
+
+def op_native(name, source, entry, *, grid=(1, 1, 1), block=(1, 1, 1), shared=0,
+              args=None, cuda_source_name=None, doc="", replace=False):
+    """注册一个用 **CUDA C 源码**写的算子 —— ORV 用 NVRTC **现场编译**，跑原生速度。
+
+    ## 为什么需要（回答「.py 会不会太慢」）
+
+    `.py` 只是**登记与胶水**，只在加载时执行一次；**热路径可以完全是原生代码**。
+    本函数接收 CUDA C 源码，首次调用时编译、之后直接启动内核 —— 没有 Python 逐元素开销。
+
+    ## 用法
+
+    ```python
+    SRC = r'''
+    extern "C" __global__ void axpy(float* y, const float* x, float a, int n) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < n) y[i] += a * x[i];
+    }
+    '''
+
+    launch = plugin.op_native(
+        "axpy", SRC, "axpy",
+        grid=lambda x, y, a, n: ((n + 255) // 256, 1, 1),
+        block=(256, 1, 1),
+        args=lambda x, y, a, n: [y._gpu.ptr, x._gpu.ptr, float(a), int(n)],
+    )
+    launch(x, y, 2.0, x.numel())
+    ```
+
+    参数
+    ----
+    source : str
+        CUDA C 源码。内核须用 `extern "C"` 导出，函数名与 `entry` 一致。
+    entry : str
+        内核函数名。
+    grid / block : 可调用 或 tuple
+        `grid` 通常依赖输入尺寸，所以支持传函数 `(*args) -> (gx, gy, gz)`；
+        `block` 也可传函数（`(*args) -> (bx, by, bz)`）或固定 tuple。
+    args : 可调用
+        `(*args) -> list[(值, ctype)]`。**必须返回 `(值, ctype)` 对**，
+        这是 ORV 内部 `launch` 的约定（它按值构建 ctypes 对象再取指针）。
+        指针类参数用 `ctypes.c_void_p`，标量用 `ctypes.c_float` / `ctypes.c_int`。
+        省略时把收到的参数原样传给内核（只适用于全是标量的场景）。
+    shared : int
+        动态共享内存字节数。
+
+    说明：本函数只管**编译与启动**，不管 autograd。要做可训练算子请配合
+    `register_numpy` 的反向，或用组合式写法。
+    """
+    if not isinstance(source, str) or not source.strip():
+        raise PluginError(
+            "op_native %r 的 source 必须是非空 CUDA C 源码字符串" % name +
+            "。修法：传源码；要用预编译二进制见 docs/PLUGIN_NATIVE.md 的 ctypes 方式")
+    if not str(entry).strip():
+        raise PluginError(
+            "op_native %r 缺少 entry（内核函数名）" % name +
+            "。修法：把 CUDA C 里 __global__ 的函数名传给 entry")
+
+    resolved = {"fn": None}
+
+    def _rt():
+        """拿到 CUDA 运行时（延迟导入，避免 plugin ↔ __init__ 循环依赖）。"""
+        from . import _cuda as _c
+        return _c()
+
+    def _ensure():
+        """首次调用时编译；同一 (算子, 架构) 只编一次。"""
+        if resolved["fn"] is not None:
+            return resolved["fn"]
+        try:
+            rt = _rt()
+        except Exception as exc:      # noqa: BLE001
+            raise PluginError(
+                "op_native %r 需要 CUDA 后端，当前环境拿不到（%s）" % (name, exc) +
+                "。修法：本插件只能在有 NVIDIA GPU 且驱动可用的机器上跑；"
+                "纯 CPU 环境请用组合式 plugin.op(...)") from exc
+        # _compile 收的是字符串架构名（"compute_70" / "sm_70"），不是整数 ——
+        # 传 int 会让 NVRTC 收到 --gpu-architecture=70 而报 invalid value。
+        # 与 ORV 内部一致：优先用 sm_ 的 cubin（驱动对 PTX 的 JIT 版本可能比 NVRTC 旧）。
+        arch_s = str(rt._cc_arch())                     # compute_70
+        sm = arch_s.replace("compute_", "sm_")          # sm_70
+        key = (str(name), sm)
+        mod = _NATIVE.get(key)
+        if mod is None:
+            cubin = rt._compile(sm, source=str(source),
+                                cu_name=(cuda_source_name or ("%s.cu" % name)),
+                                want_cubin=True)
+            # `_compile(want_cubin=True)` 返回的是 **cubin 字节**，不是 CUmodule ——
+            # 必须再 cuModuleLoadData 才能拿到可 launch 的模块句柄
+            # （直接把它当 module 传会得到 rc=400 invalid resource handle）。
+            import ctypes as _ct
+            buf = _ct.create_string_buffer(cubin, len(cubin))
+            handle = _ct.c_void_p()
+            rt._chk(rt.cu.cuModuleLoadData(_ct.byref(handle),
+                                           _ct.cast(buf, _ct.c_void_p)),
+                    "cuModuleLoadData(%s)" % name)
+            mod = handle
+            _NATIVE[key] = mod
+        resolved["fn"] = mod
+        return mod
+
+    def launch(*a, **kw):
+        mod = _ensure()
+        g = grid(*a, **kw) if callable(grid) else tuple(grid)
+        b = block(*a, **kw) if callable(block) else tuple(block)
+        av = args(*a, **kw) if callable(args) else list(a)
+        rt = _rt()
+        rt.launch(str(entry), tuple(g), tuple(b), list(av),
+                  shared=int(shared), module=mod)
+        return None
+
+    launch.__name__ = str(name)
+    launch.__doc__ = doc or ("CUDA C 原生内核 %r（entry=%s）" % (name, entry))
+    _NATIVE_OPS[str(name)] = {"entry": str(entry), "source_len": len(source)}
+    return launch
+
+
+def load_manifest(path, *, replace=False):
+    """加载 **JSON 声明式原生插件** —— 用户不用写一行 Python。见 `plugin_manifest.py`。"""
+    from .plugin_manifest import load_manifest as _lm
+    return _lm(path, replace=replace)
+
+
+def native_info():
+    """已登记的原生内核与编译状态（供诊断）。"""
+    return {
+        "registered": dict(_NATIVE_OPS),
+        "compiled": ["%s@%s" % k for k in _NATIVE],
+        "libraries": dict(_LIBS_META),
+    }
+
+
+# ───────── C 端插件（优先级最高的形态）─────────
+
+#: 已加载的预编译原生库：libpath -> ctypes.CDLL
+_LIBS = {}
+#: 已登记的原生库元信息（供 native_info）
+_LIBS_META = {}
+
+
+def load_lib(path, *, replace=False):
+    """加载一个**预编译**原生库（`.so` / `.dll` / `.dylib`），返回 ctypes 句柄。
+
+    这是**最优先的插件形态**：用户用自己的工具链（nvcc / clang / MSVC）编译，
+    ORV 只负责加载与调用，热路径**完全没有 Python 参与**。
+
+    ```c
+    // myops.cu  —— 用 nvcc -shared -o myops.so myops.cu 编译
+    extern "C" void my_scale(float* y, const float* x, float a, int n) {
+        // 里面可以自己 launch kernel
+    }
+    ```
+
+    ```python
+    lib = plugin.load_lib("myops.so")
+    scale = plugin.op_c("scale", lib, "my_scale",
+                        args=lambda y, x, a, n: [y._gpu.ptr, x._gpu.ptr, float(a), int(n)])
+    scale(y, x, 2.0, y.numel())
+    ```
+
+    ⚠️ **安全性**：加载原生库等于执行任意机器码。只加载你信任的库；
+    ORV 不做沙箱、也不校验来源。
+    """
+    import ctypes
+    import os
+
+    p = os.path.abspath(str(path))
+    if not os.path.isfile(p):
+        raise PluginError(
+            "原生库不存在: %s" % p +
+            "。修法：检查路径与文件扩展名（Windows 用 .dll、Linux 用 .so、macOS 用 .dylib）")
+    if p in _LIBS and not replace:
+        return _LIBS[p]
+    try:
+        lib = ctypes.CDLL(p)
+    except OSError as exc:
+        raise PluginError(
+            "加载原生库失败: %s (%s)" % (p, exc) +
+            "。修法：确认架构与位数匹配（64 位进程只能加载 64 位库）；"
+            "Linux 下若提示 undefined symbol，用 ldd 检查依赖") from exc
+    _LIBS[p] = lib
+    _LIBS_META[p] = {"size": os.path.getsize(p)}
+    return lib
+
+
+def op_c(name, lib, func, *, args=None, restype=None, doc=""):
+    """把原生库里导出的 **C ABI 函数**包装成可调用对象（零 Python 热路径）。
+
+    参数
+    ----
+    lib : ctypes.CDLL 或 str 路径
+        `load_lib()` 的返回值，或直接给路径。
+    func : str
+        导出的 C 函数名。
+    args : 可调用
+        `(*a) -> list`，把 Python 侧参数转成 C 函数的参数列表。
+
+    返回一个可调用对象；调用即执行原生代码。
+    """
+    if isinstance(lib, str):
+        lib = load_lib(lib)
+    fname = str(func).strip()
+    if not fname:
+        raise PluginError(
+            "op_c %r 缺少 func（导出的 C 函数名）" % name +
+            "。修法：把 C 源码里 `extern \"C\"` 的函数名传给 func")
+    try:
+        fn = getattr(lib, fname)
+    except AttributeError as exc:
+        raise PluginError(
+            "原生库里找不到导出符号 %r" % fname +
+            "。修法：确认 C 函数用 `extern \"C\"` 导出（否则 C++ 会改编函数名）；"
+            "Linux 可用 `nm -D --defined-only 你的库.so` 查导出表") from exc
+    if restype is not None:
+        fn.restype = restype
+
+    def call(*a, **kw):
+        av = args(*a, **kw) if callable(args) else list(a)
+        fn(*av)
+        return None
+
+    call.__name__ = str(name)
+    call.__doc__ = doc or ("原生库函数 %s" % fname)
+    _NATIVE_OPS[str(name)] = {"entry": fname, "kind": "c-abi"}
+    return call
+
+
 # ─────────────────────────── ② 后端 ───────────────────────────
 def backend(name, factory, *, caps=None, replace=False):
     """登记一个 GPU/CPU 后端。
