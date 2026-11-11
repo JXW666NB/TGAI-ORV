@@ -4948,6 +4948,12 @@ def plugins():
     """列出当前插件登记状态（算子/后端/优化器/层/骨架/API 兼容层）。"""
     return _plugin_mod.registered()
 
+
+# ── 共享存储参数（0.9.43）────────────────────────────────────────────────
+# 放在这里导入：param_group 依赖 plugin（require_inplace）与本模块的 Parameter，
+# 此时二者都已定义。
+from .param_group import ParameterGroup, SharedStorageError
+
 # ── 补齐 torch 常用优化器与学习率调度器（0.8.0）────────────────────────────
 # 放在文件末尾导入：opt_extra / sched 依赖本模块的 _Optim/_cuda 等，此时已定义完毕。
 from .opt_extra import (SGD as _SGDImpl, Lion as _LionImpl,        # noqa: E402

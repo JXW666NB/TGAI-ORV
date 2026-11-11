@@ -1,0 +1,26 @@
+feat(core): shared-storage parameters, with the contract enforced at construction rather than trusted
+
+Packed expert weights are the data-model prerequisite for the contiguous `[G,N,K]` layout that would let
+one SgemmStridedBatched cover every expert. Measured earlier, that only pays off if no repacking happens
+per call, so the storage has to be shared from the start. ParameterGroup holds one buffer and hands out
+numpy-slice views that genuinely share memory.
+
+The dangerous part is not the views, it is what an optimizer does to them. An out-of-place update
+(`p.data = p.data - ...`) rebinds .data to a new array and silently detaches the view, leaving weights
+updated while every view reads stale numbers. So the contract is checked rather than documented:
+
+  optimizer_class(name) routes through plugin.require_inplace, refusing optimizers that did not declare
+  works_inplace=True;
+  parameters() returns only the backing block, never the views;
+  assert_optimizer_ok() rejects an optimizer that was handed views.
+
+One test deliberately performs the out-of-place assignment and asserts np.shares_memory goes false. That
+is there to prove the hazard is real rather than theoretical, which is why the checks exist.
+
+Platform status is stated rather than implied: CPU works, CUDA does not in this version. GpuBuf shares a
+ptr for views but has no offset field, so an offset view would mean fabricating a ptr+offset buffer and
+touching every place that keys off ptr, including cache invalidation. That path can be wrong in ways
+nobody notices, so it raises instead.
+
+Suite: 630 passed / 31 skipped. Published as 0.9.43
+(sha256 1cffdcf1...8259, re-downloaded and compared).

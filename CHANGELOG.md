@@ -1,3 +1,47 @@
+## [0.9.43] - 2026-11-11
+
+**共享存储参数**（`T.ParameterGroup`）：多个参数共用同一块底层缓冲。
+
+### 为什么需要
+
+MoE 专家权重若连续存成 `[G, N, K]`，一次 `SgemmStridedBatched` 就能算完全部专家；
+否则每次都要先把 G 份权重复制成连续缓冲 —— 实测打包开销比省下的还多
+（`docs/MOE_MODERN_ARCH.md` 3.1：V2.7 慢 1.30×、256 专家慢 2.22×）。
+共享存储参数是「权重连续存」的数据模型基础。
+
+```python
+g = T.ParameterGroup([(4096, 1024)] * 8)        # 8 个专家权重
+y = x @ g.views[3].T                            # 视图可直接用于前向
+opt = T.optim.AdamW(g.parameters(), lr=1e-3)    # 优化器只拿底层那一块
+```
+
+### 契约（不遵守会静默出错，所以在**构造时**就拦）
+
+1. **只有 `works_inplace=True` 的优化器能用于本组** —— 出式更新
+   （`p.data = p.data - ...`）会把 `.data` 换成新数组、**断开视图**，
+   于是"权重更新了、视图还是旧值"。用 `group.optimizer_class(name)` 取优化器时
+   由 `plugin.require_inplace` 直接拒绝。
+2. **视图不能单独交给优化器**：`group.parameters()` 只返回底层那一块；
+   `group.assert_optimizer_ok(opt)` 会检查并报错。
+3. `group.assert_shared()` 自检视图确实共享内存。
+
+### 平台状态（如实，不含糊）
+
+| 平台 | 状态 |
+| --- | --- |
+| CPU（numpy） | ✅ **可用**，视图是切片、天然共享 |
+| CUDA | ❌ **本版不支持**：`GpuBuf` 支持共享 `ptr` 的视图，但**没有 offset 字段**；做偏移视图需新建 `ptr+offset` 缓冲，会触碰按 ptr 索引的缓存/提交逻辑。**明确报错，不静默返回错误结果。** |
+
+CUDA 支持是「零打包 → 分组 GEMM 收益」的前置条件，属后续工作。
+
+### 测试（8 条，`tests/test_param_group.py`）
+
+视图共享内存、紧密排布、`parameters()` 不含视图、`works_inplace` 强制、
+优化器拿到视图被拒、**实证"出式赋值会断开共享"**（用它来证明风险真实存在）、
+输入校验、`repr`。
+
+套件：**630 passed / 31 skipped**（+8）。
+
 ## [0.9.42] - 2026-11-11
 
 **能力模型 + 算子分派**：一个插件文件适配全部后端。这是接 Vulkan 的架构前提。
