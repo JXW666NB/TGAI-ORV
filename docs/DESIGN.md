@@ -358,6 +358,10 @@ def my_rmsnorm(x, w, y, eps):
 
 | 债 | 影响 | 处理建议 |
 | --- | --- | --- |
+| **梯度检查点显存回收弱于 PyTorch**（P100 实测：400M/16GB 上 torch 能跑、ORV OOM） | 直接削弱"省显存"这个核心卖点；16GB 卡上用不了 | 对齐 torch 的检查点回收；先做逐层激活生命周期审计 |
+| **NVRTC 依赖 DLL 定位不全**（`nvrtc-builtins64_*.dll` 找不到） | 首装即失败，用户必须自己改 PATH 才能起步 | 已修（0.9.50：`nvidia/*/lib`+`bin` 纳入搜索，并同时写进 PATH） |
+| **fp16 只覆盖前向 GEMM**，反向仍 fp32 | 无 Tensor Core 的卡（P100/Pascal）上收益远小于预期；而 torch autocast 前反向都覆盖 | 要么给反向也做 fp16，要么在文档里明确"fp16 不等于快" |
+| `Tensor` 缺 `cos` / `sin` | RoPE 类模型迁移需 numpy 预生成表 | 加两个一元算子 |
 | `ParameterGroup` 不支持 CUDA | 分组 GEMM 的收益拿不到 | 给 `GpuBuf` 加 offset 字段 + 复查所有按 ptr 索引的逻辑 |
 | 容量因子 CPU/CUDA 丢弃集合不同 | 开容量限制时 CPU 与 GPU 结果不一致（用户会在 CPU 调通、GPU 训练时看到分歧） | **可修，且不需要新内核**：`off`/`tok` 本就在主机侧，在主机上强制规范顺序（按 token 索引升序）即可。这不是硬件限制 |
 | Muon 3B 不可用 | 3B 只能用 AdamW | **不是硬件到顶**：实测 35 s 对比理想 ≈1.85 s（224 矩阵 × 5 步 × 3 GEMM，每矩阵理想 8.25 ms）⇒ 慢 **19 倍**，是内核效率问题。批处理已实测零收益（35018 vs 34993 ms），说明解药是提高单次 NS 的 GEMM 效率，不是批处理 |

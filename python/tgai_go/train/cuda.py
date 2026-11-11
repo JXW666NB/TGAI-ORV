@@ -2276,6 +2276,27 @@ def _dll_dirs():
         cand = os.path.join(entry, "torch", "lib")
         if os.path.isdir(cand):
             dirs.append(cand)
+    # ★ 2026-11-12 修（来自 P100 用户实测报告）：只扫 `torch/lib` 不够。
+    #   症状：`nvrtc: error: failed to open nvrtc-builtins64_118.dll`，
+    #   这两个 DLL 就在 `site-packages/torch/lib` 下，但进程找不到。
+    #   原因：`nvrtc64_*.dll` 是**懒加载** builtins 的，那条加载路径只看 PATH 与
+    #   add_dll_directory；而某些环境下只加后者仍失败（用户实测必须同时进 PATH）。
+    #   所以这里把 pip 装的 CUDA 轮子目录（nvidia/*/lib、nvidia/*/bin）也一并纳入。
+    for entry in list(sys.path):
+        if not entry:
+            continue
+        nv = os.path.join(entry, "nvidia")
+        if not os.path.isdir(nv):
+            continue
+        try:
+            subs = sorted(os.listdir(nv))
+        except OSError:
+            subs = []
+        for sub in subs:
+            for leaf in ("lib", "bin"):
+                cand = os.path.join(nv, sub, leaf)
+                if os.path.isdir(cand):
+                    dirs.append(cand)
     out = []
     seen = set()
     for d in dirs:
@@ -2292,6 +2313,16 @@ def _prepare_dir(path):
             os.add_dll_directory(path)
         except OSError:
             pass
+    # ★ 2026-11-12 修（P100 用户实测）：**必须同时进 PATH**。
+    #   `nvrtc64_*.dll` 懒加载 `nvrtc-builtins64_*.dll` 时，某些环境下只靠
+    #   `add_dll_directory` 找不到，但加进 PATH 就能找到。
+    #   用户实测的规避写法正是「PATH 前置 + add_dll_directory」两者都做。
+    try:
+        cur = os.environ.get("PATH", "")
+        if path and path not in cur.split(os.pathsep):
+            os.environ["PATH"] = path + (os.pathsep + cur if cur else "")
+    except Exception:      # noqa: BLE001
+        pass
 
 
 def _find_file(names, dirs):

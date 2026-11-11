@@ -1,3 +1,46 @@
+## [0.9.50] - 2026-11-12
+
+**修首装失败（NVRTC 依赖 DLL 找不到）**，并把一份**外部 P100 实测报告**的发现记入文档。
+
+### 修复：`nvrtc-builtins64_*.dll` 找不到
+
+外部用户在 **Tesla P100（sm_60，Windows，只有 PyTorch cu118，无 CUDA Toolkit）** 上首装即失败：
+
+```
+CudaError: NVRTC 编译失败 arch=compute_60
+nvrtc: error: failed to open nvrtc-builtins64_118.dll.
+```
+
+`nvrtc64_*.dll` 与 `nvrtc-builtins64_*.dll` 就在 `site-packages/torch/lib` 下，但进程找不到。
+用户的规避办法是「PATH 前置 + `os.add_dll_directory` **两者都做**」。
+
+原来 ORV 只扫 `sys.path/torch/lib` 并调用 `add_dll_directory` —— 不够。现在：
+
+1. 把 pip 装的 CUDA 轮子目录 `site-packages/nvidia/*/lib`、`nvidia/*/bin` 一并纳入搜索；
+2. `_prepare_dir()` 除了 `add_dll_directory`，**同时把目录前置进 `PATH`**
+   （这正是用户实测有效的做法）。
+
+### 一份重要的外部实测：P100 上 ORV 在 16GB 卡上反而 OOM
+
+同一份报告里还有更重的发现，已完整收入 `docs/REVIEW_P100_2026-11-12.md`：
+
+| 发现 | 影响 |
+| --- | --- |
+| 400M 稠密模型（20 层/d1280/B8/S2048）**PyTorch 能跑（14.18 GB），ORV 开检查点仍 OOM** | **直接削弱"省显存"这一核心卖点**；ORV 的检查点对激活的回收现在弱于 PyTorch |
+| fp16 **只覆盖前向 GEMM**，反向仍 fp32 | P100 无 Tensor Core，收益远小于 V100；而 torch autocast 前反向都覆盖 |
+| 缺 `cos`/`sin`、SDPA 参数约定与 torch 不同、MoE 36 专家 top-6 需重写 | 迁移成本高于预期 |
+| sm_60 本身支持，张量/模型/AdamW 能正常训练 | 硬件不是障碍，是软件缺口 |
+
+**README 已加适用范围声明**：`"比 PyTorch 省显存"目前只在 3B MoE / 32GB V100 这个已知组合上有证据`，
+不能外推。四处缺口已记入 `docs/DESIGN.md` 技术债表。
+
+### 说明
+
+本版**只修了** NVRTC DLL 定位。梯度检查点显存回收、反向 fp16、`cos`/`sin`、SDPA 约定
+这四项**尚未修**，已在技术债表与 README 里明确标注。
+
+套件：**656 passed / 36 skipped**（本次改动不影响数值路径）。
+
 ## [0.9.49] - 2026-11-11
 
 **Muon 3B 整步 35.0 s → 5.78 s（6.05×）**，并**更正一个我说错的结论**。
