@@ -1,0 +1,28 @@
+docs: add the plugin charter, and correct two claims I had overstated
+
+The charter is normative rather than descriptive: it states what must not happen, not roughly how things
+work. The reason to write it is that the plugin surface is now something other people's code depends on,
+and a promise broken quietly is worse than a feature missing -- missing means "cannot use", broken means
+"worked yesterday, computes the wrong thing today". It fixes seven invariants with a test mapped to each,
+six commitments to plugin authors, the compatibility and versioning rules, the security boundary that
+loading a native library means executing arbitrary machine code, and a review checklist that has to be
+walked before touching the plugin system. It also forbids a specific class of amendment: loosening an
+invariant so that some implementation can pass.
+
+tools/check_charter_refs.py verifies all seven referenced tests and documents actually exist, so the
+charter cannot cite protection that is not there.
+
+Two corrections, because I had both wrong:
+
+The capacity factor divergence is not a hardware problem. I claimed fixing it needed a sort kernel. The
+off and tok arrays are already host-side, so enforcing a canonical order there is enough. That matters
+because this one can reach users: someone who debugs on CPU and trains on GPU sees different tokens
+dropped when capacity is enabled.
+
+Muon at 3B is not at a hardware floor either. I had said FLOP-bound and unfixable. Working it out: 224
+matrices, five Newton-Schulz steps, roughly three GEMMs each, about 0.55 ms per GEMM ideally, gives roughly
+1.85 s against 35 s measured -- nineteen times off. So the constraint is our kernel efficiency, not the
+V100. What the batching experiment proved is only that batching is not the remedy; it never established
+that no remedy existed. Both corrections are now in DESIGN.md's debt table rather than left in chat.
+
+Documentation only, no code change, so the version stays 0.9.46.
