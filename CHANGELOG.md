@@ -1,3 +1,86 @@
+## [0.9.45] - 2026-11-11
+
+**修正 0.9.44 的分发缺口**：`torch-compat` 示例插件原来只放在 `examples/plugins/`，
+**sdist 与 wheel 都没带上** —— `pip install tgai-orv` 的用户拿不到，
+这跟"示例要能让所有人跑起来"的初衷矛盾。
+
+已把插件**移入包内**：`tgai_go/train/plugins/torch_compat.py`，随 wheel 与 sdist 一起分发。
+
+```python
+import tgai_go.train.plugins.torch_compat   # 导入即登记（只登记，不安装）
+import tgai_go.train as T
+T.plugin.activate("torch-compat")           # 显式激活
+import torch                                # 拿到的其实是 ORV
+```
+
+`examples/plugins/` 保留纯算子示例（softplus / gelu_exact / swiglu / squared_relu）。
+
+### 过程中撞到的一条项目纪律
+
+用 PowerShell 的 `Set-Content -Encoding UTF8` 创建 `__init__.py` 时写入了 **BOM 与 CRLF**，
+被项目既有的卫生检查（`test_hygiene.py` / `test_cpu.py`）立刻抓红：
+"BOM 会让 Python 报 invalid non-printable character"。
+已改用无 BOM + LF 重写。**写 Python 源文件不要用 PowerShell 的 Set-Content。**
+
+套件：**635 passed / 33 skipped**。
+
+## [0.9.44] - 2026-11-11
+
+**`torch-compat` 示例插件**：把 `torch` 这个名字指向 ORV。
+这是「**PyTorch 的 API 面本身可以是插件**」这个宣传点的**可运行证据**。
+
+### 用法
+
+```python
+import tgai_go.train as T
+T.plugin.load("examples/plugins/torch_compat.py")   # 从文件装
+T.plugin.activate("torch-compat")                   # 显式激活（会改 sys.modules）
+
+import torch, torch.nn as nn                        # 拿到的其实是 ORV
+m = nn.Linear(4, 8)
+opt = torch.optim.AdamW(m.parameters(), lr=1e-2)
+loss = (m(torch.tensor(x)) ** 2).mean()
+loss.backward(); opt.step()                         # 闭环跑通
+```
+
+这条能成立，说明**核心不必背 PyTorch 的 API 面** —— 社区一个文件就能补。
+
+### 安全边界（这是重点）
+
+**绝不覆盖真的 torch。** 若 `sys.modules["torch"]` 已被真 PyTorch 占用，本插件
+**拒绝安装**并报错，而不是悄悄替换 —— 否则用户会以为在用 PyTorch 而实际跑的是 ORV，
+这种混淆比功能缺失危险得多。
+
+这个边界在**全量测试里真实触发了**：套件中其它用例会 `import torch`（真的 PyTorch），
+于是 `test_import_torch_yields_orv` 与 `test_pytorch_style_loop_runs` 被正确跳过
+（skip 原因是"本进程已加载真 torch，插件会正确地拒绝覆盖"），而不是失败。
+
+### 覆盖范围（诚实声明，不夸大）
+
+| 已覆盖 | 未覆盖 |
+| --- | --- |
+| `torch.tensor / zeros / ones / randn` | `torchvision` / `torchaudio` 等生态包 |
+| `torch.Tensor`、`float32/float16/int64` | `torch.compile`、`torch.jit` |
+| `torch.nn`（Module/Linear/Embedding/LayerNorm/RMSNorm/Sequential/ModuleList/functional/MoE） | 二阶导数、`torch.func` |
+| `torch.optim`（AdamW/SGD/Adafactor/LAMB/Lion/Muon） | 分布式（DDP/FSDP） |
+| `torch.no_grad`、`torch.manual_seed`、`torch.cuda` | CUDA Graph 的公开 API |
+
+**这是最小可运行闭环，不是完整兼容层。** 要更完整，社区在这个文件上继续加即可 ——
+这正是插件系统的用途。
+
+### 顺带修掉一个命名限制
+
+`plugin.api` / `plugin.backend` 的名字原先要求是合法 Python 标识符，导致
+`torch-compat` 这种最自然的叫法被拒。已放宽：只有会挂成属性的层/优化器/骨架
+（`T.nn.<name>`）才要求标识符，登记键允许 `. _ -`。
+
+### 测试（7 条，`tests/test_torch_compat_plugin.py`）
+
+插件文件存在、只登记不自动激活、`import torch` 得到 ORV、**PyTorch 写法闭环跑通**、
+**拒绝覆盖真 torch**、卸载复原 `sys.modules`、重复加载幂等。
+
+套件：**635 passed / 33 skipped**（+7 条用例、+2 条正确跳过）。
+
 ## [0.9.43] - 2026-11-11
 
 **共享存储参数**（`T.ParameterGroup`）：多个参数共用同一块底层缓冲。

@@ -63,11 +63,25 @@ class PluginError(Exception):
 
 
 def _check_name(kind, name):
+    """层/优化器/骨架的名字必须是合法标识符 —— 它们会被挂成 `T.nn.<name>` 这类属性。"""
     name = str(name).strip()
     if not name or not name.isidentifier():
         raise PluginError(
             "%s 名字 %r 不是合法标识符" % (kind, name) +
             "。修法：用字母开头的标识符（如 my_layer），它会被挂成属性名")
+    return name
+
+
+def _check_key(kind, name):
+    """后端 / API 兼容层的名字只是登记键，**不**挂成属性，所以允许连字符等。
+
+    放宽的理由：像 `torch-compat` 这种叫法最自然，强行要求下划线是无谓的限制。
+    """
+    name = str(name).strip()
+    if not name or not all(c.isalnum() or c in "._-" for c in name):
+        raise PluginError(
+            "%s 名字 %r 非法" % (kind, name) +
+            "。修法：只用字母、数字与 . _ -（如 torch-compat、vulkan）")
     return name
 
 
@@ -166,7 +180,7 @@ def backend(name, factory, *, caps=None, replace=False):
 
     登记**不会**立即切换后端；要切换需 `plugin.activate(name)`。
     """
-    name = _check_name("backend", name)
+    name = _check_key("backend", name)
     if name in _BACKENDS and not replace:
         raise PluginError("后端 %r 已登记" % name +
                           "。修法：要覆盖请传 replace=True（会先检查没有插件依赖旧实现）")
@@ -273,7 +287,7 @@ def api(name, installer, *, replace=False):
     只登记、不执行 —— 因为这类插件有副作用（改 `sys.modules`），
     必须由用户显式 `plugin.activate(name)` 才会生效。
     """
-    name = _check_name("api", name)
+    name = _check_key("api", name)
     if name in _APIS and not replace:
         raise PluginError("API 兼容层 %r 已登记" % name + "。修法：要覆盖请传 replace=True")
     if not callable(installer):
