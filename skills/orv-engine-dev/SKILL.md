@@ -33,6 +33,21 @@ PyPI 包名 `tgai-orv`，import 路径 `tgai_go.train`。
    属于核心语义，插件不得改变。
 6. **改代码前先看 `docs/INDEX.md`。** 仓库有 70+ 篇文档，不先读会写出与既有结论冲突的东西。
 
+### 2.1 硬件已知限制（外部实测，2026-11-12 · P100）
+
+一位用户在 **Tesla P100 16GB（sm_60，无 Tensor Core）** 上实测，结论要先知道，别当成普适能力：
+
+| 项 | 事实 |
+| --- | --- |
+| **sm_60 本身支持** | NVRTC 能编译 `compute_60`，张量/模型/AdamW 正常训练 —— 硬件不是障碍 |
+| **首装可能报 `failed to open nvrtc-builtins64_*.dll`** | **0.9.50 已修**（会扫 `nvidia/*/lib`、`*/bin` 并写进 PATH）。仍失败时的规避：把 `site-packages/torch/lib` 前置进 `PATH` **并** 调 `os.add_dll_directory` |
+| **"比 PyTorch 省显存"有范围** | 只在 **3B MoE / 32GB V100** 有证据。400M 稠密 / 16GB 上 **PyTorch 能跑而 ORV 开检查点仍 OOM** —— 检查点回收目前弱于 torch |
+| **fp16 只覆盖前向 GEMM** | 反向仍 fp32。**无 Tensor Core 的卡上收益远小于 V100**，别以为开了 fp16 就快 |
+| **没有 `cos` / `sin`** | RoPE 类模型需 numpy 预生成表，再传给 `_rope_composed` 或引擎 |
+| **SDPA 维度约定** | 已接受 `is_causal=`，但输入要 `[B*H, S, Dh]`；torch 习惯是 `[B,H,S,Dh]` ⇒ 会报维度/广播错，需自己展平 |
+
+完整报告与复现步骤：`docs/REVIEW_P100_2026-11-12.md`。
+
 ---
 
 ## 3. 三条最容易踩的坑（真实发生过）
