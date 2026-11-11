@@ -4510,7 +4510,13 @@ class Muon(_Optim):
         #: Newton-Schulz 是否用 cuBLAS（`ns_fast=True`）。
         #: 默认 False = 顺序 FMA 内核，与 OpenBLAS 逐位一致但**很慢**
         #: （3B 有 2550 个张量要逐个正交化，实测 62.9 秒/步）。
-        #: 大模型请设 ns_fast=True：快一个数量级，代价是约 1e-7 量级的数值差异。
+        #: 大模型可设 ns_fast=True：实测 62.9 → 35.0 s/步（1.8×），代价是约 1e-7 量级差异。
+        #:
+        #: ★ 2026-11-11 实测结论：**Muon 在 3B 规模不可用**，与本开关无关。
+        #: Newton-Schulz 本身是 FLOP 密集型 —— 每个 [1024,4096] 矩阵 5 步 × 3 GEMM ≈ 96 GFLOP，
+        #: 224 个这样的矩阵合计约 21.6 TFLOP/步；V100 fp32 峰值 15.7 TFLOP/s，
+        #: 理论下限已约 1.4 秒，实测 35 秒（受带宽限制）。这是**算法固有代价**，不是实现缺陷。
+        #: 同卡上 AdamW 只要 0.709 s/步。要训 3B 请用 AdamW。
         self.ns_fast = bool(ns_fast)
         self.ns_steps = int(ns_steps)
         self.mom = momentum

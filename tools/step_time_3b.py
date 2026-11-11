@@ -71,7 +71,8 @@ def main(mode="muon-fp16", rep=3):
         opt = Fp16MomAdamW(all_params, lr=2e-4, weight_decay=0.1)
     else:
         opt = T.optim.Muon(all_params, lr=2e-4, momentum=0.95, weight_decay=0.0,
-                           fp16_mom=True, ns_fast=(mode == "muon-fast"))
+                           fp16_mom=True, ns_fast=(mode != "muon-fp32"),
+                           batch_ns=(mode == "muon-batch"))
     opt.set_layer_groups(groups)
     log("%s 状态 %.2f GiB；组 %d 个" % (mode, opt.state_bytes() / GIB, len(opt.all_groups())))
     peak()
