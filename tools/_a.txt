@@ -1,0 +1,36 @@
+docs: audit the real capability state and prepare for outside contributors
+
+Before inviting people to help, the project needs one honest statement of what exists. Two things were in
+the way: the gap analysis from 2026-11-02 claims features as missing that are now present, and the docs
+index references nine tools that were never carried into this repository. Trusting either would make a new
+contributor waste their first day.
+
+tools/inventory.py now generates docs/CAPABILITY_AUDIT.md from source and tests rather than from memory, so
+the numbers can be re-derived: 49 modules, 233 backend interface methods, 101 CUDA kernels, 16 nn exports,
+13 optimizers, 616 test cases.
+
+docs/COMMUNITY_ONBOARDING.md is the entry point, and its value is in the three-way split. Verified means
+there is a measurement behind it. Implemented-but-unverified means the code exists and has never met the
+hardware -- distributed data parallel, and the Vulkan backend, which runs bit-exact on an AMD iGPU but is
+20-150x slower than numpy because it submits and reads back per op. Not implemented means what it says: the
+DSL generators, dump_code, stats, cross-backend mixing, automatic OOM fallback. Someone picking up work
+needs to know which of those three they are starting from.
+
+The stale documents are marked rather than deleted. GAP_VS_PYTORCH.md gets a dated banner listing the four
+conclusions that no longer hold, and keeps its measurement narrative, which is the part worth preserving
+including its own self-corrections. README_OLD_0.2.md moved to docs/archive. The nine GO-era tool
+references in the index are labelled as not present in this repository instead of being silently dropped.
+
+The onboarding doc also carries the five rules a contributor has to accept, since each one exists because
+something went wrong: do not call it verified without a reproducible number, do not write unverified as
+supported, error messages must state how to fix, no per-element Python on the hot path, and plugins may be
+faster but may not change core numerical semantics.
+
+Finally it records the backend-mixing idea as design only, with the three constraints that matter more than
+the feature: implicit cross-backend copies are the main hazard because they turn into silent 10-100x
+slowdowns, heterogeneous cards have no peer-to-peer path so only pipeline parallelism is viable, and
+different vendors round differently, which costs reproducibility. Step one is a device descriptor plus an
+explicit copy_to that refuses implicit movement -- which is also the prerequisite for multi-GPU, so the two
+efforts share a foundation.
+
+Documentation only, no code change; version stays 0.9.49. Suite: 656 passed / 36 skipped.

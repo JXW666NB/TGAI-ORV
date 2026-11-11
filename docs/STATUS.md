@@ -1,5 +1,7 @@
 # 现状与证据（给接手的人）
 
+> ⚠️ 本文为快照；最新能力清单见 `CAPABILITY_AUDIT.md`。
+
 > 这份文件回答三个问题：**现在到底能干什么、证据在哪、还差什么**。
 > 判据与实验细节在 [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md)，
 > 微调全部实验（含失败）在 [FINETUNE_RESULTS.md](FINETUNE_RESULTS.md)，

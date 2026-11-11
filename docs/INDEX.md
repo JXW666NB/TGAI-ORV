@@ -78,6 +78,7 @@
 
 | 脚本 | 验证什么 |
 |---|---|
+| ⚠️ 下表脚本**本仓库未包含** | 它们是 TGAI GO（推理侧）的工具，建 ORV 仓库时未带入。归档位置请查 GO 工程；要恢复请从 GO 侧移植 |
 | `tools/verify_bpe_v27.py` | 分词与 HF 一致（应 0/11 不一致）|
 | `tools/verify_bf16_v2.py` | BF16 逐位无损 |
 | `tools/verify_bf16_direct.py` | BF16 直算 A/B（内存/速度/数值）|
@@ -113,5 +114,16 @@
 | `measurements/README.md` | 32 份原始测量/排查输出的索引（性能、显存、数值、失败排查、训练日志），README 与 ROADMAP 里的数字都源自它们 |
 
 ---
+
+
+## 十一、社区参与（2026-11-11 新增）
+
+| 文档 | 说明 |
+|---|---|
+| ★ \COMMUNITY_ONBOARDING.md\ | **想帮忙的人先读这个**：10 分钟知道现在有什么/缺什么/我能干什么，含参与前必知的 5 条纪律 |
+| \CAPABILITY_AUDIT.md\ | 脚本生成的能力清单（49 模块 / 233 后端方法 / 101 CUDA 内核 / 616 测试用例），可复核 |
+| \rchive/README_OLD_0.2.md\ | 0.2 版旧 README，仅存档 |
+
+> \GAP_VS_PYTORCH.md\、\STATUS*.md\ 是历史快照，已加时效声明；最新能力以 \CAPABILITY_AUDIT.md\ 为准。
 
 *最后更新：2026-11-11*
