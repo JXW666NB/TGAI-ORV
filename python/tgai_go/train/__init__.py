@@ -4053,7 +4053,8 @@ class MoE(Module):
         Expert:   h = silu(x @ gate.T) * (x @ up.T);  out = h @ down.T
     """
 
-    def __init__(self, d_model, d_ff, n_experts, top_k=2, gate="softmax", qb_bias=None):
+    def __init__(self, d_model, d_ff, n_experts, top_k=2, gate="softmax", qb_bias=None,
+                 n_shared=0, shared_d_ff=None):
         super().__init__()
         d_model = int(d_model)
         d_ff = int(d_ff)
@@ -4080,6 +4081,33 @@ class MoE(Module):
         self.experts = _ExpertList([
             _MoEExpert(d_model, d_ff) for _ in range(n_experts)
         ])
+        #: **共享专家**（DeepSeekMoE / Llama 4 做法）：所有 token 恒定经过、**不参与路由**，
+        #: 输出直接与路由输出**相加**。作用是吸收通用知识，让路由专家专注特化。
+        #: 为什么必须有：现代主流 MoE（DeepSeek-V3 1 个、Llama 4 各 1 个）都带共享专家；
+        #: 没有它，ORV 训不了这些结构。n_shared=0 时行为与加入该功能前完全一致。
+        self.n_shared = int(n_shared)
+        if self.n_shared < 0:
+            raise ValueError(
+                "n_shared 必须 ≥ 0，收到 %d" % self.n_shared +
+                "。修法：共享专家数量是自然数；不需要共享专家时用默认值 0")
+        self.shared_d_ff = int(shared_d_ff) if shared_d_ff else int(d_ff)
+        if self.shared_d_ff < 1:
+            raise ValueError(
+                "shared_d_ff 必须 ≥ 1，收到 %d" % self.shared_d_ff +
+                "。修法：共享专家可以不设（默认等于 d_ff），设了就要给正数")
+        self.shared_experts = _ExpertList([
+            _MoEExpert(d_model, self.shared_d_ff) for _ in range(self.n_shared)
+        ])
+
+    def _add_shared(self, x, out):
+        """把共享专家的输出加到路由输出上。
+
+        在 `_forward_flat` 这一层做，所以 **CPU 与 CUDA 两条路径自动同时生效**
+        —— 不会出现"一条实现、一条没实现"的数值不一致。
+        """
+        for e in self.shared_experts:
+            out = out + _moe_swiglu(x, e)
+        return out
 
     def forward(self, x):
         if not isinstance(x, Tensor):
@@ -4108,8 +4136,10 @@ class MoE(Module):
             # 依据 tgai_engine.c:1120「router logits 先加本偏置，再做 top-k」
             logits = logits + self.qb_bias
         if getattr(x, "device", "cpu") == "cuda":
-            return self._combine_cuda(x, logits)
-        return self._combine_cpu(x, logits)
+            out = self._combine_cuda(x, logits)
+        else:
+            out = self._combine_cpu(x, logits)
+        return self._add_shared(x, out)
 
     def _weights_cpu(self, logits, idx):
         n, k = int(idx.shape[0]), int(idx.shape[1])
