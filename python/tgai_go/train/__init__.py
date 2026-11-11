@@ -4054,7 +4054,7 @@ class MoE(Module):
     """
 
     def __init__(self, d_model, d_ff, n_experts, top_k=2, gate="softmax", qb_bias=None,
-                 n_shared=0, shared_d_ff=None):
+                 n_shared=0, shared_d_ff=None, balance="none", aux_free_lr=1e-3):
         super().__init__()
         d_model = int(d_model)
         d_ff = int(d_ff)
@@ -4098,6 +4098,19 @@ class MoE(Module):
         self.shared_experts = _ExpertList([
             _MoEExpert(d_model, self.shared_d_ff) for _ in range(self.n_shared)
         ])
+        #: 负载均衡方案。
+        #: "none"（默认）= 不均衡，与旧行为逐位相同；
+        #: "aux_free" = DeepSeek-V3 的免辅助损失方案（arXiv 2408.15664）。
+        if balance not in ("none", "aux_free"):
+            raise ValueError(
+                "balance 只接受 'none' / 'aux_free'，收到 %r" % (balance,) +
+                "。修法：需要 V3 的免辅助损失平衡就写 'aux_free'，否则用默认 'none'")
+        self.balance = balance
+        self.aux_free_lr = float(aux_free_lr)
+        #: 每个专家的选择偏置 b_i（**buffer，不是 Parameter**）。
+        #: 只参与 top-k 选择，不进门控权重、不进梯度图、不由优化器更新。
+        self.expert_bias = np.zeros(n_experts, dtype=np.float32)
+        self._last_idx = None
 
     def _add_shared(self, x, out):
         """把共享专家的输出加到路由输出上。
@@ -4128,6 +4141,9 @@ class MoE(Module):
             raise ValueError("MoE token 数过大" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         flat = x.reshape((n, self.d_model))
         y = flat * 0.0 if n == 0 else self._forward_flat(flat)
+        if self.balance == "aux_free" and getattr(self, "training", True) and n > 0:
+            # V3 的 bias 更新每步一次、在图外做（不进梯度图）
+            self._update_expert_bias(n)
         return y.reshape(tuple(int(s) for s in x.shape))
 
     def _forward_flat(self, x):
@@ -4135,11 +4151,35 @@ class MoE(Module):
         if getattr(self, "qb_bias", None) is not None:
             # 依据 tgai_engine.c:1120「router logits 先加本偏置，再做 top-k」
             logits = logits + self.qb_bias
+        sel_logits = None
+        if self.balance == "aux_free":
+            # ★ aux-loss-free（DeepSeek-V3, arXiv 2408.15664）：
+            #   sel_logits = logits + b_i 只用于**选专家**；
+            #   门控权重仍用原始 logits（由 _combine_* 保证），b_i 不进梯度图。
+            sel_logits = logits + _as_tensor(self.expert_bias)
         if getattr(x, "device", "cpu") == "cuda":
-            out = self._combine_cuda(x, logits)
+            out = self._combine_cuda(x, logits, sel_logits)
         else:
-            out = self._combine_cpu(x, logits)
+            out = self._combine_cpu(x, logits, sel_logits)
         return self._add_shared(x, out)
+
+    def _update_expert_bias(self, n):
+        """按 DeepSeek-V3 的符号更新调整 b_i（**不进梯度图、不由优化器更新**）。
+
+        b_i ← b_i − u·sign(c_i − c̄_i)，c_i 是本步该专家收到的 token 数，
+        c̄_i = T·k/N 是均匀分布的期望。过载则降 bias，欠载则升 bias。
+
+        用 `_last_idx`（combine 里**已经算出来的**那份索引），不重算 router ——
+        既省一次 GEMM，也保证"统计的确实是被执行的那次选择"。
+        """
+        idx = getattr(self, "_last_idx", None)
+        if idx is None or n <= 0:
+            return
+        c = np.bincount(np.asarray(idx, np.int64).ravel(),
+                        minlength=self.n_experts).astype(np.float64)
+        c_bar = float(n * self.top_k) / float(self.n_experts)
+        self.expert_bias = (self.expert_bias -
+                            self.aux_free_lr * np.sign(c - c_bar)).astype(np.float32)
 
     def _weights_cpu(self, logits, idx):
         n, k = int(idx.shape[0]), int(idx.shape[1])
@@ -4152,10 +4192,15 @@ class MoE(Module):
             return functional.softmax(logits[rows, cols], axis=-1)
         return functional.softmax(logits, axis=-1)[rows, cols]
 
-    def _combine_cpu(self, x, logits):
+    def _combine_cpu(self, x, logits, sel_logits=None):
         n = int(x.shape[0])
         d = int(x.shape[1])
-        idx = _moe_topk_idx(logits.data, self.top_k)
+        # ★ aux-loss-free：**用 sel_logits 选专家，用 logits 算门控权重**。
+        # 两者在普通模式下是同一个张量；aux-free 时 sel_logits = logits + bias，
+        # bias 只影响"选谁"，绝不进门控权重，否则会污染主梯度。
+        sel = logits if sel_logits is None else sel_logits
+        idx = _moe_topk_idx(sel.data, self.top_k)
+        self._last_idx = np.asarray(idx, np.int64)   # 供 aux-loss-free 统计负载，不重算
         w = self._weights_cpu(logits, idx)
         acc = None
         for e, expert in enumerate(self.experts):
@@ -4179,13 +4224,23 @@ class MoE(Module):
             return x * 0.0
         return acc
 
-    def _combine_cuda(self, x, logits):
+    def _combine_cuda(self, x, logits, sel_logits=None):
         rt = _cuda()
         n = int(x.shape[0])
         d = int(x.shape[1])
         k = self.top_k
         n_exp = self.n_experts
-        idx_buf, val_buf = rt.moe_topk(logits._gpu, k)
+        # ★ aux-loss-free：idx 从 sel_logits（含 bias）选，**权重值必须从原始 logits 取**。
+        # 所以这里只借 sel_logits 拿 idx；val_buf 来自它，只在不带 bias 时才可当权重用。
+        aux_free = sel_logits is not None
+        if aux_free:
+            idx_buf, _ = rt.moe_topk(sel_logits._gpu, k)
+            val_buf = rt.moe_gather_pairs(logits._gpu, idx_buf, n, n_exp, k)
+        else:
+            idx_buf, val_buf = rt.moe_topk(logits._gpu, k)
+        # 供 aux-loss-free 统计负载（只在需要时拉回主机）
+        if self.balance == "aux_free":
+            self._last_idx = np.asarray(rt.d2h(idx_buf), np.int64).reshape(n, k)
         if self.gate == "sigmoid":
             sel = Tensor._from_gpu(
                 val_buf, requires_grad=logits.requires_grad, _parents=(logits,))
