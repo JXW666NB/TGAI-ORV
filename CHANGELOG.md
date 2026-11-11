@@ -1,3 +1,32 @@
+## [0.9.36] - 2026-11-11
+
+补上分组 GEMM 的 **pytest 守卫**（验收原文要求「数值对照 ≤1e-5 且有 pytest 守住」）。
+四条断言已在真实 V100 上全部 PASS。
+
+### 新增 `tests/test_moe_grouped_fallback.py`
+
+| 用例 | 锁住的保证 | 真 GPU 结果 |
+| --- | --- | --- |
+| `test_non_uniform_shapes_fall_back_and_match_exactly` | 形状不一致时回退，与逐次 `gemm_nt` **逐位一致** | PASS（差 0.00e+00） |
+| `test_uniform_shapes_never_crash_and_stay_correct` | 形状一致时走分组，**无论成败不崩、数值 ≤1e-5** | PASS |
+| `test_moe_grouped_switch_defaults_off` | `TGAI_MOE_GROUPED` 默认关闭 ⇒ 关闭时行为与加分组前一致 | PASS |
+| `test_grouped_helpers_exist` | 运行时原语存在，避免静默回退掩盖缺失 | PASS |
+
+无 CUDA 的机器上后两条自动 skip（本地实测 1 passed / 3 skipped）。
+
+### 为什么必须锁住这几条
+
+2026-11-11 之前 `_grouped_ready()` 按 Ex 版签名调非 Ex 版符号，
+驱动把指针低 32 位当 `m` 读 ⇒ **必然非法访存（rc=700）**。
+因为当时它默认关闭，所以**没人发现**。现在有四道断言挡住回归。
+
+### 工具
+
+`tools/run_grouped_tests.py` —— 在无 pytest 的机器上直接调用同一批断言函数
+（GPU 机器原先没有 pytest，本版已安装 9.2.0，两条路都能跑）。
+
+套件：本地 **568 passed / 31 skipped**（新增 1 pass + 3 skip）。
+
 ## [0.9.35] - 2026-11-11
 
 **定论：Muon 在 3B 规模不可用，且这是算法固有限制。** 两种优化都实测无效。

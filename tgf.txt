@@ -1,0 +1,5 @@
+rc=0
+PASS  test_grouped_helpers_exist
+PASS  test_moe_grouped_switch_defaults_off
+PASS  test_non_uniform_shapes_fall_back_and_match_exactly
+PASS  test_uniform_shapes_never_crash_and_stay_correct
