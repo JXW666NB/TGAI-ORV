@@ -70,9 +70,11 @@ def main(mode="muon-fp16", rep=3):
         from tgai_go.train.opt_fp16mv import Fp16MomAdamW
         opt = Fp16MomAdamW(all_params, lr=2e-4, weight_decay=0.1)
     else:
+        # 注：`batch_ns` 已删除 —— 按形状分组批量做 Newton-Schulz 实测零收益
+        # （35018 ms vs 34993 ms），说明瓶颈从不是启动次数。真正的瓶颈是
+        # `sumsq_sequential`（单线程归约，101 ms/矩阵），0.9.49 已改并行。
         opt = T.optim.Muon(all_params, lr=2e-4, momentum=0.95, weight_decay=0.0,
-                           fp16_mom=True, ns_fast=(mode != "muon-fp32"),
-                           batch_ns=(mode == "muon-batch"))
+                           fp16_mom=True, ns_fast=(mode != "muon-fp32"))
     opt.set_layer_groups(groups)
     log("%s 状态 %.2f GiB；组 %d 个" % (mode, opt.state_bytes() / GIB, len(opt.all_groups())))
     peak()

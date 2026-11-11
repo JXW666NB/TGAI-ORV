@@ -4644,7 +4644,15 @@ def _newton_schulz5_gpu(rt, x, steps=5, eps=1e-7, fast=False):
     if int(x.shape[0]) > int(x.shape[1]):
         x = rt.transpose2d(x)
         transposed = True
-    sumsq = rt.read_scalar(rt.sumsq_sequential(x))
+    # ★ 2026-11-11 实测定位：这一行曾是 Muon 35 s/步的**唯一主因**。
+    #   `sumsq_sequential` 是**单线程顺序归约**（当年为了与 OpenBLAS 逐位一致），
+    #   实测单个 [1024,4096] 矩阵就要 **101 ms**（含 read_scalar 同步），
+    #   而 5 步 NS 的纯 GEMM 只要 9.3 ms —— 91% 的时间花在这里，不是算力问题。
+    #   `fast=True` 本来就已放弃逐位一致（cuBLAS 单次 ~3e-8），
+    #   所以这里同步改用两趟**并行**归约 `sumsq_parallel`。
+    #   顺序版保留给 `fast=False`（需要与 numpy 逐位对齐的场合）。
+    sumsq = rt.read_scalar(
+        rt.sumsq_parallel(x) if fast else rt.sumsq_sequential(x))
     nrm = np.sqrt(np.float32(sumsq))
     denom = np.float32(nrm + np.float32(eps))
     x = rt.div_scalar(x, float(denom))
