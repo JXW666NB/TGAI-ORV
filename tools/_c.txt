@@ -1,0 +1,25 @@
+feat(moe): capacity factor with residual bypass, plus fix a shadowed-builtin bug it exposed
+
+Modern MoE caps how many tokens an expert takes (C = ceil(alpha*T*k/N)) because expert-parallel
+training needs statically sized buffers. Tokens past the cap lose that expert's contribution but keep
+their residual, which is Switch/Mixtral/DeepSeek's residual-bypass behaviour. Added capacity_factor,
+defaulting to None so nothing changes unless asked.
+
+Writing it exposed a real bug. I used Python's builtin min inside _clamp_offsets, but this module
+shadows min with the tensor API (_api_min), so on CUDA it raised "max/min not implemented" instead of
+comparing two integers. Added _builtin_min beside the existing _builtin_max. Worth remembering: inside
+this module min and max cannot be used for scalar comparisons.
+
+The GPU run also produced a limitation I would rather state than hide. Both paths respect the cap but
+they do not keep the same tokens, because CPU and CUDA order the compact differently. At cap=24 with 96
+tokens the clamped counts agree ([17,21,24,24,24,16,24,24]) while CPU ends up with 3 tokens whose both
+experts were dropped and CUDA with none. So CPU and CUDA are no longer bit-comparable when capacity is
+on. Making them agree needs priority ordering by gate weight, which needs a sort kernel I did not
+write. The code comment and the docs say to stay on one backend while using capacity.
+
+Six tests cover the capacity formula across several T and alpha, that tokens actually get dropped,
+that the residual path survives, gradient sanity for dropped rows, that shared experts ignore the cap,
+and input validation.
+
+Suite: 593 passed / 31 skipped. Published as 0.9.40
+(sha256 cf80286b...bee5, re-downloaded and compared).

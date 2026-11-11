@@ -1,3 +1,61 @@
+## [0.9.40] - 2026-11-11
+
+**MoE 支持容量因子与残差旁路**（Switch / GShard / Mixtral / DeepSeek 的工程必配项）。
+
+### 语义
+
+```
+C = ceil(α · T · k / N)        每个专家最多接收 C 个 token
+```
+
+超过容量的 token 在本层**拿不到该专家的贡献**（MoE 输出记为 0），
+但它在 block 里的残差 `x` 仍原样流过去 —— 这就是 **residual bypass**。
+Switch / Mixtral / DeepSeek 都是这个做法：丢的是「专家加工」，不是「整个 token」。
+
+多卡 Expert Parallel 必须设（要静态分配缓冲）；单卡可不设。
+
+### 新增 API
+
+```python
+T.nn.MoE(..., capacity_factor=1.25)   # 默认 None = 不限制，与旧行为逐位相同
+```
+
+### ⚠️ 一个必须知悉的限制（实测发现，已写进代码注释）
+
+**开启容量限制后，CPU 与 CUDA 保留的 token 集合可能不同。**
+两边都严格遵守 cap，但"丢哪些"不一致 —— 因为 CPU 的排序序与 CUDA `moe_compact`
+的到达序不同。
+
+实测（cap=24，96 token）：
+
+```
+截断前 counts = [17, 21, 30, 27, 26, 16, 26, 29]
+截断后 counts = [17, 21, 24, 24, 24, 16, 24, 24]     ← cap 生效，两边一致
+CPU 有 3 个 token 两个专家全被丢；CUDA 为 0
+```
+
+⇒ **用容量限制时请固定用同一个后端。** 要做到跨后端一致，需要按门控权重排序后再截断
+（GShard 的优先路由），那需要一次排序内核，本版未做。
+
+### 顺带修掉一个真 BUG
+
+`_clamp_offsets` 里用了 Python 内置 `min`，但 **ORV 在模块命名空间里把 `min`
+遮蔽成了张量 API**（`_api_min`），导致在 CUDA 上抛「max/min 尚未实现」。
+已加 `_builtin_min = min` 别名（与已有的 `_builtin_max` 对称）。
+
+这个坑值得记下来：ORV 模块内**不能直接用 `min`/`max` 做标量比较**。
+
+### 测试（6 条，`tests/test_moe_capacity.py`）
+
+1. `capacity_factor=None` 与旧行为逐位相同；
+2. 容量公式 `ceil(α·T·k/N)` 正确（多组 T/α 交叉验证）；
+3. 容量收紧时确实有 token 被丢（MoE 输出整行为 0）；
+4. 被丢 token 的反向正常（无 nan 梯度）；
+5. **共享专家不受容量限制**（它不参与路由）；
+6. `capacity_factor ≤ 0` 报错。
+
+套件：**593 passed / 31 skipped**（+6）。
+
 ## [0.9.39] - 2026-11-11
 
 **MoE 支持 Z-loss**（ST-MoE, arXiv:2202.08906）—— router 的数值稳定手段。

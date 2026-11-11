@@ -80,6 +80,9 @@ import numpy as np
 
 # 模块最后会把 max 绑成 torch.max。这两处要的是内置 max，先留住。
 _builtin_max = max
+#: 本模块把 `min` 遮蔽成了张量 API（`_api_min`），所以内置 min 必须留一个别名，
+#: 否则标量比较会被误当成张量运算（在 CUDA 上会抛 "max/min 尚未实现"）。
+_builtin_min = min
 
 
 def _f32(x):
@@ -4055,7 +4058,7 @@ class MoE(Module):
 
     def __init__(self, d_model, d_ff, n_experts, top_k=2, gate="softmax", qb_bias=None,
                  n_shared=0, shared_d_ff=None, balance="none", aux_free_lr=1e-3,
-                 z_loss_coef=0.0):
+                 z_loss_coef=0.0, capacity_factor=None):
         super().__init__()
         d_model = int(d_model)
         d_ff = int(d_ff)
@@ -4117,6 +4120,15 @@ class MoE(Module):
         #: **调用方需自己把它加到总 loss 上**（ORV 不替你改 loss，避免隐式行为）。
         self.z_loss_coef = float(z_loss_coef)
         self.z_loss = None
+        #: 每专家容量因子 α（`C = ceil(α·T·k/N)`）。None = 不限制（默认，与旧行为一致）。
+        #: 多卡 Expert Parallel 必须设；单卡可不设。超容量走**残差旁路**。
+        if capacity_factor is not None:
+            capacity_factor = float(capacity_factor)
+            if capacity_factor <= 0:
+                raise ValueError(
+                    "capacity_factor 必须 > 0，收到 %r" % (capacity_factor,) +
+                    "。修法：常用 1.0~1.25；不想限制就用默认 None")
+        self.capacity_factor = capacity_factor
 
     def _add_shared(self, x, out):
         """把共享专家的输出加到路由输出上。
@@ -4151,6 +4163,49 @@ class MoE(Module):
             # V3 的 bias 更新每步一次、在图外做（不进梯度图）
             self._update_expert_bias(n)
         return y.reshape(tuple(int(s) for s in x.shape))
+
+    def _capacity(self, n):
+        """每专家容量 `C = ceil(α · T · k / N)`；未开启返回 None。
+
+        为什么需要：多卡 Expert Parallel 下必须静态分配缓冲，不能让某专家无限收 token。
+        单卡其实可以不设；默认 None = 不限制（与旧行为一致）。
+
+        超过容量的 token 在本层**拿不到该专家的贡献**（输出记为 0），
+        但它在 block 里的残差 `x` 仍然流过去 —— 这就是 **residual bypass**，
+        Switch / Mixtral / DeepSeek 的默认做法：丢的是"专家加工"，不是"整个 token"。
+        """
+        if self.capacity_factor is None:
+            return None
+        import math as _math
+        cap = _math.ceil(float(self.capacity_factor) * float(n) * float(self.top_k)
+                         / float(self.n_experts))
+        return _builtin_max(1, int(cap))
+
+    @staticmethod
+    def _clamp_offsets(off, cap):
+        """把专家偏移数组逐段截断到 `cap`。
+
+        截断的是「每个专家保留前 cap 个 token」，顺序是 compact 之后的顺序。
+
+        ⚠️ **已知限制（实测，务必知悉）**：CPU 与 CUDA 的 compact 顺序不同，
+        因此开启容量限制后**两条路径保留的 token 集合可能不同** —— 都严格遵守 cap，
+        但"丢哪些"不一致，所以**容量开启时 CPU/CUDA 不再逐位可比**。
+        实测：cap=24 时 CUDA 丢掉 18 个槽位、CPU 丢掉 18 个槽位但落到不同 token 上
+        （CPU 有 3 个 token 两个专家全被丢，CUDA 为 0）。
+
+        要做到跨后端一致，需要**按门控权重排序后再截断**（GShard 的优先路由），
+        那需要一次排序内核，本版未做。**用容量限制时请固定用同一个后端。**
+        """
+        off = np.asarray(off, np.int32).reshape(-1)
+        out = np.empty_like(off)
+        out[0] = off[0]
+        for e in range(1, off.size):
+            cnt = int(off[e]) - int(off[e - 1])
+            # ★ 必须用 Python 内置 min：本模块把 `min` 遮蔽成了张量 API（`_api_min`），
+            #   直接写 min(...) 会去调张量版本，在 CUDA 上抛 "max/min 尚未实现"。
+            #   这正是模块里到处用 `_builtin_max` 的原因。
+            out[e] = out[e - 1] + _builtin_min(cnt, cap)
+        return out
 
     def _router_z_loss(self, logits):
         """ST-MoE 的 Z-loss：`β · Σ_t (logsumexp(s_t))²`，压制 router logit 幅值。
@@ -4225,6 +4280,7 @@ class MoE(Module):
         sel = logits if sel_logits is None else sel_logits
         idx = _moe_topk_idx(sel.data, self.top_k)
         self._last_idx = np.asarray(idx, np.int64)   # 供 aux-loss-free 统计负载，不重算
+        cap = self._capacity(n)
         w = self._weights_cpu(logits, idx)
         acc = None
         for e, expert in enumerate(self.experts):
@@ -4238,6 +4294,10 @@ class MoE(Module):
                         slot.append(s)
             if not tok:
                 continue
+            if cap is not None and len(tok) > cap:
+                # 超容量：保留前 cap 个（到达序），其余丢弃 ⇒ 残差旁路
+                tok = tok[:cap]
+                slot = slot[:cap]
             tok_a = np.asarray(tok, dtype=np.int64)
             slot_a = np.asarray(slot, dtype=np.int64)
             y = _moe_swiglu(x[tok_a], expert)
@@ -4296,6 +4356,11 @@ class MoE(Module):
         off_buf, tok_buf, slot_buf = rt.moe_compact(idx_buf, n, n_exp, k)
         # 只有 E+1 个计数回到主机，用来跳过空专家。激活留在设备上。
         off = np.asarray(rt.d2h(off_buf), dtype=np.int32).reshape(-1)
+        cap = self._capacity(n)
+        if cap is not None:
+            # 容量限制在这里做：截断每专家的 token 段，下游 gather/scatter 全部按新 off 走。
+            # 被截掉的 token 拿不到该专家的贡献 ⇒ 残差旁路（与 CPU 路径语义一致）。
+            off = self._clamp_offsets(off, cap)
         grouped = _moe_grouped_cuda(
             x, w, tok_buf, slot_buf, off, self.experts, n, d, k)
         if grouped is not None:
