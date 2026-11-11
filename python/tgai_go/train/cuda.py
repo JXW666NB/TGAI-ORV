@@ -478,6 +478,30 @@ extern "C" __global__ void ewise_abs_bwd(const float* a, const float* g, float* 
     if (i < n) c[i] = (a[i] > 0.f) ? g[i] : ((a[i] < 0.f) ? -g[i] : 0.f);
 }
 
+/* cos / sin：RoPE 等位置编码需要。反向分别是 -sin(x) 与 cos(x)。
+   与 numpy 一致：用 cosf/sinf，不做快速近似（__cosf 精度不够）。 */
+extern "C" __global__ void ewise_cos(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = cosf(a[i]);
+}
+
+extern "C" __global__ void ewise_sin(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = sinf(a[i]);
+}
+
+/* d/dx cos(x) = -sin(x) */
+extern "C" __global__ void ewise_cos_bwd(const float* a, const float* g, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = -sinf(a[i]) * g[i];
+}
+
+/* d/dx sin(x) = cos(x) */
+extern "C" __global__ void ewise_sin_bwd(const float* a, const float* g, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = cosf(a[i]) * g[i];
+}
+
 extern "C" __global__ void ewise_relu(const float* a, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) c[i] = (a[i] > 0.f) ? a[i] : 0.f;
@@ -4649,6 +4673,44 @@ class CudaRuntime:
             grid, block = self._ewise_grid(a.n)
             self.launch("ewise_abs_bwd", grid, block, [
                 self._ptr(a), self._ptr(g), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def cos(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_cos", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def sin(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_sin", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def cos_bwd(self, a, g):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_cos_bwd", grid, block, [
+                self._ptr(a), self._ptr(g), self._ptr(out),
+                (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def sin_bwd(self, a, g):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_sin_bwd", grid, block, [
+                self._ptr(a), self._ptr(g), self._ptr(out),
+                (int(a.n), ctypes.c_int),
             ])
         return out
 

@@ -8,13 +8,13 @@
 | 项 | 数量 |
 | --- | --- |
 | Python 模块（不含下划线开头） | 49 |
-| 后端接口方法（`rt.*`） | 233 |
-| CUDA 内核 | 101 |
+| 后端接口方法（`rt.*`） | 237 |
+| CUDA 内核 | 105 |
 | `nn` 命名空间导出 | 16 |
 | 核心优化器 | 13 |
-| 测试文件 | 116 |
-| 测试用例 | 616 |
-| `cuda.py` 规模 | 281 KB |
+| 测试文件 | 118 |
+| 测试用例 | 626 |
+| `cuda.py` 规模 | 285 KB |
 
 ## 模块清单
 
@@ -29,7 +29,7 @@
 | `checkpoints.py` | 23 | `CheckpointError`, `Checkpoint` | `map_gguf_name`, `load_gguf`, `hf_name_to_ours`, `load_safetensors_dir`, `save_npz`, `load_npz`, `fix_linear_layout`, `norm_sanity` |
 | `ckpt.py` | 8 | — | `read_tok_blob`, `names_sidecar_path`, `read_names_sidecar`, `iter_named_tensors`, `save_checkpoint`, `load_checkpoint`, `list_checkpoints`, `rotate` |
 | `conv.py` | 12 | `Conv2d`, `Conv1d` | `conv2d`, `conv1d` |
-| `cuda.py` | 281 | `CudaError`, `GpuBuf`, `CudaRuntime` | `fp16_env_requested`, `bf16_env_requested`, `fp16_split_env_requested`, `attn_nop_source_path`, `runtime` |
+| `cuda.py` | 285 | `CudaError`, `GpuBuf`, `CudaRuntime` | `fp16_env_requested`, `bf16_env_requested`, `fp16_split_env_requested`, `attn_nop_source_path`, `runtime` |
 | `data.py` | 5 | `DataError` | `read_jsonl`, `normalize`, `from_hf`, `train_eval_split` |
 | `dispatch.py` | 7 | `DispatchError` | `register_impl`, `resolve`, `available`, `clear`, `snapshot`, `benchmark_overhead` |
 | `dist.py` | 7 | `DataParallel` | — |
@@ -78,13 +78,13 @@
 
 `AdamW` `LAMB` `Muon` `Module` `CausalSelfAttention` `MoE` `Parameter` `Linear` `Embedding` `RMSNorm` `Sequential` `ModuleList` `functional`
 
-## CUDA 内核（101 个）
+## CUDA 内核（105 个）
 
-`adamw_update` `adamw_update_multi` `adamw_update_multi_f16` `attn_mask_softmax` `attn_mask_softmax_bwd` `bcast_add4` `bcast_add4_v4` `broadcast_to8` `cast_bf16_to_f32` `cast_f16_to_f32` `cast_f32_to_bf16` `cast_f32_to_f16` `cat_extract` `cat_place` `ce_bwd` `ce_fwd_mean` `ce_fwd_rows` `emb_bwd_fill` `emb_bwd_hist` `emb_bwd_owned` `emb_bwd_plan` `emb_bwd_plan2` `emb_bwd_rows` `emb_bwd_rows4` `emb_gather_bwd` `emb_gather_fwd` `ewise_abs` `ewise_abs_bwd` `ewise_add` `ewise_add_v4` `ewise_clamp` `ewise_clamp_bwd` `ewise_div` `ewise_div_scalar` `ewise_exp` `ewise_exp32` `ewise_exp_v4` `ewise_log` `ewise_log32` `ewise_mul` `ewise_mul_v4` `ewise_pow` `ewise_recip` `ewise_relu` `ewise_relu_bwd` `ewise_scale` `ewise_scale_v4` `ewise_sub_scale` `fused_add_ip` `fused_add_ip_v4` `fused_rope_bwd` `fused_rope_bwd_v4` `fused_rope_ip` `fused_rope_ip_v4` `gather_flat` `gather_rows` `index_gather8` `index_scatter_add8` `log_softmax_lastdim` `log_softmax_lastdim_bwd` `moe_compact` `moe_gather_pairs` `moe_gather_rows` `moe_gather_slots` `moe_pad_rows` `moe_row_dot` `moe_row_scale` `moe_scatter_pairs` `moe_scatter_rows` `moe_scatter_slots` `moe_sigmoid` `moe_topk` `muon_momentum` `permute8` `permute8_v4` `reduce_sum` `repeat_reduce` `rms_dw_det` `rms_rstd` `rmsnorm_bwd` `rmsnorm_bwd_dx` `rmsnorm_fwd` `rope_half_bwd` `rope_half_ip` `scatter_add_flat` `scatter_add_rows` `sgemm_compose` `sgemm_mode` `silu_bwd_da` `silu_fwd_inplace` `silu_mul_bwd` `silu_mul_fwd` `softmax_lastdim` `softmax_lastdim_bwd` `sum_axis0_rows` `sum_axis8` `sumsq_final` `sumsq_partial` `sumsq_sequential` `swap_last2` `transpose2d`
+`adamw_update` `adamw_update_multi` `adamw_update_multi_f16` `attn_mask_softmax` `attn_mask_softmax_bwd` `bcast_add4` `bcast_add4_v4` `broadcast_to8` `cast_bf16_to_f32` `cast_f16_to_f32` `cast_f32_to_bf16` `cast_f32_to_f16` `cat_extract` `cat_place` `ce_bwd` `ce_fwd_mean` `ce_fwd_rows` `emb_bwd_fill` `emb_bwd_hist` `emb_bwd_owned` `emb_bwd_plan` `emb_bwd_plan2` `emb_bwd_rows` `emb_bwd_rows4` `emb_gather_bwd` `emb_gather_fwd` `ewise_abs` `ewise_abs_bwd` `ewise_add` `ewise_add_v4` `ewise_clamp` `ewise_clamp_bwd` `ewise_cos` `ewise_cos_bwd` `ewise_div` `ewise_div_scalar` `ewise_exp` `ewise_exp32` `ewise_exp_v4` `ewise_log` `ewise_log32` `ewise_mul` `ewise_mul_v4` `ewise_pow` `ewise_recip` `ewise_relu` `ewise_relu_bwd` `ewise_scale` `ewise_scale_v4` `ewise_sin` `ewise_sin_bwd` `ewise_sub_scale` `fused_add_ip` `fused_add_ip_v4` `fused_rope_bwd` `fused_rope_bwd_v4` `fused_rope_ip` `fused_rope_ip_v4` `gather_flat` `gather_rows` `index_gather8` `index_scatter_add8` `log_softmax_lastdim` `log_softmax_lastdim_bwd` `moe_compact` `moe_gather_pairs` `moe_gather_rows` `moe_gather_slots` `moe_pad_rows` `moe_row_dot` `moe_row_scale` `moe_scatter_pairs` `moe_scatter_rows` `moe_scatter_slots` `moe_sigmoid` `moe_topk` `muon_momentum` `permute8` `permute8_v4` `reduce_sum` `repeat_reduce` `rms_dw_det` `rms_rstd` `rmsnorm_bwd` `rmsnorm_bwd_dx` `rmsnorm_fwd` `rope_half_bwd` `rope_half_ip` `scatter_add_flat` `scatter_add_rows` `sgemm_compose` `sgemm_mode` `silu_bwd_da` `silu_fwd_inplace` `silu_mul_bwd` `silu_mul_fwd` `softmax_lastdim` `softmax_lastdim_bwd` `sum_axis0_rows` `sum_axis8` `sumsq_final` `sumsq_partial` `sumsq_sequential` `swap_last2` `transpose2d`
 
-## 后端接口方法（233 个）
+## 后端接口方法（237 个）
 
-`__del__` `_activate` `_alloc` `_arena_alloc` `_attn_flash_launch` `_attn_nop_launch` `_attn_set_dyn_smem` `_bcast4_vec_ok` `_bf16_epoch_bump` `_bf16_fail` `_bf16_state` `_bf16_wanted` `_bind_driver` `_bind_dto_async` `_bind_gemm_ex` `_bind_graph_api` `_bind_nvrtc` `_bind_sym` `_bmm_op` `_broadcast_lead` `_broadcast_shapes` `_capture_keep` `_cast_f16_cached` `_cast_flat_ptr` `_cast_flat_ptr_bf16` `_cat_geom` `_cc_arch` `_chk` `_chk_blas` `_chk_nvrtc` `_collect_adamw` `_compile` `_cublas_path` `_d2d_bytes` `_err_text` `_ewise_grid` `_fn` `_fn_module` `_fp16_fail` `_fp16_state` `_gemm_ex_f16` `_gemm_f16_raw` `_graph_destroy` `_graph_disable` `_graph_node_list` `_grouped_fail_note` `_grouped_ready` `_grouped_sgemm` `_grouped_tn_strided` `_in_arena` `_index_i32` `_index_launch_args` `_init_cublas` `_init_driver` `_init_kernels` `_instantiate_graph` `_left_pad8` `_make_tmpl` `_mark_submitted` `_memset32` `_moe_row_block` `_note_adamw` `_numpy_exact_gemm` `_nvrtc_log` `_nvrtc_path` `_pad4` `_pairs` `_pool_checkout` `_pool_ev_acquire` `_pool_frozen` `_pool_note` `_pool_reclaim_idle` `_pool_release` `_pool_shed_ready` `_pool_shrink_idle` `_pool_take` `_pool_token_of` `_pool_trim` `_pool_trim_to` `_ptr` `_raise_alloc_failed` `_rms_rstd_scratch` `_row_grid` `_row_strides` `_sgemm` `_sgemm_bf16` `_sgemm_f16` `_split16_fail` `_split16_pair` `_split16_state` `_split16_wanted` `_split_forget_ptr` `_strided_ready` `_strides4` `_vec4_grid` `_vec4_ok` `_warp_row_grid` `abs` `abs_bwd` `adamw` `adamw_multi` `adamw_multi_f16` `add` `add_` `add_broadcast` `attn_mask_softmax_` `attn_mask_softmax_bwd` `attn_nop_bwd` `attn_nop_bwd_flash` `attn_nop_fwd` `attn_nop_fwd_stats` `bmm` `broadcast_to` `cast_f16_to_f32` `cast_f32_to_f16` `cast_f32_to_f16_into` `cat_extract` `cat_place` `ce_bwd` `ce_fwd` `clamp` `clamp_bwd` `clone` `d2h` `div` `div_scalar` `emb_bwd` `emb_fwd` `empty` `empty_cache` `ensure` `ensure_attn_nop` `exp` `exp32` `f16_cache_clear` `f16_cache_enable` `f16_cache_stats` `fp16_gemm_on` `free` `free_device_bytes` `full` `fused_rope_` `fused_rope_bwd` `gather_flat` `gather_rows` `gemm_f16_nn_raw` `gemm_f16_nt_raw` `gemm_f16_tn_raw` `gemm_nt` `gemm_tn` `graph_abort` `graph_arm` `graph_available` `graph_begin` `graph_count` `graph_end` `graph_launch` `graph_launch_slot` `graph_release_all` `graph_stats` `grouped_nn` `grouped_nt` `grouped_tn` `h2d` `index_gather` `index_scatter_add` `launch` `log` `log32` `log_softmax_lastdim` `log_softmax_lastdim_bwd` `matmul_general` `moe_compact` `moe_gather_pairs` `moe_gather_rows` `moe_gather_slots` `moe_row_dot` `moe_row_scale` `moe_scatter_pairs` `moe_scatter_rows` `moe_scatter_rows_add` `moe_scatter_slots` `moe_sigmoid` `moe_topk` `mul` `muon_momentum` `permute` `pool_stats` `pow_scalar` `read_scalar` `recip` `release_capture_arena` `relu` `relu_bwd` `repeat_reduce` `reserve_capture_arena` `reshape` `rmsnorm_bwd` `rmsnorm_bwd_det` `rmsnorm_fwd` `rope_half_bwd` `rope_half_ip` `scale` `scale_inplace` `scatter_add_flat` `scatter_add_rows` `sgemm` `sgemm_compose` `sgemm_fp16` `sgemm_fp16_nt` `sgemm_mode` `sgemm_nt_strided_batched` `sgemm_split16` `sgemm_strided_batched` `sgemm_tn_strided_batched` `silu_bwd_da` `silu_fwd_inplace` `silu_mul_bwd` `silu_mul_fwd` `softmax_lastdim` `softmax_lastdim_bwd` `sub_scale_` `sub_view` `sum_all` `sum_axis` `sumsq_parallel` `sumsq_sequential` `swap_last2` `sync` `to_numpy` `transpose2d` `unbroadcast` `zeros`
+`__del__` `_activate` `_alloc` `_arena_alloc` `_attn_flash_launch` `_attn_nop_launch` `_attn_set_dyn_smem` `_bcast4_vec_ok` `_bf16_epoch_bump` `_bf16_fail` `_bf16_state` `_bf16_wanted` `_bind_driver` `_bind_dto_async` `_bind_gemm_ex` `_bind_graph_api` `_bind_nvrtc` `_bind_sym` `_bmm_op` `_broadcast_lead` `_broadcast_shapes` `_capture_keep` `_cast_f16_cached` `_cast_flat_ptr` `_cast_flat_ptr_bf16` `_cat_geom` `_cc_arch` `_chk` `_chk_blas` `_chk_nvrtc` `_collect_adamw` `_compile` `_cublas_path` `_d2d_bytes` `_err_text` `_ewise_grid` `_fn` `_fn_module` `_fp16_fail` `_fp16_state` `_gemm_ex_f16` `_gemm_f16_raw` `_graph_destroy` `_graph_disable` `_graph_node_list` `_grouped_fail_note` `_grouped_ready` `_grouped_sgemm` `_grouped_tn_strided` `_in_arena` `_index_i32` `_index_launch_args` `_init_cublas` `_init_driver` `_init_kernels` `_instantiate_graph` `_left_pad8` `_make_tmpl` `_mark_submitted` `_memset32` `_moe_row_block` `_note_adamw` `_numpy_exact_gemm` `_nvrtc_log` `_nvrtc_path` `_pad4` `_pairs` `_pool_checkout` `_pool_ev_acquire` `_pool_frozen` `_pool_note` `_pool_reclaim_idle` `_pool_release` `_pool_shed_ready` `_pool_shrink_idle` `_pool_take` `_pool_token_of` `_pool_trim` `_pool_trim_to` `_ptr` `_raise_alloc_failed` `_rms_rstd_scratch` `_row_grid` `_row_strides` `_sgemm` `_sgemm_bf16` `_sgemm_f16` `_split16_fail` `_split16_pair` `_split16_state` `_split16_wanted` `_split_forget_ptr` `_strided_ready` `_strides4` `_vec4_grid` `_vec4_ok` `_warp_row_grid` `abs` `abs_bwd` `adamw` `adamw_multi` `adamw_multi_f16` `add` `add_` `add_broadcast` `attn_mask_softmax_` `attn_mask_softmax_bwd` `attn_nop_bwd` `attn_nop_bwd_flash` `attn_nop_fwd` `attn_nop_fwd_stats` `bmm` `broadcast_to` `cast_f16_to_f32` `cast_f32_to_f16` `cast_f32_to_f16_into` `cat_extract` `cat_place` `ce_bwd` `ce_fwd` `clamp` `clamp_bwd` `clone` `cos` `cos_bwd` `d2h` `div` `div_scalar` `emb_bwd` `emb_fwd` `empty` `empty_cache` `ensure` `ensure_attn_nop` `exp` `exp32` `f16_cache_clear` `f16_cache_enable` `f16_cache_stats` `fp16_gemm_on` `free` `free_device_bytes` `full` `fused_rope_` `fused_rope_bwd` `gather_flat` `gather_rows` `gemm_f16_nn_raw` `gemm_f16_nt_raw` `gemm_f16_tn_raw` `gemm_nt` `gemm_tn` `graph_abort` `graph_arm` `graph_available` `graph_begin` `graph_count` `graph_end` `graph_launch` `graph_launch_slot` `graph_release_all` `graph_stats` `grouped_nn` `grouped_nt` `grouped_tn` `h2d` `index_gather` `index_scatter_add` `launch` `log` `log32` `log_softmax_lastdim` `log_softmax_lastdim_bwd` `matmul_general` `moe_compact` `moe_gather_pairs` `moe_gather_rows` `moe_gather_slots` `moe_row_dot` `moe_row_scale` `moe_scatter_pairs` `moe_scatter_rows` `moe_scatter_rows_add` `moe_scatter_slots` `moe_sigmoid` `moe_topk` `mul` `muon_momentum` `permute` `pool_stats` `pow_scalar` `read_scalar` `recip` `release_capture_arena` `relu` `relu_bwd` `repeat_reduce` `reserve_capture_arena` `reshape` `rmsnorm_bwd` `rmsnorm_bwd_det` `rmsnorm_fwd` `rope_half_bwd` `rope_half_ip` `scale` `scale_inplace` `scatter_add_flat` `scatter_add_rows` `sgemm` `sgemm_compose` `sgemm_fp16` `sgemm_fp16_nt` `sgemm_mode` `sgemm_nt_strided_batched` `sgemm_split16` `sgemm_strided_batched` `sgemm_tn_strided_batched` `silu_bwd_da` `silu_fwd_inplace` `silu_mul_bwd` `silu_mul_fwd` `sin` `sin_bwd` `softmax_lastdim` `softmax_lastdim_bwd` `sub_scale_` `sub_view` `sum_all` `sum_axis` `sumsq_parallel` `sumsq_sequential` `swap_last2` `sync` `to_numpy` `transpose2d` `unbroadcast` `zeros`
 
 ## 测试文件与用例数
 
@@ -115,6 +115,7 @@
 | `test_contrib_ops.py` | 8 |
 | `test_conv.py` | 4 |
 | `test_conv_cuda.py` | 2 |
+| `test_cos_sin.py` | 6 |
 | `test_cpu.py` | 8 |
 | `test_cuda_selfcheck.py` | 2 |
 | `test_custom_model_parity.py` | 1 |
@@ -192,6 +193,7 @@
 | `test_rope_fullwidth.py` | 1 |
 | `test_rope_half.py` | 2 |
 | `test_rope_scaling.py` | 4 |
+| `test_sdpa_4d.py` | 4 |
 | `test_sdpa_lowmem.py` | 2 |
 | `test_sft_data.py` | 3 |
 | `test_slice_probe.py` | 2 |

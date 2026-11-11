@@ -1,0 +1,48 @@
+feat(core): fix the real cause of checkpoint memory retention, accept 4-D SDPA, and add cos/sin
+
+Four gaps from the P100 review. Three fixed, one resolved as already-working.
+
+Gradient checkpointing first, because it was the P0. The review observed that ORV's checkpointing
+reclaims activations less thoroughly than PyTorch, and the cause turned out to be lower than the
+checkpoint code: every operator constructs with _parents=(self, other) unconditionally, including inside
+no_grad. So "no graph" only meant no _backward was attached, while the intermediate tensors stayed
+referenced by _parents and could not be freed. The old checkpoint worked around this by cloning its
+output to sever the chain, which cost one extra segment-sized copy per checkpoint -- 84 MB per layer at
+20 layers, d=1280, B=8, S=2048, about 1.7 GB total, the same order as the gap on a 16 GB card.
+
+The fix clears _parents on the output instead of copying. Measured on V100: dense with checkpointing
+drops from 0.857 to 0.602 GiB, 30% less. I will not overstate what that buys: the ratio against PyTorch
+only moves from 1.89x to 1.83x, because torch also drops 28%. Roughly 0.28 GiB of ORV's overhead remains
+and is in the debt table rather than explained away. A case that previously passed silently now raises:
+if fn returns one of its inputs, the ptr check catches it, because treating an input as the checkpoint
+output would accumulate gradient in the wrong place during recompute.
+
+SDPA now accepts torch's [B, H, S, Dh] as well as the internal [B*H, S, Dh]. The keyword was already
+compatible -- is_causal existed -- so the error users hit was a rank mismatch. Rather than add a rank
+flag inside the implementation and restore it at each return, which fails silently if one branch is
+missed, the original is renamed _sdpa_impl and a wrapper flattens, calls, and restores in one place.
+Four tests pin it: 4-D matches manually flattened 3-D exactly, 3-D is unchanged, backward produces 4-D
+gradients, and mismatched head counts raise.
+
+cos and sin exist now, CPU through numpy and CUDA through four new kernels, with backward as -sin(x)
+and cos(x). Six tests cover the forwards, both backward passes, a RoPE-style rotation composition, and
+CUDA-versus-CPU agreement.
+
+The fourth item turned out to be a correction rather than a fix. The review said fp16 covers only the
+forward GEMM. It does not: the fp16 branch lives in the shared GEMM core, so backward takes it too, gated
+by output size and by k <= _FP16_MAX_K. That limit defaults to no limit and is settable through
+TG_FP16_MAX_K, and the code records why long-k is dangerous -- dW shapes degrade parameter-gradient
+relative error from 3e-4 to 2e-2, with loss off by 10% at 600 steps. The reviewer's B=8, S=2048 puts k at
+16384, inside that risk zone. I did not change the default, because that trades every existing user's
+speed for accuracy on my own judgement. Measured instead: TG_FP16=1 on V100 takes dense fp32 from 18.63
+to 16.85 ms with loss differing by about 1e-07, and Pascal has no tensor cores so the gain there is much
+smaller. That is now stated in the README and the skill.
+
+Also added tools/h2h_clean.py and docs/BENCHMARK_H2H_2026-11-12.md: a self-contained head-to-head with
+one shared set of numpy-initialised weights, separate processes per side, CUDA events, and peak memory
+read through pool_stats peak_live_bytes. Results are 2.58x faster on dense fp32 and 1.68x on MoE fp32,
+with 1.2-1.9x more memory. The README no longer implies ORV is generally more memory-efficient: it says
+ORV spends memory to be faster and to finish at scales where PyTorch cannot start.
+
+Suite: 665 passed / 37 skipped; the 13 new tests also pass on the V100. Published as 0.9.51
+(sha256 803210fc...ea6d, re-downloaded and compared).

@@ -1211,6 +1211,32 @@ class Tensor:
         out._backward = bw
         return out
 
+    def _cos_cuda(self):
+        rt = _cuda()
+        x = self._gpu
+        buf = rt.cos(x)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad,
+                               _parents=(self,))
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, rt.cos_bwd(x, g))
+        out._backward = bw
+        return out
+
+    def _sin_cuda(self):
+        rt = _cuda()
+        x = self._gpu
+        buf = rt.sin(x)
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad,
+                               _parents=(self,))
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, rt.sin_bwd(x, g))
+        out._backward = bw
+        return out
+
     def _relu_cuda(self):
         rt = _cuda()
         x = self._gpu
@@ -1520,6 +1546,34 @@ class Tensor:
         def bw(g, grads):
             if self.requires_grad:
                 _acc(grads, self, g * sign)
+        out._backward = bw
+        return out
+
+    def cos(self):
+        """余弦。为 RoPE 一类位置编码准备（P100 报告指出的迁移缺口）。"""
+        if self.device == "cuda":
+            return self._cos_cuda()
+        out = Tensor(np.cos(self.data), requires_grad=self.requires_grad,
+                     _parents=(self,))
+        s = np.sin(self.data).astype(np.float32)
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, -g * s)
+        out._backward = bw
+        return out
+
+    def sin(self):
+        """正弦。为 RoPE 一类位置编码准备。"""
+        if self.device == "cuda":
+            return self._sin_cuda()
+        out = Tensor(np.sin(self.data), requires_grad=self.requires_grad,
+                     _parents=(self,))
+        c = np.cos(self.data).astype(np.float32)
+
+        def bw(g, grads):
+            if self.requires_grad:
+                _acc(grads, self, g * c)
         out._backward = bw
         return out
 
@@ -2593,7 +2647,35 @@ class _Functional:
         return z - e.sum(axis=axis, keepdims=True).log()
 
     @staticmethod
-    def scaled_dot_product_attention(q: Tensor, k: Tensor, v: Tensor, causal=False, is_causal=None,
+    def scaled_dot_product_attention(q, k, v, causal=False, is_causal=None,
+                                   scale=None, lowmem=False):
+        """与 torch 的 `F.scaled_dot_product_attention` 兼容的入口。
+
+        两种输入都可：
+          * `[B*H, S, Dh]` —— 内部展平形式（原有用法，保持不变）
+          * `[B, H, S, Dh]` —— **torch 的写法**，自动展平并在返回时还原
+
+        其它参数与 `_sdpa_impl` 完全一致。
+        """
+        rank = len(tuple(q.shape))
+        if rank != 4:
+            return _Functional._sdpa_impl(q, k, v, causal=causal,
+                                          is_causal=is_causal,
+                                          scale=scale, lowmem=lowmem)
+        B, H, S, Dh = (int(q.shape[0]), int(q.shape[1]),
+                        int(q.shape[2]), int(q.shape[3]))
+        qf = q.reshape(B * H, S, Dh)
+        kf = k.reshape(int(k.shape[0]) * int(k.shape[1]), int(k.shape[2]),
+                          int(k.shape[3]))
+        vf = v.reshape(int(v.shape[0]) * int(v.shape[1]), int(v.shape[2]),
+                          int(v.shape[3]))
+        out = _Functional._sdpa_impl(qf, kf, vf, causal=causal,
+                                     is_causal=is_causal,
+                                     scale=scale, lowmem=lowmem)
+        return out.reshape(B, H, S, Dh)
+
+    @staticmethod
+    def _sdpa_impl(q: Tensor, k: Tensor, v: Tensor, causal=False, is_causal=None,
                                      scale=None, lowmem=False):
         """q,k,v: [B*H, S, Dh]（已展平 head）。causal=True 时做下三角掩码。
 
@@ -2769,12 +2851,40 @@ def checkpoint(fn, *inputs):
             "或对每个输出分别调用 checkpoint" % type(out).__name__)
 
     # 关键：不连 _parents —— 中间激活因此可以在前向结束后被释放。
-    # 输出要**分离拷贝**一份（脱离计算图）；CUDA 上必须在设备侧复制，
-    # 走 detach() 会把它拉回主机（那是错的，也慢）。
-    if getattr(out, "device", "cpu") == "cuda":
-        res = Tensor._from_gpu(_cuda().clone(out._gpu), requires_grad=True)
-    else:
-        res = Tensor(np.array(out.data, copy=True), requires_grad=True)
+    #
+    # ★ 2026-11-12 改（来自 P100 用户实测：同形状 PyTorch 能跑、ORV 开检查点仍 OOM）：
+    #   这里原先**每次都 clone 一份输出**。代价是每段检查点多占一份段输出：
+    #   20 层 / d=1280 / B=8 / S=2048 时每层 84 MB ⇒ **白白多占 1.7 GB**，
+    #   正好是 16GB 卡上"torch 能跑、我们 OOM"的量级差。
+    #
+    #   PyTorch 的 `checkpoint` 是直接**返回输出张量本身**，不复制。我们也改成共享同一块
+    #   设备缓冲：`out` 在 `no_grad` 下算出来，没有 `_backward`，把它原地升级成图节点即可。
+    #   持有 `res` 就等于持有那块缓冲（`GpuBuf` 的 `_token` 保证池子不会回收），
+    #   所以不存在"前向缓冲被复用后再读"的风险。
+    #
+    #   仍然保留"输出必须与输入不同"这一前提：若 fn 直接返回了某个输入，
+    #   下面会显式报错，而不是把输入当成检查点输出（那会让重算的梯度加错地方）。
+    aliased = any(getattr(x, "_gpu", None) is not None
+                  and out._gpu is not None
+                  and int(x._gpu.ptr) == int(out._gpu.ptr) for x in ts)
+    if aliased:
+        raise RuntimeError(
+            "checkpoint: fn 直接返回了某个输入张量（ptr 相同）"
+            "。修法：让 fn 返回新张量（例如 return x + delta 而不是 return x），"
+            "否则重算时梯度会累加到错误的位置")
+    res = out
+    res.requires_grad = True
+    # ★ 2026-11-12：**必须切断父节点引用**。
+    #
+    #   查出真因：本引擎的算子在构造时**无条件**传 `_parents=(self, other)`，
+    #   连 `no_grad()` 里也一样。于是"不建图"只是没设 `_backward`，
+    #   **中间激活仍被 `_parents` 引用住、释放不掉**。
+    #   这正是 P100 用户看到的"ORV 的检查点对激活回收不如 PyTorch 彻底"。
+    #
+    #   旧实现用"克隆输出"来硬切断引用链，代价是每段检查点多占一份段输出
+    #   （20 层 / d=1280 / B=8 / S=2048 ⇒ 每层 84 MB，共 1.7 GB）。
+    #   现在改为直接清空 `_parents`：既切断引用（中间激活可释放），又不拷贝。
+    res._parents = ()
 
     def bw(g, grads):
         # 反向时重跑前向（必须重新打开 grad，否则重算出来的图没有 _backward）

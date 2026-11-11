@@ -103,11 +103,11 @@ def run_orv(a, cfg):
         for li in range(L):
             m = T.nn.MoE(D, cfg["d_ff"], cfg["n_experts"], top_k=cfg["top_k"],
                          gate="softmax")
-            m.router.weight._gpu = dev(w["router"][li])
+            m.router.weight._gpu = dev(w["router"][li])._gpu
             for e, ex in enumerate(m.experts):
-                ex.gate.weight._gpu = dev(w["experts"][li][e]["gate"])
-                ex.up.weight._gpu = dev(w["experts"][li][e]["up"])
-                ex.down.weight._gpu = dev(w["experts"][li][e]["down"])
+                ex.gate.weight._gpu = dev(w["experts"][li][e]["gate"])._gpu
+                ex.up.weight._gpu = dev(w["experts"][li][e]["up"])._gpu
+                ex.down.weight._gpu = dev(w["experts"][li][e]["down"])._gpu
             moes.append(m)
         p["moe"] = moes
     else:
@@ -137,23 +137,35 @@ def run_orv(a, cfg):
             h = h @ m["down"].T
         return x + h.reshape(B, S, D)
 
-    ids_t = T.tensor(ids.astype(np.int32))
-    emb = p["embed"][ids_t.reshape(-1)].reshape(BATCH, SEQ, D)
+    # ORV 的 getitem 不支持数组索引，embedding 查表用 nn.Embedding（这是它的正常用法）。
+    # 用 weight= 直接挂上同一份权重，避免多分配一张 V*D 的表。
+    emb_layer = T.nn.Embedding(cfg["vocab"], D, weight=T.Parameter(w["embed"]))
+    # emb_fwd 要的是 GpuBuf，不是 Tensor
+    emb_layer.weight._gpu = p["embed"]._gpu
+    ids_np = ids.reshape(-1).astype(np.int64)
+    emb = emb_layer(ids_np).reshape(BATCH, SEQ, D)
 
     def step():
         x = emb
         for li in range(L):
-            x = block(x, li)
+            if cfg.get("ckpt"):
+                # 每层一个检查点：与前向数值一致，但不保留层内中间激活
+                x = T.checkpoint(lambda h, _l=li: block(h, _l), x)
+            else:
+                x = block(x, li)
         lg = (x.reshape(BATCH * SEQ, D) @ p["head"].T).reshape(BATCH, SEQ, cfg["vocab"])
         flat = lg.reshape(-1, cfg["vocab"])
-        tgt = ids_t.reshape(-1)
-        lse = Fn.log_softmax(flat, axis=-1)
-        picked = lse[np.arange(int(tgt.shape[0])), tgt]
-        loss = (picked * (-1.0 / int(tgt.shape[0]))).sum()
-        return loss
+        return Fn.cross_entropy(flat, ids_np)
 
     def alloc_peak():
-        return float(rt.peak_bytes()) / (1 << 30) if hasattr(rt, "peak_bytes") else -1.0
+        # ORV 的池统计里 peak_bytes 是"活张量 + 池中空闲块"的峰值。
+        # 与 torch 的 max_memory_allocated 口径最接近的是 peak_live_bytes（只算活张量），
+        # 所以主指标用它；peak_bytes 一并报出来，避免口径误导。
+        st = rt.pool_stats()
+        return float(st.get("peak_live_bytes", 0)) / (1 << 30)
+
+    def alloc_peak_total():
+        return float(rt.pool_stats().get("peak_bytes", 0)) / (1 << 30)
 
     for _ in range(WARMUP):
         step()
@@ -166,6 +178,7 @@ def run_orv(a, cfg):
     e1.record()
     e1.synchronize()
     return dict(ms=e0.elapsed_time(e1) / REPS, peak_gib=alloc_peak(),
+                peak_incl_cached_gib=alloc_peak_total(),
                 loss=float(np.asarray(loss.to_numpy(), np.float32)))
 
 
@@ -173,6 +186,7 @@ def run_orv(a, cfg):
 def run_torch(a, cfg):
     import torch
     import torch.nn.functional as Fn
+    import torch.utils.checkpoint as t_ckpt
 
     dev = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -238,7 +252,11 @@ def run_torch(a, cfg):
         with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
             x = p["embed"][ids.reshape(-1)].reshape(BATCH, SEQ, D)
             for li in range(L):
-                x = block(x, li)
+                if cfg.get("ckpt"):
+                    x = t_ckpt.checkpoint(
+                        lambda h, _l=li: block(h, _l), x, use_reentrant=False)
+                else:
+                    x = block(x, li)
             lg = (x.reshape(BATCH * SEQ, D) @ p["head"].T).reshape(
                 BATCH, SEQ, cfg["vocab"])
         return Fn.cross_entropy(lg.reshape(-1, cfg["vocab"]).float(),
@@ -266,11 +284,13 @@ def main():
     ap.add_argument("--impl", choices=["orv", "torch"], default=None)
     ap.add_argument("--arch", choices=["dense", "moe"], default="dense")
     ap.add_argument("--dtype", choices=["fp32", "amp"], default="fp32")
+    ap.add_argument("--ckpt", action="store_true", help="每层开梯度检查点")
     ap.add_argument("--compare", action="store_true")
     a = ap.parse_args()
 
     cfg = dict(CFG)
     cfg["moe"] = (a.arch == "moe")
+    cfg["ckpt"] = bool(a.ckpt)
 
     if a.compare:
         out = {}
@@ -279,7 +299,7 @@ def main():
                 row = {}
                 for impl in ("orv", "torch"):
                     cmd = [sys.executable, os.path.abspath(__file__), "--impl", impl,
-                           "--arch", arch, "--dtype", dtype]
+                           "--arch", arch, "--dtype", dtype] + (["--ckpt"] if a.ckpt else [])
                     r = subprocess.run(cmd, capture_output=True, text=True)
                     tail = [l for l in r.stdout.strip().split("\n") if l.startswith("{")]
                     row[impl] = json.loads(tail[-1]) if tail else {"err": r.stderr[-200:]}
