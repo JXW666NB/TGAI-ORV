@@ -1,3 +1,54 @@
+## [0.9.39] - 2026-11-11
+
+**MoE 支持 Z-loss**（ST-MoE, arXiv:2202.08906）—— router 的数值稳定手段。
+这是现代 MoE 补齐清单的第 4 项（前两项是 0.9.37 共享专家、0.9.38 aux-loss-free）。
+
+### 为什么需要
+
+fp16 下 router logits 容易溢出（早期训练 router 权重摆动大），溢出会让 softmax
+退化甚至 nan。Z-loss 惩罚 logit 的绝对幅值：
+
+```
+L_z = β · Σ_t (logsumexp(s_t))²
+```
+
+### 实现技巧（避免新增内核）
+
+`log_softmax(x)_j = x_j − lse`，所以 `x_j − log_softmax_j === lse` **对每一列都成立**。
+取均值即得 lse —— 复用已有的 `log_softmax`，不新写 logsumexp 内核，
+也不会因为专家数 E 而损失精度。
+
+### 新增 API
+
+```python
+moe = T.nn.MoE(..., z_loss_coef=1e-3)    # 默认 0.0 = 关闭，与旧行为一致
+y = moe(x)
+loss = task_loss + moe.z_loss            # 需要调用方自己加，ORV 不替你改 loss
+```
+
+**注意**：ORV 不把 z_loss 自动加进你的 loss —— 隐式改 loss 会让调试变难。
+`moe.z_loss` 是一个带梯度的标量张量，未开启时为 `None`。
+
+### 实测
+
+| 项 | 结果 |
+| --- | --- |
+| 与手算 `β·Σ(logsumexp)²` 的相对差 | **6.48e-08** |
+| CPU vs CUDA | **0.00e+00（逐位相同）** |
+| GPU 上梯度到达 router | ✅ |
+| 开/关 z_loss 的前向输出 | **逐位相同**（它只多返回一个 loss 项） |
+
+### 测试（6 条，`tests/test_moe_z_loss.py`）
+
+1. 默认关闭，`z_loss is None`；
+2. 数值与手算一致（≤1e-6）；
+3. logit 幅值变大时 z_loss 单调变大（这才是"压制幅值"的作用）；
+4. 梯度能流到 router；
+5. **不影响前向输出**（逐位相同）；
+6. 与共享专家 + aux_free 同时开启也正常。
+
+套件：**587 passed / 31 skipped**（+6）。
+
 ## [0.9.38] - 2026-11-11
 
 **MoE 支持 aux-loss-free 负载均衡**（DeepSeek-V3, arXiv 2408.15664）。

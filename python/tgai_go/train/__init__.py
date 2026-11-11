@@ -4054,7 +4054,8 @@ class MoE(Module):
     """
 
     def __init__(self, d_model, d_ff, n_experts, top_k=2, gate="softmax", qb_bias=None,
-                 n_shared=0, shared_d_ff=None, balance="none", aux_free_lr=1e-3):
+                 n_shared=0, shared_d_ff=None, balance="none", aux_free_lr=1e-3,
+                 z_loss_coef=0.0):
         super().__init__()
         d_model = int(d_model)
         d_ff = int(d_ff)
@@ -4111,6 +4112,11 @@ class MoE(Module):
         #: 只参与 top-k 选择，不进门控权重、不进梯度图、不由优化器更新。
         self.expert_bias = np.zeros(n_experts, dtype=np.float32)
         self._last_idx = None
+        #: Z-loss 权重（ST-MoE, arXiv:2202.08906）。0 = 关闭（默认，与旧行为一致）。
+        #: 开启后每次前向会把 `self.z_loss` 设成一个标量张量，
+        #: **调用方需自己把它加到总 loss 上**（ORV 不替你改 loss，避免隐式行为）。
+        self.z_loss_coef = float(z_loss_coef)
+        self.z_loss = None
 
     def _add_shared(self, x, out):
         """把共享专家的输出加到路由输出上。
@@ -4146,11 +4152,29 @@ class MoE(Module):
             self._update_expert_bias(n)
         return y.reshape(tuple(int(s) for s in x.shape))
 
+    def _router_z_loss(self, logits):
+        """ST-MoE 的 Z-loss：`β · Σ_t (logsumexp(s_t))²`，压制 router logit 幅值。
+
+        为什么要它：fp16 下 router logits 容易溢出（早期训练 router 权重摆动大），
+        溢出会让 softmax 变成 one-hot 甚至 nan。Z-loss 惩罚 logit 的绝对大小，
+        是 MoE 训练的数值稳定手段（arXiv:2202.08906）。
+
+        实现技巧：`log_softmax(x)_j = x_j − lse`，所以 `x_j − log_softmax_j === lse`
+        **对每一列都成立**。取均值就得到 lse，不必新写 logsumexp 内核，
+        也不会因为 E 的大小而损失精度。
+        """
+        E = int(logits.shape[-1])
+        lp = functional.log_softmax(logits, axis=-1)
+        lse = (logits - lp).sum(axis=-1) / float(E)   # 每列都等于 lse
+        return self.z_loss_coef * (lse * lse).sum()
+
     def _forward_flat(self, x):
         logits = x @ self.router.weight.T
         if getattr(self, "qb_bias", None) is not None:
             # 依据 tgai_engine.c:1120「router logits 先加本偏置，再做 top-k」
             logits = logits + self.qb_bias
+        #: Z-loss（若开启）；调用方把它加到总 loss 上即可。None 表示未开启。
+        self.z_loss = self._router_z_loss(logits) if self.z_loss_coef else None
         sel_logits = None
         if self.balance == "aux_free":
             # ★ aux-loss-free（DeepSeek-V3, arXiv 2408.15664）：
