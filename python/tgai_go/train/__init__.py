@@ -4883,6 +4883,18 @@ class _OptimModule:
     LAMB = LAMB
     Muon = Muon
 
+    def __getattr__(self, name):
+        # 插件登记的优化器也要能从这里取到（如 plugin.optimizer("Lion2", ...)）
+        if name.startswith("_"):
+            raise AttributeError(name)
+        cls = _plugin_mod.resolve_optimizer(name)
+        if cls is None:
+            raise AttributeError(
+                "optim 里没有 %r" % name +
+                "。修法：核心自带 AdamW/SGD/Adafactor/LAMB/Lion/Muon；"
+                "其它用 plugin.optimizer(name, cls) 登记")
+        return cls
+
 
 class _NNModule:
     Module = Module
@@ -4896,9 +4908,45 @@ class _NNModule:
     ModuleList = ModuleList
     functional = functional
 
+    def __getattr__(self, name):
+        # 插件登记的层也要能从这里取到（如 plugin.layer("MyBlock", cls)）
+        if name.startswith("_"):
+            raise AttributeError(name)
+        cls = _plugin_mod.resolve_layer(name)
+        if cls is None:
+            raise AttributeError(
+                "nn 里没有 %r" % name +
+                "。修法：核心层见 docs/OP_COVERAGE.md；"
+                "自定义层用 plugin.layer(name, cls) 登记")
+        return cls
+
 
 nn = _NNModule()
 optim = _OptimModule()
+
+# ── 插件系统（六条轴，一个命名空间）────────────────────────────────────────
+# 必须先于 nn/optim 的 __getattr__ 使用，所以在这里就导入成模块级名字。
+from . import plugin as _plugin_mod
+from . import ops_plugin as _ops_plugin
+
+
+def build(name, **kwargs):
+    """按插件登记的骨架名构建模型：`T.build("deepseek_v3", n_routed=256, ...)`。
+
+    骨架由 `plugin.arch(name, builder)` 登记 —— 核心不背模型动物园。
+    """
+    builder = _plugin_mod.resolve_arch(name)
+    if builder is None:
+        have = _plugin_mod.registered()["archs"]
+        raise KeyError(
+            "没有登记名为 %r 的骨架" % name +
+            "。修法：用 plugin.arch(%r, 构造函数) 登记；已登记的有 %s" % (name, have or "（无）"))
+    return builder(**kwargs)
+
+
+def plugins():
+    """列出当前插件登记状态（算子/后端/优化器/层/骨架/API 兼容层）。"""
+    return _plugin_mod.registered()
 
 # ── 补齐 torch 常用优化器与学习率调度器（0.8.0）────────────────────────────
 # 放在文件末尾导入：opt_extra / sched 依赖本模块的 _Optim/_cuda 等，此时已定义完毕。

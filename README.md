@@ -100,6 +100,74 @@ ORV 最直接的用途是**省显存**。一个具体的实测结果：
 **计算本身始终是 fp32**：参数、激活、梯度都是 fp32，AMP 只是把矩阵乘的输入转成 fp16
 再用 fp32 累加。所以不存在"用低精度换显存"。
 
+## 插件系统：六条轴，一个命名空间
+
+**一个插件就是一个 `.py` 文件**，六条轴用同一套写法。
+
+```python
+from tgai_go.train import plugin
+import tgai_go.train as T
+
+@plugin.op("softplus")                       # ① 算子（autograd 自动，不用写反向）
+def softplus(x):
+    return (x.exp() + 1.0).log()
+
+@plugin.layer("MyBlock")                     # ② 层
+class MyBlock(T.nn.Module):
+    def __init__(self, d=512):
+        super().__init__()
+        self.lin = T.nn.Linear(d, d)
+    def forward(self, x):
+        return self.lin(x)
+
+@plugin.arch("my_model")                     # ③ 骨架
+def build(d=512, n_layers=4):
+    return T.nn.Sequential(*[MyBlock(d) for _ in range(n_layers)])
+
+plugin.optimizer("Lion2", Lion2, works_inplace=True)     # ④ 优化器
+plugin.backend("vulkan", VulkanBackend, caps={...})       # ⑤ GPU 后端
+plugin.api("torch-compat", install_torch_shim)            # ⑥ API 兼容层
+```
+
+装完后全部**立即可用**，不需要改 ORV 源码：
+
+```python
+model = T.build("my_model", d=512, n_layers=4)   # 用插件骨架
+opt   = T.optim.Lion2(model.parameters())        # 用插件优化器
+y     = T.nn.MyBlock(512)(x)                     # 用插件层
+T.plugin.summary()   # 插件：算子 1 / 后端 1 / 优化器 1 / 层 1 / 骨架 1 / API兼容层 1
+```
+
+### 三条设计原则
+
+| 原则 | 具体做法 |
+| --- | --- |
+| **简易** | 六条轴共用一个 `plugin` 对象；支持装饰器；一个文件装完全部 |
+| **通用** | 插件只**组合核心算子** ⇒ autograd 自动生效，且同一份代码适配 CUDA / Vulkan / ROCm，**不需要为每个后端写一遍** |
+| **安全** | 能力（caps / works_inplace）**必须如实声明**，不足时**当场报错**，绝不静默退化 |
+
+第三条最重要。举例：声明为出式更新的优化器**不能**用于共享存储参数，
+因为 `p.data = p.data - ...` 会把视图换成新数组、导致权重与视图不同步 ——
+这种 bug 极难查，所以框架在注册阶段就拒绝它，而不是等训练跑歪。
+
+### 加载方式
+
+```python
+plugin.load("my_plugin.py")          # 单个文件
+plugin.load_entry_points()           # pip 包声明的入口点
+plugin.autoload()                    # 自动扫 ~/.tgai/plugins/ + entry_points
+plugin.activate("torch-compat")      # 有副作用的插件（改 sys.modules 等）才需要显式激活
+```
+
+**为什么 API 兼容层要显式激活**：它会改 `sys.modules` 这类全局状态。
+装插件不该在你不知情的时候改变进程行为，所以这类插件只登记、不执行。
+
+### 能做到什么程度
+
+`plugin.api("torch-compat", ...)` 这一条轴意味着：**PyTorch 的 API 面本身可以是插件**。
+社区写一个兼容层，`import torch as T` 的老代码就能原样跑在 ORV 上 ——
+而核心不必背这个包袱。
+
 ## 常见疑问
 
 ### 数学对齐了吗？
