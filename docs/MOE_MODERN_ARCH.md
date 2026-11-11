@@ -25,7 +25,7 @@
 
 | 能力 | ORV 现状 | 重要性 |
 | --- | --- | --- |
-| **共享专家** | ❌ 完全不支持（代码里 `shared` 出现 0 次） | **高**：现代 MoE 标配 |
+| **共享专家** | ✅ **0.9.37 已支持**（`n_shared` / `shared_d_ff`） | 已完成 |
 | **aux-loss-free 平衡** | ❌ 无（有 `qb_bias` 做分位平衡，语义不同） | **高**：V3 的核心创新 |
 | **sigmoid 门控 + top-k 内重归一化** | ⚠️ 有 `sigmoid` / `softmax` / `softmax_topk` 三种，需核对与 V3 语义是否一致 | 中 |
 | **Z-loss（router 数值稳定）** | ❌ 无 | 中：fp16 下 router logit 易溢出 |
