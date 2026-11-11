@@ -4182,30 +4182,36 @@ class MoE(Module):
         return _builtin_max(1, int(cap))
 
     @staticmethod
-    def _clamp_offsets(off, cap):
-        """把专家偏移数组逐段截断到 `cap`。
+    def _capacity_mask(idx, n, cap, n_experts, top_k):
+        """返回 `[n, k]` 布尔掩码：True = 保留该 (token, 专家) 对。
 
-        截断的是「每个专家保留前 cap 个 token」，顺序是 compact 之后的顺序。
+        规则：**每个专家按 (token, slot) 升序保留前 cap 个**，其余丢弃。
 
-        ⚠️ **已知限制（实测，务必知悉）**：CPU 与 CUDA 的 compact 顺序不同，
-        因此开启容量限制后**两条路径保留的 token 集合可能不同** —— 都严格遵守 cap，
-        但"丢哪些"不一致，所以**容量开启时 CPU/CUDA 不再逐位可比**。
-        实测：cap=24 时 CUDA 丢掉 18 个槽位、CPU 丢掉 18 个槽位但落到不同 token 上
-        （CPU 有 3 个 token 两个专家全被丢，CUDA 为 0）。
+        为什么用掩码而不是截断专家偏移（这是 0.9.40 的修法，已废弃）：
 
-        要做到跨后端一致，需要**按门控权重排序后再截断**（GShard 的优先路由），
-        那需要一次排序内核，本版未做。**用容量限制时请固定用同一个后端。**
+        截断偏移量依赖后端 compact 的顺序，CPU 与 CUDA 一旦不同，
+        **丢的就不是同一批 token** —— 0.9.40 实测 CPU 丢 3 个、CUDA 丢 0 个，
+        于是开容量限制时 CPU/CUDA 结果不一致。
+        掩码只依赖 `idx`（两条路径都从同一份 logits 选出），所以天然一致。
+
+        实现用**稳定排序**：`argsort(kind="stable")` 保证同一专家内部仍是 (t,s) 升序，
+        与 CPU 逐 token 扫描的顺序完全相同。
         """
-        off = np.asarray(off, np.int32).reshape(-1)
-        out = np.empty_like(off)
-        out[0] = off[0]
-        for e in range(1, off.size):
-            cnt = int(off[e]) - int(off[e - 1])
-            # ★ 必须用 Python 内置 min：本模块把 `min` 遮蔽成了张量 API（`_api_min`），
-            #   直接写 min(...) 会去调张量版本，在 CUDA 上抛 "max/min 尚未实现"。
-            #   这正是模块里到处用 `_builtin_max` 的原因。
-            out[e] = out[e - 1] + _builtin_min(cnt, cap)
-        return out
+        flat = np.asarray(idx, np.int64).reshape(-1)
+        nk = int(flat.size)
+        if nk == 0:
+            return np.ones((int(n), int(top_k)), bool)
+        keep = np.ones(nk, bool)
+        order = np.argsort(flat, kind="stable")
+        counts = np.bincount(flat, minlength=int(n_experts))
+        start = 0
+        for c in counts:
+            c = int(c)
+            if c > cap:
+                # 该专家超容量：丢掉排序后靠后的 c - cap 个
+                keep[order[start + cap:start + c]] = False
+            start += c
+        return keep.reshape(int(n), int(top_k))
 
     def _router_z_loss(self, logits):
         """ST-MoE 的 Z-loss：`β · Σ_t (logsumexp(s_t))²`，压制 router logit 幅值。
@@ -4282,6 +4288,11 @@ class MoE(Module):
         self._last_idx = np.asarray(idx, np.int64)   # 供 aux-loss-free 统计负载，不重算
         cap = self._capacity(n)
         w = self._weights_cpu(logits, idx)
+        if cap is not None:
+            # 与 CUDA 路径**同一套掩码规则**（同一份 idx、同样的稳定排序），
+            # 所以两条路径丢的是同一批 (token, 专家) 对。
+            keep = self._capacity_mask(idx, n, cap, self.n_experts, self.top_k)
+            w = w * _as_tensor(keep.astype(np.float32))
         acc = None
         for e, expert in enumerate(self.experts):
             tok = []
@@ -4294,10 +4305,8 @@ class MoE(Module):
                         slot.append(s)
             if not tok:
                 continue
-            if cap is not None and len(tok) > cap:
-                # 超容量：保留前 cap 个（到达序），其余丢弃 ⇒ 残差旁路
-                tok = tok[:cap]
-                slot = slot[:cap]
+            # 注意：容量限制已由上面的**权重掩码**处理，这里**不能**再截断 tok/slot，
+            # 否则会重复丢弃（两套规则叠加会让 CPU 与 CUDA 再次分叉）。
             tok_a = np.asarray(tok, dtype=np.int64)
             slot_a = np.asarray(slot, dtype=np.int64)
             y = _moe_swiglu(x[tok_a], expert)
@@ -4358,9 +4367,13 @@ class MoE(Module):
         off = np.asarray(rt.d2h(off_buf), dtype=np.int32).reshape(-1)
         cap = self._capacity(n)
         if cap is not None:
-            # 容量限制在这里做：截断每专家的 token 段，下游 gather/scatter 全部按新 off 走。
-            # 被截掉的 token 拿不到该专家的贡献 ⇒ 残差旁路（与 CPU 路径语义一致）。
-            off = self._clamp_offsets(off, cap)
+            # 容量限制用**门控权重掩码**实现（见 _capacity_mask 的说明）：
+            # 把超容量的 (token, 专家) 对的权重置 0，等价于该对不参与路由，
+            # 于是被丢的 token 自然走残差旁路。只依赖 idx ⇒ CPU/CUDA 丢同一批。
+            idx_host = np.asarray(rt.d2h(idx_buf), np.int64).reshape(n, k)
+            keep = self._capacity_mask(idx_host, n, cap, n_exp, k)
+            mask_t = _as_tensor(keep.astype(np.float32))
+            w = w * mask_t
         grouped = _moe_grouped_cuda(
             x, w, tok_buf, slot_buf, off, self.experts, n, d, k)
         if grouped is not None:

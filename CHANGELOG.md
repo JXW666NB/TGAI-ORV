@@ -1,3 +1,97 @@
+## [0.9.48] - 2026-11-11
+
+**`ParameterGroup` 支持 CUDA**（偏移视图），并**修掉导出/移动文件时的两处误用**。
+
+### 之前的状态
+
+0.9.43 只有 CPU 可用，CUDA 直接报错 —— 当时判断是「`GpuBuf` 没有 offset 字段」。
+实际不成立：`GpuBuf` 的视图可以**指定任意 `ptr`**，所以偏移视图不需要改 `GpuBuf`。
+
+### 现在
+
+新增 `CudaRuntime.sub_view(buf, shape, elem_offset)`：在底层缓冲内做偏移视图，
+共享同一段显存（`view_of` 会挂 `keepalive`、清 `_token`，原缓冲先死不会被误释放），
+越界报错不静默。
+
+`ParameterGroup.to_cuda()` 用它把整组搬上设备，各视图落在正确偏移。
+
+### 真 V100 实测（`tools/param_group_gpu_check.py`）
+
+```
+1) 偏移视图指针正确: True
+2) 视图读到正确切片: True（最大偏差 0.0e+00 / 0.0e+00 / 0.0e+00）
+3) 视图参与 GEMM 与独立张量一致: True（最大差 0.0e+00）
+4) 原地改底层后视图同步: True
+```
+
+### 过程中连踩三个坑（都只有上真卡才暴露）
+
+1. **默认设备是 cuda 时 `Parameter(ndarray)` 立刻建了设备副本**，`.data` 变成 None，
+   `h2d(None)` 只得到 1 个元素 ⇒ `sub_view` 报越界。修：构造期间强制 CPU，
+   并明确**`self._arr` 是唯一权威主机副本**。
+2. **"复用已有的 `packed._gpu`"** 会读到陈旧内容（主机副本已被改）。已删除该优化。
+3. **缺少安全写入整组数据的方法** —— `packed.data = ...` 是出式赋值、会断开视图。
+   新增 `group.load(array)`：切片原地写、共享不断，已上设备时同步刷新。
+
+### 测试
+
+`tests/test_param_group.py` 增 3 条：`load` 原地写并保持共享、元素数不符报错、
+`assert_shared_gpu` 在 CPU 上是无操作。套件：**655 passed / 33 skipped**。
+
+### 附：仓库根目录整理
+
+32 个测量输出（`.txt` / `.log`）原先散在仓库根目录 —— 它们是 README 与
+`ROADMAP_3B_PERF.md` 里数字的**原始证据**，所以**移动**到 `docs/measurements/`
+并生成索引，而不是删除。`.gitignore` 增加 `/*.txt`、`/*.log` 防止复发。
+
+## [0.9.47] - 2026-11-11
+
+**修复：容量因子在 CPU / CUDA 上丢弃的 token 不一致**（会真实影响用户）。
+
+### 问题
+
+0.9.40 用「截断每个专家的偏移量」实现容量限制，这依赖后端 `moe_compact` 的顺序。
+实测两条路径丢的不是同一批 token：
+
+| | 修复前 | 修复后 |
+| --- | --- | --- |
+| `cf=1.0` 相对差 | **7.57e-01** | **5.88e-07** |
+| 丢弃 token | CPU=3，**GPU=0** | CPU=3，**GPU=3** |
+| 集合一致 | **False** | **True** |
+
+后果：用户在 CPU 上调试、在 GPU 上训练时，会看到**不该出现的分歧**。
+
+### 修法：改用门控权重掩码
+
+丢弃一个 (token, 专家) 对，等价于把该对的门控权重置 0。
+掩码**只依赖 `idx`**（两条路径都从同一份 logits 选出），所以天然一致。
+
+```python
+def _capacity_mask(idx, n, cap, n_experts, top_k):
+    # 稳定排序 ⇒ 同一专家内部仍是 (token, slot) 升序，与 CPU 扫描顺序完全相同
+    order = np.argsort(flat, kind="stable")
+    ...
+```
+
+同时**删掉**了 CPU 路径里旧的 `tok/slot` 截断 —— 否则两套规则叠加会再次分叉。
+
+### 这个修法不需要新内核
+
+之前判断"需要排序内核，暂不修"是过度悲观：`off`/`tok` 本就在主机侧，
+用 `argsort(kind="stable")` 就够。已在 `docs/DESIGN.md` 的技术债表里更正。
+
+### 测试（9 条，+3）
+
+新增三条直接验证掩码规则：
+`test_capacity_mask_keeps_first_cap_per_expert`（构造已知分布逐位核对）、
+`test_capacity_mask_is_deterministic`（稳定排序）、
+`test_capacity_mask_respects_cap_exactly`。
+
+GPU 校验也恢复成**严格判据**（要求丢弃集合一致），不再是"限制下不要求一致"。
+真 V100 结果：`cf=None/2.0/1.0` 三档全部 `集合一致=True`。
+
+套件：**652 passed / 33 skipped**。
+
 ## [0.9.46] - 2026-11-11
 
 **C 端插件优先**：插件可以是原生库，Python 只是可选外壳。

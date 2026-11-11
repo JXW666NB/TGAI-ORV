@@ -138,3 +138,43 @@ def test_rejects_bad_capacity_factor():
     for bad in (0.0, -1.0):
         with pytest.raises(ValueError):
             T.nn.MoE(8, 16, 4, capacity_factor=bad)
+
+
+# ─────────────── 掩码规则（0.9.47 起，替代旧的偏移截断）───────────────
+def test_capacity_mask_keeps_first_cap_per_expert():
+    """规则：每个专家按 (token, slot) 升序保留前 cap 个，其余丢。
+
+    这条规则**只依赖 idx**，所以 CPU 与 CUDA 必定丢同一批 —— 这是修掉
+    「CPU 丢 3 个、CUDA 丢 0 个」那个分叉的关键。
+    """
+    # 4 个 token × top-2；专家分布：e0 收到 3 个（超 cap=2），e1 收到 2 个，e2 收到 3 个
+    idx = np.array([[0, 1],
+                    [0, 1],
+                    [0, 2],
+                    [2, 2]], np.int64)
+    keep = T.nn.MoE._capacity_mask(idx, 4, 2, 3, 2)
+    # e0 的 (t,s)：(0,0),(1,0),(2,0) ⇒ 保留前两个，丢 (2,0)
+    assert keep[0, 0] and keep[1, 0] and not keep[2, 0]
+    # e1 的 (t,s)：(0,1),(1,1) ⇒ 恰好 2 个，全留
+    assert keep[0, 1] and keep[1, 1]
+    # e2 的 (t,s)：(2,1),(3,0),(3,1) ⇒ 保留前两个，丢 (3,1)
+    assert keep[2, 1] and keep[3, 0] and not keep[3, 1]
+
+
+def test_capacity_mask_is_deterministic():
+    """同一份 idx 多次调用必须给出同一份掩码（不能用不稳定排序）。"""
+    rng = np.random.default_rng(0)
+    idx = rng.integers(0, 5, (64, 2)).astype(np.int64)
+    a = T.nn.MoE._capacity_mask(idx, 64, 8, 5, 2)
+    b = T.nn.MoE._capacity_mask(idx, 64, 8, 5, 2)
+    assert np.array_equal(a, b)
+    # 每个专家保留数不超过 cap
+    for e in range(5):
+        assert int(a[idx == e].sum()) <= 8
+
+
+def test_capacity_mask_respects_cap_exactly():
+    """所有专家都超容量时，每个专家恰好保留 cap 个。"""
+    idx = np.zeros((20, 2), np.int64)          # 20 个 token 全进专家 0
+    keep = T.nn.MoE._capacity_mask(idx, 20, 5, 1, 2)
+    assert int(keep.sum()) == 5

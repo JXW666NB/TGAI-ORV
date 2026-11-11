@@ -23,3 +23,7 @@ _chk.py
 _a10_*.sh
 _*.csv
 _sweep_*.csv
+
+# 仓库根目录的临时测量/排查输出：不要提交，证据请放 docs/measurements/
+/*.txt
+/*.log

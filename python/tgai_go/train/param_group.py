@@ -83,17 +83,30 @@ class ParameterGroup:
         total = sum(_prod(s) for s in shapes)
         #: 底层那一块——**唯一**该交给优化器的对象
         self._arr = np.zeros(total, dtype=self.dtype)
-        self.packed = Parameter(self._arr)
-
-        # 建立视图：numpy 切片天然共享内存
-        off = 0
-        views = []
-        for s in shapes:
-            n = _prod(s)
-            views.append(Parameter(self._arr[off:off + n].reshape(s)))
-            off += n
+        #: 权威主机副本就是 `_arr`（不是 `packed.data`）。
+        #: 构造期间**强制 CPU**：若进程默认设备已是 cuda，`Parameter(_arr)` 会立刻
+        #: 在设备上再建一份（实测过：那份是全零，之后改主机数据不会同步），
+        #: 既白占显存，又会让 to_cuda 读到陈旧内容。
+        import sys as _sys
+        _pk = _sys.modules.get("tgai_go.train")
+        _prev = getattr(_pk, "_DEVICE", "cpu")
+        try:
+            if _pk is not None:
+                _pk._DEVICE = "cpu"
+            self.packed = Parameter(self._arr)
+            off = 0
+            views = []
+            for s in shapes:
+                n = _prod(s)
+                views.append(Parameter(self._arr[off:off + n].reshape(s)))
+                off += n
+        finally:
+            if _pk is not None:
+                _pk._DEVICE = _prev
         #: 各视图（用于前向读取）
         self.views = views
+        #: 当前设备（"cpu" / "cuda"），由 to_cuda() 更新
+        self._device = "cpu"
 
     # ---------- 契约检查 ----------
     def parameters(self):
@@ -147,6 +160,92 @@ class ParameterGroup:
             raise SharedStorageError(
                 "视图与底层不共享内存（写底层后视图没变）" +
                 "。修法：确认没有对 .data 做过出式赋值")
+        return True
+
+    def load(self, array):
+        """把数据**原地**写进底层缓冲（保持视图有效），并同步到 GPU（若已上设备）。
+
+        为什么必须用这个方法而不是 `group.packed.data = ...`：
+        `.data` 赋值是**出式**的，会把底层换成新数组、断开与视图的共享
+        （这正是 §契约 第 1 条要防的事）。`load` 用切片赋值，原地写，共享不断。
+
+        参数
+        ----
+        array : 可广播到 `(total,)` 的数组
+        """
+        src = np.ascontiguousarray(np.asarray(array), dtype=np.float32).reshape(-1)
+        if src.size != self._arr.size:
+            raise SharedStorageError(
+                "load 的元素数不对：给 %d，整组共 %d" % (src.size, self._arr.size) +
+                "。修法：传入与 shapes 总元素数一致的数组（或用 load_shaped 按视图分别给）")
+        self._arr[:] = src
+        if getattr(self, "_device", "cpu") == "cuda" and getattr(self.packed, "_gpu", None) is not None:
+            from . import _cuda
+
+            rt = _cuda()
+            base = rt.h2d(self._arr)
+            self.packed._gpu = base
+            off = 0
+            for v in self.views:
+                n = _prod(v.shape)
+                v._gpu = rt.sub_view(base, v.shape, off)
+                off += n
+        return self
+
+    def to_cuda(self):
+        """把整组搬到 GPU：视图在 GPU 上也是**共享同一段显存的偏移视图**。
+
+        实现靠 `CudaRuntime.sub_view`（在底层缓冲内做偏移视图）。这样
+        「专家权重连续存放 + 一次 strided GEMM」才可能成立 —— 不需要每次重排权重。
+
+        注意契约不变：**优化器只能拿 `packed`，不能拿视图**；
+        只有 `works_inplace=True` 的优化器允许用于本组（视图靠共享内存同步，
+        出式更新会断开）。
+        """
+        from . import _cuda
+
+        rt = _cuda()
+        # **权威副本是 `self._arr`**，每次都从它上传。
+        # 不要"复用已有的 `packed._gpu`"：主机副本可能已被改动（测试里就是），
+        # 复用陈旧设备缓冲会读到旧值 —— 实测踩过，偏差 1.3e+02。
+        host = np.ascontiguousarray(self._arr, dtype=np.float32).reshape(-1)
+        base = rt.h2d(host)
+        self.packed._gpu = base
+        off = 0
+        for v in self.views:
+            n = _prod(v.shape)
+            v._gpu = rt.sub_view(base, v.shape, off)
+            off += n
+        self._device = "cuda"
+        return self
+
+    def assert_shared_gpu(self):
+        """GPU 侧自检：每个视图的设备指针必须**正好是底层指针 + 元素偏移**。
+
+        这是结构性检查（不猜任何运行时 API），能直接证明"视图确实落在同一块显存里、
+        且位置正确"。数值层面的共享由 `tools/param_group_gpu_check.py` 用真实算子验证。
+        """
+        if getattr(self, "_device", "cpu") != "cuda":
+            return True
+        base = self.packed._gpu
+        if base is None:
+            return True
+        esz = int(base.dtype.itemsize)
+        off = 0
+        for v in self.views:
+            n = _prod(v.shape)
+            vb = v._gpu
+            if vb is None:
+                raise SharedStorageError(
+                    "视图 %r 没有设备缓冲" % (v.shape,) +
+                    "。修法：先调 group.to_cuda() 再访问 GPU 侧视图")
+            want = int(base.ptr) + off * esz
+            if int(vb.ptr) != want:
+                raise SharedStorageError(
+                    "视图 %r 的设备指针 %d != 期望 %d（底层 %d + 偏移 %d 字节）"
+                    % (v.shape, int(vb.ptr), want, int(base.ptr), off * esz) +
+                    "。修法：检查切分顺序是否与构造时一致")
+            off += n
         return True
 
     def __repr__(self):

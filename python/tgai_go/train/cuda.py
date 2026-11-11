@@ -4299,6 +4299,37 @@ class CudaRuntime:
             raise CudaError("reshape %s -> %s 元素个数 %d != %d" % (buf.shape, shape, buf.n, n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         return GpuBuf(self, buf.ptr, buf.nbytes, shape, n, buf.dtype, view_of=buf)
 
+    def sub_view(self, buf, shape, elem_offset=0):
+        """在 `buf` 的字节区间内做一个**偏移视图**（与 `reshape` 的区别：起点可偏移）。
+
+        用途：把一块大缓冲切成多段共享同一段显存。典型场景是 MoE 专家权重连续存放
+        `[G, N, K]`，每个专家是其中一段 —— 这样 `SgemmStridedBatched` 能直接算，
+        不必每次重排权重（实测重排开销比省下的还多，见 docs/MOE_MODERN_ARCH.md 3.1）。
+
+        安全性：`view_of` 会让新缓冲挂 `keepalive` 指向原缓冲、且 `_token` 为空
+        （析构不归还池），所以原缓冲先死不会被误释放。**不要再把这个 ptr 登记成第二个主人。**
+
+        越界会报错，不会静默读到别人家的显存。
+        """
+        shape = tuple(int(s) for s in shape)
+        n = 1
+        for s in shape:
+            n *= int(s)
+        esz = int(buf.dtype.itemsize)
+        off = int(elem_offset)
+        if off < 0:
+            raise CudaError("sub_view 的 elem_offset 不能为负（%d）" % off +
+                            "。修法：偏移量按元素计，从 0 开始")
+        off_bytes = off * esz
+        nbytes = n * esz
+        if off_bytes + nbytes > int(buf.nbytes):
+            raise CudaError(
+                "sub_view 越界：偏移 %d + %d 字节 > 缓冲 %d 字节（shape=%s, dtype=%s）"
+                % (off_bytes, nbytes, int(buf.nbytes), shape, buf.dtype) +
+                "。修法：检查切分后的总元素数是否超过底层缓冲")
+        return GpuBuf(self, int(buf.ptr) + off_bytes, nbytes, shape, n,
+                      buf.dtype, view_of=buf)
+
     def swap_last2(self, buf):
         if len(buf.shape) < 2:
             raise CudaError("swap_last2 至少要 2 维，收到 %s" % (buf.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")

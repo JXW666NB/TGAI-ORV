@@ -46,19 +46,18 @@ def main():
         rel = float(np.abs(y_gpu - y_cpu).max() / max(1e-9, float(np.abs(y_cpu).max())))
         z_cpu = np.abs(y_cpu).max(axis=1) == 0
         z_gpu = np.abs(y_gpu).max(axis=1) == 0
-        # ⚠️ 已知限制：开启容量后 compact 顺序不同 ⇒ 两边"丢哪些"可能不同，
-        # 因此 cf 非 None 时**不能**要求输出逐位一致或丢弃集合一致。
-        # 这里只要求：不限制时逐位一致；限制时两边都有限、且 cap 被遵守。
+        # 0.9.47 起容量限制改成**门控权重掩码**（只依赖 idx）⇒ 两条路径丢同一批，
+        # 所以这里用严格判据：输出要一致、丢弃集合也要一致。
         if cf is None:
             same_drop = bool((z_cpu == z_gpu).all())
             rep.append("cf=%-5s 相对差 %.2e | 丢弃 CPU=%d GPU=%d 一致=%s"
                        % (cf, rel, int(z_cpu.sum()), int(z_gpu.sum()), same_drop))
             ok = ok and rel <= 1e-5 and same_drop
         else:
-            finite = bool(np.isfinite(y_cpu).all() and np.isfinite(y_gpu).all())
-            rep.append("cf=%-5s 相对差 %.2e（容量限制下不要求逐位一致）| 丢弃 CPU=%d GPU=%d | 有限值=%s"
-                       % (cf, rel, int(z_cpu.sum()), int(z_gpu.sum()), finite))
-            ok = ok and finite
+            same = bool((z_cpu == z_gpu).all())
+            rep.append("cf=%-5s 相对差 %.2e | 丢弃 CPU=%d GPU=%d 集合一致=%s"
+                       % (cf, rel, int(z_cpu.sum()), int(z_gpu.sum()), same))
+            ok = ok and rel <= 1e-5 and same
 
     with io.open(OUT, "w", encoding="utf-8", newline="\n") as f:
         f.write("rc=%d\n" % (0 if ok else 1))

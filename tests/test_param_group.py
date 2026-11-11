@@ -126,3 +126,30 @@ def test_repr_is_informative():
     g = T.ParameterGroup([(2, 2), (2, 2)])
     s = repr(g)
     assert "2 个视图" in s and "8 元素" in s
+
+
+# ─────────────── load()：安全的原地写入（0.9.48）───────────────
+def test_load_writes_in_place_and_keeps_sharing():
+    """★ `load()` 必须**原地**写：写完视图仍与底层共享。
+
+    为什么不能直接用 `packed.data = ...`：那是出式赋值，会断开共享
+    （见 test_out_of_place_step_actually_breaks_and_is_caught）。
+    """
+    g = T.ParameterGroup([(2, 2), (3,)])
+    data = np.arange(7, dtype=np.float32)
+    g.load(data)
+    assert np.shares_memory(np.asarray(g.packed.data), np.asarray(g.views[0].data))
+    assert np.allclose(np.asarray(g.views[0].data).ravel(), data[:4])
+    assert np.allclose(np.asarray(g.views[1].data).ravel(), data[4:])
+
+
+def test_load_rejects_wrong_size():
+    g = T.ParameterGroup([(2, 2)])
+    with pytest.raises(SharedStorageError) as e:
+        g.load(np.zeros(3, np.float32))
+    assert "元素数" in str(e.value)
+
+
+def test_assert_shared_gpu_is_noop_on_cpu():
+    g = T.ParameterGroup([(2, 2)])
+    assert g.assert_shared_gpu() is True
