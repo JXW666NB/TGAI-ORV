@@ -168,6 +168,36 @@ plugin.activate("torch-compat")      # 有副作用的插件（改 sys.modules �
 社区写一个兼容层，`import torch as T` 的老代码就能原样跑在 ORV 上 ——
 而核心不必背这个包袱。
 
+### 单文件怎么适配全部后端
+
+插件**针对能力写，不针对后端写**：
+
+```python
+plugin.op("my_silu", fast_impl, backend="cuda", caps={"async_copy": True}, min_cc=(8, 0))
+plugin.op("my_silu", slow_impl, backend="*")     # 任何后端的通用回退
+```
+
+分派按当前后端的**真实能力**（`caps`）与计算能力（`cc`）选实现：
+有快路径就用，没有就走回退。所以同一份插件代码在 CUDA / Vulkan / ROCm 上都能跑，
+**以后接 Vulkan 时不必把每个插件重写一遍**。
+
+热路径用静态绑定避免分派开销：
+
+```python
+_silu = plugin.bind("my_silu", backend, caps=caps, arch=cc, dtype="fp32")
+for _ in range(steps):
+    y = _silu(x)          # 零分派开销
+```
+
+> 实测分派净开销 **约 630 ns**：对大 GEMM（~0.4 ms）只占 0.16%，
+> 但对小 elemwise（~15 µs）占 4.2%。所以**热路径必须 `bind()`**，
+> 这条写进了 [PLUGIN_DISPATCH.md](docs/PLUGIN_DISPATCH.md)。
+
+### 能力不足必须报错
+
+没有可用实现时抛 `DispatchError`，并逐条说明每个候选缺什么
+（缺哪个能力 / 计算能力不满足 / dtype 不符）—— 绝不静默挑一个跑不了的分支。
+
 ## 常见疑问
 
 ### 数学对齐了吗？

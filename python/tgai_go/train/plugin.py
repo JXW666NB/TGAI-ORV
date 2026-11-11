@@ -42,6 +42,7 @@ import io
 import os
 
 from . import ops_plugin as _ops
+from . import dispatch as _disp
 
 #: 已登记的后端：(name -> {"factory", "caps"})
 _BACKENDS = {}
@@ -71,7 +72,8 @@ def _check_name(kind, name):
 
 
 # ─────────────────────────── ① 算子 ───────────────────────────
-def op(name, fn=None, *, kind="functional", doc="", replace=False):
+def op(name, fn=None, *, kind="functional", doc="", replace=False,
+       backend=None, caps=None, min_cc=None, max_cc=None, dtype=None, prio=0):
     """注册**组合式**算子（用已有 Tensor 算子拼出来 ⇒ autograd 自动生效）。
 
     这是最省事的一条路：**不用写反向**，也天然适配所有后端。
@@ -86,13 +88,67 @@ def op(name, fn=None, *, kind="functional", doc="", replace=False):
     # 或者直接给函数
     plugin.op("softplus", lambda x: (x.exp() + 1.0).log())
     ```
+
+    **多后端 / 多能力（为 Vulkan 铺路）**：给出 `backend` / `caps` / `min_cc` /
+    `max_cc` / `dtype` 时，实现会登记进分派表，运行时按当前后端与能力选择：
+
+    ```python
+    plugin.op("my_silu", fast, backend="cuda", caps={"async_copy": True}, min_cc=(8, 0))
+    plugin.op("my_silu", slow)          # 通用回退（不给条件 = 处处可用）
+    ```
+
+    `piro` 用于同条件下多个候选的优先级（大的优先）。
     """
     if fn is None:
         def deco(f):
-            op(name, f, kind=kind, doc=doc, replace=replace)
+            op(name, f, kind=kind, doc=doc, replace=replace, backend=backend,
+               caps=caps, min_cc=min_cc, max_cc=max_cc, dtype=dtype, prio=prio)
             return f
         return deco
+    if backend is not None or caps or min_cc is not None or max_cc is not None:
+        # 条件化实现：进分派表，不进 functional 命名空间（同一算子可有多个实现）。
+        # `backend="*"` 表示"任何后端的通用回退"，分派时会与具体后端实现一起参与选择。
+        return _disp.register_impl(name, backend or "*", fn, caps=caps,
+                                   min_cc=min_cc, max_cc=max_cc, dtype=dtype, prio=prio)
     return _ops.register(name, fn, kind=kind, doc=doc, replace=replace)
+
+
+def resolve_op(name, backend, *, caps=None, arch=None, dtype=None):
+    """按后端与能力解析算子实现（单次查表 + 缓存）。
+
+    这是插件「单文件适配全后端」的运行时入口：插件不判断"是不是 CUDA"，
+    而是由分派按**真实能力**选实现。
+
+    ⚠️ **别在热循环里反复调它**。实测分派净开销约 560 ns：
+    对大 GEMM（~0.4 ms）只占 0.14%，但对小 elemwise（~15 µs）占 3.7%，超标。
+    热路径请用 `bind()` 解析一次、之后直接调用。
+    """
+    return _disp.resolve(name, backend, caps=caps, arch=arch, dtype=dtype)
+
+
+def bind(name, backend, *, caps=None, arch=None, dtype=None):
+    """**静态绑定**：解析一次，返回可直接调用的函数。
+
+    热路径的正确用法（把分派开销压到零）：
+
+    ```python
+    _silu = plugin.bind("silu", T.backend_name(), caps=T.capabilities(),
+                        arch=T.compute_capability(), dtype="fp32")
+
+    # 之后在循环里直接调，无任何分派开销
+    for _ in range(steps):
+        y = _silu(x)
+    ```
+
+    实测分派开销约 560 ns/次：大算子无感，但小算子（~15 µs）会占 3.7%，
+    所以**热路径必须用 bind 而不是 resolve_op**。
+    """
+    return _disp.resolve(name, backend, caps=caps, arch=arch, dtype=dtype)
+
+
+def dispatch_overhead():
+    """实测分派开销（纳秒）。用于判断某条路径该用 bind 还是 resolve_op。"""
+    return _disp.benchmark_overhead()
 
 
 def op_numpy(name, forward, backward, *, kind="functional", doc="", replace=False):
