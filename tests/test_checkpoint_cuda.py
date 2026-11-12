@@ -38,14 +38,30 @@ def test_checkpoint_recomputes_in_backward():
     assert np.allclose(np.asarray(x.grad, np.float64), [2.0, 4.0, 6.0])
 
 
-def test_checkpoint_output_is_detached_from_graph():
+def test_checkpoint_output_keeps_input_edge_but_drops_intermediates():
+    """检查点输出只连**输入**，不连中间激活。
+
+    2026-11-12 改：原来这里断言 `out._parents == ()`，即"完全断开"。
+    那个方向是错的 —— 外层图在段与段之间断开后，反向只能靠嵌套递归往上一层钻，
+    于是**一次调用把整条链全部重算**，所有段的激活同时驻留（实测 6 层就 8.47 GiB）。
+    PyTorch 的 `CheckpointFunction` 是反过来的：外层图保持连通，
+    只把中间激活切断，重算时再用 `detach_variable` 让嵌套反传停在输入处。
+
+    所以现在要守的是两件事：
+      * `out._parents` **恰好是**需要梯度的输入（外层图连通）；
+      * 中间激活没有被 `out` 引用（不出现第三个节点）。
+    """
     def f(x):
-        return x * 3.0
+        mid = x * 2.0          # 中间激活，不该被 out 引用
+        return mid * 3.0
 
     x = T.tensor(np.array([1.0], np.float32), requires_grad=True)
     out = T.checkpoint(f, x)
     assert out.requires_grad
-    assert not out._parents, "输出不能连父节点，否则中间激活释放不掉"
+    assert len(out._parents) == 1, "输出应连到输入，保持外层图连通"
+    assert out._parents[0] is x, "连的必须是输入本身，不是中间张量"
+    # 数值仍然等价于直接调用
+    assert np.allclose(np.asarray(out.to_numpy(), np.float32), np.array([6.0], np.float32))
 
 
 def test_checkpoint_with_no_grad_input_passes_through():

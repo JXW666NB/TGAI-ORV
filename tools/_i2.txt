@@ -1,0 +1,37 @@
+﻿feat(core): rework checkpointing after PyTorch, taking the P100 config from 31 GiB to 7.6 GiB
+
+The reviewer could not train on a 16 GB P100 while PyTorch managed the same shape. Reading
+torch/utils/checkpoint.py instead of guessing at ORV's behaviour found the cause, and it was a design reversal.
+
+My previous version set res._parents to empty in order to drop the intermediate activations. That severed the
+outer graph between segments, so backward had no edge to follow and instead relied on the nested
+re.backward(g) inside bw recursing into the previous segment -- whose output's _backward is that segment's own
+bw. One call therefore unwound the entire chain, and every segment's activations existed at once. The
+per-block trace showed this exactly: forward ended at 0.133 GiB, yet the first block to run its backward
+already saw 8.474 GiB, about 1.41 GiB per layer, the sum of all six.
+
+PyTorch does two things together. It keeps the outer graph connected, and it recomputes from detached leaves
+so the nested backward stops at the inputs; the input gradients are then returned as the node's backward
+result and the outer engine routes them onward.
+
+So the checkpoint output's parents now hold exactly the inputs that require grad, which keeps the chain intact
+without referencing any intermediate, and bw recomputes from detached leaves that share the existing buffer
+rather than copying it, then hands their gradients back through _acc.
+
+Measured on the V100, backward peak by depth went 4.080, 7.439, 10.799 GiB to 2.517, 2.752, 2.987. The slope
+fell from 1.68 GiB per layer to 0.117, and what remains is leaf weight gradients accumulating, which is
+expected. The no-checkpoint control is unchanged at 4.00, 7.28 and 10.57, confirming the change touches only
+the checkpoint path. GPU numerics still match, five tests passing.
+
+The reviewer's target shape, twenty layers with 606M parameters at B=2 and S=2048, went from running out at
+31.29 GiB to a 7.56 GiB peak and now fits in 16 GB.
+
+The test that asserted an output must have no parents was asserting the wrong invariant; it now checks that the
+output connects to its input and to nothing intermediate, plus numerical equivalence.
+
+Also fixed the CI that had been red on every push: a BOM-bearing scratch file of mine was in the index, and two
+plugin tests passed find_library's soname libc.so.6 to a function that treats its argument as a path, which only
+fails on Linux. Both tests now run on Windows too instead of skipping.
+
+Suite: 670 passed / 40 skipped. Published as 0.9.53
+(sha256 3943f87a...1db1, re-downloaded and compared).

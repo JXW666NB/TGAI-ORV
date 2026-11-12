@@ -2966,27 +2966,60 @@ def checkpoint(fn, *inputs):
             "否则重算时梯度会累加到错误的位置")
     res = out
     res.requires_grad = True
-    # ★ 2026-11-12：**必须切断父节点引用**。
+    # ★ 2026-11-12 第二次修（对齐 PyTorch `CheckpointFunction`，见 torch/utils/checkpoint.py）
     #
-    #   查出真因：本引擎的算子在构造时**无条件**传 `_parents=(self, other)`，
-    #   连 `no_grad()` 里也一样。于是"不建图"只是没设 `_backward`，
-    #   **中间激活仍被 `_parents` 引用住、释放不掉**。
-    #   这正是 P100 用户看到的"ORV 的检查点对激活回收不如 PyTorch 彻底"。
+    #   上一版把 `res._parents` 清成 `()` 来切断中间激活 —— 这个方向错了，代价极大：
+    #   外层图因此**在段与段之间断开**，反向时只能靠 `bw` 里的 `re.backward(g)` 递归往上一层钻，
+    #   而上一层的输出 `_backward` 正是它自己的 `bw` ⇒ **一次调用把整条链全部重算**，
+    #   所有段的激活同时驻留。实测（L=6/S=2048/B=2）：前向结束 0.133 GiB，
+    #   但第一段反向一开始就是 8.474 GiB ≈ 6 层激活之和，反向峰值 10.8 GiB。
     #
-    #   旧实现用"克隆输出"来硬切断引用链，代价是每段检查点多占一份段输出
-    #   （20 层 / d=1280 / B=8 / S=2048 ⇒ 每层 84 MB，共 1.7 GB）。
-    #   现在改为直接清空 `_parents`：既切断引用（中间激活可释放），又不拷贝。
-    res._parents = ()
+    #   PyTorch 的做法是两件事一起做：
+    #     ① **外层图保持连通**（输出节点仍指向真实输入），中间激活靠"没有父节点链"而释放；
+    #     ② 反向重算时用 `detach_variable` 把输入变成**叶子**，嵌套反传就停在它们身上，
+    #        再把 `detached.grad` 作为本节点的 backward **返回值**交还外层引擎。
+    #
+    #   对应到这里：parents 只指向"需要梯度的输入"，不再清空；`bw` 里用 detached 输入重算。
+    res._parents = tuple(x for x in ts if x.requires_grad)
 
     def bw(g, grads):
-        # 反向时重跑前向（必须重新打开 grad，否则重算出来的图没有 _backward）
+        # 重算用 detached 输入：它们 `_backward is None`（叶子），
+        # 嵌套反传走到这里就停，不会递归进上一段。
+        ds = []
+        fargs = []
+        for a in inputs:
+            if isinstance(a, Tensor) and a.requires_grad:
+                if a.device == "cuda":
+                    d = Tensor._from_gpu(a._gpu, requires_grad=True)
+                else:
+                    d = Tensor(a.data, requires_grad=True)
+                d._parents = ()
+                d._backward = None
+                d.grad = None
+                ds.append((a, d))
+                fargs.append(d)
+            else:
+                fargs.append(a)
+
         prev2 = _GRAD_ENABLED[0]
         _GRAD_ENABLED[0] = True
         try:
-            re = fn(*inputs)
+            re = fn(*fargs)
         finally:
             _GRAD_ENABLED[0] = prev2
-        re.backward(g)                  # 梯度直接累加到 inputs.grad
+        re.backward(g)
+
+        # 把 detached 输入的梯度交还外层引擎（= PyTorch 的 `return (None, None) + grads`）。
+        for orig, d in ds:
+            gg = d.grad
+            if gg is None:
+                continue
+            if orig.device == "cuda":
+                _acc(grads, orig, gg._gpu if isinstance(gg, Tensor) else gg)
+            else:
+                _acc(grads, orig,
+                     np.asarray(gg.data if isinstance(gg, Tensor) else gg,
+                                dtype=np.float32))
 
     res._backward = bw
     return res
