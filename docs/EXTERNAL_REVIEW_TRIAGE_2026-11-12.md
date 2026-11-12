@@ -24,9 +24,9 @@
 
 | # | 问题 | 状态 |
 | --- | --- | --- |
-| 6 | 文档数字互斥：README 徽章 656 / 正文 558 / `STATUS.md` 160 / 实际收集 710；版本徽章仍写 0.9.49 | **未修** |
-| 7 | `tools/kernel_count.py` 等脚本硬编码作者本机路径（`D:\tgai_orv\...`、`D:/SFT语料库`）| **未修**（同类约十余个 `align_*.py`）|
-| 8 | 仓库卫生：`release/` 40 MB exe、`backups/` 3.77 MB、`cuda.py.bak-*`、`ppo_trainer_part.txt` 与源码混放 | **未修** |
+| 6 | 文档数字互斥：README 徽章 656 / 正文 558 / `STATUS.md` 160 / 实际收集 710；版本徽章仍写 0.9.49 | ✅ **已修**：版本徽章改为 **shields 动态读 PyPI**（`img.shields.io/pypi/v/tgai-orv`），彻底不再手写；测试数与内核数不再写死，改为指向脚本生成的 `CAPABILITY_AUDIT.md`；正文 `# 0.9.49` 与 `558 passed` 一并改掉 |
+| 7 | 工具脚本硬编码作者本机路径（`D:\tgai_orv\...`、`D:/SFT语料库`）| ✅ **已处理**：`kernel_count.py` 改为从 `V27_RUN` / `V27_TG` 环境变量读，缺失时明确说明"这是作者本机工具"并指向 `profile_block.py`；新增 `tools/README.md` 把「通用工具」与「作者本机一次性脚本」分开登记。其余 `align_*.py` 等属第二类，**保留可追溯、不再假装能直接跑** |
+| 8 | 仓库卫生：`release/` 40 MB exe、`backups/` 3.77 MB、`cuda.py.bak-*`、`ppo_trainer_part.txt` 与源码混放 | 🟡 **部分修**：`backups/`（18 个）与源码内 `.bak`/空 txt **已从索引移除并加入 gitignore**（文件仍在磁盘上，历史可查）；`release/`（38 MB / 45 文件）**有意保留** —— 有 3 处文档引用它，是 ESP32 线的真实交付物 |
 
 ## 外部报告同时确认的事（不需要改）
 

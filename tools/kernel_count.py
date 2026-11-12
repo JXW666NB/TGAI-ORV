@@ -2,23 +2,63 @@
 """统计一层的前向/反向**发射了多少次 kernel**，并按内核名分类（找出小 kernel 大户）。
 
 思路：给 rt.launch 装计数器（只统计名字），跑一层前向 + 反向，输出 Top-N。
-运行（需独占 GPU）：python kernel_count.py
+
+## 这是**作者本机**的脚本，不是给所有用户跑的
+
+它需要两个仓库之外的东西（V2.7 训练入口与一个 .tg 权重）：
+
+    V27_RUN  作者本机的 v27_train_run.py（**不在仓库里**）
+    V27_TG   V2.7 的 .tg 权重路径
+
+2026-11-12 修（外部报告 P2）：原来把这两个路径写死在 `D:\\tgai_orv\\...`，
+换台机器直接崩。现在改成从环境变量或命令行读，缺了就**明确告诉你要什么**。
+
+运行（需独占 GPU）：
+
+    set V27_RUN=D:\\path\\v27_train_run.py
+    set V27_TG=D:\\path\\model.tg
+    python kernel_count.py
 """
+import os
 import sys
 from collections import Counter
 
 import numpy as np
 
-sys.path.insert(0, r"D:\tgai_orv\TGAI-ORV-main\python")
+# 仓库根：本文件在 <repo>/tools/ 下
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PKG = os.path.join(_REPO, "python")
+if os.path.isdir(os.path.join(_PKG, "tgai_go")) and _PKG not in sys.path:
+    sys.path.insert(0, _PKG)
 
-import importlib.util
+import importlib.util                     # noqa: E402
 
-_spec = importlib.util.spec_from_file_location("V27RUN", r"D:\tgai_orv\v27_train_run.py")
+
+def _need(name, what):
+    val = os.environ.get(name, "").strip()
+    if not val:
+        raise SystemExit(
+            "%s 未设置（需要%s）。\n"
+            "修法：本脚本是**作者本机**工具，依赖仓库外的 V2.7 训练入口与权重。\n"
+            "  set %s=<v27_train_run.py 的绝对路径>\n"
+            "  set V27_TG=<V2.7 .tg 权重的绝对路径>\n"
+            "只想做通用性能分析的话，用 tools/profile_block.py（自带合成权重，无外部依赖）。"
+            % (name, what, name))
+    if not os.path.isfile(val):
+        raise SystemExit(
+            "%s 指向的文件不存在: %s\n修法：改成正确路径，或用 tools/profile_block.py（无外部依赖）"
+            % (name, val))
+    return val
+
+
+RUN_PATH = _need("V27_RUN", "作者的 v27_train_run.py，不在仓库内")
+MODEL_TG = _need("V27_TG", "V2.7 的 .tg 权重")
+
+_spec = importlib.util.spec_from_file_location("V27RUN", RUN_PATH)
 RUN = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(RUN)
 log = RUN.log
 
-MODEL_TG = r"D:\TGAI\models\V2.7\TGAI_NB_V2.7_v4.tg"
 SEQ = 128
 NL = 28
 

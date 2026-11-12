@@ -6,12 +6,15 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.49-blue" alt="version">
+  <a href="https://pypi.org/project/tgai-orv/"><img src="https://img.shields.io/pypi/v/tgai-orv?label=version" alt="version"></a>
   <img src="https://img.shields.io/badge/python-3.9+-green" alt="python">
   <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
-  <img src="https://img.shields.io/badge/tests-656%20passed-brightgreen" alt="tests">
-  <img src="https://img.shields.io/badge/CUDA%20kernels-101-blueviolet" alt="kernels">
+  <img src="https://img.shields.io/badge/CUDA%20kernels-100%2B-blueviolet" alt="kernels">
 </p>
+
+> 版本徽章直接读 PyPI（`img.shields.io/pypi/v/tgai-orv`），**不再手写版本号** ——
+> 手写会漂移（曾长期停在 0.9.49 而实际已发 0.9.53）。测试数与内核数同样不写死，
+> 见 [`docs/CAPABILITY_AUDIT.md`](docs/CAPABILITY_AUDIT.md)（脚本扫描生成，可随时重跑）。
 
 ---
 
@@ -377,7 +380,7 @@ pip install tgai-orv
 
 ```python
 import tgai_go.train as T
-print(T.__version__)          # 0.9.49
+print(T.__version__)          # 当前发布版本，例如 0.9.56
 print(T.amp_state())          # 看 CUDA 是否可用；全 False 表示只能用 CPU
 ```
 
@@ -549,9 +552,10 @@ import tgai_go.train as T
 | 训练工具 | 梯度裁剪、梯度累积、`DataLoader`（`Dataset`/`IterableDataset`/`Sampler`/`collate`/多线程） |
 | 精度 | `T.amp()`（fp16 / bf16，可编程开关，无需重启进程） |
 | 生态互转 | `T.from_torch(...)`、`T.to_torch(...)`、checkpoint 读写 |
-| 融合算子 | 101 个 CUDA 内核；CUDA 上 CPU-only 算子调用点 **0** |
+| 融合算子 | 100+ 个 CUDA 内核；CUDA 上 CPU-only 算子调用点 **0** |
 
-**测试**：`558 passed`，覆盖上表每一行的数值对照。
+**测试**：数量不写死（会随版本漂移），以 `docs/CAPABILITY_AUDIT.md` 与 CI 为准；
+上表每一行都有对应的数值对照用例。
 
 ---
 

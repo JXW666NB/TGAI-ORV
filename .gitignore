@@ -34,3 +34,6 @@ tools/_*.txt
 
 # PyTorch 源码（只用于研读，不入库）
 pytorch-src/
+backups/
+*.bak-*
+python/tgai_go/train/*.bak*
