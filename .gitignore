@@ -37,3 +37,6 @@ pytorch-src/
 backups/
 *.bak-*
 python/tgai_go/train/*.bak*
+publish_ready/
+cpu/build/
+cpu/build/*

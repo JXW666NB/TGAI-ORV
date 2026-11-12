@@ -1,3 +1,61 @@
+## [0.9.58] - 2026-11-12
+
+**修复随包原生库损坏 —— 推理在 `.TG` v3 上真正可用。** 我此前的判断有误，这里更正。
+
+### 真因：不是"需要重编"，而是仓库里三个 DLL 都被截断/错位
+
+外部报告指出两个引擎 DLL 的 PE 头错位 1 字节，我据此认为必须重编。实际排查发现：
+
+| 文件 | 仓库里的 | 本机另一个干净副本 | 结论 |
+| --- | --- | --- | --- |
+| `libtgai_engine.dll` | PE 签名在 `e_lfanew` 前 1 字节 | 297472 字节，PE 正常 | **损坏** |
+| `libtgai_engine_vk.dll` | 同上（0x108 vs 0x107）| 331776 字节，PE 正常 | **损坏** |
+| **`libomp.dll`** | **968175 字节** | **968192 字节** | **少 17 字节，损坏** |
+
+`libomp.dll` 这一条是**之前没人发现的**：它 PE 头正常，所以只查 PE 会被漏掉；
+但引擎在 `DllMain` 阶段就要绑定 OpenMP 符号，坏的 libomp 会让
+`ctypes.CDLL("libtgai_engine.dll")` 直接**访问违例**（`0xC0000005`）——
+连"已知能用"的引擎 DLL 放进 `_native/` 也会崩，正是这个原因。
+
+三个文件全部换成完好副本后，实测：
+
+```
+CDLL OK  libomp.dll
+CDLL OK  libtgai_engine.dll
+CDLL OK  libtgai_engine_vk.dll
+[tgai_engine] BUILD 2026-10-18-v3.8-gguf-native-experimental
+加载成功: Model layers=6 d_model=192 vocab=8192 max_seq=128
+```
+
+### 同时修掉"改了源码却没生效"的构建陷阱
+
+`rebuild_cpu.bat` 里写死 `G=D:\tgai_nlp\TGAI GO` —— 它编的是**旧 GO 树**，
+不是本仓库的 `src/`。新增 **`build_engine.bat`**：
+
+* 用 `%~dp0` 定位仓库根，`vswhere` 自动找 `vcvars64.bat`（找不到时给出装什么）；
+* 编译前断言 `src\tgai_engine.c` 存在，确保编的是本仓库；
+* 实测可用：MSVC 19.44 从本仓库 `src/` 编出 `cpu\build\libtgai_engine.dll`。
+
+### 引擎源码已与 GO 对齐
+
+逐文件比对 `src/`：**只有两处不同** —— `tgai_engine.c`（GO 更新）与 `tgai_engine.h`，
+已同步进本仓库；其余 18 个文件逐字节相同。
+
+### 新增排查工具
+
+* `tools/pick_engine_dll.py` —— 扫全盘候选 DLL，三重判据（`e_lfanew` 处是否为 `PE\0\0`、
+  Machine 是否 x64、`CDLL` 是否真能加载），一眼看出哪些可用；
+* `tools/probe_infer.py` —— 分离"库能加载"与"模型能读"，并打印 `.TG` 的版本号。
+
+### 仍未解决：`.TG` **V4** 读不了
+
+C 引擎只认 v1/v3（`src/tgai_engine.c:2369`：`"版本不兼容 (支持 v1/v3)"`），
+而本仓库的 `tg4.py` 是 **V4** 自描述分区容器、训练检查点就按 v4 写。
+所以 **ORV 训出来的 v4 权重目前无法被引擎加载** —— 这是"训推一体"真正缺的一环，
+需要给引擎加 v4 解析（分区表 + `NAM` 名字表），不是打包问题。
+
+套件：本地 670 passed / 42 skipped。
+
 ## [0.9.57] - 2026-11-12
 
 **修外部报告的 P0：`pip install` 后推理端直接不可用。**
