@@ -1,8 +1,0 @@
-﻿docs: fix INDEX entries I had corrupted, and link the generality audit
-
-Two lines in the docs index had their backticks turned into backslashes by a PowerShell escaping mistake of
-mine, and the MEMORY_BACKWARD_PEAK entry still carried the conclusion I later disproved -- that checkpointing
-does not free activations. Both are corrected, the entry now says the forward pass is fine and the real cost is
-the 1.8 GiB per layer backward peak, and the generality audit is linked alongside them.
-
-Version stays 0.9.52.
