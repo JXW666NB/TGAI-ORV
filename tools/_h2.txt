@@ -1,0 +1,29 @@
+﻿docs: trace every checkpoint block and narrow the backward peak to one interval
+
+Sampling live memory around each checkpoint block's backward settles one question and opens another.
+
+Blocks do release. Entering block one 6.813 GiB and exiting at 7.029, then 5.153 to 5.466, and so on down
+to 0.172 to 0.779, so the exit figure falls monotonically across the six blocks. There is no accumulation
+from block to block, which is what I suspected last turn and what this trace disproves.
+
+What does not make sense yet is the starting point. The forward pass ends at 0.133 GiB, yet the very first
+block to run its backward already sees 8.474 GiB live. That is 8.3 GiB appearing between the end of forward
+and the first traced call, which divides into about 1.41 GiB per layer, the exact size of all six layers'
+activations. So at the moment backward begins, every layer's activations are resident at once, and they are
+then released one block at a time as backward walks back through the stack.
+
+The per-block net increase from 0.117 up to 0.607 is ordinary leaf gradients accumulating, roughly 0.1 GiB of
+weight gradient per layer, and it accounts for the final 0.759 GiB.
+
+The leading explanation is that the nested call is doing more than one block. Inside bw, re.backward(g) walks a
+graph that contains inputs, the previous checkpoint's output, and that node still has a _backward because it is
+the previous block's bw. A nested walk therefore continues into it, so a single call unwinds the entire chain
+rather than one segment, and every segment's activations exist simultaneously. That also explains why the trace
+records the deepest point first.
+
+The next probe is written down: sample before and after re.backward(g) inside bw, and count the nodes in re's
+graph whose _backward is not None, checking whether the previous checkpoint node appears among them. If it
+does, the fix is the one PyTorch uses -- stop the nested walk at inputs by detaching it, and let the outer loop
+carry the gradient into the previous block.
+
+Documentation only. Version stays 0.9.52.
