@@ -348,4 +348,21 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # 自检**永远不该朝用户吐 traceback**：它存在的意义就是"把环境状况讲清楚"。
+    # 缺驱动 / 无 GPU / 后端不可用时，给一段可直接粘贴的结论，再以 2 退出。
+    try:
+        raise SystemExit(main())
+    except SystemExit:
+        raise
+    except BaseException as _exc:      # noqa: BLE001 - 兜底就该全抓
+        import traceback as _tb
+        print()
+        print("自检没跑完 —— 环境不满足，不是代码坏了：")
+        print("  %s: %s" % (type(_exc).__name__, str(_exc)[:300]))
+        print()
+        print("这通常表示本机没有可用的 GPU 或驱动。把下面这段贴给开发者即可：")
+        print("-" * 64)
+        for _ln in _tb.format_exc().strip().split("\n")[-12:]:
+            print(_ln)
+        print("-" * 64)
+        raise SystemExit(2)
