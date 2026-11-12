@@ -42,9 +42,11 @@ PyPI 包名 `tgai-orv`，import 路径 `tgai_go.train`。
 | **sm_60 本身支持** | NVRTC 能编译 `compute_60`，张量/模型/AdamW 正常训练 —— 硬件不是障碍 |
 | **首装可能报 `failed to open nvrtc-builtins64_*.dll`** | **0.9.50 已修**（会扫 `nvidia/*/lib`、`*/bin` 并写进 PATH）。仍失败时的规避：把 `site-packages/torch/lib` 前置进 `PATH` **并** 调 `os.add_dll_directory` |
 | **"比 PyTorch 省显存"有范围** | 只在 **3B MoE / 32GB V100** 有证据。400M 稠密 / 16GB 上 **PyTorch 能跑而 ORV 开检查点仍 OOM** —— 检查点回收目前弱于 torch |
-| **fp16 只覆盖前向 GEMM** | 反向仍 fp32。**无 Tensor Core 的卡上收益远小于 V100**，别以为开了 fp16 就快 |
-| **没有 `cos` / `sin`** | RoPE 类模型需 numpy 预生成表，再传给 `_rope_composed` 或引擎 |
-| **SDPA 维度约定** | 已接受 `is_causal=`，但输入要 `[B*H, S, Dh]`；torch 习惯是 `[B,H,S,Dh]` ⇒ 会报维度/广播错，需自己展平 |
+| **fp16 是「反向也走」但受形状门槛** | fp16 分支在**共享 GEMM 核心**里，前向反向都走；门槛 `m*n ≥ 262144` 且 `k ≤ _FP16_MAX_K`（默认不限，可用 `TG_FP16_MAX_K` 调）。**长 K 的 dW 有精度风险**：代码记录梯度相对误差会从 3e-4 恶化到 2e-2。`B=8/S=2048` 时 k=16384 正处风险区 ⇒ 开 fp16 必须在目标卡实测 |
+| **AMP 不省激活显存** | 参数/激活/梯度**全程 fp32**，只有 GEMM 输入 cast。torch autocast 把激活存 fp16 ⇒ 天然省一半激活显存。**这是 ORV 显存差距的结构性原因之一**，不是"开销没优化好" |
+| **`sdpa_lowmem` 只支持 `dh==64`** | `dh=128` 会**静默退回全量注意力**（不报错）。d_head=128 的模型别以为开了低显存 |
+| **没有 `cos` / `sin`** | **0.9.51 已加**。旧版本需 numpy 预生成表 |
+| **SDPA 维度约定** | 已接受 `is_causal=` 与 `[B,H,S,Dh]`（0.9.51 起自动展平）；旧版本要 `[B*H, S, Dh]` |
 
 ### 2.2 别把这两件事混为一谈
 

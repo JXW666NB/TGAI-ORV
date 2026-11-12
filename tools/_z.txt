@@ -1,0 +1,28 @@
+﻿docs: checkpointing measurably does not free activations, which is why the P100 cannot train
+
+I tried to show that 0.9.51 had already made the P100 configuration fit. It had not, and the measurement says
+so plainly. Holding D=1280, dh=128, FF=5120, S=2048 and B=1 while varying only the layer count, the forward
+peak with checkpointing grows 2.09, 3.83, 7.30 GiB for 2, 4 and 8 layers. Linear growth of roughly 0.87 GiB
+per layer, and higher than the same model without checkpointing at 1.56, 3.09, 6.17. If checkpointing worked
+the peak would be nearly independent of depth, differing only by the residual stream at about 21 MB a layer.
+
+Reproducing the reviewer's configuration on the V100 also fails, running out at 31.29 GiB live -- my parameter
+count was larger, 606M against their 434M, but both figures sit far above the roughly 7.4 GiB that a working
+implementation should need: 6.4 GiB of parameters, gradients and AdamW state, plus about 1 GiB for a single
+layer of activations.
+
+So the 0.9.51 change, clearing _parents on the checkpoint output and dropping the clone, was insufficient. It
+looked like a 30% win on the small dense test because at d=512 and S=512 each layer's activations are a few
+megabytes; the defect only shows at S=2048 with dh=128, where one layer costs 0.87 GiB.
+
+The document records four candidate causes in order of likelihood, led by the possibility that no_grad here
+only suppresses _backward while operators still write _parents unconditionally, so clearing the output's
+parents does not break whatever chain keeps the intermediates alive. It also records what a fixed version must
+satisfy: peak differences under 0.2 GiB across depths, strictly below the no-checkpoint baseline, bit-identical
+numerics, and the reviewer's own configuration completing a step on 16 GB.
+
+For the P100 owner right now, the honest answer is that the current release cannot run that shape, and the
+workaround is about eight layers at S=2048 or sixteen at S=1024 with batch one, roughly 13.4 GiB estimated and
+still needing measurement. That is bypassing the problem, not solving it.
+
+Documentation only. Suite: 670 passed / 40 skipped. Version stays 0.9.52.
