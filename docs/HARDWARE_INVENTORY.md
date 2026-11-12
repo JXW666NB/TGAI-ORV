@@ -11,7 +11,8 @@
 | 显卡 | **AMD Radeon (TM) Graphics**（iGPU） | **Tesla V100-PCIE-32GB** + **GeForce GT 730** |
 | **CUDA** | ❌ 无 NVIDIA、无 `nvidia-smi` | ✅ **1 个**：`GPU 0: Tesla V100-PCIE-32GB`<br>UUID `GPU-6b615e44-f60e-f629-5337-849d1154239a` |
 | **Vulkan** | ✅ **1 个设备**：`AMD Radeon (TM) Graphics`，`apiVersion 1.3.260`，`PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU` | ❌ **0 个**：`vulkaninfo` 报 `Failed to detect any valid GPUs`（`vkEnumeratePhysicalDevices` → `ERROR_INITIALIZATION_FAILED`）|
-| Vulkan ICD | 有（可用）| **`HKLM\SOFTWARE\Khronos\Vulkan\Drivers` 不存在** ⇒ 未注册 ICD。<br>`C:\Windows\System32\vulkan-1.dll` 与 `vulkan-1-999-0-0-0.dll` 在，但只是 loader |
+| **驱动模式** | — | **`driver_model.current = TCC`**（Tesla Compute Cluster），驱动 `580.88` |
+| Vulkan 为何不可用 | — | **TCC 模式按设计不提供图形 API**（无 OpenGL / 无 Vulkan），与"ICD 是否注册"无关。`HKLM\SOFTWARE\Khronos\Vulkan\Drivers` 不存在只是同一件事的表现 |
 | 驱动 | AMD `31.0.21924.4004` | V100 `32.0.15.8088`（2025-07-27）<br>GT730 `27.21.14.5671`（2020-09-30）|
 
 ## 2. 由此得出的硬结论
@@ -40,23 +41,37 @@
 
 | 路径 | 状态 | 原因 |
 | --- | --- | --- |
-| CUDA | ❌ | `nvidia-smi -L` 不列它；驱动 `27.21.14.5671`（2020）与 V100 的 `32.0.15.8088` 属不同分支，两版 NVIDIA 驱动并存 |
-| Vulkan | ❌ | 整机 Vulkan ICD 未注册（不是这块卡单独的问题）|
+| CUDA | ❌ | `nvidia-smi -L` 不列它；驱动 `27.21.14.5671`（2020）与 V100 的 `580.88` 属不同分支 |
+| Vulkan | ❌ | 整机 Vulkan 不可用（V100 处于 TCC 模式）|
 
-**理论上可尝试的修复**（未验证，仅供后续参考）：在 `DriverStore` 里找到 `nvoglv64.dll`
-（NVIDIA 的 Vulkan ICD），手工在 `HKLM\SOFTWARE\Khronos\Vulkan\Drivers` 注册其完整路径。
-注册后 `vulkaninfo` 若能看到 V100 或 GT730，才有资格谈 TG Link 的实验。
+**为什么二选一（用户说明 + 实测印证）**：GT730 是**亮机卡**（只为有显示输出），该机**无核显**。
+Windows 上 **GeForce 驱动与 Data Center 驱动只能装一个** —— 装了 GT730 的消费卡驱动，
+V100 的驱动就坏；反之 GT730 不可用。所以这台机器是「V100 走 CUDA + GT730 只亮机」的配置。
+
+**我曾提过的"手工注册 `nvoglv64.dll`"是错的，已作废**：V100 在 **TCC** 模式下按设计
+不提供 Vulkan，注册 ICD 也无用；要开 Vulkan 必须把卡切到 WDDM 并改装含图形组件的驱动，
+那会改变 CUDA 行为，且仍与 GT730 驱动冲突。
+
+## 3.5 关键推论：**这个阻塞是 Windows 特有的**
+
+**TCC 只是 Windows 上的概念。** 在 **Linux** 上同一份 NVIDIA 驱动同时提供 CUDA 与 Vulkan，
+V100 不需要在两者间二选一；而 Linux 也正是 **`dma-buf` 外部内存**（比 Windows 的
+`OPAQUE_WIN32` 更成熟的跨设备共享路径）的主场。
+
+⇒ **结论：TG Link 的 P2P 实验应该放在 Linux 上做，不是"硬件不具备"，而是"Windows 上被 TCC 卡住"。**
+租机时选 **同机 ≥2 张卡的 Linux 实例**，先验证"2 个 Vulkan 设备之间的机制"，再谈跨厂商。
 
 ## 4. 因此：什么能做、什么不能做
 
 | 事项 | 可行性 |
 | --- | --- |
-| 探针的**静态能力层**（枚举设备、查扩展与句柄类型交集） | ✅ 两台都能跑；但两台各自只有 1 个设备 ⇒ 配对结论为空 |
+| 探针的**静态能力层**（枚举设备、查扩展与句柄类型交集） | ✅ 两台都能跑；但**笔记本只有 1 个设备、远端 0 个** ⇒ 配对结论为空 |
 | 探针的**实测层**（导出/导入/带宽） | ❌ 需要同一台机器上至少 2 个 Vulkan 设备 |
-| 跨厂商 P2P 验证 | ❌ 硬件不存在 |
-| 同厂商 P2P（V100↔GT730） | ❌ GT730 CUDA 不可用、Vulkan 未注册 |
+| 跨厂商 P2P 验证 | ❌ 当前两台机器都没有跨厂商同机组合 |
+| 同厂商 P2P（V100↔GT730） | ❌ Windows 上 V100 处 TCC、GT730 驱动冲突 ⇒ **不行**；**Linux 上才可能** |
 | **host-staged 集合通信（tier 3）** | ✅ 只需多个进程，不需要特殊硬件 |
 | 跨机 DP（笔记本 iGPU + 远端 V100，走网络） | ⚠️ 正确性可测、速度不可测；且**要先有 Vulkan 训练后端**（目前 0 个内核）|
+| **租一台 Linux 双卡机验机制** | ✅ **推荐路径**（Linux 无 TCC，同驱动同时支持 CUDA + Vulkan）|
 
 ## 5. 给未来的规划者
 
