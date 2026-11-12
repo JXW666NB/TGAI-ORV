@@ -1,3 +1,37 @@
+## [0.9.57] - 2026-11-12
+
+**修外部报告的 P0：`pip install` 后推理端直接不可用。**
+
+### 问题
+
+外部实测（GTX 1060 / 干净 venv）：`pip install tgai-orv` 之后 `tgai_go.load()` 报
+`FileNotFoundError: DLL not found` —— wheel 里**只有 80 个 py 文件，不含 `_native/`**。
+"训推一体"在 pip 形态下是断的。
+
+进一步：把仓库里的 `_native/*.dll` 手工拷进 site-packages 也加载不了，
+`ctypes.CDLL` 报 `OSError [WinError 193] 不是有效的 Win32 应用程序`
+（两个引擎 DLL 的 PE 签名都比 DOS 头 `e_lfanew` 早 1 字节）。
+
+### 本版改了什么
+
+| 改动 | 说明 |
+| --- | --- |
+| **`pyproject.toml` 补 package-data** | `"tgai_go" = ["_native/*.dll", "_native/*.so", "_native/*.dylib"]` —— 原生库随 wheel 分发 |
+| **`native_available()` 为假时报可执行指引** | 不再抛裸 `FileNotFoundError`；告知升级 / 源码安装 / `dll=` 指定，并说明训练侧不受影响 |
+| **原生库加载失败时同理** | 捕获 `OSError`，其中 WinError 193 明确说明"随包 DLL 损坏、需重编"，并给出三条替代路径 |
+| **`kernel_count.py` 去硬编码** | 改为读 `V27_RUN` / `V27_TG`，缺失时说明这是作者本机工具并指向 `profile_block.py` |
+| **README 数字不再写死** | 版本徽章改为 shields 动态读 PyPI；测试数/内核数指向 `CAPABILITY_AUDIT.md` |
+| **仓库卫生** | `backups/`（18 个）与源码内 `.bak`/空 txt 移出索引并 gitignore；`release/` 保留（3 处文档引用）|
+
+### 仍未解决（如实记录）
+
+**随包的 Windows 引擎 DLL 本身是坏的**（PE 头错位 1 字节），需要**重编**才能用；
+本机没有 C 编译器，无法在此完成。所以本版把"文件打包对了"这条路修通，
+但**推理在 Windows 上仍不可用**，直到 DLL 重编。详见
+`docs/EXTERNAL_REVIEW_TRIAGE_2026-11-12.md`。
+
+套件：本地 670 passed / 42 skipped。
+
 ## [0.9.56] - 2026-11-12
 
 **有 GPU 的机器上不再系统性变红（14 个 → 0）**，并修 `op_native` 违约时的报错。

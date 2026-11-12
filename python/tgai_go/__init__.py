@@ -39,9 +39,9 @@ try:
     try:
         __version__ = _pkg_version("tgai-orv")
     except _PNF:
-        __version__ = "0.9.56"
+        __version__ = "0.9.57"
 except Exception:  # noqa: BLE001  极端老的 Python / 精简环境
-    __version__ = "0.9.56"
+    __version__ = "0.9.57"
 
 # 库默认不往 stdout 输出（脚本版会打印，库不该）
 _logging.getLogger('tgai_go').addHandler(_logging.NullHandler())
@@ -213,8 +213,33 @@ def load(path, *, dll=None, extend_ctx=0, threads=None, preload=False):
     """
     if not _os.path.exists(path):
         raise FileNotFoundError('模型文件不存在: %s' % path)
-    e = TGEngine(dll_path=dll)
-    e.load(path, extend_ctx=extend_ctx)
+    # ★ 2026-11-12（外部报告 P0）：pip 装出来的 wheel 此前**不含** _native/ 原生库，
+    #   于是这里直接抛 `FileNotFoundError: DLL not found`，用户不知道是打包问题还是自己缺东西。
+    #   另外 ≤0.9.56 的 Windows 引擎 DLL 存在 PE 头错位（ctypes 报 WinError 193），
+    #   也不是用户能修的。两种情形都给可执行的指引。
+    if dll is None and not native_available():
+        raise RuntimeError(
+            '找不到推理引擎的原生库（%s 下没有 .dll/.so/.dylib）' % native_dir()
+            + '。修法：① 升级到 tgai-orv>=0.9.57（此版本起 _native/ 会随 wheel 分发）；'
+              '② 或从源码安装：git clone 后 `pip install -e .`；'
+              '③ 或用 dll= 显式指定引擎库路径。'
+              '注：训练侧（tgai_go.train）不依赖这个原生库，不受影响')
+    try:
+        e = TGEngine(dll_path=dll)
+        e.load(path, extend_ctx=extend_ctx)
+    except OSError as exc:
+        _extra = ""
+        if "193" in str(exc) or "not a valid Win32" in str(exc):
+            _extra = ('其中 WinError 193 表示原生 DLL 本身损坏 —— '
+                      'tgai-orv ≤0.9.56 随包的 Windows 引擎 DLL 存在 PE 头错位（已知缺陷，'
+                      '需重编，见 docs/EXTERNAL_REVIEW_TRIAGE_2026-11-12.md）。')
+        raise RuntimeError(
+            '推理引擎原生库加载失败：%s' % str(exc).rstrip('。')
+            + '。修法：' + _extra
+            + '① 用 dll= 显式指向你自己的引擎库；'
+              '② 或在 Linux 上构建/使用；'
+              '③ 检查该 .dll 能否被 `ctypes.CDLL(路径)` 单独加载。'
+              '注：训练侧（tgai_go.train）不依赖这个原生库，不受影响') from exc
     if threads:
         got = e.set_threads(threads)
         if got > 0:

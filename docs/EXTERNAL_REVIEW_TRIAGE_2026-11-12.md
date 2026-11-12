@@ -7,10 +7,11 @@
 
 | # | 问题 | 状态 |
 | --- | --- | --- |
-| 1 | **wheel 不含推理用的原生库**（`_native/*.dll`），`pip install` 后 `tgai_go.load()` 报 `FileNotFoundError` | **未修**。需要把 `_native` 纳入 package-data；但见第 2 条 —— 光打包会把坏 DLL 一起发出去 |
-| 2 | **仓库里 Windows 引擎 DLL 的 PE 头错位 1 字节**（`libtgai_engine.dll`：`e_lfanew=0xF8` 而 PE 实际在 `0xF7`；VK 版 0x108 vs 0x107）。手工拷贝也 `WinError 193` | **未修**。要重编 DLL，属于独立任务；**当前不要把"训推一体"当成立** |
+| 1 | **wheel 不含推理用的原生库**（`_native/*.dll`），`pip install` 后 `tgai_go.load()` 报 `FileNotFoundError` | ✅ **已修（0.9.57）**：`pyproject.toml` 补 `"tgai_go" = ["_native/*.dll", ...]`；从 PyPI 回读的 wheel 已确认含 `libomp.dll` / `libtgai_engine.dll` / `libtgai_engine_vk.dll`。同时把"缺库"和"加载失败"两种情形都改成**带修法的指引** |
+| 2 | **仓库里 Windows 引擎 DLL 的 PE 头错位 1 字节**（`e_lfanew=0xF8` 而 PE 在 `0xF7`）。手工拷贝也 `WinError 193` | 🟡 **报错已改善、根因未修**：`ctypes.CDLL` 失败的 `OSError` 现在会被包成 `RuntimeError`，其中 WinError 193 明确指出"随包 DLL 损坏、需重编"，并给出三条替代路径。**根因需要重编 DLL，本机没有 C 编译器，无法完成** |
 
-⇒ 结论：**推理端在 pip 形态下不可用**，这是已知状态。训练端不受影响。
+⇒ 结论：**打包路径已修通，但 Windows 上的推理仍然不可用**，直到 DLL 重编。
+这是已知状态，不要对外宣称"训推一体"已在 pip 形态下成立。训练端不受影响。
 
 ## P1（影响正确使用或回归能力）
 

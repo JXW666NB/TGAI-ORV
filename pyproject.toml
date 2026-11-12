@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # 若被占名，改这一行即可（import 名始终是 tgai_go，不受影响）。
 [project]
 name = "tgai-orv"
-version = "0.9.56"
+version = "0.9.57"
 description = "PyTorch-free LLM engine: train and infer with one codebase. 训推一体，不依赖 PyTorch。"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -48,5 +48,14 @@ include = ["tgai_go*"]
 
 # CUDA 算子源码必须随包分发：train/cuda.py 运行时通过 attn_nop_source_path()
 # 从 training/kernels/ 读取 tgai_attn_nop.cu 现编；缺了它 lowmem 注意力路径不可用。
+#
+# `_native/*` 是推理引擎的原生库（libtgai_engine*.dll/.so）。
+# 2026-11-12 修（外部报告 P0）：此前**漏了这一项**，于是 `pip install` 后
+# `tgai_go.load()` 直接 FileNotFoundError —— "训推一体"在 pip 形态下是断的。
+# 注意：0.9.56 及更早发布的 Windows 引擎 DLL 存在 PE 头错位（详见
+# docs/EXTERNAL_REVIEW_TRIAGE_2026-11-12.md），需要重编后才真正可用；
+# 现在至少把文件打进包里，且加载失败时给的是可执行的指引而不是裸异常。
 [tool.setuptools.package-data]
 "tgai_go.train" = ["kernels/*.cu", "kernels/*.cuh"]
+"tgai_go" = ["_native/*.dll", "_native/*.so", "_native/*.dylib"]
+
