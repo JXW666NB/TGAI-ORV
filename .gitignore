@@ -27,3 +27,6 @@ _sweep_*.csv
 # 仓库根目录的临时测量/排查输出：不要提交，证据请放 docs/measurements/
 /*.txt
 /*.log
+
+# 朋友的复现包（第三方代码，不入库）
+_repro_v21e/

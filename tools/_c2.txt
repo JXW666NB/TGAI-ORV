@@ -1,0 +1,27 @@
+﻿docs: run the reviewer's PyTorch reproduction and record what ORV has to match
+
+The package runs cleanly on the V100. Full v2.1e, 434,229,976 parameters, fp16 autocast plus per-layer
+checkpointing: 30 steps at B=8 and S=2048 gives 5,667 tok/s with a 10.28 GB peak, loss falling 10.76 to 3.89;
+B=2 gives 3,494 tok/s at 8.59 GB. The smoke configuration finishes in 2.2 s at 37,964 tok/s. Their synthetic
+corpus generates without trouble, so this is now a usable reference rather than an estimate.
+
+Placed next to it, ORV's own figure is sobering: a six-layer simplified dense model at B=2 reaches a 10.80 GiB
+backward peak, more than torch spends on twenty layers at B=8. The difference is structural, not tuning.
+
+Reading the config corrects one of the reviewer's own priorities. The plan asks for sdpa_lowmem to grow from
+64 to 128, but att_dhead is 128 for two layers and 96 for the other eighteen -- head dimension is never 64.
+Extending to 128 alone leaves eighteen layers still materialising attention. The fix has to cover 96 as well,
+or be written for arbitrary head dimension.
+
+The dominant cause is that torch's autocast stores activations in fp16 while ORV's AMP casts only GEMM inputs
+and keeps activations fp32, roughly doubling that term. That work is already listed as pending in
+MULTIVENDOR_ROADMAP section 6 under real AMP with bf16 activation storage, and it has never been done. It is
+the only lever that closes the gap; chunked cross-entropy and a wider lowmem kernel are secondary.
+
+The document also notes that ORV has no port of this model yet, so no comparable number exists. Porting it --
+RoPE, learnable RMSNorm, LayerScale, per-layer head dimensions and six MoE layers -- is the next step, and it
+doubles as a test of whether ORV's layer set can express a real user's architecture.
+
+The reproduction pack is third-party code and stays out of the repository; _repro_v21e/ is gitignored.
+
+Documentation only. Version stays 0.9.52.

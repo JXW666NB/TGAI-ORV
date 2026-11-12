@@ -1,0 +1,97 @@
+# v2.1e 复现基准与 ORV 差距（2026-11-12）
+
+> 来源：P100 用户提供的复现包 `repro_v21e.zip`（PyTorch 原版，已按第三方代码处理，
+> 不入库，`.gitignore` 里有 `_repro_v21e/`）。
+> 本文记录**在 V100 上跑出的权威基线**，以及 ORV 要追平必须做什么。
+
+## 1. 复现包实测（V100 32GB）
+
+命令：`python repro_train.py --data data --steps 30 --batch N --seq 2048`
+（fp16 autocast + GradScaler + 每层梯度检查点 + AdamW 三组 + warmup/cosine + 裁剪 1.0）
+
+| 配置 | tok/s | 峰值显存 | loss（首→末）| 耗时 |
+| --- | --- | --- | --- | --- |
+| **B=8 / S=2048** | **5,667** | **10.28 GB** | 10.7634 → 3.8856 | 86.7 s |
+| **B=2 / S=2048** | **3,494** | **8.59 GB** | 10.7694 → 4.4583 | 35.2 s |
+| 冒烟（21M 小模型） | 37,964 | 0.60 GB | 10.5702 → 10.3599 | 2.2 s |
+
+模型：**434,229,976 参数**（激活 315,988,480 = 72.8%），20 层。
+loss 正常下降 ⇒ 复现包本身没问题，可作为 ORV 的对标基准。
+
+**这两个数字（10.28 GB @ B=8、5,667 tok/s）就是 ORV 必须对标的目标。**
+
+## 2. 模型结构（决定适配成本的真实细节）
+
+从 `v21e_config.py` 读到：
+
+| 项 | 值 |
+| --- | --- |
+| 层数 | 20 |
+| **每层 d_head 不同** | `att_dhead = {g:128, h:96, i:96}`，`att_plan = [g,g] + [h,h] + [i]*10 + [h]*6`<br>⇒ **18 层 dh=96，2 层 dh=128** |
+| RoPE | θ=50000，只作用 Q/K |
+| 归一化 | **可学习** RMSNorm（γ 是参数，不是固定缩放）|
+| 残差缩放 | LayerScale 初值 0.3，单独参数组 lr×10 |
+| FFN | 稠密 `ffn_dim=2560`；`ffn_plan` 里 `b` 在索引 6/8/10/12/14/16 |
+| **MoE 层位置** | **6 层 MoE（第 7,9,11,13,15,17 层），其余 14 层稠密** |
+| MoE | 36 专家 × 内部 256，top-6，无共享专家，Loss-Free Balancing（bias clamp ±2）|
+| 掩码 | **bool `[B,T,T]`**（因果 & 同文档），不是 float 掩码 |
+| 损失 | 分块 CE（避免 `[B,T,V]`）|
+
+### 一个必须更正的点
+
+用户报告里写「P0：`sdpa_lowmem` 的 dh 从 64 扩到 128」。
+但实测配置是 **dh=96（18 层）+ dh=128（2 层），没有 64**。
+
+⇒ **只把 lowmem 支持扩到 128 仍然没用**，18/20 层还是走全量物化。
+正确做法是支持 **96 与 128**（或做成对任意 dh 的通用实现）。
+
+## 3. ORV 目前的差距（实测）
+
+| 侧 | 配置 | 显存 |
+| --- | --- | --- |
+| torch（20 层全模型）| B=8 / S=2048 | **10.28 GB** |
+| ORV（**6 层**简化 dense）| B=2 / S=2048 | **反向峰值 10.80 GiB** |
+
+**ORV 6 层 B=2 的反向峰值，已经超过 torch 20 层 B=8 的总用量。**
+这不是调参问题，是结构差异。
+
+已定位的两个原因（按影响排序）：
+
+| # | 原因 | 量级 |
+| --- | --- | --- |
+| 1 | **torch autocast 把激活存成 fp16；ORV 的 AMP 只把 GEMM 输入 cast，激活全程 fp32** | 激活约 **2×** |
+| 2 | ORV 单层反向峰值 1.8 GiB；其中 SDPA 物化 `[BH,S,S]` 约 335 MB（dh=128 时） | 每层 1/4~1/3 |
+
+**第 1 条是决定性的**，而且它已经在 `MULTIVENDOR_ROADMAP.md` §6 里被列为待做项
+（「真 AMP（bf16 激活存储）」），只是一直没做。
+
+## 4. 要让 P100 / 16GB 真能训，按影响排序的动作
+
+| 优先级 | 动作 | 预期 |
+| --- | --- | --- |
+| **P0** | **激活存 fp16/bf16（真 AMP）** | 激活减半 ⇒ 这是唯一能追平 torch 的杠杆 |
+| P0 | 分块 CE（用已有 `functional.linear_cross_entropy`）| 省掉 `[B,T,V]` 物化 |
+| P1 | `sdpa_lowmem` 支持 dh=96/128 | 每层省 ~335 MB（dh=128）或 ~250 MB（dh=96）|
+| P1 | 反向复用 SDPA 的 `P` 与 `dP` | 未知，需实测 |
+| P2 | bool 掩码支持 | 他的模型用 `[B,T,T]` bool；ORV 只有 causal 与 float 掩码 |
+
+**注意 P0 第二条的可行性**：ORV 已有 `linear_cross_entropy(x, weight, target, chunk=)`，
+但需要确认它与「忽略 -100」「跨文档不计损失」的语义能对上。
+
+## 5. 下一步
+
+1. **先量清楚**：ORV 侧目前没有 v2.1e 的端口。要给出可比数字，需要把
+   `v21e_model.py` 移植到 ORV（RoPE + 可学习 RMSNorm + LayerScale + 混合头数 + 6 层 MoE）。
+   这本身也是对 ORV 表达能力的检验。
+2. **移植时先只做 dense 版**（`--no-moe` 之类），对齐 torch 的 B=8/B=2 两个点，
+   再上 MoE。
+3. 每一步都按用户给的协议报：同一份合成语料、5 步预热 + 20 步均值、tok/s + 峰值显存 + loss。
+
+## 6. 复现命令
+
+```bash
+# 在 GPU 机器上（D:\tgai_orv\repro_v21e）
+python synth_data.py --dir data --tokens 20000000
+python repro_train.py --data data --steps 30 --batch 8 --seq 2048 --json out_b8.json
+python repro_train.py --data data --steps 30 --batch 2 --seq 2048 --json out_b2.json
+```
