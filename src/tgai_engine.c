@@ -1180,6 +1180,10 @@ struct TGModel {
     const uint8_t* tokenizer_data;
     const TGWeightEntry* weight_table;
     const uint8_t* weight_data;
+    /* TG4（2026-11-13）：TG4 文件里没有 v3 那种 FNV 表，加载时按 NAM 现造一张
+     * 定长记录表并 malloc 出来，由本字段持有所有权（tg_free 里释放）。
+     * v3/v1/GGUF 路径下恒为 NULL。 */
+    void* weight_table_alloc;
 
     /* 权重查找表 (hash → entry 指针) */
     const TGWeightEntry** weight_lookup;
@@ -2191,6 +2195,186 @@ static int load_tokenizer(TGModel* m) {
 #define TGAI_GGUF_ATTACH 1
 #include "tgai_gguf.inc"
 
+/* ═══ TG4 容器挂接（2026-11-13）═══
+ *
+ * ## 为什么单独写一段，而不是复用 v3 的表
+ *
+ * TG4 与 v3 家族有**两处硬差别**，不能共用读取：
+ *   1. **头字段偏移不同**：TG4 在 8/12 处是 header_bytes/flags，28 处是 head_dim……
+ *      直接按 `TGHeader` 解释会得到"层数=header_bytes"这类错值；
+ *   2. **没有 FNV 权重表**：TG4 用 section table + NAM 名字表。
+ *
+ * 所以这里把 TG4 的头按它自己的偏移读出来，再把 NAM 的每个名字用 `fnv1a_64()` 翻译成
+ * 引擎内部统一使用的 `TGWeightEntry`（名字哈希 + 偏移 + 形状），malloc 一张表交给
+ * `m->weight_table`。**之后的流程（查找表构建、load_tokenizer、preload_weights）完全共享**，
+ * 不需要第二套推理路径。
+ *
+ * TOK 分区与 v3 的分词段**字节布局一致**，所以直接把 `tokenizer_off/len` 指过去即可。
+ */
+static uint32_t tg4_rd32(const uint8_t* b, size_t off) {
+    uint32_t v = 0; memcpy(&v, b + off, 4); return v;
+}
+static uint64_t tg4_rd64(const uint8_t* b, size_t off) {
+    uint64_t v = 0; memcpy(&v, b + off, 8); return v;
+}
+/*: dtype 码 → 每元素字节数（与 Python 端 `tg4._ESZ` 对齐；量化类型留给 v3 路径）*/
+static uint64_t tg4_elemsize(uint32_t dt) {
+    switch (dt) {
+        case 0: return 4;   /* fp32 */
+        case 1: return 2;   /* fp16 */
+        case 2: return 1;   /* int8 */
+        case 6: return 2;   /* bf16 */
+        default: return 0;  /* 量化类型：TG4 写出端不会产生，遇到即报错 */
+    }
+}
+
+static TGError tg4_attach(TGModel* m, char* msg, size_t msg_cap) {
+    const uint8_t* b = (const uint8_t*)m->mapped;
+    const size_t n = m->mapped_size;
+    if (!b || n < 128) {
+        snprintf(msg, msg_cap, "TG4 文件短于 128 字节头（%zu 字节）", n);
+        return TG_ERR_MAGIC;
+    }
+
+    /* 1. 头：**TG4 自己的偏移** */
+    uint32_t nl = tg4_rd32(b, 16), dm = tg4_rd32(b, 20), nh = tg4_rd32(b, 24);
+    uint32_t hd = tg4_rd32(b, 28), dff = tg4_rd32(b, 32), voc = tg4_rd32(b, 36);
+    uint32_t ms = tg4_rd32(b, 40), nkv = tg4_rd32(b, 44), ne = tg4_rd32(b, 48);
+    uint32_t na = tg4_rd32(b, 52), arch = tg4_rd32(b, 56), wdt = tg4_rd32(b, 60);
+    uint32_t rope = tg4_rd32(b, 64);
+    uint32_t pad = tg4_rd32(b, 80), bos = tg4_rd32(b, 84);
+    uint32_t eos = tg4_rd32(b, 88), unk = tg4_rd32(b, 92);
+    uint64_t tok_off = tg4_rd64(b, 96), tok_len = tg4_rd64(b, 104);
+    uint64_t sect_off = tg4_rd64(b, 112), sect_cnt = tg4_rd64(b, 120);
+
+    if (nl == 0 || dm == 0 || nh == 0 || voc == 0) {
+        snprintf(msg, msg_cap, "TG4 头字段非法（layers=%u d_model=%u heads=%u vocab=%u）",
+                 nl, dm, nh, voc);
+        return TG_ERR_INVALID;
+    }
+    if (sect_cnt == 0 || sect_cnt > 64 ||
+        sect_off + sect_cnt * 32ull > (uint64_t)n) {
+        snprintf(msg, msg_cap, "TG4 分区表越界（off=%llu cnt=%llu 文件=%zu）",
+                 (unsigned long long)sect_off, (unsigned long long)sect_cnt, n);
+        return TG_ERR_MAGIC;
+    }
+
+    m->header.magic = TG4_MAGIC;
+    m->header.version = 4;
+    m->header.n_layers = nl;
+    m->header.d_model = dm;
+    m->header.n_heads = nh;
+    m->header.d_ff = dff;
+    m->header.vocab_size = voc;
+    m->header.max_seq_len = ms;
+    m->header.n_experts = ne;
+    m->header.n_activated = na;
+    m->header.weight_dtype = wdt;
+    m->header.rope_theta = rope;
+    m->header.pad_token_id = pad;
+    m->header.bos_token_id = bos;
+    m->header.eos_token_id = eos;
+    m->header.unk_token_id = unk;
+    m->header.arch_type = arch;
+    m->header.num_kv_heads = nkv;
+    m->header.modality_flags = 0;
+    m->header.extension_off = 0;
+    if (hd > 0) m->head_dim = (int)hd;      /* TG4 显式带 head_dim；0 则回退推导 */
+
+    /* 2. 分区表：找 NAM(2) / WGT(3) / TOK(1) */
+    uint64_t nam_off = 0, nam_len = 0, wgt_off = 0, wgt_len = 0;
+    for (uint64_t i = 0; i < sect_cnt; i++) {
+        const uint8_t* e = b + sect_off + (size_t)i * 32;
+        uint32_t type = tg4_rd32(e, 0);
+        uint64_t off = tg4_rd64(e, 8), len = tg4_rd64(e, 16);
+        if (off + len > (uint64_t)n) continue;          /* 越界分区：跳过（前向兼容）*/
+        if (type == 2) { nam_off = off; nam_len = len; }
+        else if (type == 3) { wgt_off = off; wgt_len = len; }
+        else if (type == 1 && tok_off == 0) { tok_off = off; tok_len = len; }
+    }
+    if (!nam_off || !wgt_off) {
+        snprintf(msg, msg_cap, "TG4 缺分区（NAM=%llu WGT=%llu）",
+                 (unsigned long long)nam_off, (unsigned long long)wgt_off);
+        return TG_ERR_MAGIC;
+    }
+
+    /* 3. NAM：u32 count | u32 pool_off | count×32B 记录 | 名字池 */
+    if (nam_len < 8) {
+        snprintf(msg, msg_cap, "TG4 的 NAM 分区过短（%llu 字节）",
+                 (unsigned long long)nam_len);
+        return TG_ERR_INVALID;
+    }
+    uint32_t cnt = tg4_rd32(b, nam_off);
+    uint32_t pool_off = tg4_rd32(b, nam_off + 4);
+    if (cnt == 0 || cnt > 1000000 || 8ull + (uint64_t)cnt * 32ull > nam_len) {
+        snprintf(msg, msg_cap, "TG4 的 NAM 记录数非法（count=%u，NAM=%llu 字节）",
+                 cnt, (unsigned long long)nam_len);
+        return TG_ERR_INVALID;
+    }
+
+    TGWeightEntry* tab = (TGWeightEntry*)calloc((size_t)cnt, sizeof(TGWeightEntry));
+    if (!tab) {
+        snprintf(msg, msg_cap, "TG4 权重表 calloc 失败（%u 条）", cnt);
+        return TG_ERR_OOM;
+    }
+    for (uint32_t i = 0; i < cnt; i++) {
+        const uint8_t* r = b + nam_off + 8 + (size_t)i * 32;
+        uint32_t noff = tg4_rd32(r, 0);
+        uint32_t nlen = (uint32_t)r[4] | ((uint32_t)r[5] << 8);
+        uint32_t ndim = (uint32_t)r[6], dt = (uint32_t)r[7];
+        uint64_t doff = tg4_rd64(r, 8);
+        uint32_t sh[4] = { tg4_rd32(r, 16), tg4_rd32(r, 20),
+                           tg4_rd32(r, 24), tg4_rd32(r, 28) };
+        char namebuf[256];
+        if (ndim == 0 || ndim > 4 || nlen == 0 || nlen >= sizeof(namebuf) ||
+            (uint64_t)pool_off + noff + nlen > nam_len) {
+            snprintf(msg, msg_cap, "TG4 的 NAM 第 %u 条记录非法（ndim=%u nlen=%u）",
+                     i, ndim, nlen);
+            free(tab); return TG_ERR_INVALID;
+        }
+        memcpy(namebuf, b + nam_off + pool_off + noff, nlen);
+        namebuf[nlen] = 0;
+
+        uint64_t esz = tg4_elemsize(dt);
+        if (!esz) {
+            snprintf(msg, msg_cap, "TG4 张量 %s 的 dtype=%u 暂不支持（仅 fp32/fp16/int8/bf16）",
+                     namebuf, dt);
+            free(tab); return TG_ERR_UNSUPPORTED;
+        }
+        uint64_t prod = 1;
+        for (uint32_t k = 0; k < ndim; k++) prod *= (uint64_t)sh[k];
+        if (doff + prod * esz > wgt_len) {
+            snprintf(msg, msg_cap, "TG4 张量 %s 越出 WGT 分区（off=%llu len=%llu WGT=%llu）",
+                     namebuf, (unsigned long long)doff,
+                     (unsigned long long)(prod * esz), (unsigned long long)wgt_len);
+            free(tab); return TG_ERR_INVALID;
+        }
+        tab[i].name_hash = fnv1a_64(namebuf);
+        tab[i].offset = doff;
+        tab[i].length = prod * esz;
+        tab[i].dtype = dt;
+        tab[i].ndim = ndim;
+        for (int k = 0; k < TG_MAX_NDIM; k++) tab[i].shape[k] = sh[k];
+        tab[i].scale_or_pad = 0;
+    }
+
+    m->weight_table = tab;
+    m->weight_table_alloc = tab;              /* 所有权交给 tg_free */
+    m->header.weight_table_count = cnt;
+    m->weight_data = b + wgt_off;
+    m->header.weight_data_off = wgt_off;
+    m->header.weight_data_len = wgt_len;
+    m->header.tokenizer_off = tok_off;
+    m->header.tokenizer_len = tok_len;
+    /* ★ 必须同时设指针：公共流程里的 load_tokenizer() 读的是 `m->tokenizer_data`，
+     *   只填 header 里的 off/len 会留下悬空指针 ⇒ 加载时 NULL 访问违例。 */
+    m->tokenizer_data = b + tok_off;
+    dbg("[tg4] attached: layers=%u d_model=%u head_dim=%u tensors=%u WGT=%llu\n",
+        nl, dm, hd, cnt, (unsigned long long)wgt_len);
+    snprintf(msg, msg_cap, "TG4 OK: %u 张量, %u 层, d_model=%u", cnt, nl, dm);
+    return TG_OK;
+}
+
 TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
     dbg("[tg_load] enter path=%s use_mmap=%d\n", path, use_mmap);
     TGModel* m = (TGModel*)calloc(1, sizeof(TGModel));
@@ -2294,6 +2478,21 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
         {
             uint32_t fmagic = 0;
             if (m->mapped_size >= 4) memcpy(&fmagic, m->mapped, 4);
+            /* ★ TG4 容器（2026-11-13 正式支持）：magic 是 "TG4\0"。
+             *   头偏移与 v3 不同、且用 section table + NAM 而不是 FNV 表，
+             *   所以交给 tg4_attach 做适配；之后查表/分词/预加载全部复用后面的公共流程。 */
+            if (fmagic == TG4_MAGIC) {
+                char t4msg[256];
+                t4msg[0] = 0;
+                TGError rc4 = tg4_attach(m, t4msg, sizeof(t4msg));
+                if (rc4 != TG_OK) {
+                    set_err(t4msg[0] ? t4msg : "TG4 挂接失败");
+                    if (out_err) *out_err = rc4;
+                    tg_free(m); return NULL;
+                }
+                dbg("[tg_load] %s\n", t4msg);
+                /* 三个 section 指针已在 tg4_attach 内设好，下面 v3 的赋值会跳过 */
+            }
             /* ★ GGUF 原生加载（2026-10-18 正式启用）
              *   Q/K 的 RoPE 正向置换已验证与 llama.cpp 一致，
              *   实测 Qwen2.5-0.5B / Qwen3-0.6B 均可直接加载并正确生成。 */
@@ -2362,8 +2561,13 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
                 return m;
             }
         }
-        set_err("magic 不匹配"); if (out_err) *out_err = TG_ERR_MAGIC;
-        tg_free(m); return NULL;
+        /* ★ TG4 已在上面的分支里挂接成功（填好了 header / 表 / 分词段），
+         *   这里**不能**再报 "magic 不匹配" —— 那会把刚挂好的模型打回去。
+         *   只有既不是 TG_MAGIC、也不是 TG4、也不是 GGUF 时才走到这条兜底。 */
+        if (m->header.magic != TG4_MAGIC) {
+            set_err("magic 不匹配"); if (out_err) *out_err = TG_ERR_MAGIC;
+            tg_free(m); return NULL;
+        }
     }
     /* 版本校验: 接受 v1 (TGAI GO 原生) 和 v3 (ORV 多模态扩展, Task 27b) */
     if (m->header.version != TG_VERSION && !TG_IS_V3FAMILY(m->header.version)) {
@@ -2402,10 +2606,12 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
         }
     }
 
-    /* section 指针 */
-    m->tokenizer_data = (const uint8_t*)m->mapped + m->header.tokenizer_off;
-    m->weight_table = (const TGWeightEntry*)((const uint8_t*)m->mapped + m->header.weight_table_off);
-    m->weight_data = (const uint8_t*)m->mapped + m->header.weight_data_off;
+    /* section 指针（TG4 已在 tg4_attach 里设好，不能覆盖）*/
+    if (m->header.magic != TG4_MAGIC) {
+        m->tokenizer_data = (const uint8_t*)m->mapped + m->header.tokenizer_off;
+        m->weight_table = (const TGWeightEntry*)((const uint8_t*)m->mapped + m->header.weight_table_off);
+        m->weight_data = (const uint8_t*)m->mapped + m->header.weight_data_off;
+    }
     dbg("[tg_load] sections set tok=%p wt=%p wd=%p\n",
             m->tokenizer_data, m->weight_table, m->weight_data);
 
@@ -2539,6 +2745,7 @@ void tg_free(TGModel* m) {
     tg_engine_cuda_shutdown();
 #endif
     free(m->weight_lookup);
+    free(m->weight_table_alloc);   /* TG4 现造的表（v3/GGUF 路径为 NULL） */
     free(m->vocab);
     free(m->vocab_strbuf);
     free(m->merge_a);

@@ -62,6 +62,12 @@
 #define TG_VERSION_V4 4u
 /* 凡「v3 家族」都走同一条读取路径（定长头 + FNV 表 + TLV 扩展段）。 */
 #define TG_IS_V3FAMILY(v) ((v) == TG_VERSION_V3 || (v) == TG_VERSION_V4)
+
+/* TG4 容器（2026-11-13 起正式支持）
+ *   与 v3 家族**不是**同一个东西：magic 不同、头字段偏移不同（TG4 有 header_bytes/flags/head_dim）、
+ *   权重表不是 FNV 表而是 **section table + NAM 名字表**。
+ *   本常量用于 tg_load 里的分支判定；TG4 的头必须按它**自己的偏移**解析，不能套 TGHeader。 */
+#define TG4_MAGIC 0x00344754u   /* b"TG4\0" */
 #define TG_HEADER_SIZE 128u
 #define TG_MAX_NDIM 4
 #define TG_MAX_NAME_HASH 256u

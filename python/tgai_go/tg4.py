@@ -31,6 +31,63 @@ ALIGN = 64
 _HDR = struct.Struct("<16I4I6Q4I")     # 64 + 16 + 48 + 16 = 144? -> 见 _pack_header 校验
 _SEC = struct.Struct("<IIQQII")        # type/flags/off/len/align/crc32 = 32B
 _NAM = struct.Struct("<I H B B Q 4I")  # name_off/len/ndim/dtype/data_off/shape[4] = 32B
+#: NAM 分区头：记录数 + 字符串池相对本分区起点的偏移
+_NAM_HDR = struct.Struct("<II")
+
+
+def _pack_nam(meta):
+    """把 `[(name, {off,dtype,shape})]` 打成**二进制定长记录 + 名字池**。
+
+    ## 为什么不用 JSON（2026-11-13 改）
+
+    此前 NAM 存 JSON（为的是修二进制池越界的老 bug）。但要让 **C 引擎**读 TG4，
+    JSON 就得在 C 里再写一个解析器 —— 那是白添的风险，而引擎里唯一的"结构化读"
+    只有 chat-meta 的 TLV。改回定长记录后，C 侧只需"读定长数组 + 读一串名字"。
+
+    改的时候**真实 TG4 文件为 0 个**（已扫盘确认），所以这次改格式没有任何迁移成本。
+
+    布局：
+
+        u32 count | u32 pool_off          ← _NAM_HDR（8B）
+        count × 32B 记录（name_off 相对 pool_off，data_off 相对 WGT 起点）
+        名字字符串池（UTF-8 连续存放）
+
+    读端仍**兼容旧 JSON NAM**（首个非空白字节是 `[` 时按 JSON 解析）。
+    """
+    recs = bytearray()
+    pool = bytearray()
+    for row in meta:
+        nm = row["name"].encode("utf-8")
+        shape = list(row["shape"])
+        if len(shape) > 4:
+            raise ValueError("TG4 的 NAM 每条最多记 4 维，%r 有 %d 维。修法："
+                             "先把张量 reshape 到 ≤4 维再写" % (row["name"], len(shape)))
+        shape = shape + [0] * (4 - len(shape))
+        recs += _NAM.pack(len(pool), len(nm), len(row["shape"]), int(row["dtype"]),
+                          int(row["off"]), *shape)
+        pool += nm
+    pool_off = _NAM_HDR.size + len(recs)
+    return _NAM_HDR.pack(len(meta), pool_off) + bytes(recs) + bytes(pool)
+
+
+def _unpack_nam(buf):
+    """解析 NAM 分区 → `[{name, off, dtype, shape}]`；自动区分二进制 / 旧 JSON。"""
+    if not buf:
+        raise ValueError("TG4 的 NAM 分区是空的。修法：用 write_tg4_stream 重写该文件")
+    if buf[0:1] == b"[":
+        # 旧文件（JSON 记录）
+        return [dict(name=r["name"], off=int(r["off"]), dtype=int(r["dtype"]),
+                     shape=tuple(int(x) for x in r["shape"]))
+                for r in json.loads(buf.decode("utf-8"))]
+    cnt, pool_off = _NAM_HDR.unpack_from(buf, 0)
+    out = []
+    for i in range(cnt):
+        name_off, name_len, ndim, dtype, data_off, s0, s1, s2, s3 = \
+            _NAM.unpack_from(buf, _NAM_HDR.size + i * _NAM.size)
+        nm = buf[pool_off + name_off: pool_off + name_off + name_len].decode("utf-8")
+        shape = [s0, s1, s2, s3][:ndim]
+        out.append(dict(name=nm, off=int(data_off), dtype=int(dtype), shape=tuple(shape)))
+    return out
 
 
 def _pack_header(h):
@@ -122,10 +179,9 @@ def write_tg4(path, tensors, cfg, tok=None, arc=None, train=None, per_tensor_has
         wgt += _enc(a, dt_file)
         ent_meta.append((n, res))
 
-    # NAM 用 JSON：982 个名字约 100 KB，换来"不会错位"（二进制池的越界解码已踩过）
-    nam = json.dumps(
-        [{"name": n, "off": r["off"], "dtype": r["dtype"], "shape": list(r["shape"])}
-         for n, r in ent_meta], ensure_ascii=False).encode("utf-8")
+    # NAM 用二进制定长记录 + 名字池（2026-11-13 起；旧的 JSON 仍可读）
+    nam = _pack_nam([dict(name=n, off=r["off"], dtype=r["dtype"], shape=r["shape"])
+                     for n, r in ent_meta])
 
     payloads = [(SEC_TOK, tok or b""), (SEC_NAM, nam), (SEC_WGT, bytes(wgt))]
     if arc is not None:
@@ -179,13 +235,11 @@ class TG4(object):
             raise ValueError("TG4 缺 NAM 名字表。修法：用本仓库 write_tg4 重写；"
                              "没有名字表就无法按名取张量")
         off, ln = self.sections[SEC_NAM]
-        rows = json.loads(self._m[off:off + ln].decode("utf-8"))
+        rows = _unpack_nam(self._m[off:off + ln])
         names, ent = [], {}
         for r in rows:
-            nm = r["name"]
-            names.append(nm)
-            ent[nm] = dict(off=int(r["off"]), dtype=int(r["dtype"]),
-                           shape=tuple(int(x) for x in r["shape"]))
+            names.append(r["name"])
+            ent[r["name"]] = dict(off=r["off"], dtype=r["dtype"], shape=r["shape"])
         return names, ent, None
 
     def names(self):
@@ -278,9 +332,7 @@ def write_tg4_stream(path, items, cfg, arc=None, train=None, per_tensor_hash=Fal
             pos += len(blob)
         wgt_len = pos - WGT_START
         # 之后的分区；最后写表
-        payloads = [(SEC_NAM, json.dumps(
-            [{"name": m["name"], "off": m["off"], "dtype": m["dtype"],
-              "shape": m["shape"]} for m in meta], ensure_ascii=False).encode("utf-8"))]
+        payloads = [(SEC_NAM, _pack_nam(meta))]
         if tok:
             payloads.append((SEC_TOK, bytes(tok)))
         if arc is not None:
