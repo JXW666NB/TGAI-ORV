@@ -310,7 +310,7 @@ extern "C" __global__ void attn_fwd_nop(const float* __restrict__ Q, const float
     if (t0 >= seq || dh != DH) return;
 
     float* smQ = smem;
-    float* smK = smem + 4096;
+    float* smK = smem + (BT * DH);
     float* smV = smK + 64 * BC;
 
     load_QT(Q, smQ, t0, h, nh, dh, tid, seq);
@@ -400,7 +400,7 @@ extern "C" __global__ void attn_fwd_stats(const float* __restrict__ Q, const flo
     if (t0 >= seq || dh != DH) return;
 
     float* smQ = smem;
-    float* smK = smem + 4096;
+    float* smK = smem + (BT * DH);
     float* smV = smK + 64 * BC;
 
     load_QT(Q, smQ, t0, h, nh, dh, tid, seq);
@@ -499,7 +499,7 @@ extern "C" __global__ void attn_fwd_stats(const float* __restrict__ Q, const flo
 // = 69632 bytes. Q/dO stride 72 cuts the dK/dV smem bank conflicts.
 // ---------------------------------------------------------------------------
 
-#define QSTR 72
+#define QSTR (DH + 8)
 
 __device__ __forceinline__ void load_T72(const float* __restrict__ src, float* __restrict__ dst,
                                          int tok0, int h, int nh, int dh, int tid, int seq) {
@@ -997,7 +997,7 @@ __device__ __noinline__ void bwd_dq(const float* __restrict__ dO, const float* _
                                     int t0, int h, int seq, int nh, int dh, float scale,
                                     int tid, int lane, int row0) {
     float* smQ = smem;
-    float* smK = smem + 4096;
+    float* smK = smem + (BT * DH);
     float* smV = smK + 64 * BC;
 
     load_QT(Q, smQ, t0, h, nh, dh, tid, seq);
@@ -1065,7 +1065,7 @@ __device__ __noinline__ void bwd_dq(const float* __restrict__ dO, const float* _
 #pragma unroll
         for (int r = 0; r < 8; ++r) ds[r] = p[r] * (dp[r] - D[r]);
 
-        float* smDS = smem + 4096;
+        float* smDS = smem + (BT * DH);
         float* smKR = smDS + BC * DH;
 #pragma unroll
         for (int r = 0; r < 8; ++r) smDS[lane * BT + row0 + r] = ds[r];
@@ -1105,7 +1105,7 @@ __device__ __noinline__ void bwd_dkv_one(const float* __restrict__ dO, const flo
                                          int tid, int lane, int warp, int row0,
                                          float dk0[8], float dk1[8], float dv0[8], float dv1[8]) {
     float* smQ = smem;
-    float* smK = smem + 4096;
+    float* smK = smem + (BT * DH);
     float* smV = smK + 64 * BC;
 
     load_QT(Q, smQ, q0, h, nh, dh, tid, seq);
