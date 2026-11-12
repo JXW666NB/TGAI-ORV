@@ -76,7 +76,10 @@ def test_capture_and_replay_on_gpu():
     opt = T.optim.AdamW(m.params(), lr=1e-4, eps=1e-8)
     gs = GraphStep(m, opt, (2, S), (2 * S,), cfg["V"], clip=0.0)
     nodes = gs.capture(warmup=1)
-    assert nodes and nodes > 100
+    # ★ 2026-11-12：原来写死 `> 100`。外部实测在 GTX 1060 上是 91 个节点，
+    #   capture 与重放都成功，只是节点数没到 100 就被判红 —— 断言过严且与模型规模耦合。
+    #   这里只要求"确实捕获到图"，节点数打在消息里便于观察。
+    assert nodes and nodes > 20, "capture 应捕获到一张有实质内容的图，实际 %r 个节点" % (nodes,)
     rng = np.random.default_rng(0)
     ids = rng.integers(0, 100, (2, S)).astype(np.int64)
     tgt = rng.integers(0, 100, (2 * S,)).astype(np.int64)

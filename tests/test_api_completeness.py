@@ -106,8 +106,26 @@ def test_cuda_ops_require_a_cuda_device():
 
     在没有 CUDA 的机器上，强行把张量标成 cuda 必须**明确报错**（不是静默算错），
     且报错信息要能让人看出是 CUDA/驱动问题。
+
+    ★ 2026-11-12：本用例靠"只在属性上伪装 device"来模拟无卡情形，在有 N 卡的机器上
+    内核真能跑，于是等不到异常。CUDA 可用时跳过。
     """
     assert hasattr(x_tensor_cls(), "_relu_cuda"), "relu 的 CUDA 分支应已接上内核"
+    # 本机 CUDA 真的可用时，"伪装 device 看它报错"这个场景不存在 ⇒ 跳过。
+    # 不可用时（CI 就是这种），照旧用伪装法验证报错清晰 —— 那时的它才有意义。
+    import numpy as _np
+    import tgai_go.train as _T
+    _usable = False
+    try:
+        _T.set_default_device("cuda")
+        _T.tensor(_np.zeros((1,), "float32"))
+        _usable = True
+    except Exception:                           # noqa: BLE001
+        pass
+    finally:
+        _T.set_default_device("cpu")
+    if _usable:
+        pytest.skip("本机 CUDA 可用，伪装 device 的用例不适用")
     x = _x(requires_grad=False)
     x.device = "cuda"                                   # 只在属性上伪装，不碰真设备
     with pytest.raises(Exception) as ei:

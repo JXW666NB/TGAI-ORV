@@ -282,6 +282,19 @@ def op_native(name, source, entry, *, grid=(1, 1, 1), block=(1, 1, 1), shared=0,
         g = grid(*a, **kw) if callable(grid) else tuple(grid)
         b = block(*a, **kw) if callable(block) else tuple(block)
         av = args(*a, **kw) if callable(args) else list(a)
+        # ★ 2026-11-12（外部实测）：args 忘记写 ctype 时，内部 launch 会抛
+        #   `TypeError: cannot unpack non-iterable int object` —— 看不出是自己的问题。
+        #   这里提前校验，直接把"该怎么写"贴出来。
+        for _i, _it in enumerate(av):
+            if not (isinstance(_it, (tuple, list)) and len(_it) == 2):
+                raise PluginError(
+                    "op_native %r 的第 %d 个参数不是 (值, ctype) 对，收到 %r"
+                    % (name, _i, _it)
+                    + "。修法：args 必须返回 [(值, ctype), ...]。例如想写 "
+                      "`args=lambda x, y, a, n: [y._gpu.ptr, x._gpu.ptr, float(a), int(n)]`，"
+                      "要改成 `[(y._gpu.ptr, ctypes.c_void_p), "
+                      "(x._gpu.ptr, ctypes.c_void_p), (float(a), ctypes.c_float), "
+                      "(int(n), ctypes.c_int)]` —— 指针用 c_void_p，标量用 c_float / c_int")
         rt = _rt()
         rt.launch(str(entry), tuple(g), tuple(b), list(av),
                   shared=int(shared), module=mod)

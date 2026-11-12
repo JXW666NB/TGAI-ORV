@@ -20,8 +20,15 @@ def test_python_fallback_is_always_available():
 
 
 def test_missing_backend_raises_with_fix_hint():
+    """声明一个**不认识的后端**必须报 ValueError 并带「修法」。
+
+    ★ 2026-11-12：原来声明 `{"cuda": "nope.cu"}`，在**没有** CUDA 的机器上走到
+    "后端不可用"分支抛 ValueError；在有 CUDA 的机器上会真的去编译 `nope.cu`，
+    抛的是 CudaError —— 于是同一份用例在不同机器上结果不同。
+    改用不认识的后端名，就与有没有显卡无关了。
+    """
     with pytest.raises(ValueError) as ei:
-        ops_native.register("_t_only_cuda", {"cuda": "nope.cu"})
+        ops_native.register("_t_only_nonexistent", {"tpu": "nope.cu"})
     assert "修法" in str(ei.value)
 
 

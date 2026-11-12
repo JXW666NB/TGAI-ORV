@@ -1,3 +1,48 @@
+## [0.9.56] - 2026-11-12
+
+**有 GPU 的机器上不再系统性变红（14 个 → 0）**，并修 `op_native` 违约时的报错。
+
+### 背景
+
+外部测试者在 GTX 1060 上跑 CI 等价套件，得到 679 passed / **14 failed** / 17 skipped；
+其中**单独跑这些用例全部通过**。根因不是库算错，而是**测试之间互相污染**：
+
+* 大量测试调 `T.set_default_device("cuda")` 后不还原；后续测试在 CUDA 上建张量时
+  `tensor.data` 恒为 `None`，`np.asarray(t.data)` 于是得到 None/NaN（`test_adafactor` 一次报 6 个 NaN）。
+* 另有一批用例**隐含"本机没有 N 卡"**这个前提。
+
+### 改法
+
+| 类别 | 处置 |
+| --- | --- |
+| 顺序污染（8 个：adafactor×6 + llama_structure + load_stream）| `tests/conftest.py` 新增 **autouse fixture**：每个用例结束后把默认设备还原。一处修，覆盖全部 |
+| 假设无 CUDA（`conv` / `api_completeness` / `ops_bundle`）| 本机 CUDA 真可用时**跳过**（该场景不存在）；无卡时行为不变 |
+| `ops_native::test_missing_backend…` | 改用**不认识的后端名**，从此与有没有显卡无关 |
+| CUDA Graph 节点数断言 | `> 100` 改为 `> 20`：1060 上是 91 个节点，capture 与重放都成功，只是阈值过严 |
+| `optimizer_parity::test_orv_adamw_matches_torch` | 被上面的设备还原 fixture 修好（它原本在 CPU 上对拍，却被前序测试留成 CUDA）|
+
+### `plugin.op_native`：违约时报错可读
+
+`args` 按文档必须返回 `[(值, ctype), ...]`。传成 `[0]` 这种裸值时，
+内部会抛 `TypeError: cannot unpack non-iterable int object` —— 看不出是自己的问题。
+现在提前校验并抛 `PluginError`，消息里直接给出可照抄的正确写法
+（`[(y._gpu.ptr, ctypes.c_void_p), (float(a), ctypes.c_float), ...]`）。
+
+### 验证
+
+| 环境 | 结果 |
+| --- | --- |
+| 本地（无 GPU）| 670 passed / 42 skipped |
+| **V100 + `TG_RUN_CUDA_TESTS=1`** | **281 passed / 12 skipped / 0 failed**（改前 14 failed）|
+
+### 说明
+
+外部报告里另外两条 P0 **仍未修**，见 `docs/EXTERNAL_REVIEW_TRIAGE_2026-11-12.md`：
+wheel 不含推理用的 `_native` 原生库；仓库里 Windows 引擎 DLL 的 PE 头错位 1 字节（需重编）。
+推理端在 pip 形态下不可用是已知状态，训练端不受影响。
+
+套件：本地 670 passed / 42 skipped；V100 上 281 passed / 12 skipped。
+
 ## [0.9.55] - 2026-11-12
 
 **修外部实测的 P1：Pascal 消费卡上融合注意力反向报错看不懂。**
