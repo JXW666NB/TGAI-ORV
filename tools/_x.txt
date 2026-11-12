@@ -1,0 +1,33 @@
+﻿docs: plan the gap between a deliverable CUDA backend and starting Vulkan
+
+The plan lists only problems that have been measured, each with an acceptance criterion, and it starts from
+an inventory rather than from ambition. The verification tooling is already there -- accept.py, fifteen
+align scripts, conv_cuda_parity.py, pytorch_loss_curve.py -- so what is missing is not instruments but
+long-run evidence, memory, distribution, and an entry point an outsider can run.
+
+Six gaps, in the order I would attack them. Memory first, because the measured 1.2-1.9x overhead decides how
+large a model fits at all, and because the remaining 0.28 GiB after the checkpoint fix is unattributed: the
+next step is per-tensor attribution, not re-running the four directions that GAP_VS_PYTORCH proposed on
+2026-11-02, some of which have since been wired up. Long-run convergence second, because twenty steps is all
+the evidence we have and it is the weakest of the three criteria the project set for itself. Then the getitem
+gap, which I hit three times while writing a benchmark today and which any newcomer writing embedding lookup
+or gather-based cross-entropy will hit immediately.
+
+Two items run in parallel and need no GPU: making accept.py produce a verdict in one command, and the static
+half of a TG Link probe. The probe matters because group members are already sending results back -- the P100
+report was one -- and without a template that data scatters across chat logs. It answers a question I got
+wrong twice this week by guessing instead of measuring.
+
+Distribution stays a separate track, and it needs Linux. The V100 host runs in TCC, where Vulkan is
+unavailable by design, so a Windows rental would repeat the same dead end. Same-vendor host-staged all-reduce
+is also the tier-3 base that TG Link later builds on.
+
+The document also states what will not be done and why: no Vulkan training backend before CUDA can serve as
+its reference, no P2P measurement without a machine holding two Vulkan devices, no in-process backend mixing
+before the singleton is dismantled, no dynamic OOM migration because the cost can exceed the benefit.
+
+Four decisions are left explicitly open for the owner rather than decided by me: the _FP16_MAX_K default, the
+multi-GPU target shape, whether 7B is a hard goal, and how far the bit-exact reproducibility promise extends
+once different transports are involved.
+
+Documentation only. Suite: 665 passed / 37 skipped. Version stays 0.9.51.
