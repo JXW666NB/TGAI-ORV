@@ -35,13 +35,23 @@ PyPI 包名 `tgai-orv`，import 路径 `tgai_go.train`。
 
 ### 2.1 硬件已知限制（外部实测，2026-11-12 · P100）
 
-一位用户在 **Tesla P100 16GB（sm_60，无 Tensor Core）** 上实测，结论要先知道，别当成普适能力：
+现场已验证的架构（截至 2026-11-12）：
+
+| 架构 | 卡 | 结论 |
+| --- | --- | --- |
+| **sm_60** | Tesla P100 16GB | NVRTC 能编 `compute_60`，正常训练 —— 硬件不是障碍 |
+| **sm_61** | GTX 1060 6GB | 外部用户用它训出了 aisa1-3；30M 级模型 <1 GB 显存 |
+| **sm_70** | Tesla V100 32GB | 3B MoE 全参一步 24.78 GiB / 709 ms（AdamW） |
+
+一位用户在 **P100 16GB（sm_60，无 Tensor Core）** 上实测，结论要先知道，别当成普适能力：
 
 | 项 | 事实 |
 | --- | --- |
 | **sm_60 本身支持** | NVRTC 能编译 `compute_60`，张量/模型/AdamW 正常训练 —— 硬件不是障碍 |
+| **sm_61（1060 等消费卡）上融合注意力反向不可用** | `_ATTN_FLASH_SMEM = 68 KB`、`_ATTN_FLASH_G2_SMEM = 84 KB`，而 **sm_61 单 block 动态 smem 上限只有 48 KB 且不支持 opt-in** ⇒ `lowmem=True` 前向正常、**反向抛 `cuFuncSetAttribute(attn_bwd_flash maxdyn) rc=1 invalid argument`**。默认 `lowmem=False` 时不受影响（外部实测，2026-11-12）|
+| **Windows 必须自备 CUDA Toolkit 12.x（或 torch 的 lib）** | 驱动目录里**没有** NVRTC / cuBLAS；`tgai-orv[cuda]` 这个 extra **只对 Linux 生效**。所以"有驱动就不用装 Toolkit"在 Windows **不成立**（外部实测）|
 | **首装可能报 `failed to open nvrtc-builtins64_*.dll`** | **0.9.50 已修**（会扫 `nvidia/*/lib`、`*/bin` 并写进 PATH）。仍失败时的规避：把 `site-packages/torch/lib` 前置进 `PATH` **并** 调 `os.add_dll_directory` |
-| **不省显存，反而多 1.2–1.9×** | 六组头对头实测一致（`docs/BENCHMARK_H2H_2026-11-12.md`）。ORV 用显存换速度与"装得下更大的模型"，**不要对外声称省显存** |
+| **显存：开不开检查点差一个量级** | 实测（D=1280/L=12/dh=128/FF=5120/S=1024/B=4，fp32+AdamW）：**不开检查点** ORV 19.58 vs torch 8.16 GiB（**2.40×**）；**开检查点** ORV 8.02 vs torch 7.56（**1.06×**）。权重/梯度/优化器三类两边**字节完全相同**，差距 100% 在激活。⇒ **检查点不是可选项**，`docs/MEMORY_ATTRIBUTION_2026-11-12.md` |
 | **检查点 0.9.53 起与 PyTorch 语义对齐** | 旧版把 `_parents` 清空，导致外层图段间断开、反向递归整链重算。按 `torch/utils/checkpoint.py` 的 `CheckpointFunction` 重做后：每层反向峰值 **1.68 → 0.117 GiB**；20 层/606M/B=2/S=2048 由 **31.29 GiB 降到 7.56 GiB**（`docs/MEMORY_BACKWARD_PEAK_2026-11-12.md`）|
 | **"能装下更大模型"的准确含义** | 指 PyTorch 在 **1.997B 稠密**就 OOM（31.40 GiB）而 ORV 能跑 **3B MoE**（24.78 GiB）。这是融合减少中间量，不是"更省显存" |
 | **fp16 是「反向也走」但受形状门槛** | fp16 分支在**共享 GEMM 核心**里，前向反向都走；门槛 `m*n ≥ 262144` 且 `k ≤ _FP16_MAX_K`（默认不限，可用 `TG_FP16_MAX_K` 调）。**长 K 的 dW 有精度风险**：代码记录梯度相对误差会从 3e-4 恶化到 2e-2。`B=8/S=2048` 时 k=16384 正处风险区 ⇒ 开 fp16 必须在目标卡实测 |
@@ -239,6 +249,8 @@ hist = T.fit(model, loader, steps=2000, lr=3e-4, amp=True)
 | 6 | 无 `torch.compile` | 加速靠 `T.amp()` 与逐层 CUDA Graph |
 | 7 | AMP 语义不同：参数/激活/梯度全程 fp32，仅 GEMM 输入 cast | **不需要 GradScaler** |
 | 8 | 无 torchvision/torchaudio | 只做训练核心 |
+| 9 | **CPU 上 `opt.step()` 之后 `p.data` 变成 Tensor**，`p.to_numpy()` 会返回 Tensor 而不是 ndarray（CUDA 上正常）| 一律 `np.asarray(p.to_numpy(), np.float32)`；或统一在 CUDA 上取 |
+| 10 | **pip 装的 wheel 不含推理用的原生库**（`_native/*.dll`），`tgai_go.load()` 会 `FileNotFoundError` | 推理要用源码装（`pip install -e .`）；这是已知打包缺陷（外部实测）|
 
 ---
 
