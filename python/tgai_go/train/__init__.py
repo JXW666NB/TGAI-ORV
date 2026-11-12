@@ -1634,6 +1634,17 @@ class Tensor:
 
     def _getitem_cuda(self, idx):
         rt = _cuda()
+        arr = _int_index_array(idx)
+        if arr is not None:
+            n = int(self.shape[0]) if len(self.shape) else 0
+            # 负数按 numpy 语义折回；越界立刻报错，不要下发到设备
+            arr = np.where(arr < 0, arr + n, arr)
+            if arr.size and (int(arr.min()) < 0 or int(arr.max()) >= n):
+                raise IndexError(
+                    "数组索引越界：取值范围 [0, %d)，收到 [%d, %d]"
+                    % (n, int(arr.min()), int(arr.max())) +
+                    "。修法：检查索引数组，或确认首轴长度是 %d" % n)
+            return self._array_index_cuda(arr)
         out_shape, base, divs, strides = _slice_gather_plan(self.shape, idx)
         buf = rt.index_gather(self._cuda_logical_storage(), out_shape, base, divs, strides)
         out = Tensor._from_gpu(buf, requires_grad=self.requires_grad, _parents=(self,))
@@ -1643,6 +1654,52 @@ class Tensor:
             if self.requires_grad:
                 # g 是切出来的形状。清零后只加回被选中的位置，其余保持 0。
                 _acc(grads, self, rt.index_scatter_add(g, in_shape, base, divs, strides))
+        out._backward = bw
+        return out
+
+    def _array_index_cuda(self, arr):
+        """首轴整型数组索引的设备实现。`arr` 是**已归一化**（无负数、已查越界）的 int64 数组。
+
+        前向走融合核；反向走主机遍历（`np.add.at` 才能正确处理重复下标）。
+        反向比融合核慢，但 correctness 优先；embedding 场景请用 `nn.Embedding`。
+        """
+        rt = _cuda()
+        shape = tuple(int(x) for x in self.shape)
+        if not shape:
+            raise NotImplementedError(
+                "0 维张量不支持数组索引。修法：先 reshape 成至少一维")
+
+        n_src = shape[0]
+        tail = shape[1:]
+        row_size = 1
+        for d in tail:
+            row_size *= int(d)
+        n_rows = int(arr.size)
+
+        idx_buf = rt.h2d(arr.astype("int32"), dtype=__import__("numpy").int32)
+        src = self._cuda_logical_storage()
+        if len(tail) == 0:
+            buf = rt.gather_flat(src, idx_buf, n_src)
+            out_shape = (n_rows,)
+        else:
+            buf = rt.gather_rows(src, idx_buf, n_src, row_size, n_rows)
+            out_shape = (n_rows,) + tail
+        out = Tensor._from_gpu(buf, requires_grad=self.requires_grad,
+                               _parents=(self,))
+        if tuple(int(x) for x in out.shape) != out_shape:
+            out = out.reshape(out_shape)
+
+        def bw(g, grads):
+            if not self.requires_grad:
+                return
+            # 主机中转：g 可能是多维，先摊平成 (n_rows, row_size)
+            g_np = np.asarray(g.to_numpy(), np.float32)
+            full = np.zeros(shape, dtype=np.float32)
+            if row_size == 1 and len(tail) == 0:
+                np.add.at(full, arr, g_np.reshape(-1))
+            else:
+                np.add.at(full, arr, g_np.reshape((n_rows,) + tail))
+            _acc(grads, self, rt.h2d(full))
         out._backward = bw
         return out
 
@@ -1805,6 +1862,41 @@ def _acc(grads, node, g):
 
 def _as_tensor(x):
     return x if isinstance(x, Tensor) else Tensor(x)
+
+
+def _int_index_array(idx):
+    """若不是「单个整型数组充当首轴索引」就返回 None。
+
+    只认：`x[arr]` 或 `x[arr, :]`（arr 是一维整型）。其余形态交给原有切片计划。
+    负数按 numpy 语义折回，越界在这里就报错 —— 别让它跑到设备上算成错误位置。
+    """
+    import numpy as _np
+
+    if isinstance(idx, tuple):
+        if len(idx) != 2 or not isinstance(idx[1], slice):
+            return None
+        if not (idx[1].start is None and idx[1].stop is None
+                and idx[1].step is None):
+            return None
+        idx = idx[0]
+    if isinstance(idx, slice) or idx is Ellipsis:
+        return None
+    if isinstance(idx, list):
+        if not idx or not all(isinstance(v, (int, _np.integer)) for v in idx):
+            return None
+        idx = _np.asarray(idx, dtype=_np.int64)
+    if isinstance(idx, Tensor):
+        if getattr(idx, "device", "cpu") == "cuda":
+            idx = _np.asarray(idx.to_numpy())
+        else:
+            idx = _np.asarray(idx.data)
+    if not isinstance(idx, _np.ndarray):
+        return None
+    if idx.dtype.kind not in "iu":
+        return None
+    if idx.ndim != 1:
+        return None
+    return idx.astype(_np.int64, copy=False)
 
 
 def _has_array_index(idx):

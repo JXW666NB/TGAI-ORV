@@ -1,0 +1,29 @@
+﻿feat(core): array indexing on CUDA, so embedding lookup and gather-CE stop raising
+
+The CPU path already supported x[idx] through np.add.at; only the CUDA path refused, with
+NotImplementedError: 切片暂不支持索引类型 ndarray. Anyone writing embedding lookup or gather-based
+cross-entropy on a GPU hit it on the first attempt, and I hit it three times while writing the benchmark.
+
+First-axis one-dimensional integer indexing now works on CUDA. Forward uses the existing fused kernels,
+gather_flat for a 1-D source and gather_rows otherwise. Backward stages through the host and uses
+np.add.at, which is the only way to get duplicate indices right here -- the affine scatter plan cannot
+express arbitrary row indices, and getting duplicates wrong would let a model train while learning the
+wrong thing without any error. Negative indices fold back the way numpy does, and out-of-range raises
+IndexError on the host instead of computing into the wrong location on the device.
+
+I am stating the cost rather than hiding it: the host-staged backward is slower than a fused kernel. That
+is a deliberate trade for correctness first, and for embeddings nn.Embedding with its dedicated kernels is
+still the right call. Multi-dimensional fancy indexing and boolean masks remain unsupported.
+
+Eight tests, all passing on the V100: forward against numpy, negative indices, list indices, duplicate-index
+gradient accumulation asserted to be 2 rather than 1, out-of-range, 1-D sources, and CUDA matching CPU
+bit-for-bit.
+
+Also landed this round, documentation only: the CUDA-to-Vulkan plan with seven work packages and an explicit
+not-doing list, the measured two-machine hardware inventory, the self-contained head-to-head benchmark, and
+the correction that TG Link and backend mixing are different problems. The inventory records that the V100
+host runs in TCC, which is why Vulkan cannot initialise there, and that this limitation exists only on
+Windows.
+
+Suite: 670 passed / 40 skipped. Published as 0.9.52
+(sha256 e94cce7d...1e29, re-downloaded and compared).
