@@ -2841,6 +2841,22 @@ class CudaRuntime:
             "compute capability minor")
         return "compute_%d%d" % (int(major.value), int(minor.value))
 
+    def _device_smem_limit(self):
+        """单 block 动态共享内存上限（字节）。优先 opt-in 上限，取不到退回普通上限。
+
+        为什么要分两档：Volta/图灵/安培可以通过 cuFuncSetAttribute **opt-in** 到更大上限
+        （V100 是 96 KB），而 Pascal 消费卡（sm_61 等）只有 48 KB **且不支持 opt-in** ——
+        融合注意力的反向内核要 68/84 KB，在那些卡上必然失败（外部实测 2026-11-12）。
+        """
+        val = ctypes.c_int()
+        # 97 = CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
+        #  8 = CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK
+        for attr in (97, 8):
+            rc = int(self.cu.cuDeviceGetAttribute(ctypes.byref(val), attr, self.dev))
+            if rc == 0 and int(val.value) > 0:
+                return int(val.value)
+        return 0
+
     def _nvrtc_path(self):
         if sys.platform == "win32":
             path = _find_glob(_is_nvrtc_main, self._dirs)
@@ -6648,14 +6664,26 @@ class CudaRuntime:
             raise CudaError("attn_flash 只接受 dh=64，收到 %d" % dh + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if seq < 0 or nh < 0:
             raise CudaError("attn_flash 形状非法 seq=%d nh=%d" % (seq, nh) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        tile = 128 if name == "attn_bwd_flash_g2" else _ATTN_NOP_BQ
+        smem = _ATTN_FLASH_G2_SMEM if name == "attn_bwd_flash_g2" else _ATTN_FLASH_SMEM
+        # ★ 2026-11-12（外部实测）：Pascal 消费卡（sm_61 等）单 block 动态 smem 上限只有 48 KB
+        #   且不支持 opt-in，而这里要 68/84 KB ⇒ 之前会以 `cuFuncSetAttribute rc=1 invalid argument`
+        #   这种看不懂的形式炸掉。现在**先查上限再设 opt-in**，把"为什么"和"怎么办"说清楚。
+        _lim = self._device_smem_limit()
+        if _lim and int(smem) > _lim:
+            _cc = self._cc_arch().replace("compute_", "sm_")
+            raise CudaError(
+                "融合注意力反向需要 %d KB 动态共享内存，本卡（%s）上限只有 %d KB"
+                % (int(smem) // 1024, _cc, int(_lim) // 1024)
+                + "。修法：改用 lowmem=False（默认，走物化注意力，多花显存但能出结果）；"
+                  "或减小 seq / batch。Pascal 消费卡（sm_61 等）上限 48 KB 且不支持 opt-in，"
+                  "该路径在那些卡上不可用；V100（sm_70）可 opt-in 到 96 KB 正常使用")
         ready = getattr(self, "_attn_flash_names", None)
         if ready is None:
             ready = self._attn_flash_names = set()
         if name not in ready:
             self._attn_set_dyn_smem(name, _ATTN_FLASH_MAX_SMEM)
             ready.add(name)
-        tile = 128 if name == "attn_bwd_flash_g2" else _ATTN_NOP_BQ
-        smem = _ATTN_FLASH_G2_SMEM if name == "attn_bwd_flash_g2" else _ATTN_FLASH_SMEM
         gy = (int(seq) + tile - 1) // tile
         if gy < 1:
             gy = 1

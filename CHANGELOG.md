@@ -1,3 +1,44 @@
+## [0.9.55] - 2026-11-12
+
+**修外部实测的 P1：Pascal 消费卡上融合注意力反向报错看不懂。**
+
+### 问题（外部实测，GTX 1060 / sm_61）
+
+`scaled_dot_product_attention(..., lowmem=True)` 前向正常，**反向抛**
+`cuFuncSetAttribute(attn_bwd_flash maxdyn) rc=1 invalid argument` —— 完全看不出原因。
+
+真因：融合注意力反向要 `_ATTN_FLASH_SMEM = 68 KB`（g2 变体 84 KB），
+而 sm_61 单 block 动态 smem 上限只有 **48 KB 且不支持 opt-in**；
+而 opt-in 的设置调用排在检查之前，于是先炸在那里。
+
+### 改法
+
+* 新增 `_device_smem_limit()`：先取 `MAX_SHARED_MEMORY_PER_BLOCK_OPTIN`（属性 97），
+  取不到退回 `MAX_SHARED_MEMORY_PER_BLOCK`（属性 8）；
+* `_attn_flash_launch` **把上限检查提到 opt-in 之前**，超限时报：
+
+```
+融合注意力反向需要 68 KB 动态共享内存，本卡（sm_61）上限只有 48 KB。
+修法：改用 lowmem=False（默认，走物化注意力，多花显存但能出结果）；或减小 seq / batch。
+Pascal 消费卡（sm_61 等）上限 48 KB 且不支持 opt-in，该路径在那些卡上不可用；
+V100（sm_70）可 opt-in 到 96 KB 正常使用
+```
+
+### 验证
+
+* 新增 `tests/test_attn_smem_guard.py`（2 例）：模拟本卡上限 48 KB，断言报错含上限、`修法`、
+  `lowmem=False` 与卡型提示；另验上限足够时**不误伤**且叶子张量真拿到梯度。**V100 上 2 passed**。
+* `tools/attn_ref.py --check`：dh=64 的 16 个数组与改前**最大绝对差 0.000e+00** ⇒ 正常路径未受影响。
+
+### 文档
+
+新增 `docs/EXTERNAL_REVIEW_TRIAGE_2026-11-12.md`：外部报告 8 条问题的台账，
+逐条标明「已修 / 未修」。**未修的两条 P0（wheel 缺 `_native`、仓库 DLL 的 PE 头错位 1 字节）
+明确写清，推理端在 pip 形态下不可用是已知状态。**
+
+套件：本地（无 GPU）**670 passed / 42 skipped**；V100 上 **672 passed / 40 skipped**
+（新增的 2 例在无 CUDA 时跳过）。
+
 ## [0.9.54] - 2026-11-12
 
 **内核不再写死 head 维度**（行为不变，已逐位验证）；同一版校正了文档与 skill 里的事实。

@@ -39,9 +39,9 @@ try:
     try:
         __version__ = _pkg_version("tgai-orv")
     except _PNF:
-        __version__ = "0.9.54"
+        __version__ = "0.9.55"
 except Exception:  # noqa: BLE001  极端老的 Python / 精简环境
-    __version__ = "0.9.54"
+    __version__ = "0.9.55"
 
 # 库默认不往 stdout 输出（脚本版会打印，库不该）
 _logging.getLogger('tgai_go').addHandler(_logging.NullHandler())
