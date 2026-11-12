@@ -1,0 +1,29 @@
+﻿docs: write down what surpassing PyTorch would mean, measured against the reference we now have
+
+The reference is concrete now, so the document states a single benchmark that any claim has to beat: the
+reviewer's full v2.1e at B=8 and S=2048 on the V100, 5,667 tok/s at a 10.28 GB peak.
+
+The honest current score is one win and one loss. ORV is faster per step, 2.58x on dense fp32 and 1.68x on MoE
+fp32, because its kernels fuse work PyTorch leaves as separate launches, and it fits models PyTorch cannot
+start, 3B MoE at 24.78 GiB where pure PyTorch runs out at 1.997B. It is also fatter, 1.2 to 1.9 times the
+memory, and its fp16 buys 1.11x against PyTorch's 2.17x. Checkpointing only just reached parity in 0.9.53.
+
+Everything that could exceed PyTorch comes from one structural fact: ORV owns the whole stack, so it can fuse
+across operator boundaries instead of streaming every intermediate through HBM. An MLP chain of gate, up, silu
+and mul writes and rereads three [B*S, FF] tensors that are 84 MB each at this shape, roughly 500 MB of traffic
+per layer that fusion removes.
+
+The other levers are memory, where selective checkpointing per layer and offloading optimizer state can push
+under the 10.28 GB the reference spends; CUDA graphs by default, where the measured 627 ns dispatch is only 7%
+of a large step but dominant for RL rollouts and small models; per-generation tuning tables, which pairs with
+the plan to cover every Nvidia architecture; and verifiable numerics, which I think is the most distinctive
+because PyTorch does not offer it. ORV already gates fp16 by shape with recorded error, and already has
+deterministic reductions that reproduce bit for bit. Turning those into a promise -- an error bound plus
+automatic fallback, and bit-exact reproducibility by default -- is a quality advantage rather than a speed one,
+and nobody else is doing it.
+
+The document also lists what not to attempt: chasing full API coverage, competing with torch.compile on how much
+it can fuse automatically, claiming memory savings before they exist, or meeting NVLink-class setups with
+host-staged multi-GPU.
+
+Documentation only. Version stays 0.9.53.
