@@ -1,0 +1,29 @@
+﻿docs: record the measured hardware topology, because two planning errors came from assuming it
+
+I said the AMD Radeon integrated GPU and the V100 could form a mixed-vendor pair for TG Link. They cannot:
+they are on different machines, and peer-to-peer requires one PCI bus. The topology is the reverse of what I
+assumed -- the laptop running the agent has only the AMD iGPU with no NVIDIA at all, and the remote host
+reached over SSH has both the V100 and a GT 730.
+
+Probing both machines settles what is testable. The laptop has exactly one Vulkan device, the AMD iGPU at
+Vulkan 1.3.260. The remote has exactly one CUDA device, the V100, and Vulkan enumerates nothing there:
+vulkaninfo fails with "Failed to detect any valid GPUs" because HKLM\SOFTWARE\Khronos\Vulkan\Drivers does
+not exist, so the loader is installed but no ICD is registered. The GT 730 is unusable through either API --
+nvidia-smi does not list it, its driver is from 2020 against the V100's 2025 one, and Vulkan cannot initialise
+on that machine at all.
+
+So no machine has both CUDA and Vulkan working, no machine has two usable GPUs, and no mixed-vendor pair
+exists anywhere in reach. That means TG Link's central hypothesis is blocked on hardware rather than on code,
+and this needs to be stated plainly before anyone schedules work against it. It also means the Vulkan
+forward and backward that VULKAN_BACKEND.md records were measured on the laptop, not on the V100 host.
+
+What remains feasible is the static half of a probe, which enumerates capabilities on both machines, and
+tier-3 host-staged collectives, which need several processes but no special hardware. Both P2P tiers need at
+least two Vulkan devices on one machine; renting two cards on a single host would validate the mechanism even
+if the vendors match.
+
+Documented with the exact evidence -- driver versions, the missing registry key, the failing vulkaninfo line --
+plus a note that the GT 730 might be recovered by registering nvoglv64.dll from the driver store, unverified.
+INDEX and the skill now point at the inventory before any multi-GPU planning.
+
+Documentation only. Suite: 665 passed / 37 skipped. Version stays 0.9.51.
