@@ -31,3 +31,6 @@ _sweep_*.csv
 # 朋友的复现包（第三方代码，不入库）
 _repro_v21e/
 tools/_*.txt
+
+# PyTorch 源码（只用于研读，不入库）
+pytorch-src/
