@@ -52,6 +52,16 @@
 #define TG_MAGIC 0x49414754u  /* "TGAI" little-endian */
 #define TG_VERSION 1u      /* v1: TGAI GO 当前写出的版本 (单模态, arch_type/num_kv_heads 已从 reserved 拆分) */
 #define TG_VERSION_V3 3u   /* v3: ORV 产出的多模态扩展版本 (modality_flags + extension_off 拆分原 reserved) */
+/* v4 (2026-11-12): 头里 version=4，但**布局与 v3 完全一致** —— 定长 128B 头 + FNV 权重表，
+ * 只是版本号变了。实测证据：V2.7 的 `TGAI_NB_V2.7_v4.tg`（6.06 GB, layers=28 d_model=1024）
+ * 与 ORV 训练检查点 `weights.tg` 都是 magic=0x49414754 + version=4，且 Python 侧的
+ * `read_tg()` 能直接解析出层数/宽度并读出张量表。
+ * 所以引擎侧按 v3 处理即可，**不需要**新的读取路径。
+ * 注意：仓库里的 `tg4.py` 是另一套「TG4」容器（magic 0x00344754 + section table），
+ * 与这里的 v4 不是同一件事，且目前全仓库无人 import —— 不要混为一谈。 */
+#define TG_VERSION_V4 4u
+/* 凡「v3 家族」都走同一条读取路径（定长头 + FNV 表 + TLV 扩展段）。 */
+#define TG_IS_V3FAMILY(v) ((v) == TG_VERSION_V3 || (v) == TG_VERSION_V4)
 #define TG_HEADER_SIZE 128u
 #define TG_MAX_NDIM 4
 #define TG_MAX_NAME_HASH 256u

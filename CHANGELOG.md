@@ -1,3 +1,57 @@
+## [0.9.59] - 2026-11-12
+
+**C 引擎现在读得 `.TG` v4 —— V2.7 的 v4 权重与 ORV 训练检查点都能加载。**
+
+### 先纠正一个前提：仓库里有**两套**"v4"，别混
+
+| 名字 | 实质 | 谁在用 |
+| --- | --- | --- |
+| `pack.py::TGWriter.write_stream(version=4)` | **v3 布局 + 头里 version=4**（`magic=0x49414754`） | ORV 训练检查点、V2.7 的 `TGAI_NB_V2.7_v4.tg` |
+| `tg4.py` | 真正的新容器：`magic=0x00344754` + **section table** + `NAM` 名字表 | **全仓库无人 import**（写了没启用）|
+
+实测证据（V100）：`TGAI_NB_V2.7_v4.tg`（6.06 GB）与 `ckpt_test/step_000002/weights.tg`
+都是 `magic=0x49414754` + `version=4`，且 Python 的 `read_tg()` 能直接解析出
+`layers=28 d_model=1024 n_heads=16` 并读出张量表 —— 也就是说**布局与 v3 完全一致**。
+
+### 所以引擎侧只需放行版本号
+
+`src/tgai_format.h` 新增 `TG_VERSION_V4` 与 `TG_IS_V3FAMILY(v)`；
+`src/tgai_engine.c` 三处版本判定改用该宏（扩展段解析、版本校验、v3 专属校验），
+报错文案改为 `版本不兼容 (支持 v1/v3/v4)`。**没有新增读取路径** —— 因为不需要。
+
+### 实测（V100，32GB）
+
+| 文件 | 版本 | 结果 |
+| --- | --- | --- |
+| `TGAI_NB_V2.7_v4.tg` | 4 | ✅ `layers=28 d_model=1024 vocab=32779 max_seq=8192` |
+| `TGAI_NB_V2.7.tg` | 3 | ✅ 同上（向后兼容）|
+
+端到端出字（不只是加载）：
+
+```
+encode('你好') -> [2, 911, 2002]
+generate -> '同管航,。450**更版取合的佾\n很or'
+```
+
+### 引擎源码与 GO 对齐
+
+逐文件比对 `src/`：只有 `tgai_engine.c` 与 `tgai_engine.h` 落后于 GO，已同步；
+其余 18 个文件逐字节相同。
+
+### 新增工具
+
+* `tools/set_tg_version.py` —— 只改头里的版本号（v3↔v4），并**拒绝** TG4 新容器；
+* `tools/probe_tg_layout.py` —— 一句话分辨"v3 家族 / TG4 新容器 / 未知"，并试跑 `read_tg`；
+* `tools/gen_smoke.py` —— 加载 → 编码 → 生成 → 解码的端到端冒烟（"能加载"与"能出字"分开验）；
+* `build_engine.bat` —— 从**本仓库** `src/` 构建（旧的 `rebuild_cpu.bat` 写死编旧 GO 树）。
+
+### 仍未做
+
+`tg4.py` 那套 TG4 容器（section table）目前**没有任何读写方使用**，
+本版没有把它接进推理链路 —— 需要单独立项，不能与本次的 v4 混为一谈。
+
+套件：673 passed / 42 skipped（新增 2 例 v4 回归）。
+
 ## [0.9.58] - 2026-11-12
 
 **修复随包原生库损坏 —— 推理在 `.TG` v3 上真正可用。** 我此前的判断有误，这里更正。

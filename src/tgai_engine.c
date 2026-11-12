@@ -1827,7 +1827,7 @@ static int init_block_cache(TGModel* m) {
      *     猜错会【静默】算出完全不同的数值（不报错，最难查的一类）。
      *   ★ 只有 v1/v3 且 extension_off 落在文件内的文件才会走这段；
      *     老 .TG（V2.7 的 extension_off=0xFFFFFEEA 是历史垃圾值）会被范围检查挡掉。 */
-    if ((m->header.version == TG_VERSION || m->header.version == TG_VERSION_V3) &&
+    if ((m->header.version == TG_VERSION || TG_IS_V3FAMILY(m->header.version)) &&
         m->header.extension_off > 0 &&
         (uint64_t)m->header.extension_off + 12 <= (uint64_t)m->mapped_size) {
         const uint8_t* p = (const uint8_t*)m->mapped + m->header.extension_off;
@@ -2366,8 +2366,8 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
         tg_free(m); return NULL;
     }
     /* 版本校验: 接受 v1 (TGAI GO 原生) 和 v3 (ORV 多模态扩展, Task 27b) */
-    if (m->header.version != TG_VERSION && m->header.version != TG_VERSION_V3) {
-        set_err("版本不兼容 (支持 v1/v3)"); if (out_err) *out_err = TG_ERR_VERSION;
+    if (m->header.version != TG_VERSION && !TG_IS_V3FAMILY(m->header.version)) {
+        set_err("版本不兼容 (支持 v1/v3/v4)"); if (out_err) *out_err = TG_ERR_VERSION;
         tg_free(m); return NULL;
     }
     /* v3 专属校验 (Task 27b): 当前只允许纯文本 (modality_flags 为 0 或仅 TEXT 位)
@@ -2379,7 +2379,7 @@ TGModel* tg_load(const char* path, int use_mmap, TGError* out_err) {
      *   C 的 == 优先级高于 &, 若写成 (flags & ~TG_MODALITY_TEXT == 0)
      *   会被解析为 (flags & ((~TEXT)==0)) = (flags & 0) = 0 恒真, 永不拒绝!
      *   必须显式括号: ((flags & ~TEXT) != 0) */
-    if (m->header.version == TG_VERSION_V3) {
+    if (TG_IS_V3FAMILY(m->header.version)) {
         uint32_t flags = m->header.modality_flags;
 #ifndef TG_ENABLE_MM
         /* 纯文本模式: 拒绝多模态 (保持向后兼容, 不影响现有 .TG 读取) */
