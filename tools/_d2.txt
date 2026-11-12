@@ -1,0 +1,30 @@
+﻿docs: audit generality instead of porting one model
+
+The rule is that whatever PyTorch can express, ORV should express, so the unit of comparison is a capability
+and not a model. I checked the public API for the abilities the reviewer's model happens to need, phrased
+generally, and three are missing.
+
+Head count and head dimension are tied together. nn.CausalSelfAttention takes d_model and n_heads and derives
+d_head as d_model over n_heads, so a configuration where n_heads times d_head differs from d_model -- ten heads
+of ninety-six against 1280, for instance -- cannot be expressed at all without hand-writing the attention. This
+also explains why sdpa_lowmem insists on exactly 64: because d_head is forced, the kernel could hard-code one
+value. Once d_head becomes a parameter the kernel has to accept arbitrary values, or a user who changes head
+dimension silently loses the low-memory path.
+
+SDPA accepts only causal. PyTorch's takes an attn_mask of bool or float, which is how document packing,
+prefix-LM and custom padding are done, and ORV users have to materialise the whole attention and mask it
+afterwards, paying both time and memory. A bool mask path wants to be fused because that is the packing
+hot path.
+
+AMP does not save activation memory. torch.autocast stores activations in fp16; T.amp casts only GEMM inputs
+and keeps activations fp32, so the same shape costs roughly twice the activation memory. That is the main
+reason the P100 cannot train and the main contributor to the measured 1.2 to 1.9x memory ratio.
+
+Four other abilities already exist, and LayerScale is deliberately not counted as a gap because a learnable
+scalar multiplier via nn.Parameter is a legitimate way to write it.
+
+The acceptance test is what makes this about generality rather than one user: write the model as a user would,
+using only public API and no model-specific branches, and record every point where it cannot be built. Fix
+those in general form. The user-side implementation then compiles unchanged, which is the proof.
+
+Documentation only. Version stays 0.9.52.
