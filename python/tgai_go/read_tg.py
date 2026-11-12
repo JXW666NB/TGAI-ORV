@@ -17,6 +17,11 @@ except Exception:                            # pragma: no cover
     _MMap = type(b"")
 
 TG_MAGIC = 0x49414754
+#: TG4 容器（自描述分区 + NAM 名字表）。**与 v3 家族不是一个格式**：
+#: 头偏移不同、没有 FNV 表。`read_tg` 会把它翻译成同构 info（见 `_read_tg4`）。
+TG4_MAGIC = 0x00344754          # b"TG4\0"
+#: TG4 的 dtype 码 → 每元素字节数（与 `tg4._ESZ` 对齐）
+_ESZ4 = {0: 4, 1: 2, 2: 1, 6: 2}
 #: dtype 码 → (名字, 每元素字节数, numpy 承载类型)
 #: 0/1/2/3 是原始四类；4/5 是量化容器（Q8_0/Q4_0，需 dequant 才能变浮点）；
 #: 6 是 **BF16**（V2.7 的实际存储类型，实测 header weight_dtype=6）。
@@ -86,6 +91,12 @@ def read_tg(path, mmap_mode=True):
             raw = None
     if raw is None:
         raw = f.read()
+    # ★ 容器分派（2026-11-13）：TG4（magic "TG4\0"）与 v3 家族头偏移不同、且没有 FNV 表。
+    #   这里把它**翻译成同构的 info**（table/data_off/tokens 语义都对齐 v3），
+    #   于是 load_tensor / list_tensors / ckpt.load_tg / v27_train 全部无需改动即可读 TG4。
+    magic0 = struct.unpack_from("<I", raw, 0)[0]
+    if magic0 == TG4_MAGIC:
+        return _read_tg4(raw, path)
     h = struct.unpack("<16I6Q4I", raw[:128])
     (magic, version, wdt, n_layers, d_model, n_heads, d_ff, vocab, max_seq,
      n_experts, n_act, rope_theta, pad, bos, eos, unk,
@@ -138,8 +149,77 @@ def read_tg(path, mmap_mode=True):
             path=path, _file=f, mmap=isinstance(raw, _MMap))
 
 
+def _read_tg4(raw, path):
+    """把 **TG4** 容器翻译成与 v3 同构的 `info`。
+
+    ## 为什么要翻译而不是另写一套读取器
+
+    下游（`load_tensor` / `list_tensors` / `ckpt.load_tg` / `v27_train`）都只认
+    `info["table"]` + `info["data_off"]` + `info["tokens"]` 这套语义。
+    TG4 的差别只在**容器布局**：头偏移不同、表是 NAM 名字表而不是 FNV 表。
+    只要把 NAM 的每行翻成 `dict(hash=fnv1a64(name), off=…, len=…, dtype, ndim, shape)`，
+    并把 `data_off` 指向 WGT 分区起点，下游就全部无需改动即可读 TG4。
+
+    TG4 的 `off` 本来就是**相对 WGT 起点**，与 v3 的 `off` 语义一致，所以这里是等价映射。
+    """
+    (magic, version, hb, flags, n_layers, d_model, n_heads, head_dim, d_ff, vocab,
+     max_seq, nkv, n_experts, n_act, arch, wdt) = struct.unpack_from("<16I", raw, 0)
+    rope_theta = struct.unpack_from("<f", raw, 64)[0]
+    pad, bos, eos, unk = struct.unpack_from("<4I", raw, 80)
+    tok_off, tok_len = struct.unpack_from("<2Q", raw, 96)
+    sect_off, sect_cnt = struct.unpack_from("<2Q", raw, 112)
+
+    secs = {}
+    for i in range(sect_cnt):
+        typ, _fl, off, ln, _al, _crc = struct.unpack_from("<IIQQII", raw, sect_off + i * 32)
+        secs.setdefault(typ, (off, ln))          # 同类分区只取第一个
+
+    # SEC_TOK=1 SEC_NAM=2 SEC_WGT=3（与 tg4.py 的常量一致）
+    if 2 in secs:
+        from .tg4 import _unpack_nam
+        (_nam_off, nam_len) = secs[2]
+        rows = _unpack_nam(raw[_nam_off:_nam_off + nam_len])
+    else:
+        raise ValueError("TG4 缺 NAM 名字表。修法：用 write_tg4_stream 重写该文件")
+    if 3 not in secs:
+        raise ValueError("TG4 缺 WGT 权重分区。修法：确认改文件不是空壳")
+    wgt_off, wgt_len = secs[3]
+
+    table, names = [], []
+    for r in rows:
+        names.append(r["name"])
+        n = 1
+        for v in r["shape"]:
+            n *= int(v)
+        esz = _ESZ4.get(int(r["dtype"]), 0)
+        table.append(dict(hash=fnv1a64(r["name"]), off=int(r["off"]),
+                          len=n * esz if esz else 0, dtype=int(r["dtype"]),
+                          ndim=len(r["shape"]), shape=list(r["shape"]), scale=0))
+
+    # 分词段可能在两处：头里的 tok_off/tok_len（`write_tg4` 旧路径），
+    # 或 `TOK` 分区（`write_tg4_stream` 走这条，头里留 0）。
+    # ★ 2026-11-13 踩过：只读头会得到 0 长，于是"分词表为空"——必须回退到分区表。
+    if tok_len < 8 and 1 in secs:
+        tok_off, tok_len = secs[1]
+    if tok_len >= 8:
+        tokens, merges, specials = parse_tokenizer(raw, tok_off)
+    else:
+        tokens, merges, specials = [], [], []
+
+    return dict(header=dict(magic=magic, version=version, weight_dtype=wdt,
+                            n_layers=n_layers, d_model=d_model, n_heads=n_heads,
+                            head_dim=head_dim, d_ff=d_ff, vocab=vocab, max_seq=max_seq,
+                            n_experts=n_experts, n_activated=n_act,
+                            rope_theta=rope_theta, pad=pad, bos=bos, eos=eos, unk=unk,
+                            arch=arch, num_kv_heads=nkv, modality_flags=0,
+                            extension_off=0),
+            tokens=tokens, merges=merges, specials=specials,
+            table=table, data_off=wgt_off, raw=raw, meta={}, meta_ok=False,
+            path=path, _file=None, mmap=isinstance(raw, _MMap),
+            container="TG4", nam_names=names)
+
+
 def close_tg(info):
-    """释放 mmap/文件句柄（mmap 打开的文件不关会一直占着句柄）。"""
     if not info:
         return
     raw = info.get("raw")
@@ -313,6 +393,10 @@ def list_tensors(path_or_info, path=None):
         info, p = path_or_info, (path or path_or_info.get("path"))
     else:
         info, p = read_tg(path_or_info), path_or_info
+    # ★ TG4 自带名字表 ⇒ 直接用文件里的名字，不必依赖旁挂（旁挂只服务 v3 的哈希表）
+    if info.get("nam_names"):
+        return [(nm, list(e["shape"]), int(e["dtype"]), int(e["off"]), int(e["len"]))
+                for nm, e in zip(info["nam_names"], info["table"])]
     names = load_names(p) if p else None
     by_hash = {}
     if names:

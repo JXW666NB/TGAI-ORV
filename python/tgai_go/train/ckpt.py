@@ -4,7 +4,7 @@
 设计要点（都对应实测约束）：
 
 * **权重写成 v4 `.TG`**：与产线同容器，训练产物可直接被引擎加载（实测 GPU 接管）。
-  写盘走 `TGWriter.write_stream`（单张量内存），分词段从源 `.tg` 原样复用（`tok_blob`）。
+  写盘走 `tg4.write_tg4_stream`（单张量内存，**TG4 容器**），分词段从源 `.tg` 原样复用（`tok_blob`）。
 * **动量写成每层一个 `npz`**：10.9 GB 不能整体驻留内存；`save_opt_states` 逐层落盘。
 * **`meta.json` 记录 step / loss / 时间 / 张量数**：续训需要步数，排查需要上下文。
 * **轮转**：完整检查点 16.96 GB（权重 6.06 + 动量 10.90），磁盘有限，只留最近 `keep` 个。
@@ -34,7 +34,7 @@ def read_tok_blob(tg_path):
         magic = head[:4]
         if magic != b"TGAI":
             raise ValueError("不是 TGAI 容器：%s（magic=%r）。"
-                             "修法：检查点权重必须是 `TGWriter` 写出的 .TG（v3/v4），"
+                             "修法：检查点权重必须是 .TG（v3 或 TG4；本版本起新检查点写 TG4），"
                              "先确认路径没指错、文件没被别的格式覆盖" % (tg_path, magic))
         tok_off, tok_len = struct.unpack_from("<2Q", head, 64)
         f.seek(tok_off)
@@ -124,7 +124,6 @@ def iter_named_tensors(tr, st, names):
 
 def save_checkpoint(ckpt_dir, tr, st, opts, head_opt, names, src_tg, step, cfg, meta=None):
     """写一个完整检查点，返回目录路径。"""
-    from tgai_go.pack import DT_BF16, TGWriter
     from tgai_go.train.opt_fp16mv import save_opt_states
 
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -136,16 +135,24 @@ def save_checkpoint(ckpt_dir, tr, st, opts, head_opt, names, src_tg, step, cfg, 
          if k in cfg}
     c.update({k: int(cfg.get(k) or 0) for k in ("pad", "bos", "eos", "unk",
                                                 "n_kv_heads", "arch")})
-    w = TGWriter(n_layers=c["n_layers"], d_model=c["d_model"], n_heads=c["n_heads"],
-                 d_ff=c["d_ff"], vocab=c["vocab"], max_seq=c["max_seq"],
-                 n_experts=c["n_experts"], n_activated=c["n_activated"],
-                 rope_theta=c["rope_theta"], pad=c["pad"], bos=c["bos"],
-                 eos=c["eos"], unk=c["unk"], n_kv_heads=c.get("n_kv_heads", 0),
-                 arch=c.get("arch", 0), weight_dtype=DT_BF16)
     cfg_out = dict(cfg)
     cfg_out.update(c)
     wpath = os.path.join(ckpt_dir, CKPT_WEIGHTS)
-    w.write_stream(wpath, iter_named_tensors(tr, st, names), version=4, tok_blob=tok_blob)
+    # ★ 2026-11-13：检查点权重改写 **TG4** 容器（自描述分区 + NAM 名字表 + 内置分词表）。
+    #
+    # 为什么换：v3 家族（含"v3 布局 + version=4"）的权重表只有 FNV 哈希、没有名字，
+    # 做不了优化器映射 / 部分加载 / 按名 diff；而 TG4 的 NAM 直接给出名字。
+    # 文件名**保持 `weights.tg`** —— 路径是外部契约，容器由 magic 区分：
+    # `read_tg()` 两种都认（TG4 走 `_read_tg4` 翻成同构 info），所以旧检查点仍可读取/续训。
+    from tgai_go import tg4
+    cfg4 = dict(n_layers=c["n_layers"], d_model=c["d_model"], n_heads=c["n_heads"],
+                head_dim=int(cfg.get("head_dim") or (c["d_model"] // max(1, c["n_heads"]))),
+                d_ff=c["d_ff"], vocab=c["vocab"], max_seq=c["max_seq"],
+                n_kv_heads=c.get("n_kv_heads", 0), n_experts=c["n_experts"],
+                n_activated=c["n_activated"], arch=c.get("arch", 0),
+                weight_dtype=int(tg4.DT_BF16), rope_theta=c["rope_theta"],
+                pad_id=c["pad"], bos_id=c["bos"], eos_id=c["eos"], unk_id=c["unk"])
+    tg4.write_tg4_stream(wpath, iter_named_tensors(tr, st, names), cfg4, tok=tok_blob)
 
     odir = os.path.join(ckpt_dir, CKPT_OPT_DIR)
     os.makedirs(odir, exist_ok=True)

@@ -1,3 +1,50 @@
+## [0.9.60] - 2026-11-13
+
+**检查点与导出改用 TG4 容器**，兑现「以后统一 v4」；`read_tg` 现在两种容器都认。
+
+### 为什么换容器
+
+此前"v4"其实是 **v3 布局 + 头里 version=4**：权重表只有 FNV 哈希、**没有名字**，
+于是按名映射 / 部分加载 / 按名 diff 全都做不了。TG4 的 `NAM` 直接给出名字，
+头里还有独立的 `head_dim` 字段。
+
+### 改了什么
+
+| 位置 | 改动 |
+| --- | --- |
+| `ckpt.save_checkpoint` | 权重写 **TG4**（`tg4.write_tg4_stream`，流式、峰值=单张量），**分词表随权重**；优化器仍逐层 npz |
+| `ckpt.CKPT_WEIGHTS` | **文件名保持 `weights.tg`** —— 路径是外部契约，容器由 magic 区分，旧检查点仍可读 |
+| `export.save_tg` | 导出改 TG4；`TGWriter` 只用于编码分词段（TOK 布局与 v3 一致，不重复实现） |
+| `read_tg` | **透明读 TG4**：`_read_tg4()` 把 NAM 翻成同构 `info`（`table`/`data_off`/`tokens` 语义对齐 v3）⇒ `load_tensor` / `list_tensors` / `ckpt.load_tg` / `v27_train` **全部无需改动** |
+| `list_tensors` | TG4 自带名字时直接用文件里的名字，不再依赖旁挂 |
+
+### 修掉一个自己引入的 bug
+
+`_read_tg4` 起初只读**头里的** `tok_off/tok_len`，而 `write_tg4_stream` 把 TOK 放在
+**分区表**里（头里留 0）⇒ 读出来"分词表为空"。已改为**头优先、空则回退到 `TOK` 分区**。
+这个 bug 是被"检查点写出的 TG4 应自带分词表"这条测试抓到的。
+
+### 验证
+
+| 项 | 结果 |
+| --- | --- |
+| 本地套件 | **681 passed / 42 skipped** |
+| V100 GPU 门 | **287 passed / 12 skipped / 0 failed** |
+| 引擎读真实 TG4 | `TGAI_NB_V2.7.tg4`（982 张量 / 6.0 GB）→ `layers=28 d_model=1024 vocab=32779`，`encode`/`generate` 正常 |
+| 检查点 → 引擎 | `save_checkpoint` 写出的 TG4 **直接被引擎加载**（组合用例，非只验两半） |
+| 导出 | `save_tg` 输出 magic=TG4、名字可枚举、分词表随文件 |
+
+### 新增工具
+
+* `tools/to_tg4.py` —— v3 → TG4 流式转换（需名字边车；峰值内存=单张量）；
+* `tools/ls_dirs.py` —— 列目录内容（远端排查用，避免 shell 里拼 `&`）。
+
+### 兼容性
+
+* **v3 与"v3 布局 + version=4"仍可读**（`read_tg` 按 magic 分派；引擎侧 `TG_IS_V3FAMILY`）；
+* 旧检查点目录（`weights.tg` 是 v3 家族）继续可续训 —— 只读路径不变；
+* `TG4` 容器**没有**历史文件（落地前已扫盘确认为 0 个），本版起它才是"新写出的 v4"。
+
 ## [0.9.59] - 2026-11-12
 
 **C 引擎现在读得 `.TG` v4 —— V2.7 的 v4 权重与 ORV 训练检查点都能加载。**

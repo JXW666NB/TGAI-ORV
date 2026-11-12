@@ -146,14 +146,29 @@ def save_tg(path, params, *, n_layers, d_model, n_heads, d_ff, vocab_tokens, mer
     if abs(th - round(th)) > 1e-9:
         raise ValueError("rope_theta 必须是整数值才能写进 .TG 头（收到 %r）" % (rope_theta,) + "。修法：把 rope_theta 设成整数（例如 10000）；.TG 头只存整数")
     rope_theta = int(round(th))
+    # ★ 2026-11-13：导出改写成 **TG4** 容器（自描述分区 + NAM 名字表 + 内置分词表）。
+    #   为什么：v3 家族的权重表只有 FNV 哈希、没有名字，做不了按名映射/部分加载；
+    #   而 TG4 的 NAM 直接带名字，且头里有独立的 `head_dim` 字段。
+    #
+    #   `TGWriter` 在这里只用来**编码分词段字节**（v3 与 TG4 的 TOK 布局完全一致），
+    #   避免再写一份编码器；权重本身走 `tg4.write_tg4_stream`（流式，峰值=单张量）。
     wr = TGWriter(n_layers=n_layers, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
                   vocab=len(vocab_tokens), max_seq=max_seq,
                   n_experts=n_experts, n_activated=n_activated, rope_theta=rope_theta,
                   n_kv_heads=n_kv_heads, weight_dtype=weight_dtype, **kw)
-    wr.add_weights(w)
     wr.set_tokenizer(vocab_tokens, merges=merges,
                      special_ids=special_ids or [0, 0, 0, 0])
-    wr.write(path)
+    tok_blob = wr._tokenizer_bytes()
+
+    from .. import tg4
+    cfg4 = dict(n_layers=n_layers, d_model=d_model, n_heads=n_heads,
+                head_dim=int(head_dim or natural), d_ff=d_ff,
+                vocab=len(vocab_tokens), max_seq=max_seq,
+                n_kv_heads=n_kv_heads, n_experts=n_experts, n_activated=n_activated,
+                arch=int(arch or 0), weight_dtype=int(weight_dtype),
+                rope_theta=int(rope_theta),
+                pad_id=0, bos_id=0, eos_id=0, unk_id=0)
+    tg4.write_tg4_stream(path, iter(w.items()), cfg4, tok=tok_blob)
     # ★ 旁挂名字表（2026-11-08）：`.TG` 表里只有 FNV 哈希，不存名字 —— 推理够用，
     #   但当检查点用就**无法枚举参数**（做不了优化器映射/LoRA 挂载/部分加载）。
     #   这里顺手写一个 `<model>.TG.names.json`：纯旁挂，引擎不读 ⇒ 对产线零风险。
