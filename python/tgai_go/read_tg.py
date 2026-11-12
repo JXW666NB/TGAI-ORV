@@ -35,6 +35,39 @@ def fnv1a64(name: str) -> int:
     return h
 
 
+def parse_tokenizer(buf, off):
+    """解析分词段（v3 的 TOK 段与 TG4 的 `SEC_TOK` 分区**同一套字节布局**）。
+
+    ## 为什么要抽出来共用
+
+    v3 把分词表放在头里 `tok_off/tok_len` 指向的位置，TG4 把它放进 `TOK` 分区，
+    **但两者内容布局完全一致**：
+        u32 v_size, u32 n_merges
+        n_merges × (u16 a, u16 b)
+        v_size × (u8 len, bytes utf-8)
+        16 字节 specials 的 id
+    2026-11-13 抽出本函数，让 v3 与 TG4 共用一份解析（此前只在 read_tg 内联）。
+
+    返回 `(tokens, merges, specials)`。
+    """
+    o = off
+    v_size, n_merges = struct.unpack_from("<II", buf, o)
+    o += 8
+    merges = []
+    for _ in range(n_merges):
+        a, b = struct.unpack_from("<HH", buf, o)
+        o += 4
+        merges.append((a, b))
+    tokens = []
+    for _ in range(v_size):
+        ln = buf[o]
+        o += 1
+        tokens.append(buf[o:o + ln].decode("utf-8", "replace"))
+        o += ln
+    specials = list(buf[o:o + 16])
+    return tokens, merges, specials
+
+
 def read_tg(path, mmap_mode=True):
     """解析 `.TG` 头/词表/权重表。
 
@@ -59,23 +92,8 @@ def read_tg(path, mmap_mode=True):
      tok_off, tok_len, wt_off, wt_cnt, wd_off, wd_len, arch, nkv, modflags, ext_off) = h
     assert magic == TG_MAGIC, hex(magic)
 
-    # tokenizer
-    o = tok_off
-    v_size, n_merges = struct.unpack_from("<II", raw, o)
-    o += 8
-    merges = []
-    for _ in range(n_merges):
-        a, b = struct.unpack_from("<HH", raw, o)
-        o += 4
-        merges.append((a, b))
-    tokens = []
-    for _ in range(v_size):
-        ln = raw[o]
-        o += 1
-        tokens.append(raw[o:o + ln].decode("utf-8", "replace"))
-        o += ln
-    specials = list(raw[o:o + 16])
-    o += 16
+    # tokenizer（与 TG4 的 TOK 分区共用同一个解析器）
+    tokens, merges, specials = parse_tokenizer(raw, tok_off)
 
     # weights
     table = []

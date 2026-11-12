@@ -206,6 +206,30 @@ class TG4(object):
         off, ln = self.sections[sec]
         return json.loads(self._m[off:off + ln].decode("utf-8"))
 
+    def tokenizer(self):
+        """解析 `TOK` 分区 → `(tokens, merges, specials)`。
+
+        **分词段与 v3 完全同一套字节布局**，所以共用 `read_tg.parse_tokenizer`。
+        没有 TOK 分区、或分区短于最小长度时返回空三元组（**不要抛** ——
+        老 TG4 文件由 `write_tg4` 写出时 TOK 可能是空的，仍需可读）。
+        """
+        if SEC_TOK not in self.sections:
+            return [], [], []
+        off, ln = self.sections[SEC_TOK]
+        if ln < 8:
+            return [], [], []
+        from .read_tg import parse_tokenizer
+        return parse_tokenizer(self._m, off)
+
+    def tokens(self):
+        return self.tokenizer()[0]
+
+    def merges(self):
+        return self.tokenizer()[1]
+
+    def specials(self):
+        return self.tokenizer()[2]
+
     def close(self):
         try:
             self._m.close()
@@ -218,15 +242,20 @@ class TG4(object):
     def __exit__(self, *a):
         self.close()
 
-def write_tg4_stream(path, items, cfg, arc=None, train=None, per_tensor_hash=False):
+def write_tg4_stream(path, items, cfg, arc=None, train=None, per_tensor_hash=False,
+                     tok=None):
     """**流式**写 TG4：items 是 (name, ndarray) 的迭代器，写一个释放一个。
 
     为什么需要：3B 模型 983 个张量合计 fp32 约 12 GB，而 write_tg4 要求全部同时在内存
     （实测在 32 GB 机器上会把进程拖死）。这里改成**先流式写 WGT，再写 NAM 与分区表**，
     峰值内存 = 单张量（embedding ≈ 67 MB）。
 
+    `tok`：**分词段原始字节**（与 v3 的 TOK 段同一套布局）。2026-11-13 补上 ——
+    此前本函数没有该参数，导致导出的 v4 **不含分词表**，即便权重正确也不能直接给引擎用
+    （`docs/TRAIN_V27_ORV.md` §19 记的 P0）。传 `None` 或空字节时不写 TOK 分区。
+
     布局与 write_tg4 兼容（读端不需要区分）：
-        128B 头占位 → WGT（边写边记偏移/哈希）→ NAM/ARC/TRAIN/HASH → section table → 回填头
+        128B 头占位 → WGT（边写边记偏移/哈希）→ NAM/ARC/TRAIN/HASH/TOK → section table → 回填头
     """
     WGT_START = HEADER_BYTES
     meta, hashes = [], {}
@@ -252,6 +281,8 @@ def write_tg4_stream(path, items, cfg, arc=None, train=None, per_tensor_hash=Fal
         payloads = [(SEC_NAM, json.dumps(
             [{"name": m["name"], "off": m["off"], "dtype": m["dtype"],
               "shape": m["shape"]} for m in meta], ensure_ascii=False).encode("utf-8"))]
+        if tok:
+            payloads.append((SEC_TOK, bytes(tok)))
         if arc is not None:
             payloads.append((SEC_ARC, json.dumps(arc, ensure_ascii=False).encode("utf-8")))
         if train is not None:
