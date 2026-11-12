@@ -46,20 +46,21 @@ PyPI 包名 `tgai-orv`，import 路径 `tgai_go.train`。
 | **没有 `cos` / `sin`** | RoPE 类模型需 numpy 预生成表，再传给 `_rope_composed` 或引擎 |
 | **SDPA 维度约定** | 已接受 `is_causal=`，但输入要 `[B*H, S, Dh]`；torch 习惯是 `[B,H,S,Dh]` ⇒ 会报维度/广播错，需自己展平 |
 
-### 2.2 后端混用 / 多厂商（TG Link）—— 已有设计，别再重新设计
+### 2.2 别把这两件事混为一谈
 
-有人问「能不能一张卡混用 CUDA+Vulkan、或 N 卡 + A 卡、或把脏活丢给弱卡」时：
+| | 定义 | 层级 | 状态 |
+| --- | --- | --- | --- |
+| **TG Link** | 用 **Vulkan 让显卡与显卡之间 P2P**，实现**多厂商交火** | 设备**之间** | 只有设计，未验证可行性 |
+| **后端混用** | **一个进程里**用多种不同后端训练模型 | **进程内** | 未设计、未实现 |
+| （多设备） | 同后端、多张同厂商卡、同进程 | 进程内 | 也没有（`dist.py` 是多进程） |
 
-**先读 `docs/MULTIVENDOR_ROADMAP.md`**，那是权威定义。三条必须记住的结论：
+三条容易搞错的地方：
 
-1. 跨厂商 GPU **直连做不到**（NVLink 仅 NVIDIA、Infinity Fabric 仅 AMD、跨厂商 PCIe P2P 通常被禁）。
-2. **但 DP 不需要直连**：0.5B fp32 梯度 ≈1 GB/步 ÷ PCIe 实测 10–12 GB/s ≈ 0.1 s 归约，
-   相对 0.8 s/步仅 **≈12%** 开销。不可行的是 **TP**；PP 只传激活，也可 host 中转。
-3. **TG Link 是进程级方案**（每 rank 一进程、各自一个后端），**不需要**「单进程多设备」重构 ——
-   这一点最容易被误判成前置条件。
-
-当前状态：**不执行**。V3（TG Link v0）排在 V2（Vulkan 训练后端）之后，
-而训练侧 Vulkan 内核目前是 **0 个**。
+1. **TG Link 不是 host-staged all-reduce**。`docs/MULTIVENDOR_ROADMAP.md` §3 的 host-staged 是
+   **退路**；原始设想是 Vulkan 真 P2P。真 P2P 若能成，能解锁**跨厂商 TP**；host-staged 只够 DP/PP。
+2. **TG Link 与后端混用层级不同**，不能用一个方案同时解决。
+3. **`_CudaAPI` 是进程级单例** —— 后端混用（进程内多后端）必须先拆它；
+   而 TG Link 走跨进程，**不需要**拆它。我曾把这两者的前置条件搞反。
 
 完整报告与复现步骤：`docs/REVIEW_P100_2026-11-12.md`。
 

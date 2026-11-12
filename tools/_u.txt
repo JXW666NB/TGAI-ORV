@@ -1,0 +1,24 @@
+﻿docs: separate TG Link from backend mixing, since they are different problems
+
+The user clarified two definitions I had merged. TG Link is Vulkan-based peer-to-peer between GPUs, aimed at
+multi-vendor operation. Backend mixing is using several different backends inside one process. Different
+layers, different difficulties, no shared solution -- and I had written a single INDEX section treating them
+as one thing, plus repeated the mistake in the skill.
+
+I also corrected a claim I introduced an hour ago. I wrote that real P2P would unlock cross-vendor tensor
+parallelism. It would not. TP needs NVLink-class bandwidth around 300+ GB/s, while PCIe 3.0 x16 gives 10-12
+GB/s, an order of magnitude short; nobody runs TP over PCIe even within one vendor. So TG Link's honest
+payoff is collective-communication efficiency: host staging costs two PCIe hops, A to host then host to B,
+so effective bandwidth roughly halves, and real peer access would recover that factor of two, lower latency,
+and stop consuming host memory. That is worth having, and it is not TP.
+
+One distinction matters for prerequisites and I had it backwards before. Backend mixing, being in-process,
+does have to dismantle the _CudaAPI singleton along with the buffers, memory pool, CUDA graph capture and
+fp16 shadow cache that assume one backend. TG Link goes across processes, so it does not. Two problems, two
+very different amounts of work.
+
+MULTIVENDOR_ROADMAP.md now opens with a note that its own section 3 describes host-staged collectives, which
+is the fallback, not the original intent -- the intent is real Vulkan peer-to-peer. That document had been
+quietly reframing the goal downward, which is exactly how an ambition gets lost.
+
+Documentation only. Suite: 665 passed / 37 skipped. Version stays 0.9.51.
