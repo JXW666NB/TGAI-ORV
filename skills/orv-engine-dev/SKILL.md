@@ -41,7 +41,9 @@ PyPI 包名 `tgai-orv`，import 路径 `tgai_go.train`。
 | --- | --- |
 | **sm_60 本身支持** | NVRTC 能编译 `compute_60`，张量/模型/AdamW 正常训练 —— 硬件不是障碍 |
 | **首装可能报 `failed to open nvrtc-builtins64_*.dll`** | **0.9.50 已修**（会扫 `nvidia/*/lib`、`*/bin` 并写进 PATH）。仍失败时的规避：把 `site-packages/torch/lib` 前置进 `PATH` **并** 调 `os.add_dll_directory` |
-| **"比 PyTorch 省显存"有范围** | 只在 **3B MoE / 32GB V100** 有证据。400M 稠密 / 16GB 上 **PyTorch 能跑而 ORV 开检查点仍 OOM** —— 检查点回收目前弱于 torch |
+| **不省显存，反而多 1.2–1.9×** | 六组头对头实测一致（`docs/BENCHMARK_H2H_2026-11-12.md`）。ORV 用显存换速度与"装得下更大的模型"，**不要对外声称省显存** |
+| **检查点 0.9.53 起与 PyTorch 语义对齐** | 旧版把 `_parents` 清空，导致外层图段间断开、反向递归整链重算。按 `torch/utils/checkpoint.py` 的 `CheckpointFunction` 重做后：每层反向峰值 **1.68 → 0.117 GiB**；20 层/606M/B=2/S=2048 由 **31.29 GiB 降到 7.56 GiB**（`docs/MEMORY_BACKWARD_PEAK_2026-11-12.md`）|
+| **"能装下更大模型"的准确含义** | 指 PyTorch 在 **1.997B 稠密**就 OOM（31.40 GiB）而 ORV 能跑 **3B MoE**（24.78 GiB）。这是融合减少中间量，不是"更省显存" |
 | **fp16 是「反向也走」但受形状门槛** | fp16 分支在**共享 GEMM 核心**里，前向反向都走；门槛 `m*n ≥ 262144` 且 `k ≤ _FP16_MAX_K`（默认不限，可用 `TG_FP16_MAX_K` 调）。**长 K 的 dW 有精度风险**：代码记录梯度相对误差会从 3e-4 恶化到 2e-2。`B=8/S=2048` 时 k=16384 正处风险区 ⇒ 开 fp16 必须在目标卡实测 |
 | **AMP 不省激活显存** | 参数/激活/梯度**全程 fp32**，只有 GEMM 输入 cast。torch autocast 把激活存 fp16 ⇒ 天然省一半激活显存。**这是 ORV 显存差距的结构性原因之一**，不是"开销没优化好" |
 | **`sdpa_lowmem` 只支持 `dh==64`** | `dh=128` 会**静默退回全量注意力**（不报错）。d_head=128 的模型别以为开了低显存 |
@@ -104,13 +106,16 @@ hist  = T.fit(model, data, steps=2000, lr=3e-4, amp=True)
 | 类别 | 有什么 |
 | --- | --- |
 | 张量 / autograd | `Tensor`、广播、`backward()`、`requires_grad`、`no_grad` |
-| `nn` | `Module`、`Linear`、`Embedding`、`LayerNorm`、`RMSNorm`、`Conv1d/2d`、`Dropout`、`BatchNorm1d/2d`、`MaxPool/AvgPool`、`Sequential`、`ModuleList`、`MoE` |
-| 优化器 | `AdamW`、`SGD`、`Adafactor`、`LAMB`、`Lion`、`Muon` |
+| 张量搬运 | **只有** `.cuda()`、`.to(device)`、`.cpu()`、`.to_numpy()`。**没有 `.to_cuda()`** |
+| `nn` | `Module`、`Parameter`、`Linear`、`Embedding`、`LayerNorm`、`RMSNorm`、`Conv1d/2d`、`Dropout`、`BatchNorm1d/2d`、`MaxPool/AvgPool`、`Sequential`、`ModuleList`、`MoE`、`CausalSelfAttention` |
+| 优化器 | `AdamW`、`SGD`、`Adafactor`、`LAMB`、`Lion`、`Muon`、`Accumulator`、`scale_grads` |
 | 调度 | `CosineLR`、`LinearLR`、`StepLR`、`warmup` |
-| 训练工具 | 梯度裁剪、梯度累积、`DataLoader`（`Dataset`/`IterableDataset`/`Sampler`/`collate`/多线程） |
-| 精度 | `T.amp()`（fp16 / bf16，可编程开关，无需重启进程） |
-| 生态互转 | `T.from_torch(...)`、`T.to_torch(...)`、checkpoint 读写 |
-| 规模 | 49 模块 / 233 后端接口方法 / 101 CUDA 内核 / 13 优化器 / 656 测试用例 |
+| 训练工具 | 梯度裁剪 `clip_grad_norm_(params, max_norm)`、梯度累积、`DataLoader`（`Dataset`/`IterableDataset`/`Sampler`/`collate`/多线程） |
+| 精度 | `T.amp()` / `amp_on()` / `amp_off()` / `amp_state()`。**语义与 `torch.autocast` 不同**：只把 **GEMM 输入** cast 成 fp16/bf16，**参数/激活/梯度全程 fp32** ⇒ 不省激活显存、不需要 GradScaler。门槛是 `m*n ≥ 262144` 且 `k ≤ _FP16_MAX_K`（`TG_FP16_MAX_K` 可调） |
+| 注意力 | `functional.scaled_dot_product_attention(q,k,v, causal=|is_causal=, scale=, lowmem=)`，输入 `[B,H,S,Dh]`。低显存内核**只支持 `Dh==64`**；`sdpa_lowmem_ready()` 无参数，只表示"本机有该内核"，**不按形状判断** |
+| 索引 / 收集 | `x[idx]` 只支持**首轴一维整型**（CPU 与 CUDA 都可，0.9.52 起）；另可用 `gather_flat(x, flat_index, n_src=None)`、`index_select(x, dim, index)`。多维花式索引与布尔掩码不支持 |
+| 生态互转 | `from_torch(module)`、`to_torch(module)`、`state_dict_from_torch(module)`、`state_dict_to_torch(module)`、`save(obj, f)`、`load(f, map_location=None)` |
+| 规模 | 见 `docs/CAPABILITY_AUDIT.md`（脚本生成，数字会变，**不要在这里抄死**） |
 
 **权威来源**：`docs/CAPABILITY_AUDIT.md`（脚本扫描生成，可重新生成）；`docs/OP_COVERAGE.md`（算子矩阵）。
 
@@ -131,7 +136,66 @@ import tgai_go.train as T
 
 ```python
 model = T.from_torch(torch_model)
-# 或 mine.load_state_dict(T.from_torch_state_dict(torch_sd))
+# 或只搬权重（注意：参数是 torch 的 module，不是 state_dict）：
+mine.load_state_dict(T.state_dict_from_torch(torch_model))
+```
+
+**用已发布的 pip 包（没有仓库）时的最小验证脚本** —— 只用 `tgai_go.train` + numpy，
+20 步小模型，打印 loss 与峰值显存。**这段在 V100 上逐字实跑过**
+（`loss 6.238792 → 6.176723`，峰值 `0.077 GiB`，loss 下降即环境正常）：
+
+```python
+import time
+import numpy as np
+import tgai_go.train as T
+from tgai_go.train import functional as Fn
+
+T.set_default_device("cuda")
+rt = T._cuda()
+rng = np.random.default_rng(0)
+V, D, L, NH, FF, S, B = 512, 256, 2, 4, 1024, 128, 4
+DH = D // NH
+
+def dev(n, m):
+    return T.Tensor._from_gpu(rt.h2d(rng.normal(0, 0.02, (n, m)).astype(np.float32)))
+
+qkv = [dev(3 * D, D) for _ in range(L)]
+o = [dev(D, D) for _ in range(L)]
+g = [dev(FF, D) for _ in range(L)]
+u = [dev(FF, D) for _ in range(L)]
+dn = [dev(D, FF) for _ in range(L)]
+head = dev(V, D)
+emb = T.nn.Embedding(V, D)
+params = [emb.weight, head] + qkv + o + g + u + dn
+for t in params:
+    t.requires_grad = True
+
+ids = rng.integers(0, V, (B, S)).astype(np.int64)
+tgt = rng.integers(0, V, (B, S)).astype(np.int64)
+x = emb(ids.reshape(-1)).reshape(B, S, D)
+for i in range(L):
+    z = x.reshape(-1, D) @ qkv[i].T
+    q, k, v = z.reshape(B, S, 3, NH, DH).permute(2, 0, 3, 1, 4)
+    y = Fn.scaled_dot_product_attention(q.reshape(B * NH, S, DH),
+                                        k.reshape(B * NH, S, DH),
+                                        v.reshape(B * NH, S, DH), is_causal=True)
+    x = x + (y.reshape(B, NH, S, DH).permute(0, 2, 1, 3)
+             .reshape(-1, D) @ o[i].T).reshape(B, S, D)
+    f = x.reshape(-1, D)
+    x = x + ((Fn.silu(f @ g[i].T) * (f @ u[i].T)) @ dn[i].T).reshape(B, S, D)
+
+opt = T.optim.AdamW(params, lr=1e-3)
+for step in range(20):
+    loss = Fn.cross_entropy((x.reshape(-1, D) @ head.T).reshape(-1, V), tgt.reshape(-1))
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    rt.sync()
+    if step in (0, 19):
+        st = rt.pool_stats()
+        print("step %2d loss %.6f 峰值 %.3f GiB"
+              % (step, float(np.asarray(loss.to_numpy()).reshape(-1)[0]),
+                 st["peak_live_bytes"] / (1 << 30)))
 ```
 
 **搬完必须对拍前向**：
