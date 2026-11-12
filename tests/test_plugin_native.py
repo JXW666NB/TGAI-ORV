@@ -36,6 +36,43 @@ import pytest
 import tgai_go.train as T
 from tgai_go.train import plugin, plugin_manifest
 
+#: POSIX 上 libc 常驻的目录（按常见度排序）
+_POSIX_LIB_DIRS = (
+    "/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu",
+    "/lib64", "/usr/lib64", "/lib", "/usr/lib",
+)
+
+
+def _system_c_library():
+    """返回系统 C 库的**绝对路径**；解析不出来就返回 None（调用方跳过）。
+
+    ## 为什么需要这个
+
+    `ctypes.util.find_library("c")` 在 Linux 上返回的是 **soname**（如 `libc.so.6`），
+    **不是路径**。直接把它交给 `plugin.load_lib` 会被 `os.path.abspath` 拼到当前目录下，
+    于是在 Ubuntu CI 上必然报「原生库不存在: <仓库根>/libc.so.6」——
+    而 Windows 上 `find_library("msvcrt")` 常常返回 None，用例被跳过，
+    所以这个 bug 只在 Linux 暴露过（2026-11-12 CI 红了两条）。
+
+    这里把它解析成真实存在的文件：先试 `find_library` 的结果（若本身是文件），
+    再扫常见库目录。找不到就返回 None，让用例 skip 而不是假失败。
+    """
+    for name in ("msvcrt", "c"):
+        got = _ctypes_util.find_library(name)
+        if got and os.path.isfile(got):
+            return os.path.abspath(got)
+    if sys.platform == "win32":
+        for nm in ("msvcrt.dll",):
+            if os.path.isfile(nm):
+                return os.path.abspath(nm)
+        return None
+    for d in _POSIX_LIB_DIRS:
+        for nm in ("libc.so.6", "libc.so", "libc.dylib"):
+            p = os.path.join(d, nm)
+            if os.path.isfile(p):
+                return p
+    return None
+
 
 @pytest.fixture(autouse=True)
 def _clean():
@@ -83,9 +120,9 @@ def test_load_lib_missing_file_explains_fix():
 
 
 def test_load_lib_is_cached():
-    path = _ctypes_util.find_library("msvcrt") or _ctypes_util.find_library("c")
+    path = _system_c_library()
     if not path:
-        pytest.skip("本机找不到系统 C 库")
+        pytest.skip("本机找不到系统 C 库的绝对路径")
     a = plugin.load_lib(path)
     b = plugin.load_lib(path)
     assert a is b, "同一路径应复用句柄，不重复加载"
@@ -147,9 +184,9 @@ def test_manifest_requires_core_fields():
 
 def test_manifest_binds_ops_end_to_end():
     """端到端：JSON + 原生库 → 算子可调用（用系统 C 库的 abs 做真实绑定）。"""
-    libname = _ctypes_util.find_library("msvcrt") or _ctypes_util.find_library("c")
+    libname = _system_c_library()
     if not libname:
-        pytest.skip("本机找不到系统 C 库")
+        pytest.skip("本机找不到系统 C 库的绝对路径")
     d = tempfile.mkdtemp()
     try:
         p = os.path.join(d, "myops.json")
