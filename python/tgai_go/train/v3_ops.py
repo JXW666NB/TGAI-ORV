@@ -424,6 +424,41 @@ def moe_route_orv(x, router_w, top_k, expert_bias=None):
     return topi, topv, s_all
 
 
+def situ_gate_orv(g, u, beta1=4.0, beta2=25.0):
+    """融合 SiTU 门：`β1·tanh(g/β1)·σ(g) · β2·tanh(u/β2)`。
+
+    ## 为什么要有它
+
+    原先用 7 个算子拼（缩放 / tanh / 还原 / sigmoid 的 4 步 / 两次相乘），
+    每个中间量都是 (N, d_ff)，且**全部留到反向**。实测 8 专家的 `situ_glu` 一共留 216 MiB，
+    是 MoE 每层 237 MiB 的主体。
+
+    PyTorch 的做法（`ActivationSiluKernel.cu`）：整个逐元素链是**一个内核**，
+    反向只读输入重算，不留中间量。这里照同一思路实现：前向一次分配，反向读 (g, u) 重算。
+    """
+    import tgai_go.train as T
+    if g.device != "cuda":
+        raise NotImplementedError(
+            "situ_gate_orv 只有 CUDA 融合内核。修法：CPU 上请用 situ_glu_numpy 对拍，"
+            "或在该路径走组合实现")
+    rt = T._cuda()
+    buf = rt.situ_glu(g._gpu, u._gpu, float(beta1), float(beta2))
+    need = bool(g.requires_grad or u.requires_grad)
+    out = T.Tensor._from_gpu(buf, requires_grad=need, _parents=(g, u) if need else ())
+    if not need:
+        return out
+
+    def bw(gr, grads):
+        dg, du = rt.situ_glu_bwd(gr, g._gpu, u._gpu, float(beta1), float(beta2))
+        if g.requires_grad:
+            T._acc(grads, g, dg)
+        if u.requires_grad:
+            T._acc(grads, u, du)
+
+    out._backward = bw
+    return out
+
+
 def situ_glu_orv(x, w1, w2, w3, beta1=4.0, beta2=25.0):
     """SiTU-GLU 的 ORV 张量版（专家 FFN 的激活）。
 
@@ -437,9 +472,9 @@ def situ_glu_orv(x, w1, w2, w3, beta1=4.0, beta2=25.0):
     """
     g = x @ w1.transpose(0, 1)
     u = x @ w2.transpose(0, 1)
-    # ★ 代数合并（与逐式等价，少一个 (N,d_ff) 临时量）：
-    #   (tg·β₁)·sigmoid(g) = (tg·β₁)·(0.5·sg+0.5) = (tg·(sg+1))·(β₁/2)
-    #   其中 tg = tanh(g/β₁)、sg = tanh(g/2)。每个 (N,d_ff) 临时量在多专家多层下会累积成 GB 级。
+    if g.device == "cuda":
+        # 融合内核：不留中间量（见 situ_gate_orv 的说明）
+        return situ_gate_orv(g, u, beta1, beta2) @ w3.transpose(0, 1)
     tg = _tanh(g * (1.0 / beta1))
     sg = _tanh(g * 0.5)
     gate = (tg * (sg + 1.0)) * (0.5 * beta1)

@@ -1819,7 +1819,9 @@ class Tensor:
         return out
 
     def tanh(self):
-        """组合式（2*sigmoid(2x)-1）⇒ CPU/CUDA 都能用。"""
+        """CUDA 上走融合内核；CPU 走组合式（2*sigmoid(2x)-1，numpy 侧无所谓开销）。"""
+        if self.device == "cuda":
+            return _tanh_cuda(self)
         from . import nn_ops as _O
         return _O.tanh(self)
 
@@ -3215,6 +3217,23 @@ def _sdpa_lowmem(q, k, v, scale):
         if v.requires_grad:
             _acc(grads, v, rt.permute(dv_sk, (1, 0, 2)))
 
+    out._backward = bw
+    return out
+
+
+def _tanh_cuda(x):
+    """tanh 走融合内核（单次分配）；反向用 `1 − y²`，复用前向输出。
+
+    原先没有 tanh 内核，靠 `2·sigmoid(2x)−1` 组合，实测 16 MB 输入吃掉 176 MiB（11×），
+    是 `situ_glu_orv` 756 MiB 与 MoE 每层 450 MiB 的主要来源。
+    """
+    rt = _cuda()
+    y = rt.tanh(x._gpu)
+    out = Tensor._from_gpu(y, requires_grad=x.requires_grad, _parents=(x,))
+
+    def bw(g, grads):
+        if x.requires_grad:
+            _acc(grads, x, rt.tanh_bwd(g, y))
     out._backward = bw
     return out
 

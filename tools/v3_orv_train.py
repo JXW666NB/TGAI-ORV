@@ -62,7 +62,13 @@ def build(cfg, rng):
             # 不能每步用 cat([W1[e]…]) 现拼（既偏架构，又多拷 E×d_ff×d 个元素）
             router=p(E, d),
             wq=p(n_q * d_k, d), wk=p(n_kv * d_k, d), wv=p(n_kv * d_k, d), wo=p(d, n_q * d_k),
-            W1=p(E, d_ff, d), W2=p(E, d_ff, d), W3=p(E, d, d_ff),
+            # ★ 专家权重用**独立参数列表**，不用三维张量再 [e] 索引：
+            #   实测 `W3d[e]` 每次都拷贝（4 MiB/次），MoE 每层索引 24 次（8 专家 × 3 权重），
+            #   拷出来的副本还会被自动微分保留到反向 —— 一层约 200 MiB 的纯浪费。
+            #   列表索引不产生任何 GPU 拷贝。
+            W1=[p(d_ff, d) for _ in range(E)],
+            W2=[p(d_ff, d) for _ in range(E)],
+            W3=[p(d, d_ff) for _ in range(E)],
         ))
     return P
 
@@ -70,7 +76,11 @@ def build(cfg, rng):
 def params_of(P):
     out = [P["emb"], P["ln_f"], P["head"]]
     for L in P["layers"]:
-        out.extend(L.values())
+        for k, v in L.items():
+            if isinstance(v, list):      # 专家权重是列表
+                out.extend(v)
+            else:
+                out.append(v)
     return out
 
 

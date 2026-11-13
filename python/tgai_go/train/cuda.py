@@ -461,6 +461,55 @@ extern "C" __global__ void ewise_log(const float* a, float* c, int n) {
     if (i < n) c[i] = logf(a[i]);
 }
 
+// tanh：单次分配，无 workspace。原先没有这个内核，tanh 只能靠 2*sigmoid(2x)-1 组合实现，
+// 实测 16 MB 输入会吃掉 176 MiB（11×），是 MoE 每层 450 MiB 的主要来源。
+extern "C" __global__ void ewise_tanh(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = tanhf(a[i]);
+}
+
+// tanh 反向：复用前向输出 y（= tanh(x)），d/dx = 1 - y*y，不需要再存 x。
+extern "C" __global__ void ewise_tanh_bwd(const float* g, const float* y, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { float t = y[i]; c[i] = g[i] * (1.0f - t * t); }
+}
+
+// SiTU-GLU 融合门（前向）：out = [β1·tanh(g/β1)·sigmoid(g)] · [β2·tanh(u/β2)]
+// 照 PyTorch 的做法（ActivationSiluKernel.cu）：整个逐元素链一个内核，只产出 out，
+// 不产生 gate/tanh/sigmoid 等中间张量。原先用 7 个算子拼，每步留存 9 个 (N,d_ff) 临时量。
+extern "C" __global__ void situ_glu_fwd(const float* g, const float* u, float* out,
+                                        int n, float b1, float b2) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float gv = g[i], uv = u[i];
+        float t1 = tanhf(gv / b1);
+        float s = 1.0f / (1.0f + expf(-gv));
+        float up = b2 * tanhf(uv / b2);
+        out[i] = (b1 * t1 * s) * up;
+    }
+}
+
+// SiTU-GLU 反向：只读 dout/g/u，重算 gate 与导数，不依赖任何中间量。
+//   gate = β1·tanh(g/β1)·σ(g),  dgate/dg = (1−tanh²)·σ + β1·tanh·σ·(1−σ)
+//   up   = β2·tanh(u/β2),       dup/du  = 1 − tanh²
+extern "C" __global__ void situ_glu_bwd(const float* dout, const float* g, const float* u,
+                                        float* dg, float* du, int n, float b1, float b2) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float gv = g[i], uv = u[i];
+        float t1 = tanhf(gv / b1);
+        float s = 1.0f / (1.0f + expf(-gv));
+        float t2 = tanhf(uv / b2);
+        float gate = b1 * t1 * s;
+        float up = b2 * t2;
+        float dgate = (1.0f - t1 * t1) * s + b1 * t1 * s * (1.0f - s);
+        float dup = 1.0f - t2 * t2;
+        float d = dout[i];
+        dg[i] = d * up * dgate;
+        du[i] = d * gate * dup;
+    }
+}
+
 extern "C" __global__ void ewise_recip(const float* a, float* c, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) c[i] = __fdiv_rn(1.f, a[i]);
@@ -4698,6 +4747,54 @@ class CudaRuntime:
                     self._ptr(a), self._ptr(out), (n, ctypes.c_int),
                 ])
         return out
+
+    def tanh(self, a):
+        """tanh 融合核（单次分配）。反向用 `ewise_tanh_bwd`，见 `tanh_bwd`。"""
+        out = self.empty(a.shape, dtype=np.float32)
+        n = int(a.n)
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("ewise_tanh", grid, block, [
+                self._ptr(a), self._ptr(out), (n, ctypes.c_int),
+            ])
+        return out
+
+    def tanh_bwd(self, g, y):
+        """`d tanh = g·(1 − y²)`，y 为前向输出。"""
+        out = self.empty(y.shape, dtype=np.float32)
+        n = int(y.n)
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("ewise_tanh_bwd", grid, block, [
+                self._ptr(g), self._ptr(y), self._ptr(out), (n, ctypes.c_int),
+            ])
+        return out
+
+    def situ_glu(self, g, u, beta1, beta2):
+        """融合 SiTU-GLU 前向：`β1·tanh(g/β1)·σ(g) · β2·tanh(u/β2)`，单次分配。"""
+        out = self.empty(g.shape, dtype=np.float32)
+        n = int(g.n)
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("situ_glu_fwd", grid, block, [
+                self._ptr(g), self._ptr(u), self._ptr(out), (n, ctypes.c_int),
+                (float(beta1), ctypes.c_float), (float(beta2), ctypes.c_float),
+            ])
+        return out
+
+    def situ_glu_bwd(self, dout, g, u, beta1, beta2):
+        """融合反向：返回 (dg, du)，只读 dout/g/u，无中间量。"""
+        dg = self.empty(g.shape, dtype=np.float32)
+        du = self.empty(u.shape, dtype=np.float32)
+        n = int(g.n)
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("situ_glu_bwd", grid, block, [
+                self._ptr(dout), self._ptr(g), self._ptr(u),
+                self._ptr(dg), self._ptr(du), (n, ctypes.c_int),
+                (float(beta1), ctypes.c_float), (float(beta2), ctypes.c_float),
+            ])
+        return dg, du
 
     def log(self, a):
         out = self.empty(a.shape, dtype=np.float32)

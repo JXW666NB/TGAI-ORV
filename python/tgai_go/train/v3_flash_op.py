@@ -25,6 +25,17 @@ def _np(t):
 
 
 def _fwd_device(qt, kt, vt, causal, cq, ck):
+    """块化前向（不建图）：内部只做数值计算，反向由 `_bwd_device` 重算。
+
+    这里必须显式 `no_grad` —— 本函数每块都会创建若干小张量，块数 = (S/cq)×(S/ck)，
+    在 S=2048、64 块下是 32×32；若建图，这些张量全部留到反向，实测吃掉约 2 GB。
+    """
+    import tgai_go.train as T
+    with T.no_grad():
+        return _fwd_device_impl(qt, kt, vt, causal, cq, ck)
+
+
+def _fwd_device_impl(qt, kt, vt, causal, cq, ck):
     """返回 (O, LSE)，都是 numpy；q/k/v 是 (BH, S, D) 设备张量。"""
     import tgai_go.train as T
     BH, S, D = (int(s) for s in qt.shape)

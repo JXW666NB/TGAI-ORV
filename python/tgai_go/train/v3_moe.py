@@ -108,7 +108,8 @@ def moe_dispatch_orv(x, eids_np, gate, W1, W2, W3, beta1=4.0, beta2=25.0):
     xs = x[order]                                     # gather（可反传）
     g_sorted = gate[order]
 
-    E = int(W1.shape[0])
+    # 专家权重可以是三维张量（W1[e] 会拷贝）或**列表**（不拷贝，推荐）。
+    E = len(W1) if isinstance(W1, (list, tuple)) else int(W1.shape[0])
     counts = np.bincount(eids, minlength=E)
     parts, bounds = [], np.cumsum(counts)
     start = 0
