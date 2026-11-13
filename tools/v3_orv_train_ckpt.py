@@ -48,11 +48,11 @@ def vram_peak(stop, base, prof):
     prof["peak"] = peak
 
 
-def layer_fwd(x, L, cos, sin, d_k, n_q, n_kv):
+def layer_fwd(x, L, cos, sin, d_k, n_q, n_kv, lowmem=False):
     """一层前向：h = x + attn(rmsnorm(x)); y = h + moe(rmsnorm(h))。"""
     h = x + V.attention_orv(V.rmsnorm_orv(x, L["ln1"]),
                             L["wq"], L["wk"], L["wv"], L["wo"],
-                            cos, sin, d_k, n_q, n_kv)
+                            cos, sin, d_k, n_q, n_kv, lowmem=lowmem)
     hn3 = V.rmsnorm_orv(h, L["ln2"])
     hn = hn3.reshape(int(h.shape[1]), int(h.shape[2]))
     eids, g, _s = MOE.route_top1(hn, L["router"])
@@ -74,6 +74,8 @@ def main():
     ap.add_argument("--n_q", type=int, default=8)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--lowmem", action="store_true",
+                    help="注意力走不物化 S² 的内核（需 dh==64）")
     a = ap.parse_args()
 
     T.set_default_device("cuda")
@@ -105,7 +107,7 @@ def main():
             x = P["emb"][ids].reshape(1, a.seq, a.d)
             bounds = [np.asarray(x.to_numpy(), np.float32)]
             for L in P["layers"]:
-                x = layer_fwd(x, L, cos, sin, d_k, a.n_q, cfg["n_kv"])
+                x = layer_fwd(x, L, cos, sin, d_k, a.n_q, cfg["n_kv"], lowmem=a.lowmem)
                 bounds.append(np.asarray(x.to_numpy(), np.float32))
 
         # ---- 头 + 损失（接图）----
@@ -120,7 +122,8 @@ def main():
         # ---- 反向：逐层重算 ----
         for i in range(len(P["layers"]) - 1, -1, -1):
             xi = leaf(bounds[i])
-            y = layer_fwd(xi, P["layers"][i], cos, sin, d_k, a.n_q, cfg["n_kv"])
+            y = layer_fwd(xi, P["layers"][i], cos, sin, d_k, a.n_q, cfg["n_kv"],
+                          lowmem=a.lowmem)
             y.backward(T.tensor(np.ascontiguousarray(g_up)))
             g_up = np.asarray(xi.grad.to_numpy(), np.float32)
             # ★ 每层反向完把池缓存归还驱动：否则不同尺寸的临时块会被池"缓存"住，
