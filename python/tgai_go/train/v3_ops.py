@@ -23,6 +23,7 @@ ORV 的 `train` 包里 **没有** 导出 `sigmoid`（只确认了 `tanh`）。�
 实现，数学上**精确相等**，且只依赖已确认存在的 `tanh`。
 这样这个算子不会因为"某个函数没导出"而在运行时才炸。
 """
+import math
 import os
 import sys
 
@@ -244,3 +245,85 @@ def moe_update_bias(expert_bias, usage, gamma, top_k, n_experts, ema=None,
         u = ema_decay * np.asarray(ema, np.float32) + (1.0 - ema_decay) * u
     b += np.where(u < ideal, float(gamma), -float(gamma))
     return b
+
+
+# ═══════════════════════════════════════════════════════════
+# CSA（Compressed Sparse Attention）的两个关键步骤
+# ═══════════════════════════════════════════════════════════
+
+def csa_compress(h, c, seg=None):
+    """序列压缩：把连续 `c` 个位置均值池化成 1 个 chunk，输出长度**恒为 ceil(T/c)**。
+
+    参考实现（`model_v3.py::CompressedSparseAttention._compress`）：
+
+    * `seg=None`：按固定 chunk 池化，**尾部复制补齐**；
+    * `seg` 给出（每 token 的文档号）：**按文档边界分段池化**（每篇文档独立切 chunk、
+      首尾相接），末尾**补零**到 `Tc`，无效 chunk 由掩码屏蔽。
+
+    ★ 为什么必须按文档分段（P0-A 实测依据）：固定 chunk 会把两篇文档的 token 池进同一个
+      chunk，于是文档 B 的 token **看不到自己文档开头那几个**（被一起屏蔽了）——
+      权重看着对，但被池化的**内容本身脏了**。
+    """
+    x = np.asarray(h, np.float32)
+    if x.ndim != 3:
+        raise ValueError("h 形状应为 (B,T,L)，收到 %s" % (x.shape,))
+    B, T, L = x.shape
+    c = max(2, int(c))
+    Tc = int(math.ceil(T / float(c)))
+    out = np.zeros((B, Tc, L), np.float32)
+
+    if seg is None:
+        for b in range(B):
+            for k in range(Tc):
+                lo, hi = k * c, min((k + 1) * c, T)
+                out[b, k] = x[b, lo:hi].mean(axis=0)
+            if Tc * c > T:                       # 尾部复制补齐
+                last = T - 1
+                for k in range(Tc):
+                    if k * c >= T:
+                        out[b, k] = x[b, last]
+        return out
+
+    sd = np.asarray(seg)
+    if sd.ndim == 1:
+        sd = sd[None, :]
+    for b in range(B):
+        pos = 0
+        doc_ids = []
+        for t in range(T):
+            if t == 0 or sd[b, t] != sd[b, t - 1]:
+                doc_ids.append(t)
+        doc_ids.append(T)
+        chunks = []
+        for di in range(len(doc_ids) - 1):
+            lo, hi = doc_ids[di], doc_ids[di + 1]
+            for k in range(lo, hi, c):
+                chunks.append(x[b, k:min(k + c, hi)].mean(axis=0))
+        for k, ch in enumerate(chunks[:Tc]):
+            out[b, k] = ch
+        # 不足 Tc 的 chunk 保持全零（无效 chunk 由掩码屏蔽）
+    return out
+
+
+def csa_conv_causal(x, w):
+    """因果**深度可分离**卷积：`y[t] = Σ_{j<k} w[j] ⊙ x[t-j]`（越界补 0）。
+
+    `x`：`(B,Tc,L)`；`w`：`(L, k)`（每通道一组核，depthwise）。
+    ★ 只向左填充 ⇒ **不看未来**。参考实现记录过真 bug：旧代码用 `padding=k-1`（双向），
+      再切前 Tc 个位置，导致每个位置仍能看见**未来 2 个 chunk**（实测 chunk 8 的输出
+      在输入未变的情况下变化 1.450e+00）。
+    """
+    x = np.asarray(x, np.float32)
+    B, Tc, L = x.shape
+    w = np.asarray(w, np.float32)
+    if w.shape[0] != L:
+        raise ValueError("卷积核通道数 %d 与特征维 %d 不一致。修法：核应为 (L,k)"
+                         % (w.shape[0], L))
+    k = w.shape[1]
+    pad = np.zeros((B, k - 1, L), np.float32)          # 只补左侧（历史）
+    xp = np.concatenate([pad, x], axis=1)
+    out = np.zeros((B, Tc, L), np.float32)
+    for j in range(k):
+        seg = xp[:, (k - 1 - j):(k - 1 - j + Tc), :]    # t-j
+        out += seg * w[:, j][None, None, :]
+    return out
