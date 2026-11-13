@@ -450,3 +450,28 @@ def rmsnorm_numpy(x, weight, eps=1e-6):
     x = np.asarray(x, np.float32)
     ms = (x * x).mean(axis=-1, keepdims=True)
     return (x / np.sqrt(ms + eps)).astype(np.float32) * np.asarray(weight, np.float32)
+
+
+# ═══════════ 分段求和（scatter_add）：MoE 分派缺的原语，这里给判定基准 ═══════════
+
+def scatter_add_numpy(ids, values, n_rows):
+    """判定基准：`out[ids[i]] += values[i]`（重复下标累加，越界报错）。
+
+    MoE 分派缺的就是这个原语：取行已有（`x[ids]`），回填没有（无赋值索引）。
+    反向 = 按 ids 取行（见 `scatter_add_backward_numpy`）。
+    """
+    idx = np.asarray(ids).reshape(-1).astype(np.int64)
+    val = np.asarray(values, np.float32)
+    n = int(n_rows)
+    if idx.size and (idx.min() < 0 or idx.max() >= n):
+        raise ValueError(
+            "scatter_add 下标越界：范围 [%d, %d]，n_rows=%d。修法：检查 topk 返回的专家下标"
+            "是否超出 n_experts，或把 n_rows 传对" % (int(idx.min()), int(idx.max()), n))
+    out = np.zeros((n,) + val.shape[1:], np.float32)
+    np.add.at(out, idx, val)
+    return out
+
+
+def scatter_add_backward_numpy(ids, grad_out):
+    """scatter_add 的反向：`values.grad = grad_out[ids]`（就是取行）。"""
+    return np.asarray(grad_out, np.float32)[np.asarray(ids).reshape(-1).astype(np.int64)]
