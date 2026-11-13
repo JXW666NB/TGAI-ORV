@@ -141,9 +141,13 @@ def _bwd_device_impl(qt, kt, vt, dot, lse_t, ot, causal, cq, ck):
     return dq, dk, dv
 
 
-def flash_attn(q, k, v, causal=True, cq=64, ck=64):
-    # 块大小实测（seq2048，整模型）：64 → 5,820 MiB / 11.3 s；32 → 6,194 MiB / 38.8 s。
-    # 更小的块**并没有**降峰值（峰值不由此处主导），却把循环次数翻倍 ⇒ 保留 64/64。
+def flash_attn(q, k, v, causal=True, cq=512, ck=512):
+    # 块大小实测（S=2048、B1H8D64，前向+反向总耗时 / 峰值）：
+    #   64/64 1.140 s / 40 MiB     128/128 0.342 s
+    #   256/128 0.252 s            256/256 0.181 s
+    #   512/256 0.162 s            512/512 0.149 s / 26 MiB  ← 采用
+    # 结论：块**越大越快**（Python 循环次数 ∝ (S/cq)·(S/ck)，每次启动约 10 µs），
+    #   而显存几乎不变 —— 早先只试过 32/32 更慢，误以为"小即省"。
     """`q,k,v` 形状 (B,H,S,D) 的 ORV 张量；返回 (B,H,S,D)。块化、不物化 S×S。"""
     import tgai_go.train as T
 
