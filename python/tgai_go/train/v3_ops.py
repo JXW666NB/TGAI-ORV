@@ -123,3 +123,69 @@ def v3_rope_numpy(x, cos, sin):
     rh[..., ::2] = -x[..., 1::2]
     rh[..., 1::2] = x[..., ::2]
     return x * cos + rh * sin
+
+
+# ═══════════════════════════════════════════════════════════
+# GlobalAttention（numpy 精确参考）
+# ═══════════════════════════════════════════════════════════
+
+def gqa_repeat(kv, n_q, n_kv):
+    """把 KV 头按 `repeat_interleave` 复制到与 Q 头数一致。
+
+    参考实现：`k.repeat_interleave(rep, dim=1)`，`rep = n_q // n_kv`
+    —— 是**交错**复制（每头连续 rep 份），不是 tile。
+    """
+    if n_q == n_kv:
+        return kv
+    rep = int(n_q) // int(n_kv)
+    return np.repeat(kv, rep, axis=1)
+
+
+def attention_numpy(x, wq, wk, wv, wo, cos, sin, rot_dim, add_mask,
+                    n_q, n_kv, rope_perm=None):
+    """GlobalAttention 的 numpy 精确参考（训练路径，无 KV cache）。
+
+    与 `model_v3.py::GlobalAttention.forward` 的对应关系：
+
+        q,k,v   = 投影 → (B,n,T,d_k)
+        q,k     = rope(仅前 rot_dim 维)
+        k,v     = GQA 交错复制到 n_q 头
+        out     = softmax(q·kᵀ/√d_k + mask) · v → 拼头 → o_proj
+
+    `add_mask` 形状 `(B,1,T,S)` 或 `(T,S)`（加性，0 可见 / -inf 不可见）。
+    """
+    B, T, _ = x.shape
+    d_k = wq.shape[0] // int(n_q)
+    q = (x @ wq.T).reshape(B, T, int(n_q), d_k).transpose(0, 2, 1, 3)
+    k = (x @ wk.T).reshape(B, T, int(n_kv), d_k).transpose(0, 2, 1, 3)
+    v = (x @ wv.T).reshape(B, T, int(n_kv), d_k).transpose(0, 2, 1, 3)
+
+    # RoPE 只作用在前 rot_dim 维（partial）
+    def _rope(t):
+        if rot_dim >= d_k:
+            return v3_rope_numpy(t, cos[None, None], sin[None, None])
+        head = v3_rope_numpy(t[..., :rot_dim], cos[None, None], sin[None, None])
+        return np.concatenate([head, t[..., rot_dim:]], axis=-1)
+
+    q = _rope(q)
+    k = _rope(k)
+    k = gqa_repeat(k, n_q, n_kv)
+    v = gqa_repeat(v, n_q, n_kv)
+
+    scores = (q @ k.transpose(0, 1, 3, 2)) / np.sqrt(float(d_k))
+    mask = add_mask if add_mask.ndim == 4 else add_mask[None, None]
+    p = attention_numpy_softmax(scores, mask)
+    out = p @ v                                   # (B,n,T,d_k)
+    out = out.transpose(0, 2, 1, 3).reshape(B, T, int(n_q) * d_k)
+    return out @ wo.T
+
+
+def attention_numpy_softmax(scores, add_mask):
+    """数值稳定 softmax（掩码位置的权重严格为 0）。"""
+    s = scores + add_mask
+    m = np.max(s, axis=-1, keepdims=True)
+    m = np.where(np.isfinite(m), m, 0.0)
+    e = np.exp(s - m)
+    e = np.where(np.isfinite(add_mask), e, 0.0)
+    den = e.sum(axis=-1, keepdims=True)
+    return e / np.where(den > 0, den, 1.0)
