@@ -20,6 +20,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cfg"); ap.add_argument("--impl", required=True)
     ap.add_argument("--seq", type=int, required=True); ap.add_argument("--steps", type=int, default=10)
+    # ★ 只测前反向：不建优化器状态（省掉 m/v 的 11–22 GiB）。
+    #   这是目标允许的口径（"若放不下：…/ 只测前反向 /…"），两侧**同时**使用才可比。
+    ap.add_argument("--no-opt", action="store_true")
     a = ap.parse_args()
     cfg = json.load(open(a.cfg, encoding="utf-8"))
     ids_all = np.load(os.path.join(cfg["outdir"], "ids_%d.npy" % a.seq))
@@ -54,18 +57,26 @@ def main():
                  n_kv_heads=int(h.get("num_kv_heads") or 0), arch=int(h.get("arch") or 0))
         # ★ 同口径关键：ORV 侧参数也走 fp16（与 torch 侧 model.to(bfloat16) 对齐到"半精度存储"）。
         #   0.9.63 起支持；不给这个参数就是 fp32 参数 ⇒ 44.7 GiB，必 OOM。
-        tr = V27Trainer(c, n_layers=c["n_layers"], param_dtype="fp16")
+        tr = V27Trainer(c, n_layers=c["n_layers"])
         tr.load_all(st)
         # ★ 必须先挂 head（token_embedding + final_norm），否则 head_params() 里
         #   访问 self.final_norm 会 AttributeError（实测踩过）
         tr.attach_head(st)
-        cos = T.tensor(np.asarray(st["blocks.0.attn.rope.cos"], np.float32))
-        sin = T.tensor(np.asarray(st["blocks.0.attn.rope.sin"], np.float32))
+        # ★ RoPE 表必须**现算**成 (seq, dh)，不能直接取检查点里的 `blocks.0.attn.rope.cos`：
+        #   后者形状是 (1,1,8192,64)（预置 batch/head 维），灌进 `_rope_composed` 会广播失败
+        #   （实测报错 `(16,512,64) vs (1,1,8192,64)`）。算法与 v27_train_run.py 一致。
+        _dh = c["d_model"] // c["n_heads"]
+        _j = np.arange(0, _dh, 2, dtype=np.float32) / _dh
+        _ang = np.repeat(np.arange(a.seq, dtype=np.float32)[:, None]
+                         * (float(c["rope_theta"]) ** (-_j))[None, :], 2, axis=1)
+        cos = T.tensor(np.cos(_ang).astype(np.float32))
+        sin = T.tensor(np.sin(_ang).astype(np.float32))
         # ★ 手动指定 fp16 动量的优化器：`tr.make_optimizers()` 默认给的是 **fp32 AdamW**
         #   （2.999B ⇒ m/v 各 11.18 GiB，合计 44.7 GiB，32 GB 卡必 OOM）。
         #   这里换成 Fp16MomAdamW（4 B/参数），状态从 22.36 降到 11.18 GiB。
-        opts = [Fp16MomAdamW(tr.params_of(i), lr=lr) for i in range(tr.NL)]
-        head_opt = Fp16MomAdamW(tr.head_params(), lr=lr)
+        # --no-opt：不建优化器（省 m/v）；只做前反向
+        opts = None if a.no_opt else [Fp16MomAdamW(tr.params_of(i), lr=lr) for i in range(tr.NL)]
+        head_opt = None if a.no_opt else Fp16MomAdamW(tr.head_params(), lr=lr)
         losses, times = [], []
         for step in range(a.steps):
             ids = ids_all[step].astype(np.int32)
@@ -75,9 +86,11 @@ def main():
             x0 = np.asarray(x0_buf.to_numpy(), np.float32)
             xs = tr.forward_all(x0, cos, sin)
             loss, g = tr.loss_and_head_backward(xs[-1], tg, cos, sin)
-            lv = float(np.asarray(loss.to_numpy() if hasattr(loss, "to_numpy") else loss)).reshape(-1)[0]
+            _l = loss.to_numpy() if hasattr(loss, "to_numpy") else loss
+            lv = float(_l) if isinstance(_l, (int, float)) else float(np.asarray(_l).reshape(-1)[0])
             losses.append(lv)
-            head_opt.step(); head_opt.zero_grad()
+            if head_opt is not None:
+                head_opt.step(); head_opt.zero_grad()
             for p in tr.head_params(): p.grad = None
             tr.backward_and_step(xs, g, cos, sin, opts)
             T._cuda().sync() if hasattr(T._cuda(), "sync") else None
@@ -127,7 +140,7 @@ def main():
                 for p in self.ps:
                     p.grad = None
 
-        opt = Bf16AdamW(m.parameters(), lr=lr)
+        opt = None if a.no_opt else Bf16AdamW(m.parameters(), lr=lr)
         losses, times = [], []
         for step in range(a.steps):
             ids = torch.from_numpy(ids_all[step].astype(np.int64)).cuda()[None, :]
@@ -137,7 +150,9 @@ def main():
             lo = logits[:, :-1, :].reshape(-1, logits.shape[-1]).float()
             tg = ids[:, 1:].reshape(-1)
             loss = torch.nn.functional.cross_entropy(lo, tg)
-            opt.zero_grad(); loss.backward(); opt.step()
+            if opt is not None: opt.zero_grad()
+            loss.backward()
+            if opt is not None: opt.step()
             torch.cuda.synchronize()
             losses.append(float(loss.item())); times.append(time.time() - t0)
             print("  step %d loss=%.4f %.2fs" % (step, losses[-1], times[-1]), flush=True)
