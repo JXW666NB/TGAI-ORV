@@ -64,7 +64,6 @@ PyPI 包名 `tgai-orv`，import 路径 `tgai_go.train`。
 | **SDPA 维度约定** | 已接受 `is_causal=` 与 `[B,H,S,Dh]`（0.9.51 起自动展平）；旧版本要 `[B*H, S, Dh]` |
 
 ### 2.2 多设备：现在只有单卡
-
 **ORV 目前只保证单卡。** 下面这些**都不存在**，不要按它们设计：
 
 | 常被误以为有的 | 真实状态 |
@@ -93,6 +92,29 @@ PyPI 包名 `tgai-orv`，import 路径 `tgai_go.train`。
 完整报告与复现步骤：`docs/REVIEW_P100_2026-11-12.md`。
 
 ---
+
+### 2.3 大模型全参训练的显存门槛（V2.7 = 2.999B 实测）
+
+**32 GB 卡上，全参训练的可行线是 fp16/bf16 的「权重+梯度+优化器状态」= 22.35 GiB**：
+
+| 方案 | 权重 | 梯度 | Adam m/v | 合计 | 32 GB 能否 |
+| --- | --- | --- | --- | --- | --- |
+| fp32 全套 | 11.18 | 11.18 | 22.36 | **44.7 GiB** | ✗ |
+| fp32 权重/梯度 + fp16 状态 | 11.18 | 11.18 | 11.18 | **33.5 GiB** | ✗ |
+| fp16/bf16 权重+梯度+状态 | 5.59 | 5.59 | 11.18 | **22.35 GiB** | ✓（留激活）|
+
+**实测过的事实**（别凭印象说）：
+
+* **PyTorch 原生 `AdamW` 是 fp32 状态** ⇒ 2.999B 要 39.11 GiB，实测三档 seq(512/1024/2048) 全 OOM，
+  死点在 `torch/optim/adamw.py::_init_group`（模型和梯度已建好，崩在分配 `exp_avg_sq`）。
+* **ORV 0.9.62 的 `V27Trainer.make_optimizers()` 返回 `T.optim.AdamW`（fp32）**，参数也以 fp32 存放
+  ⇒ 44.7 GiB，同样三档全 OOM。**只把优化器换成 `Fp16MomAdamW` 只到 33.5 GiB，仍然放不下** ——
+  必须同时把权重/梯度降到 fp16。
+* 改 fp16 参数的落点是三个类的流式装载方法（`Linear` / `MoE` / `RMSNorm` 的
+  `load_state_dict_stream` 里的 `h2d` dtype）+ `V27Trainer.__init__` 的 `param_dtype` 透传；
+  **别去改 `load_layer`**（它只喂 numpy 切片，精度不在那儿定）。head/final_norm/RoPE 表保持 fp32。
+
+细节与语料格式坑（V2.6 旧标记 vs V2.7 `<用户>` 标记）见 `docs/V27_SFT_BENCH_2026-11-13.md`。
 
 ## 3. 三条最容易踩的坑（真实发生过）
 

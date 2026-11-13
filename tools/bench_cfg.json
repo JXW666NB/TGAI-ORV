@@ -1,0 +1,23 @@
+{
+  "model_tg": "D:/tgai/models/V2.7/TGAI_NB_V2.7.tg",
+  "model_pt": "D:/tgai/models/V2.7/tgai_v27_v5_merged.pt",
+  "model_py": "D:/tgai_nlp/checkpoints/TGAI NB/TGAI NB 2.7/1_code/model.py",
+  "corpus": "D:/orv_bench/cot_v27.jsonl",
+  "outdir": "D:/orv_bench",
+  "config": {
+    "n_layers": 28,
+    "d_model": 1024,
+    "n_heads": 16,
+    "d_ff": 4096,
+    "vocab_size": 32779,
+    "max_seq_len": 8192,
+    "n_experts": 8,
+    "n_activated": 2,
+    "rope_theta": 10000,
+    "pad_token_id": 0
+  },
+  "seqs": [512, 1024, 2048],
+  "batch": 1,
+  "steps": 10,
+  "lr": 0.00001
+}
