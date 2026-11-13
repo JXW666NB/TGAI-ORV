@@ -58,30 +58,36 @@ def attention_flash_forward(x, wq, wk, wv, wo, cos, sin, rot_dim, n_q, n_kv,
             rows = int(qb.shape[2])
             m = np.full((B, n_q, rows), -np.inf, np.float32)
             l = np.zeros((B, n_q, rows), np.float32)
-            acc = np.zeros((B, n_q, rows, d_k), np.float32)
-            # 因果：key 只到本块末尾
+            # ★ acc 放在**设备侧**：它才是 O(S·d) 的那一项（m/l 只有几十 KB，留主机无妨）
+            acc = T.tensor(np.zeros((B, n_q, rows, d_k), np.float32))
             kmax = min(Tlen, qi + rows) if causal else Tlen
             for ki in range(0, kmax, ck):
                 kb = k[:, :, ki:min(ki + ck, kmax), :]
                 vb = v[:, :, ki:min(ki + ck, kmax), :]
-                sb = (qb @ kb.transpose(0, 1).transpose(2, 3)) * scale \
-                    if False else ((qb.reshape(B * n_q, rows, d_k)
-                                    @ kb.reshape(B * n_q, int(kb.shape[2]), d_k).transpose(1, 2)) * scale)
-                sb = np.asarray(sb.to_numpy(), np.float32).reshape(B, n_q, rows, -1)
-                cols = sb.shape[-1]
+                cols = int(kb.shape[2])
+                sb = ((qb.reshape(B * n_q, rows, d_k)
+                       @ kb.reshape(B * n_q, cols, d_k).transpose(1, 2)) * scale)
+                sb_np = np.asarray(sb.to_numpy(), np.float32).reshape(B, n_q, rows, cols)
                 if causal:
                     abs_q = np.arange(rows)[:, None] + qi
                     abs_k = np.arange(cols)[None, :] + ki
-                    sb = np.where(abs_k <= abs_q, sb, -np.inf)
-                m_new = np.maximum(m, sb.max(-1))
+                    sb_np = np.where(abs_k <= abs_q, sb_np, -np.inf)
+                m_new = np.maximum(m, sb_np.max(-1))
                 m_new = np.where(np.isfinite(m_new), m_new, 0.0)
-                e = np.exp(sb - m_new[..., None])
-                e = np.where(np.isfinite(sb), e, 0.0)
-                l = l * np.exp(m - m_new) + e.sum(-1)
-                acc = acc * np.exp(m - m_new)[..., None] + (e @ np.asarray(vb.to_numpy(), np.float32).reshape(B, n_q, cols, d_k))
+                alpha = np.exp(m - m_new)                       # (B,nq,rows)
+                e_np = np.exp(sb_np - m_new[..., None])
+                e_np = np.where(np.isfinite(sb_np), e_np, 0.0)
+                l = l * alpha + e_np.sum(-1)
+                e_t = T.tensor(np.ascontiguousarray(e_np.reshape(B * n_q, rows, cols)))
+                vb_t = vb.reshape(B * n_q, cols, d_k)
+                part = (e_t @ vb_t).reshape(B, n_q, rows, d_k)
+                acc = acc * T.tensor(np.ascontiguousarray(
+                    alpha.reshape(B, n_q, rows, 1), np.float32)) + part
                 m = m_new
             lse = m + np.log(np.maximum(l, 1e-20))
-            outs.append((acc / np.maximum(l, 1e-20)[..., None]).reshape(B, n_q, rows, d_k))
+            denom = T.tensor(np.ascontiguousarray(
+                np.maximum(l, 1e-20).reshape(B, n_q, rows, 1), np.float32))
+            outs.append(np.asarray((acc / denom).to_numpy(), np.float32))
             lses.append(lse)
         out = np.concatenate(outs, axis=2)
         lse_all = np.concatenate(lses, axis=2)
