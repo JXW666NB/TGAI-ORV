@@ -127,7 +127,9 @@ def main():
     stop.set(); th.join(timeout=3)
     res = dict(cfg=cfg, losses=losses, step_s=float(np.mean(times)),
                tok_s=a.seq / float(np.mean(times)),
-               peak_mib=prof.get("peak"), base_mib=base)
+               peak_mib=prof.get("peak"), base_mib=base,
+               # ★ 精确高水位：运行时池自己记的峰值，不受 nvidia-smi 采样间隔影响
+               pool=T._cuda().pool_stats())
     print("RESULT", json.dumps({k: v for k, v in res.items() if k != "losses"}, ensure_ascii=False))
     print("losses", losses)
     if a.out:
