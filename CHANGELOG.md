@@ -1,3 +1,51 @@
+## [0.9.62] - 2026-11-13
+
+**数据并行（`tgai_go.train.dist`）修掉 6 个 bug，其中两个静默、两个直接卡死。**
+本轮改动集中在 `dist.py`，并在 `cuda.py` 新增 `copy_h2d_into()`。
+
+### 为什么要修（都是实测现象，不是推测）
+
+| # | 现象 | 根因 |
+| --- | --- | --- |
+| ① | 多卡照常训练、loss 照降，但**各卡初始权重其实不同** | `broadcast()` 读 `p.data`；CUDA 张量的 `.data` 是 `None`，而 `np.ascontiguousarray(None, dtype=float32)` **不报错**、返回 `array([nan])` ⇒ 每个参数被当成"1 个 nan"，权重根本没广播 |
+| ② | rank≠0 的权重不会被改写 | 写回目标 `np.ascontiguousarray(...)` 是**临时数组**，不是张量视图 |
+| ③ | 一个 rank `rc=0` 正常退出，另一个卡在 `barrier` 直到超时（实测约 3 次挂 1 次） | `close()` 删掉自己落下的 `bar_*` 标记 ⇒ 跑得快的一方把标记删了，慢的一方还在 `_wait_for` |
+| ④ | 训练挂死，报错却说"rank0 没创建共享内存" | 按"有梯度的条目"拼缓冲：某 rank 缺一层梯度（MoE 没路由到）时字节总数不同 ⇒ 共享内存**名字**不同 ⇒ 一边创建、一边等 |
+| ⑤ | 缺梯度那侧的 `p.grad` 是 **CPU ndarray** | 设备判定看"原来的 grad 是不是张量"，缺梯度时 `orig is None` 走了 `p.grad = val` 兜底 |
+| ⑥ | `DataParallel(world=2)` 一构造就阻塞 | 握手写在 `__init__` 里 |
+
+### 改法
+
+* 新增 `_get_data()` / `_set_data()`：按**参数设备**取值/写回；CUDA 走 `to_numpy()` 与新的
+  `CudaAPI.copy_h2d_into()`（**原地**写，不新分配 —— `h2d()` 会新分配并漏掉旧缓冲，
+  275 MB 的模型每广播一次就漏一份）；
+* `all_reduce_grads()`：按 `params` 固定顺序遍历，**缺梯度按 0 补齐**，保证各 rank 字节数一致；
+* `_set_grad()`：判定依据改成 `p.device`；
+* `close()` **不再删** barrier 标记；残留由下次启动的 `ready` 握手统一清理；
+* 握手改为**惰性** `_start()`，由 `broadcast()` / `all_reduce_grads()` 触发；
+* 新增 `shard_indices(n, contiguous=True)` —— 数据并行必须各卡喂不同数据；
+* 文档字符串补齐**使用契约**（params 顺序一致、冻结参数不要传、检查点只 rank0 写）
+  与**等效 batch / 学习率**口径（默认平均 ⇒ 等效 `world × per_rank_batch`，lr 不自动改）。
+
+### 验证
+
+| 层 | 内容 | 结果 |
+| --- | --- | --- |
+| CPU 两进程 | 广播一致 + 梯度平均 [1,3]→2 | ✅ 连续 5 次全绿（修 ③ 前 1/3 概率挂） |
+| CPU 两进程 | **某 rank 缺一层梯度**不卡死，按 0 补成 2.5 | ✅ 确定性复现（worker 里让 rank0 延迟 0.5 s） |
+| 设备语义单测 | 把"numpy 对 None 返回 nan"这个坑本身钉住 | ✅ 7 条 |
+| **同一张 V100 两个 rank** | 与单进程等效对拍：广播后 p=1.0/q=7.0；平均后 p_grad=2.0、q_grad=2.5；缺梯度侧 grad 也是 CUDA 张量 | ✅ `tools/dist_gpu_check.py` PASS |
+| 本地套件 | — | **690 passed / 42 skipped** |
+| V100 GPU 门 | 发版前跑 | **295 passed / 12 skipped / 0 failed** |
+
+### 仍未验证（别当成已验）
+
+* **真两张卡的加速比**：本机没有双卡机，加速比与主机中转开销都**没测**；
+* **`dist_p2p.py`（CUDA IPC + `cuMemcpyPeerAsync`）完全未验证** —— 单卡上 peer copy 没意义；
+* TP / PP 未实现。
+
+现状与复现命令见 `docs/DISTRIBUTED_STATUS_2026-11-13.md`。
+
 ## [0.9.61] - 2026-11-13
 
 **文档校正版：不改代码行为，只把"能做什么/不能做什么"写准。**
