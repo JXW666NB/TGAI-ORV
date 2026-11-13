@@ -97,6 +97,26 @@ PyTorch 在 V100 上没有 flash，用的是 mem-efficient（分块、不物化�
 现在可确认——**可省的正是这 2,748 MiB，检查点方向是对的，那次是实现 bug**（我在反向循环里
 每层 `leaf()` 重建整层图并同时持有旧引用），不是机制无效。
 
+### ⚠️ 最终结论（2026-11-13 晚，追溯更正）
+
+上面这段仍然是错的。真正的原因是**引擎缺陷**：
+
+```
+PyTorch C++（torch/csrc/autograd/VariableTypeUtils.h:49）：
+    if (!requires_grad || !GradMode::is_enabled()) { ... return false; }
+ORV（修复前）：
+    obj.requires_grad = bool(requires_grad)      # 完全没看 _GRAD_ENABLED
+```
+
+⇒ `with T.no_grad()` 只是清了一个没人查的标志，**图照样建、激活照样留**。
+实测（2 层、E=8、seq2048）：`no_grad` 前向增量 **+1,978 MiB**；补上那行后 **+54 MiB**（36×）。
+
+修复提交 `467a4f2`。这解释了两次检查点失败——不是机制错，也不是我的编排错，是开关无效。
+修复后检查点不再爆炸，但本规模下不划算：8 层 seq2048 峰值 **6,024 MiB**（79 s/步）
+vs 普通路径 **5,820 MiB**（11 s/步），因为可省的激活只有约 2 GB，多一次前向的时间代价更大。
+
+**更大价值在别处**：修复前所有 `no_grad` 路径（推理、eval、采样）都在白占内存。
+
 下一步：按 `V27Trainer` 的既有模式（`forward_all` 不建图 + 逐层重算）重做，而非自创。
 验收：1 层 `peak_live` 从 3,891 降到接近 1,142 + 参数梯度；8 层随之从 5,820 下降。
 
