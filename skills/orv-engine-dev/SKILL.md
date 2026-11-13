@@ -63,21 +63,18 @@ PyPI 包名 `tgai-orv`，import 路径 `tgai_go.train`。
 | **没有 `cos` / `sin`** | **0.9.51 已加**。旧版本需 numpy 预生成表 |
 | **SDPA 维度约定** | 已接受 `is_causal=` 与 `[B,H,S,Dh]`（0.9.51 起自动展平）；旧版本要 `[B*H, S, Dh]` |
 
-### 2.2 别把这两件事混为一谈
+### 2.2 多设备：现在只有单卡
 
-| | 定义 | 层级 | 状态 |
-| --- | --- | --- | --- |
-| **TG Link** | 用 **Vulkan 让显卡与显卡之间 P2P**，实现**多厂商交火** | 设备**之间** | 只有设计，未验证可行性 |
-| **后端混用** | **一个进程里**用多种不同后端训练模型 | **进程内** | 未设计、未实现 |
-| （多设备） | 同后端、多张同厂商卡、同进程 | 进程内 | 也没有（`dist.py` 是多进程） |
+**ORV 目前只保证单卡。** 下面这些**都不存在**，不要按它们设计：
 
-三条容易搞错的地方：
+| 常被误以为有的 | 真实状态 |
+| --- | --- |
+| 多厂商交火 / 显卡间 P2P（"TG Link"） | **只是文档里的设想，未实现、未验证**。`docs/MULTIVENDOR_ROADMAP.md` 是路线设想，不是能力说明 |
+| 一个进程里混用多种后端 | **未设计、未实现**（`_CudaAPI` 是进程级单例，要支持得先拆它） |
+| 同后端多张同厂商卡同进程 | 也没有。`dist.py` 是**多进程**、per-rank，且**未在真多卡上验证过** |
 
-1. **TG Link 不是 host-staged all-reduce**。`docs/MULTIVENDOR_ROADMAP.md` §3 的 host-staged 是
-   **退路**；原始设想是 Vulkan 真 P2P。真 P2P 若能成，能解锁**跨厂商 TP**；host-staged 只够 DP/PP。
-2. **TG Link 与后端混用层级不同**，不能用一个方案同时解决。
-3. **`_CudaAPI` 是进程级单例** —— 后端混用（进程内多后端）必须先拆它；
-   而 TG Link 走跨进程，**不需要**拆它。我曾把这两者的前置条件搞反。
+**不要向用户宣称** ORV 支持上述任何一种。要做多卡，目前只有 `dist.py` 的多进程路线，
+且需要自己在目标机器上先验证。
 
 完整报告与复现步骤：`docs/REVIEW_P100_2026-11-12.md`。
 
@@ -309,8 +306,12 @@ for _ in range(steps):
 
 ## 8. 训练完之后：用内置 TGAI GO 推理
 
-ORV 仓库自带 TGAI GO 推理侧（`tgai.py` / `tgai.bat` + C 引擎），训完的模型可以**直接跑推理**，
-不需要转成别的框架格式。
+训完的模型可以**直接推理**，不需要转成别的框架格式。先明确一件事：
+
+> **两种安装形态能用到的命令不一样。**
+> `pip install tgai-orv` 装出来的包里**只有 `python -m tgai_go`**（wheel 里没有 console entry point，
+> 也没有 `tgai_tui.py`）；`tgai.bat` / `tgai_tui.py` / `tgai_chat.py` / `tgai_ui.py` 都在**源码仓库根目录**，
+> 只有 clone 下来才有。
 
 ### 第 1 步：导出成 `.TG`
 
@@ -323,48 +324,83 @@ save_tg("my_model.TG", params,          # params: {训练侧名字: numpy 数组
         max_seq=512, n_experts=8, n_activated=2, rope_theta=10000.0)
 ```
 
-`params` 用**训练侧命名**（`experts.{e}.gate/up/down`）；导出时会映射成引擎的 `w1/w2/w3`。
+`params` 用**训练侧命名**（`experts.{e}.gate/up/down`），导出时映射成引擎的 `w1/w2/w3`。
+**0.9.60 起导出写的是 TG4 容器**（built-in 名字表 + 分词表），引擎从 0.9.58 起就能读。
+
+### 第 2 步：三种跑法（按你手上的东西选）
+
+#### A. 只有 pip 包 —— 用 `python -m tgai_go`
+
+```bash
+python -m tgai_go version                       # 版本 + 原生库是否就位
+python -m tgai_go info  -m my_model.TG          # 层数/宽度/词表/上下文（会加载权重）
+python -m tgai_go meta  -m my_model.TG          # 只看内嵌对话配置（不加载权重）
+python -m tgai_go gen   -m my_model.TG "你好" -n 128 -t 0.6 --top-k 40 --top-p 0.9
+python -m tgai_go chat  -m my_model.TG -s "你是一个简洁的助手"
+```
+
+* `gen` = **单次生成**，打印完整回复；
+* `chat` = **交互 REPL**（流式输出），内置 `/exit`（退出）、`/clear`（清历史与 KV cache）、`/stats`（轮数/线程/上下文上限）；
+* 通用参数：`-n/--max-tokens`、`-t/--temperature`、`--top-k`、`--top-p`、`--threads`、`--stop`（可多次）、`--preload`。
+
+#### B. clone 了仓库 —— 有 TUI 和服务
+
+```bash
+python tgai_tui.py -m my_model.TG --sys "你是一个简洁的助手"   # 全屏 TUI（依赖同目录 tgai_chat.py / tgai_ui.py）
+tgai.bat chat -m my_model.TG        # 同上，Windows 一键（不带参数会自动挑模型）
+tgai.bat server -m my_model.TG      # 只开 OpenAI 兼容服务
+tgai.bat bench                       # 基准测试
+tgai.bat convert ...                 # .pt / .gguf → .TG
+tgai.bat rebuild                     # 重编引擎（等价于仓库根的 build_engine.bat）
+tgai.bat selfcheck                   # 自检
+tgai.bat help                        # 完整帮助
+```
+
+TUI 内斜杠命令（已核实存在）：`/help`（全部命令）、`/params`（调参）、`/exit`。
+
+#### C. 写在 Python 里
+
+```python
+import tgai_go
+
+with tgai_go.load("my_model.TG") as m:            # dll= 可显式指定引擎库
+    print(m.n_layers, m.d_model, m.vocab_size, m.max_seq_len)
+
+    # 单次
+    print(m.generate("你好", max_tokens=64, temperature=0.6, top_k=40, top_p=0.9))
+
+    # 多轮（带历史与 KV cache），流式
+    s = m.session(system="你是一个简洁的助手")
+    for chunk in s.stream("讲个故事", max_tokens=64):
+        print(chunk, end="", flush=True)
+    s.clear()
+
+    ids = m.encode("你好"); print(ids, m.decode(ids))
+```
+
+### 训练检查点可以**直接**当模型跑
+
+`ckpt.save_checkpoint` 写出的 `weights.tg`（TG4，含分词表）就是一个可加载的模型 ——
+不必先导出。实测（V100）：`tgai_go.load(".../step_000002/weights.tg")` 得到
+`layers=28 d_model=1024 vocab=32779`，`encode('你好')` 与 `generate` 都正常。
+
+```python
+with tgai_go.load(r"D:/runs/step_000002/weights.tg") as m:
+    print(m.generate("你好", max_tokens=32))
+```
 
 ### 导出时三个会让模型"能加载但生成崩"的坑
 
 | 坑 | 症状 | 处理 |
 | --- | --- | --- |
 | **RoPE 的 cos/sin 没填** | 加载正常，`generate` 时 `access violation reading 0x…` —— 引擎**按指针直接读**这块 buffer | `collect()` 已按公式补齐，别绕过它自己拼 cfg |
-| **`head_dim != d_model // n_heads`** | **导出必错且不报错**，引擎按 `d_model//n_heads` 解析 | `.TG` 头里**没有 head_dim 字段**，表达不了这种结构。要么改结构，要么换格式 |
+| **`head_dim != d_model // n_heads`** | v3 容器头里**没有 head_dim 字段**，引擎按 `d_model//n_heads` 解析 ⇒ 导出必错且不报错 | **TG4 头里有独立 `head_dim`**（引擎会用它），但 `save_tg` 目前仍对非自然 head_dim 报错 —— 要放开需先在目标模型上实测 |
 | **RoPE theta 与训练侧不一致** | 位置编码错位，输出乱 | 训练用什么 theta，导出就传什么 |
-
-### 第 2 步：用 GO 跑起来
-
-```bash
-tgai.bat models                          # 列出可用模型（序号 + 大小）
-tgai.bat chat -m my_model.TG             # 直接对话
-tgai.bat server -m my_model.TG           # 只开 OpenAI 兼容服务（默认 8080）
-tgai.bat server -m my_model.TG --port 11435
-tgai.bat chat --server 8080              # 对话 + 同进程开服务
-tgai.bat bench                           # 基准测试
-```
-
-选择计算后端（加 `--dll`）：
-
-```bash
-tgai.bat chat --dll cpu\build\libtgai_engine.dll              # 纯 CPU
-tgai.bat chat --dll cpu\build\libtgai_engine_gpubridge.dll    # GPU 桥
-```
-
-对话内命令：`/help` `/params` `/model <路径>` `/server [端口]` `/env` `/stats` `/clear` `/exit`
-
-### 已有 `.pt` / `.gguf` 想转 `.TG`
-
-```bash
-tgai.bat convert <args>
-```
-
-细节见 `docs/GGUF_TO_TG.md`、`docs/TG_V4_FORMAT.md`。
 
 ### 交付前必须验证的三件事
 
-1. **加载不崩**：`tgai.bat models` 能列出来
-2. **生成不崩**：问一句话能出完整回复（RoPE buffer 缺失在这一步才暴露）
+1. **加载不崩**：`python -m tgai_go info -m my_model.TG` 能打印层数/宽度
+2. **生成不崩**：`python -m tgai_go gen -m my_model.TG "你好"` 能出完整回复（RoPE buffer 缺失在这一步才暴露）
 3. **数值对得上**：同一 prompt 下，训练侧前向的 logits 与引擎输出的 top-k 一致或高度接近
 
 漏掉第 2 步是最常见的翻车方式 —— 加载成功会让人误以为导出正确。
@@ -483,7 +519,7 @@ ckpt.list_checkpoints(...)        # 配合 rotate() 做滚动保留
 
 | 需求 | 文档 |
 | --- | --- |
-| **想混用不同后端 / 混杂厂商多卡（TG Link）** | ★ `docs/MULTIVENDOR_ROADMAP.md`（**权威**，别从零推导） |
+| **想搞多厂商交火 / 进程内混后端** | `docs/MULTIVENDOR_ROADMAP.md` —— **只是路线设想，未实现**。别据此向用户承诺能力 |
 | 想帮忙/了解现状 | ★ `docs/COMMUNITY_ONBOARDING.md` |
 | ORV 到底有什么 | ★ `docs/CAPABILITY_AUDIT.md` |
 | 长期设计与技术债 | ★ `docs/DESIGN.md` |

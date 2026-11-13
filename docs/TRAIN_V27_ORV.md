@@ -413,8 +413,21 @@ top-1 命中率比随机高 **4 个数量级**。
 * **不再写 v3（magic `TGAI`）**；检查点、导出、发布一律用 **v4（magic `TG4\0`）**；
 * 生产 `TGAI_NB_V2.7.tg` 目前是 v3 —— 它是**历史文件**，读它没问题（`read_tg` 走 v3 路径），
   但**新产物不再兼容 v3**；
-* 待确认项（下轮验证）：**引擎当前能否读 v4**。若不能，需要引擎侧加 v4 读取，
-  或发布前用转换器把 v4 转回 v3（届时再定）。
+
+### 落地结果（2026-11-13 已兑现，原"待确认项"清零）
+
+* **检查点**：`ckpt.save_checkpoint` 从 **0.9.60** 起写 **TG4**（NAM 名字表 + 内置分词表，
+  优化器状态仍逐层 npz）。文件名保持 `weights.tg`，容器由 magic 区分，**旧检查点仍可读/续训**。
+* **导出**：`export.save_tg` 同期改为写 TG4。
+* **引擎**：`src/tgai_engine.c` 已有 `TG4_MAGIC` 分支（`tg4_attach()`：解析 section table + NAM，
+  用 `fnv1a_64()` 翻成引擎的 `TGWeightEntry`，`TOK` 交给分词器）。
+  实测 `TGAI_NB_V2.7.tg4`（982 张量 / 6.0 GB）→ `layers=28 d_model=1024 vocab=32779`，`encode`/`generate` 正常。
+* **Python 读端**：`read_tg()` 按 magic 分派，TG4 走 `_read_tg4()` 翻成与 v3 同构的 `info`，
+  于是 `load_tensor` / `list_tensors` / `load_tg` / `v27_train` 全部无需改动。
+* **兼容性**：v3 与"v3 布局 + version=4"仍可读（引擎侧 `TG_IS_V3FAMILY`）；
+  迁移工具 `tools/to_tg4.py`（v3 → TG4，需名字边车，流式、峰值=单张量）。
+* 落地前已扫盘确认**真实 TG4 文件为 0 个**，因此格式调整（NAM 由 JSON 改二进制定长记录）
+  没有迁移负担；读端仍兼容旧 JSON NAM。
 
 ### 因此"检查点导出"的具体任务（不再是 v3 写入器）
 
