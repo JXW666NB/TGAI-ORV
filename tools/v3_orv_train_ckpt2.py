@@ -54,10 +54,13 @@ def main():
     ap.add_argument("--n_q", type=int, default=4)
     ap.add_argument("--top_k", type=int, default=2,
                     help="每 token 激活专家数。真实 V3 是 2（model_v3.py:145）")
+    ap.add_argument("--policy", default="standard",
+                    choices=["standard", "speed", "extreme", "memory"],
+                    help="执行策略：显存与速度的取舍，见 T.set_policy")
     a = ap.parse_args()
     TOP_K[0] = int(a.top_k)
-
     T.set_default_device("cuda")
+    T.set_policy(a.policy)
     rt = T._cuda()
     cfg = dict(d=a.d, d_ff=4 * a.d, E=a.E, layers=a.layers, n_q=a.n_q, n_kv=2,
                vocab=4096, seq=a.seq, steps=a.steps)

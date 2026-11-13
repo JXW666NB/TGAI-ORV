@@ -498,6 +498,61 @@ cuda = _CudaAPI()
 # ─────────────────────────── 自动微分 ───────────────────────────
 _GRAD_ENABLED = [True]
 
+# ═══════════════════════════════════════════════════════════════════════
+# 执行策略：显存 与 速度 的取舍（用户可切）
+# ═══════════════════════════════════════════════════════════════════════
+# 设计原则：**同一份代码，四组预设**，不复制实现。算子读这里的值决定行为。
+#   standard  默认：块化注意力 512 + 掩码缓存 + 不额外回收（与今天实测一致）
+#   speed     空间换速度：更大块、缓存一切可缓存的、允许额外 workspace
+#   extreme   极致：在 speed 的基础上再叠加"检查点 + 小工作集"，目标是
+#             显存 ≤ 标准 且 速度 ≥ PyTorch —— 需要融合内核到位后才可能达成
+#   memory    省显存优先：小块、频繁回收、检查点，速度让位
+_POLICY_PRESETS = {
+    "standard": dict(attn_tile=512, cache_masks=True, inplace_acc=True,
+                     fused_rope=True, empty_cache_every=0, checkpoint_hint=False),
+    "speed":    dict(attn_tile=1024, cache_masks=True, inplace_acc=True,
+                     fused_rope=True, empty_cache_every=0, checkpoint_hint=False),
+    "extreme":  dict(attn_tile=512, cache_masks=True, inplace_acc=True,
+                     fused_rope=True, empty_cache_every=8, checkpoint_hint=True),
+    "memory":   dict(attn_tile=128, cache_masks=True, inplace_acc=False,
+                     fused_rope=True, empty_cache_every=1, checkpoint_hint=True),
+}
+_POLICY = [dict(_POLICY_PRESETS["standard"])]
+_POLICY_NAME = ["standard"]
+
+
+def set_policy(name):
+    """切换执行策略。`name` ∈ {"standard","speed","extreme","memory"}。
+
+    返回切换后的策略字典（调用方可读，但不要就地改；要改请用 `set_policy_value`）。
+    """
+    if name not in _POLICY_PRESETS:
+        raise ValueError(
+            "未知策略 %r。修法：用 set_policy('standard'|'speed'|'extreme'|'memory')"
+            % (name,))
+    _POLICY[0] = dict(_POLICY_PRESETS[name])
+    _POLICY_NAME[0] = name
+    return dict(_POLICY[0])
+
+
+def get_policy():
+    """当前策略名与取值（只读副本）。"""
+    return _POLICY_NAME[0], dict(_POLICY[0])
+
+
+def set_policy_value(key, value):
+    """微调单个策略项（例如只把 attn_tile 调到 256）。返回新策略。"""
+    if key not in _POLICY[0]:
+        raise ValueError(
+            "策略里没有 %r。修法：可用项 %s" % (key, sorted(_POLICY[0])))
+    _POLICY[0][key] = value
+    return dict(_POLICY[0])
+
+
+def policy(key, default=None):
+    """供算子内部读取策略值。"""
+    return _POLICY[0].get(key, default)
+
 
 class no_grad:
     """对应 torch.no_grad()。"""

@@ -54,10 +54,7 @@ def _fwd_device_impl(qt, kt, vt, causal, cq, ck):
             vb = vt[:, ki:ki + cols, :].reshape(BH, cols, D)
             sb = (qb @ kb.transpose(1, 2)) * scale
             if causal:
-                r = np.arange(rows)[:, None]
-                cc = np.arange(cols)[None, :]
-                arr = np.where((cc - r) <= (qi - ki), 0.0, NEG).astype(np.float32)
-                sb = sb + T.tensor(arr.reshape(1, rows, cols))
+                sb = sb + _causal_mask(rows, cols, qi - ki)
             m_new = T.cat([m.reshape(BH, rows, 1),
                            sb.max(axis=-1).reshape(BH, rows, 1)], dim=2).max(axis=-1)
             alpha = (m - m_new).exp()
@@ -105,10 +102,7 @@ def _bwd_device_impl(qt, kt, vt, dot, lse_t, ot, causal, cq, ck):
             vb = vt[:, ki:ki + cols, :].reshape(BH, cols, D)
             sb = (qb @ kb.transpose(1, 2)) * scale
             if causal:
-                r = np.arange(rows)[:, None]
-                cc = np.arange(cols)[None, :]
-                arr = np.where((cc - r) <= (qi - ki), 0.0, NEG).astype(np.float32)
-                sb = sb + T.tensor(arr.reshape(1, rows, cols))
+                sb = sb + _causal_mask(rows, cols, qi - ki)
             p = (sb - lb.reshape(BH, rows, 1)).exp()
             # ★ 立刻折算到主机累加：原先 `.append(设备张量)` 会把 528 个分片
             #   （S=2048、64 块时）全部留在显存里直到函数末尾，是随 seq **二次**增长的
@@ -141,7 +135,36 @@ def _bwd_device_impl(qt, kt, vt, dot, lse_t, ot, causal, cq, ck):
     return dq, dk, dv
 
 
-def flash_attn(q, k, v, causal=True, cq=512, ck=512):
+_MASK_CACHE = {}
+
+
+def _causal_mask(rows, cols, offset):
+    """因果掩码 `(cols - r) <= offset ? 0 : NEG`，按 (rows, cols, offset) 缓存。
+
+    掩码只由**块对的相对偏移**决定：cq=ck 时同一对角线上的所有块对共用一张，
+    所以缓存后 S=2048（4×4 块）只需 7 张，而不是每对重建一次并 host→device 上传。
+    缓存受策略 `cache_masks` 控制；关掉则每次现建（省显存、费时间）。
+    """
+    import tgai_go.train as T
+    key = (rows, cols, int(offset))
+    use_cache = bool(T.policy("cache_masks", True))
+    if use_cache and key in _MASK_CACHE:
+        return _MASK_CACHE[key]
+    r = np.arange(rows)[:, None]
+    cc = np.arange(cols)[None, :]
+    arr = np.where((cc - r) <= offset, 0.0, NEG).astype(np.float32)
+    t = T.tensor(arr.reshape(1, rows, cols))
+    if use_cache:
+        _MASK_CACHE[key] = t
+    return t
+
+
+def _clear_mask_cache():
+    """释放掩码缓存（切换策略或需要回收显存时调用）。"""
+    _MASK_CACHE.clear()
+
+
+def flash_attn(q, k, v, causal=True, cq=None, ck=None):
     # 块大小实测（S=2048、B1H8D64，前向+反向总耗时 / 峰值）：
     #   64/64 1.140 s / 40 MiB     128/128 0.342 s
     #   256/128 0.252 s            256/256 0.181 s
@@ -151,6 +174,10 @@ def flash_attn(q, k, v, causal=True, cq=512, ck=512):
     """`q,k,v` 形状 (B,H,S,D) 的 ORV 张量；返回 (B,H,S,D)。块化、不物化 S×S。"""
     import tgai_go.train as T
 
+    if cq is None or ck is None:
+        tile = int(T.policy("attn_tile", 512))
+        cq = tile if cq is None else cq
+        ck = tile if ck is None else ck
     B, H, S, D = (int(s) for s in q.shape)
     BH = B * H
     qt = q.reshape(BH, S, D)
