@@ -22,7 +22,7 @@ def main():
     v0 = rng.normal(0, .3, (B, H, S, D)).astype(np.float32)
 
     print("%-10s %10s %10s" % ("块大小", "前+反向秒", "峰值 MiB"))
-    for cq, ck in ((256, 128), (256, 256), (512, 256), (512, 512)):
+    for cq, ck in ((512, 512), (1024, 512), (1024, 1024), (2048, 1024)):
         rt.empty_cache()
         p0 = rt.pool_stats()["peak_live_bytes"]
         q = T.tensor(q0, requires_grad=True)
