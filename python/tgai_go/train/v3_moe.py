@@ -56,6 +56,28 @@ def _situ_np(x, w1, w2, w3, beta1=4.0, beta2=25.0):
     return (gate * up) @ np.asarray(w3, np.float32).T
 
 
+def route_top1(hn, router_w):
+    """top_k=1 的路由：`eids`（主机下标，仅用于分派）+ `gate`（保留梯度）。
+
+    ## 为什么不用 `T.topk`
+
+    实测：`T.topk` 在 CUDA 上**未实现**（只有 CPU 路径）：
+    `NotImplementedError: CUDA topk 尚未实现`。
+
+    top_k=1 时有等价替代：
+        s_all = softmax(router(x));  gate = max(s_all, dim=-1)   ← 梯度流到最大项
+        eids  = argmax(s_all)                                     ← 离散下标，不需梯度
+    与 `topk(...,1)` 数学一致，且不需要 topk。
+    """
+    import tgai_go.train as T
+    z = hn @ router_w.transpose(0, 1)
+    s_all = T.functional.softmax(z, axis=-1)
+    gate = s_all.max(axis=-1)
+    sv = s_all.to_numpy() if hasattr(s_all, "to_numpy") else s_all
+    eids = np.argmax(np.asarray(sv), axis=-1).reshape(-1).astype(np.int64)
+    return eids, gate, s_all
+
+
 def moe_dispatch_numpy(x, eids, gate, W1, W2, W3, beta1=4.0, beta2=25.0):
     """判定基准：逐专家对选中行算 SiTU-GLU，再按 order 散回原位。"""
     x = np.asarray(x, np.float32)
@@ -94,11 +116,9 @@ def moe_dispatch_orv(x, eids_np, gate, W1, W2, W3, beta1=4.0, beta2=25.0):
         end = int(bounds[e])
         if end > start:
             rows = xs[start:end]                      # 只取该专家的 token
-            parts.append(V.situ_glu_orv(rows,
-                                        T.tensor(np.ascontiguousarray(W1[e], np.float32)),
-                                        T.tensor(np.ascontiguousarray(W2[e], np.float32)),
-                                        T.tensor(np.ascontiguousarray(W3[e], np.float32)),
-                                        beta1, beta2))
+            # ★ `W1[e]` 本身就是张量（对三维张量取整数下标），不要再包 T.tensor ——
+            #   包了会对张量调 np.ascontiguousarray，报 "setting an array element with a sequence"
+            parts.append(V.situ_glu_orv(rows, W1[e], W2[e], W3[e], beta1, beta2))
         start = end
     if not parts:
         return x * 0.0
