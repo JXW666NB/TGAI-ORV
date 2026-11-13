@@ -266,7 +266,8 @@ def csa_compress(h, c, seg=None):
     """
     x = np.asarray(h, np.float32)
     if x.ndim != 3:
-        raise ValueError("h 形状应为 (B,T,L)，收到 %s" % (x.shape,))
+        raise ValueError("h 形状应为 (B,T,L)，收到 %s。修法：把输入 reshape 成三维再压缩"
+                         % (x.shape,))
     B, T, L = x.shape
     c = max(2, int(c))
     Tc = int(math.ceil(T / float(c)))
