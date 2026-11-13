@@ -3463,7 +3463,7 @@ class Module:
             out.update(m.state_dict(prefix + k + "."))
         return out
 
-    def load_state_dict_stream(self, items):
+    def load_state_dict_stream(self, items, dtype=None):
         """**流式**装载：`items` 是 (name, ndarray) 的可迭代对象，逐个上传即释放。
 
         与 `load_state_dict(dict)` 的区别（3B 权重装载必用这个）：
@@ -3471,7 +3471,13 @@ class Module:
         * 覆盖已有 `_gpu` 时**先释放旧块**（否则构造期分配的随机权重会泄漏一半显存）。
 
         宿主峰值 = 单个张量；显存峰值 = 参数总量。任一张量缺失/多余/形状不符都直接报错。
+
+        `dtype`：设备侧存储精度，`None` 保持历史行为 = fp32。
+        传 `np.float16` 可把权重按 fp16 存放（2.999B 全参训练在 32 GB 卡上必须如此：
+        fp32 权重+梯度+优化器状态 = 44.7 GiB 放不下，fp16 全套 = 22.35 GiB 才进得去）。
+        **数值敏感处（RMSNorm / final_norm / RoPE 表 / head）应保持 fp32**，由调用方决定。
         """
+        _dt = np.float32 if dtype is None else dtype
         params = {n: p for n, p in self.named_parameters()}
         seen = set()
         for name, arr in items:
@@ -3479,7 +3485,7 @@ class Module:
             if p is None:
                 raise KeyError("没有参数 %r。修法：用 named_parameters() 核对名字（%d 个可用）"
                                % (name, len(params)))
-            arr = np.ascontiguousarray(arr, np.float32)
+            arr = np.ascontiguousarray(arr, _dt)
             try:
                 want = tuple(int(x) for x in p.shape)
             except Exception:                      # _gpu 已被释放：用构造时记下的形状
@@ -3490,7 +3496,7 @@ class Module:
             if getattr(p, "device", "cpu") == "cuda":
                 rt = _cuda()
                 old = getattr(p, "_gpu", None)
-                p._gpu = rt.h2d(arr)
+                p._gpu = rt.h2d(arr, dtype=_dt)
                 p.data = None
                 if old is not None and int(old.n) > 0:
                     try:

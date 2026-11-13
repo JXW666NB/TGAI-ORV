@@ -38,8 +38,14 @@ def _as_np(a):
 class V27Trainer(object):
     """按层组织，支持逐层反向；权重经 `load_state_dict_stream` 流式上卡。"""
 
-    def __init__(self, cfg, n_layers=None):
+    def __init__(self, cfg, n_layers=None, param_dtype="fp32"):
         self.cfg = dict(cfg)
+        # ★ 参数存储精度（2026-11-13 加）：默认 fp32 保持历史行为。
+        #   2.999B 全参训练在 32 GB 卡上必须用 fp16：fp32 权重+梯度+优化器状态 = 44.7 GiB 放不下，
+        #   fp16 全套 = 22.35 GiB 才进得去。**只作用于注意力和 MoE 权重**，
+        #   RMSNorm / final_norm / RoPE 表由调用方保持 fp32（数值敏感）。
+        _pd = str(param_dtype).lower()
+        self._pdt = np.float16 if _pd in ("fp16", "float16", "half") else np.float32
         self.D = int(cfg["d_model"])
         self.NH = int(cfg["n_heads"])
         self.DH = self.D // self.NH
@@ -104,18 +110,18 @@ class V27Trainer(object):
         ow = _as_np(sd[p + "attn.out_proj.weight"])
         if getattr(self, "fused_heads", False):
             # 检查点本来就是全宽 [D, D]（见 load_layer 上方说明），整张装载即可
-            L["q"][0].load_state_dict_stream(iter([("weight", np.ascontiguousarray(qw))]))
-            L["k"][0].load_state_dict_stream(iter([("weight", np.ascontiguousarray(kw))]))
-            L["v"][0].load_state_dict_stream(iter([("weight", np.ascontiguousarray(vw))]))
-            L["o"][0].load_state_dict_stream(iter([("weight", np.ascontiguousarray(ow))]))
+            L["q"][0].load_state_dict_stream(iter([("weight", np.ascontiguousarray(qw))]), dtype=self._pdt)
+            L["k"][0].load_state_dict_stream(iter([("weight", np.ascontiguousarray(kw))]), dtype=self._pdt)
+            L["v"][0].load_state_dict_stream(iter([("weight", np.ascontiguousarray(vw))]), dtype=self._pdt)
+            L["o"][0].load_state_dict_stream(iter([("weight", np.ascontiguousarray(ow))]), dtype=self._pdt)
         else:
             for h in range(NH):
                 sl = slice(h * DH, (h + 1) * DH)
-                L["q"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(qw[sl]))]))
-                L["k"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(kw[sl]))]))
-                L["v"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(vw[sl]))]))
+                L["q"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(qw[sl]))]), dtype=self._pdt)
+                L["k"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(kw[sl]))]), dtype=self._pdt)
+                L["v"][h].load_state_dict_stream(iter([("weight", np.ascontiguousarray(vw[sl]))]), dtype=self._pdt)
                 L["o"][h].load_state_dict_stream(
-                    iter([("weight", np.ascontiguousarray(ow[:, sl]))]))
+                    iter([("weight", np.ascontiguousarray(ow[:, sl]))]), dtype=self._pdt)
         del qw, kw, vw, ow
 
         def moe_items():
@@ -127,7 +133,7 @@ class V27Trainer(object):
                        _as_np(sd[p + "moe.experts.%d.w2.weight" % e]))
                 yield ("experts.%d.down.weight" % e,
                        _as_np(sd[p + "moe.experts.%d.w3.weight" % e]))
-        L["moe"].load_state_dict_stream(moe_items())
+        L["moe"].load_state_dict_stream(moe_items(), dtype=self._pdt)
         qb = _as_np(sd[p + "moe._qb_bias"]) if (p + "moe._qb_bias") in sd else None
         if qb is not None:
             L["moe"].qb_bias = T.tensor(qb)
