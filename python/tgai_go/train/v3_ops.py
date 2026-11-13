@@ -425,3 +425,24 @@ def situ_glu_orv(x, w1, w2, w3, beta1=4.0, beta2=25.0):
     gate = (_tanh(g * (1.0 / beta1)) * beta1) * _sigmoid(g)
     up = _tanh(u * (1.0 / beta2)) * beta2
     return (gate * up) @ w3.transpose(0, 1)
+
+
+def rmsnorm_orv(x, weight, eps=1e-6):
+    """RMSNorm 的**函数式** ORV 版：`x / sqrt(mean(x^2) + eps) * w`。
+
+    ORV 已有 `RMSNorm` 模块（CUDA 上走融合内核），但层组装需要一个不依赖模块实例的纯函数。
+    参考实现用 `torch.rsqrt(mean(x^2) + eps)`，这里用 `sqrt` 后相除，数学等价。
+
+    ★ 性能说明：这是**组合实现**（mean → add → sqrt → div → mul 五步），比融合内核多几次访存。
+      先保证数值正确，速度留到优化阶段再换融合版 —— 这也是"下一步改什么"里的一条。
+    """
+    ms = (x * x).mean(axis=-1, keepdims=True)
+    denom = (ms + float(eps)).sqrt()
+    return (x / denom) * weight
+
+
+def rmsnorm_numpy(x, weight, eps=1e-6):
+    """同一公式的 numpy 版，作为对拍基准。"""
+    x = np.asarray(x, np.float32)
+    ms = (x * x).mean(axis=-1, keepdims=True)
+    return (x / np.sqrt(ms + eps)).astype(np.float32) * np.asarray(weight, np.float32)
