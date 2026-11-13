@@ -25,13 +25,20 @@ from tgai_go.train import v3_ops as V, v3_moe as MOE  # noqa: E402
 from v3_orv_train import build, params_of  # noqa: E402
 
 
+TOP_K = [1]        # 由 --top_k 覆盖；默认 2 = 真实 V3（model_v3.py:145）
+
+
 def layer_fwd(x, L, cos, sin, d_k, n_q, n_kv):
     h = x + V.attention_orv(V.rmsnorm_orv(x, L["ln1"]), L["wq"], L["wk"], L["wv"],
                             L["wo"], cos, sin, d_k, n_q, n_kv, flash=True)
     Tlen = int(h.shape[1]); d = int(h.shape[2])
     hn = V.rmsnorm_orv(h, L["ln2"]).reshape(Tlen, d)
-    eids, g, _s = MOE.route_top1(hn, L["router"])
-    mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
+    if int(TOP_K[0]) == 1:
+        eids, g, _s = MOE.route_top1(hn, L["router"])
+        mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
+    else:
+        eids, gates, _s = MOE.route_topk(hn, L["router"], int(TOP_K[0]))
+        mo = MOE.moe_topk_orv(hn, eids, gates, L["W1"], L["W2"], L["W3"])
     if "S1" in L:                                  # 共享专家（与 PyT 的 n_shared_experts=1 对齐）
         mo = mo + V.situ_glu_orv(hn, L["S1"], L["S2"], L["S3"])
     return h + mo.reshape(1, Tlen, d)
@@ -44,8 +51,11 @@ def main():
     ap.add_argument("--E", type=int, default=8)
     ap.add_argument("--seq", type=int, default=2048)
     ap.add_argument("--steps", type=int, default=2)
-    ap.add_argument("--n_q", type=int, default=8)
+    ap.add_argument("--n_q", type=int, default=4)
+    ap.add_argument("--top_k", type=int, default=2,
+                    help="每 token 激活专家数。真实 V3 是 2（model_v3.py:145）")
     a = ap.parse_args()
+    TOP_K[0] = int(a.top_k)
 
     T.set_default_device("cuda")
     rt = T._cuda()

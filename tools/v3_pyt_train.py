@@ -42,13 +42,15 @@ def main():
     ap.add_argument("--steps", type=int, default=5)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--top_k", type=int, default=2,
+                    help="每 token 激活的专家数。真实 V3 是 2（model_v3.py:145），默认对齐")
     a = ap.parse_args()
 
     import model_v3 as M
 
     cfg = M.TGAIV3Config(vocab_size=4096, d_model=a.d, n_layers=a.layers,
                          n_heads=4, n_kv_heads=2, d_ff=4 * a.d,
-                         n_experts=a.E, n_activated=1, n_shared_experts=1,
+                         n_experts=a.E, n_activated=a.top_k, n_shared_experts=1,
                          max_seq_len=a.seq, moe_balance="sign")
     model = M.TGAIV3Model(cfg).cuda()
     # ★ 与 ORV 侧同口径：PyTorch 也开梯度检查点

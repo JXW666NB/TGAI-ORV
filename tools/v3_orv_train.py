@@ -104,6 +104,8 @@ def main():
                     help="块化在线 softmax 注意力（不物化 S×S，反向重算）")
     ap.add_argument("--no-shared", action="store_true",
                     help="关闭共享专家。PyT 侧是 n_shared_experts=1，默认开启以保持同构")
+    ap.add_argument("--top_k", type=int, default=2,
+                    help="每 token 激活专家数。真实 V3 是 2（model_v3.py:145），默认对齐")
     a = ap.parse_args()
     a.shared = not a.no_shared          # 默认开启（与 PyT 对齐）
 
@@ -149,8 +151,14 @@ def main():
             #   那会造出 [E·d_ff, d] = [16384, 512] 的矩阵，`hn @ routerᵀ` 得到 **[S, 16384]**，
             #   softmax 与掩码各再一张 ⇒ 每层约 384 MiB 的纯浪费（S=2048 时）。
             #   参考实现的 router 是 `nn.Linear(d_model, n_experts)`，只有 [E, d]。
-            eids, g, _s = MOE.route_top1(hn, L["router"])
-            mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
+            if int(a.top_k) == 1:
+                eids, g, _s = MOE.route_top1(hn, L["router"])
+                mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
+            else:
+                # 真实 V3 是 top_k=2（model_v3.py:145）：softmax 全体专家 → 取前 k →
+                # 门控用原始亲和度（不重新归一化），见 route_topk 的说明。
+                eids, gates, _s = MOE.route_topk(hn, L["router"], int(a.top_k))
+                mo = MOE.moe_topk_orv(hn, eids, gates, L["W1"], L["W2"], L["W3"])
             # ★ 共享专家：参考实现是 `n_activated=1, n_shared_experts=1`，即
             #   路由专家 top_k=1 的加权和 **再加上** 一个对所有 token 都生效的 FFN。
             #   之前 ORV 缺这一支，导致两侧参数不等（少 25.2 M），比较不是同构的。

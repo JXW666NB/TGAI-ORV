@@ -78,6 +78,66 @@ def route_top1(hn, router_w):
     return eids, gate, s_all
 
 
+def route_topk(hn, router_w, k=2, bias=None):
+    """top_k=k 的路由，语义严格对齐参考实现 `model_v3.py:1039-1057`：
+
+        s_all = softmax(router(x), dim=-1)        # 对**全体**专家做 softmax
+        sel   = s_all + bias                       # 偏置**只影响选择**，不进门控
+        topi  = top-k(sel)                         # 每 token 取前 k
+        gate  = s_all[topi]                        # 门控用**原始亲和度**，不重新归一化
+
+    实现照 PyTorch 的 C 端思路（`aten/src/ATen/native/cuda/TensorTopK.cu`）：
+    小切片不物化排序、不用 mask，**一个内核里每行一个线程完成选择**，
+    反向等价于 `gather` 的反向（把门控梯度散射回原位，其余为 0）。
+
+    返回 `(eids, gate2, s_all)`：
+      * `eids`  (N, k) int64 主机下标 —— 只用于分派，不参与求导
+      * `gate2` (N, k) 张量 —— 选中的原始亲和度，**带梯度**
+      * `s_all` (N, E) 张量 —— 供调用方复用（z-loss 等）
+    """
+    import tgai_go.train as T
+    rt = T._cuda()
+    z = hn @ router_w.transpose(0, 1)
+    s_all = T.functional.softmax(z, axis=-1)
+    n, E = int(s_all.shape[0]), int(s_all.shape[1])
+    b = (np.zeros(E, np.float32) if bias is None
+         else np.asarray(bias, np.float32).reshape(E))
+    bias_t = T.tensor(b)
+    # 选择用 (s + bias)，门控取原始 s —— 两个现成内核：
+    #   `moe_topk`       每个 token 的 top-k（内核内完成，不物化排序）
+    #   `moe_gather_pairs` 按 idx 取 gate；反向用 `moe_scatter_pairs` 散射回原位
+    sel = s_all + bias_t
+    idx_buf, _val = rt.moe_topk(sel._gpu, int(k))
+    gate_buf = rt.moe_gather_pairs(s_all._gpu, idx_buf, n, E, int(k))
+    eids = np.asarray(idx_buf.to_numpy() if hasattr(idx_buf, "to_numpy") else idx_buf)
+    eids = eids.astype(np.int64).reshape(n, -1)
+
+    need = bool(s_all.requires_grad)
+    gates = T.Tensor._from_gpu(gate_buf, requires_grad=need,
+                               _parents=(s_all,) if need else ())
+    if need:
+        def bw(g, grads):
+            ds = rt.moe_scatter_pairs(g, idx_buf, n, E, int(k))
+            T._acc(grads, s_all, ds)
+
+        gates._backward = bw
+    return eids, gates, s_all
+
+
+def moe_topk_orv(x, eids, gates, W1, W2, W3, beta1=4.0, beta2=25.0):
+    """top_k>1 的分派：每个槽各跑一次分派，再按该槽门控加权求和。
+
+    数学上等于 `Σ_k gate_k · FFN_{i_k}(x)`，与参考实现一致；
+    代价是 k 次分派（k=2 时约两倍），换来语义正确。
+    """
+    k = int(eids.shape[1])
+    out = None
+    for slot in range(k):
+        part = moe_dispatch_orv(x, eids[:, slot], gates[:, slot], W1, W2, W3, beta1, beta2)
+        out = part if out is None else out + part
+    return out
+
+
 def moe_dispatch_numpy(x, eids, gate, W1, W2, W3, beta1=4.0, beta2=25.0):
     """判定基准：逐专家对选中行算 SiTU-GLU，再按 order 散回原位。"""
     x = np.asarray(x, np.float32)

@@ -22,7 +22,7 @@
 | 全局注意力（GQA + 部分 RoPE + 掩码）| ✅ 已完成 | 单层对齐 <1e-4；块化版本前向 1.2e-07、反向 1e-9 |
 | 块化注意力（不物化 S×S）| ✅ 已完成 | `v3_flash_op.flash_attn`，512/512 块 |
 | MoE 路由 top_k=1 | ✅ 已完成 | `route_top1`，前向 5.07e-07 |
-| **MoE 路由 top_k=2** | ❌ **未实现** | CUDA 无 `topk`；需按分数取前二并归一 |
+| **MoE 路由 top_k=2** | ✅ **已实现**（`route_topk`）| 下标与参考一致；前向 1.12e-08；dx 有限差分 3.96e-06 |
 | 共享专家 | ✅ 今天补齐 | `build()` 增加 `S1/S2/S3`，`--no-shared` 可关 |
 | SiTU-GLU | ✅ 融合内核 | 单算子峰值 756 → 228 MiB |
 | RMSNorm | ✅ 融合内核 | 每层留存 12 → 4 MiB |
@@ -33,16 +33,16 @@
 
 **ORV 目前能训的是 V3 的骨架，不是完整的 V3。** 具体地：
 
-- 已能跑通：嵌入 → (全局注意力 + MoE top1 + 共享专家) ×N → 最终 norm → 头 → 交叉熵，
+- 已能跑通：嵌入 → (全局注意力 + **MoE top_k=2** + 共享专家) ×N → 最终 norm → 头 → 交叉熵，
   真实训练步（AdamW、权重真更新）、梯度检查点、块化注意力，全部实测通过。
-- 缺失：**top_k=2、CSA、BlockAttnRes** 三项。其中 BlockAttnRes 与 CSA 会改变
-  显存与计算的结构（前者增加跨层激活，后者改变注意力复杂度）。
+- 缺失：**CSA、BlockAttnRes** 两项。两者都会改变显存与计算结构
+  （BlockAttnRes 增加跨层激活，CSA 改变注意力复杂度）。
 
 ### 对本仓库那张对比表的限定
 
-`docs/V3_FAIR_CKPT_COMPARISON.md` 的表是 **ORV(top_k=1) vs PyT(top_k=1)**：
-两侧自洽、同口径、同为真实训练步，但**都不是真实 V3**（真实为 top_k=2 + BlockAttnRes + CSA）。
-该表回答的是"**两个引擎在相同模型上的差异**"，不回答"ORV 能否训真实 V3"。
+`docs/V3_FAIR_CKPT_COMPARISON.md` 的表现在是 **ORV(top_k=2) vs PyT(top_k=2)**，
+两侧都含共享专家、4 个注意力头、都开检查点 —— 除 CSA/BlockAttnRes 外与真实 V3 一致。
+该表回答"**两个引擎在相同模型上的差异**"；要回答"ORV 能否训完整 V3"，还差那两项。
 
 ## 4. 补齐顺序建议（按显存收益/风险排序）
 

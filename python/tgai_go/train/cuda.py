@@ -474,6 +474,50 @@ extern "C" __global__ void ewise_tanh_bwd(const float* g, const float* y, float*
     if (i < n) { float t = y[i]; c[i] = g[i] * (1.0f - t * t); }
 }
 
+// ── MoE 路由的 top-k（每行一个线程，k 很小、E 很小）────────────────────────────
+// 照 PyTorch 的思路（aten/src/ATen/native/cuda/TensorTopK.cu）：小切片不物化排序，
+// 直接在寄存器里选。这里 E≤64、k≤4，一个线程扫一遍即可，无中间张量、无 mask。
+//   s:    (n, E) softmax 后的亲和度
+//   bias: (E,)   只影响**选择**，不进门控（DeepSeek 的做法）
+//   idx:  (n, k) float 保存下标（≤64，fp32 精确），网关侧再转 int
+//   gate: (n, k) 选中的**原始亲和度** s[r, idx]
+extern "C" __global__ void moe_topk_fwd(const float* s, const float* bias,
+                                        float* idx, float* gate,
+                                        int n, int E, int k) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n) return;
+    const float* row = s + (long long)r * E;
+    for (int slot = 0; slot < k; ++slot) {
+        int best = -1;
+        float bestv = -3.0e38f;
+        for (int e = 0; e < E; ++e) {
+            float v = row[e] + bias[e];
+            bool used = false;
+            for (int j = 0; j < slot; ++j) {
+                if ((int)idx[(long long)r * k + j] == e) { used = true; break; }
+            }
+            if (!used && v > bestv) { bestv = v; best = e; }
+        }
+        if (best < 0) best = 0;
+        idx[(long long)r * k + slot] = (float)best;
+        gate[(long long)r * k + slot] = row[best];
+    }
+}
+
+// 反向：门控的梯度只知道落在被选中的专家上（下标离散，不下传），
+// 其余位置为 0 —— 等价于 PyTorch `gather` 的反向（scatter 回原位置）。
+extern "C" __global__ void moe_topk_bwd(const float* dgate, const float* idx,
+                                        float* ds, int n, int E, int k) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n) return;
+    float* row = ds + (long long)r * E;
+    for (int e = 0; e < E; ++e) row[e] = 0.0f;
+    for (int slot = 0; slot < k; ++slot) {
+        int e = (int)idx[(long long)r * k + slot];
+        row[e] += dgate[(long long)r * k + slot];
+    }
+}
+
 // SiTU-GLU 融合门（前向）：out = [β1·tanh(g/β1)·sigmoid(g)] · [β2·tanh(u/β2)]
 // 照 PyTorch 的做法（ActivationSiluKernel.cu）：整个逐元素链一个内核，只产出 out，
 // 不产生 gate/tanh/sigmoid 等中间张量。原先用 7 个算子拼，每步留存 9 个 (N,d_ff) 临时量。
