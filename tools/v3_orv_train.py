@@ -80,6 +80,10 @@ def main():
     ap.add_argument("--steps", type=int, default=5)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--n_q", type=int, default=4,
+                    help="注意力查询头数；d/n_q 即 dh。dh==64 时 sdpa_lowmem 可用")
+    ap.add_argument("--lowmem", action="store_true",
+                    help="走不物化 P 的注意力内核（需 dh==64 + causal + CUDA）")
     a = ap.parse_args()
 
     T.set_default_device("cuda")
@@ -87,7 +91,7 @@ def main():
                                "--format=csv,noheader,nounits"],
                               capture_output=True, text=True).stdout.splitlines()[0])
     cfg = dict(d=a.d, d_ff=4 * a.d, E=a.E, layers=a.layers,
-               n_q=4, n_kv=2, vocab=4096, seq=a.seq, steps=a.steps)
+               n_q=a.n_q, n_kv=2, vocab=4096, seq=a.seq, steps=a.steps)
 
     rng = np.random.default_rng(0)
     P = build(cfg, rng)
@@ -108,7 +112,8 @@ def main():
         for L in P["layers"]:
             h = x + V.attention_orv(V.rmsnorm_orv(x, L["ln1"]),
                                     L["wq"], L["wk"], L["wv"], L["wo"],
-                                    cos, sin, a.d // cfg["n_q"], cfg["n_q"], cfg["n_kv"])
+                                    cos, sin, a.d // cfg["n_q"], cfg["n_q"], cfg["n_kv"],
+                                    lowmem=a.lowmem)
             hn3 = V.rmsnorm_orv(h, L["ln2"])
             hn = hn3.reshape(a.seq, a.d)                  # MoE 按行分派，用二维视图
             router = T.cat([L["W1"][e] for e in range(a.E)], dim=0)   # 占位：见 route_top1 注释
