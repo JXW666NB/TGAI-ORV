@@ -58,10 +58,14 @@ def situ_glu(x, w1, w2, w3, beta1=4.0, beta2=25.0):
 
 
 def situ_glu_numpy(x, w1, w2, w3, beta1=4.0, beta2=25.0):
-    """同一公式的 numpy 版本，作为对拍基准（与 PyTorch 参考逐式对应）。"""
+    """同一公式的 numpy 版本，作为对拍基准（与 PyTorch 参考逐式对应）。
+
+    sigmoid 用 `0.5·(1+tanh(x/2))` 恒等式：直接写 `1/(1+exp(-g))` 在 g 很大时会溢出报警
+    （实测：CI 上 `-50·|W|` 量级的输入触发 `overflow encountered in exp`）。
+    """
     g = x @ w1.T
     u = x @ w2.T
-    gate = (beta1 * np.tanh(g / beta1)) * (1.0 / (1.0 + np.exp(-g)))
+    gate = (beta1 * np.tanh(g / beta1)) * (0.5 * (1.0 + np.tanh(0.5 * g)))
     up = beta2 * np.tanh(u / beta2)
     return (gate * up) @ w3.T
 

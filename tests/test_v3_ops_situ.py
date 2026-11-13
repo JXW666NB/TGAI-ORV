@@ -66,7 +66,7 @@ def test_output_is_bounded_by_beta_product():
     # 因此这里用 numpy 直接验证 gate/up 两个中间量。
     g = big @ w1.T
     u = big @ w2.T
-    gate = (4.0 * np.tanh(g / 4.0)) * (1.0 / (1.0 + np.exp(-g)))
+    gate = (4.0 * np.tanh(g / 4.0)) * (0.5 * (1.0 + np.tanh(0.5 * g)))
     up = 25.0 * np.tanh(u / 25.0)
     assert np.abs(gate).max() <= 4.0 + 1e-6
     assert np.abs(up).max() <= 25.0 + 1e-6

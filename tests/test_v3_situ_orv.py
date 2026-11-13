@@ -51,6 +51,6 @@ def test_bounded_on_orv_too():
     # 中间量 gate*up 的上界是 100；w3 会再放大，这里用 numpy 复核中间量
     g = x @ w1.T
     u = x @ w2.T
-    gate = (4.0 * np.tanh(g / 4.0)) * (1.0 / (1.0 + np.exp(-g)))
+    gate = (4.0 * np.tanh(g / 4.0)) * (0.5 * (1.0 + np.tanh(0.5 * g)))
     up = 25.0 * np.tanh(u / 25.0)
     assert np.abs(gate * up).max() <= 100.0 + 1e-3
