@@ -336,6 +336,7 @@ def csa_conv_causal(x, w):
 
 def attention_orv(x, wq, wk, wv, wo, cos, sin, rot_dim, n_q, n_kv, causal=True,
                   attn_mask=None):
+
     """GlobalAttention 的 ORV 张量版（训练路径）。
 
     形状约定：`x` `(B,T,d_model)`；权重 `(out,in)`；`cos/sin` `(T, rot_dim)`。
@@ -381,3 +382,28 @@ def attention_orv(x, wq, wk, wv, wo, cos, sin, rot_dim, n_q, n_kv, causal=True,
         out = T.functional.scaled_dot_product_attention(q, k, v, causal=causal)
     out = out.transpose(1, 2).reshape(B, Tlen, n_q * d_k)
     return out @ wo.transpose(0, 1)
+
+
+def moe_route_orv(x, router_w, top_k, expert_bias=None):
+    """MoEv3 路由的 ORV 张量版（**无偏置**路径）。
+
+    与 `moe_route_numpy` 同口径：`s_all = softmax(router(x))`，`topk` 选专家，
+    门控 = 选中的原始亲和度。
+
+    ## 为什么只支持 `expert_bias=None`
+
+    ORV 目前**没有 `gather`**（按任意下标取元素）。有偏置时：
+        sel = s_all + b  → topi = topk(sel) → gate = s_all[topi]   ← 这一步需要 gather
+    所以偏置版要等 gather 落地。训练从零开始时 `b = 0`，本路径覆盖起步阶段，
+    也是"同权重同输入比 logits"够用的路径。
+    """
+    if expert_bias is not None:
+        raise NotImplementedError(
+            "带偏置的 MoE 路由暂不支持：ORV 没有 gather，无法在下标 topi 上取 s_all。"
+            "修法：① 传 expert_bias=None（训练起步 b=0 时完全等价）；"
+            "② 或先给 ORV 补一个按行 gather（运行时已有 gather_rows 可用于 embedding）；"
+            "③ 或在 numpy 侧算好路由再灌回张量（仅离线对拍可用）")
+    z = x @ router_w.transpose(0, 1)
+    s_all = T.functional.softmax(z, axis=-1)
+    topv, topi = T.topk(s_all, int(top_k), dim=-1)
+    return topi, topv, s_all
