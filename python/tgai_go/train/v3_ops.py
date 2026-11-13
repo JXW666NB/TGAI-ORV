@@ -407,3 +407,21 @@ def moe_route_orv(x, router_w, top_k, expert_bias=None):
     s_all = T.functional.softmax(z, axis=-1)
     topv, topi = T.topk(s_all, int(top_k), dim=-1)
     return topi, topv, s_all
+
+
+def situ_glu_orv(x, w1, w2, w3, beta1=4.0, beta2=25.0):
+    """SiTU-GLU 的 ORV 张量版（专家 FFN 的激活）。
+
+    与 `situ_glu_numpy` 同式：
+
+        gate = (β₁·tanh(g/β₁)) ⊙ sigmoid(g)     β₁=4
+        up   = β₂·tanh(u/β₂)                    β₂=25
+        y    = w3(gate ⊙ up)                    ⇒ 上界 β₁·β₂ = 100
+
+    权重形状均为 `(out,in)`；`sigmoid` 仍用 `0.5·(1+tanh(x/2))` 恒等式（ORV 未导出 sigmoid）。
+    """
+    g = x @ w1.transpose(0, 1)
+    u = x @ w2.transpose(0, 1)
+    gate = (_tanh(g * (1.0 / beta1)) * beta1) * _sigmoid(g)
+    up = _tanh(u * (1.0 / beta2)) * beta2
+    return (gate * up) @ w3.transpose(0, 1)
