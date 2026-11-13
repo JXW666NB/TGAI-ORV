@@ -610,7 +610,12 @@ class Tensor:
         obj._gpu = gpu
         obj.data = None
         obj.grad = None
-        obj.requires_grad = bool(requires_grad)
+        # ★ 照 PyTorch 的语义（torch/csrc/autograd/VariableTypeUtils.h:49）：
+        #   `if (!requires_grad || !GradMode::is_enabled()) return false;`
+        #   没开梯度模式时一律不要求梯度 ⇒ 上层算子不会建图 ⇒ no_grad 才真的省内存。
+        #   原先只信调用方传的值，导致 `with T.no_grad()` 形同虚设（实测：图照样建，
+        #   显存与建图模式完全相同，检查点因此两次失败）。
+        obj.requires_grad = bool(requires_grad) and _GRAD_ENABLED[0]
         obj._parents = _parents
         obj._backward = _backward
         obj._lazy_T = None

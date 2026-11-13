@@ -9,6 +9,7 @@
 验收：1 层 seq2048 E=8 的 peak_live 应从 3,891 MiB 降到接近「只前向 1,142 + 参数梯度」。
 """
 import argparse
+import gc
 import json
 import subprocess
 import sys
@@ -71,12 +72,16 @@ def main():
                 bounds.append(x)
 
         last = T.tensor(np.asarray(bounds[-1].to_numpy(), np.float32), requires_grad=True)
+        print("  前向(no_grad)完成 live=%.0f MiB" % (rt.pool_stats()["live_bytes"] / 2**20),
+              flush=True)
         logits = V.rmsnorm_orv(last, P["ln_f"]).reshape(a.seq, a.d) @ P["head"].transpose(0, 1)
         loss = T.functional.cross_entropy(logits, tgt)
         lv = loss.to_numpy() if hasattr(loss, "to_numpy") else loss
         lv = float(lv) if isinstance(lv, (int, float)) else float(np.asarray(lv).reshape(-1)[0])
         loss.backward()
         g_up = np.asarray(last.grad.to_numpy(), np.float32)
+        print("  头部反传完成 live=%.0f MiB" % (rt.pool_stats()["live_bytes"] / 2**20),
+              flush=True)
         del last, logits, loss
         rt.empty_cache()
 
@@ -86,7 +91,12 @@ def main():
             y.backward(T.tensor(np.ascontiguousarray(g_up)))
             g_up = np.asarray(xi.grad.to_numpy(), np.float32)
             del xi, y
+            # ★ 若图里有引用环（tensor → _backward 闭包 → tensor），`del` 不会立即释放，
+            #   必须 gc.collect()。实测每层残留 ≈98 MB ≈ 6 个 (N, d_ff)，正是 MoE 的中间量。
+            gc.collect()
             rt.empty_cache()
+            print("    layer %d done, live=%.0f MiB"
+                  % (i, rt.pool_stats()["live_bytes"] / 2**20), flush=True)
 
         opt.step()
         times.append(time.time() - t0); losses.append(lv)
