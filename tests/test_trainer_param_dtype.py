@@ -37,8 +37,16 @@ def test_default_is_fp32():
 
 @pytest.mark.parametrize("name", ["fp16", "float16", "half", "FP16"])
 def test_fp16_switch(name):
-    tr = V27Trainer(CFG, n_layers=1, param_dtype=name)
-    assert tr._pdt is np.float16
+    """fp16 参数存储**当前不可用** —— 必须早失败并说清修法。
+
+    2026-11-13 在 V100 上实测：参数存成 fp16 后，`T.cat(...)` 直接抛
+    `CUDA cat 目前只支持 float32`。本引擎张量语义统一 float32，fp16 只在 GEMM 内部
+    （`rt.fp16_gemm`）。所以这里断言"早失败 + 消息带修法"，而不是让它跑到深处才崩。
+    """
+    with pytest.raises(NotImplementedError) as ei:
+        V27Trainer(CFG, n_layers=1, param_dtype=name)
+    msg = str(ei.value)
+    assert "float32" in msg and "修法" in msg
 
 
 @pytest.mark.parametrize("name", ["fp32", "float32", "", None])

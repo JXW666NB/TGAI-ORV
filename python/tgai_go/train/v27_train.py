@@ -46,6 +46,17 @@ class V27Trainer(object):
         #   RMSNorm / final_norm / RoPE 表由调用方保持 fp32（数值敏感）。
         _pd = str(param_dtype).lower()
         self._pdt = np.float16 if _pd in ("fp16", "float16", "half") else np.float32
+        if self._pdt is np.float16:
+            # ★ 2026-11-13 实测结论：**当前不可用**，所以在这里早失败而不是让用户撞到深处。
+            #   ORV 的张量语义统一 float32（见 `CUDA cat 目前只支持 float32` 等算子守卫），
+            #   fp16 只存在于 GEMM 内部（`rt.fp16_gemm`），不是"把张量存成 fp16"。
+            #   真要让 2.999B 全参进 32 GB 卡，需要的是**核心算子支持 fp16/BF16 存储**，
+            #   那是一个后端工程，不是加个 dtype 开关。
+            raise NotImplementedError(
+                "param_dtype='fp16' 暂不支持：本引擎张量统一 float32，低精度只在 GEMM 内部（rt.fp16_gemm）。"
+                "修法：① 保持 param_dtype='fp32'（默认）；② 想要省显存请用梯度检查点、"
+                "分片优化器或更小 batch；③ 要给权重真做 fp16 存储，需先让 cat/matmul/反向等核心算子"
+                "支持半精度张量，属于后端改造")
         self.D = int(cfg["d_model"])
         self.NH = int(cfg["n_heads"])
         self.DH = self.D // self.NH

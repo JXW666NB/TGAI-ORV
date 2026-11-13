@@ -52,8 +52,13 @@ def main():
                  vocab=int(h["vocab"]), max_seq=int(h["max_seq"]),
                  pad=int(h["pad"]), bos=int(h["bos"]), eos=int(h["eos"]), unk=int(h["unk"]),
                  n_kv_heads=int(h.get("num_kv_heads") or 0), arch=int(h.get("arch") or 0))
-        tr = V27Trainer(c, n_layers=c["n_layers"])
+        # ★ 同口径关键：ORV 侧参数也走 fp16（与 torch 侧 model.to(bfloat16) 对齐到"半精度存储"）。
+        #   0.9.63 起支持；不给这个参数就是 fp32 参数 ⇒ 44.7 GiB，必 OOM。
+        tr = V27Trainer(c, n_layers=c["n_layers"], param_dtype="fp16")
         tr.load_all(st)
+        # ★ 必须先挂 head（token_embedding + final_norm），否则 head_params() 里
+        #   访问 self.final_norm 会 AttributeError（实测踩过）
+        tr.attach_head(st)
         cos = T.tensor(np.asarray(st["blocks.0.attn.rope.cos"], np.float32))
         sin = T.tensor(np.asarray(st["blocks.0.attn.rope.sin"], np.float32))
         # ★ 手动指定 fp16 动量的优化器：`tr.make_optimizers()` 默认给的是 **fp32 AdamW**
