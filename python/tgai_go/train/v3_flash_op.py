@@ -107,6 +107,8 @@ def _bwd_device(qt, kt, vt, dot, lse_t, ot, causal, cq, ck):
 
 
 def flash_attn(q, k, v, causal=True, cq=64, ck=64):
+    # 块大小实测（seq2048，整模型）：64 → 5,820 MiB / 11.3 s；32 → 6,194 MiB / 38.8 s。
+    # 更小的块**并没有**降峰值（峰值不由此处主导），却把循环次数翻倍 ⇒ 保留 64/64。
     """`q,k,v` 形状 (B,H,S,D) 的 ORV 张量；返回 (B,H,S,D)。块化、不物化 S×S。"""
     import tgai_go.train as T
 
