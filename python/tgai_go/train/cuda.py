@@ -3610,6 +3610,41 @@ class CudaRuntime:
             self._h2d_cache[cache_slot] = ((src.shape, src.dtype.str, src.tobytes()), buf)
         return buf
 
+    def copy_h2d_into(self, buf, arr):
+        """把 host 数据**原地**写进已有的设备缓冲（不新分配）。
+
+        ## 为什么需要
+
+        `h2d()` 每次都 `empty()` 一块新显存。参数广播、权重复原这类"把值写回已有张量"的
+        操作若走 `h2d()`，旧缓冲就没人释放 —— 275 MB 的模型广播一次就漏 275 MB/卡。
+        这里直接用 `cuMemcpyHtoDAsync` 写进 `buf.ptr`。
+
+        要求 **nbytes 完全一致**（形状由调用方校验）：长度不同时不会自动 realloc，
+        因为那会让持有 `buf` 的其它组件（优化器、KV cache）拿到悬空引用。
+        """
+        src = np.ascontiguousarray(np.asarray(arr), dtype=buf.dtype)
+        if int(src.nbytes) != int(buf.nbytes):
+            raise ValueError(
+                "copy_h2d_into 长度不符：目标 %d 字节，源 %d 字节。"
+                "修法：形状不同的张量要重建缓冲（先 self.empty 再拷），不要原地写"
+                % (int(buf.nbytes), int(src.nbytes)))
+        if src.nbytes:
+            # 异步拷贝必须抓住自己的一份 —— 调用方的数组随时可能被改写
+            hold = np.array(src, copy=True, order="C")
+            self._mark_submitted(buf.ptr)
+            self._activate()
+            self._chk(self.cu.cuMemcpyHtoDAsync(
+                ctypes.c_uint64(buf.ptr),
+                hold.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_size_t(int(hold.nbytes)),
+                self._stream), "cuMemcpyHtoDAsync")
+            buf.host_hold = hold
+            if self._capturing:
+                self._graph_host_keeps.append(hold)
+        if buf.n == 1 and np.issubdtype(buf.dtype, np.floating):
+            buf.known_scalar = float(src.reshape(-1)[0])
+        return buf
+
     def d2h(self, buf):
         """只同步计算流。拷贝排在这条流已有工作之后，不再先 cuCtxSynchronize 整颗设备。"""
         if self._capturing:
