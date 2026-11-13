@@ -88,6 +88,9 @@ def main():
         for i in range(len(P["layers"]) - 1, -1, -1):
             xi = T.tensor(np.asarray(bounds[i].to_numpy(), np.float32), requires_grad=True)
             y = layer_fwd(xi, P["layers"][i], cos, sin, d_k, a.n_q, cfg["n_kv"])
+            if step == 0 and i in (7, 4, 0):
+                print("      layer %d 建图后 live=%.0f MiB"
+                      % (i, rt.pool_stats()["live_bytes"] / 2**20), flush=True)
             y.backward(T.tensor(np.ascontiguousarray(g_up)))
             g_up = np.asarray(xi.grad.to_numpy(), np.float32)
             del xi, y

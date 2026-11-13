@@ -88,8 +88,8 @@ def _bwd_device_impl(qt, kt, vt, dot, lse_t, ot, causal, cq, ck):
     BH, S, D = (int(s) for s in qt.shape)
     scale = 1.0 / np.sqrt(float(D))
     dq_parts = []
-    dk_parts = [[] for _ in range((S + ck - 1) // ck)]
-    dv_parts = [[] for _ in range((S + ck - 1) // ck)]
+    dk_acc = {}                     # 按 key 块编号累积，**主机侧** numpy
+    dv_acc = {}
     for qi in range(0, S, cq):
         rows = min(cq, S - qi)
         qb = qt[:, qi:qi + rows, :].reshape(BH, rows, D)
@@ -110,11 +110,14 @@ def _bwd_device_impl(qt, kt, vt, dot, lse_t, ot, causal, cq, ck):
                 arr = np.where((cc - r) <= (qi - ki), 0.0, NEG).astype(np.float32)
                 sb = sb + T.tensor(arr.reshape(1, rows, cols))
             p = (sb - lb.reshape(BH, rows, 1)).exp()
-            dv_parts[ki // ck].append(p.transpose(1, 2) @ db)
+            # ★ 立刻折算到主机累加：原先 `.append(设备张量)` 会把 528 个分片
+            #   （S=2048、64 块时）全部留在显存里直到函数末尾，是随 seq **二次**增长的
+            #   那一项（实测反向额外 32 → 112 MiB）。主机侧累加只占 O(S·D)。
+            dv_acc[ki // ck] = dv_acc.get(ki // ck, 0) + _np(p.transpose(1, 2) @ db)
             dp = db @ vb.transpose(1, 2)
             ds = p * (dp - dsum)
             dq_b = dq_b + (ds @ kb) * scale
-            dk_parts[ki // ck].append((ds.transpose(1, 2) @ qb) * scale)
+            dk_acc[ki // ck] = dk_acc.get(ki // ck, 0) + _np((ds.transpose(1, 2) @ qb) * scale)
             if os.environ.get("FLASHDBG2") and qi == 1984:
                 _rt3 = T._cuda()
                 print("    [块内] qi=1984 ki=%4d live=%.1f MiB"
@@ -127,13 +130,14 @@ def _bwd_device_impl(qt, kt, vt, dot, lse_t, ot, causal, cq, ck):
     dq = np.concatenate(dq_parts, axis=1)
     dk = np.zeros((BH, S, D), np.float32)
     dv = np.zeros((BH, S, D), np.float32)
-    for bi, parts in enumerate(dk_parts):
-        if not parts:
-            continue
+    for bi, arr in dk_acc.items():
         ki = bi * ck
-        cols = min(ck, S - ki)
-        dk[:, ki:ki + cols, :] = np.sum(np.stack([_np(x) for x in parts], 0), 0)
-        dv[:, ki:ki + cols, :] = np.sum(np.stack([_np(x) for x in dv_parts[bi]], 0), 0)
+        cols = arr.shape[1]
+        dk[:, ki:ki + cols, :] = arr
+    for bi, arr in dv_acc.items():
+        ki = bi * ck
+        cols = arr.shape[1]
+        dv[:, ki:ki + cols, :] = arr
     return dq, dk, dv
 
 
