@@ -189,3 +189,58 @@ def attention_numpy_softmax(scores, add_mask):
     e = np.where(np.isfinite(add_mask), e, 0.0)
     den = e.sum(axis=-1, keepdims=True)
     return e / np.where(den > 0, den, 1.0)
+
+
+# ═══════════════════════════════════════════════════════════
+# MoEv3 路由（numpy 参考）
+# ═══════════════════════════════════════════════════════════
+
+def moe_route_numpy(x, router_w, expert_bias=None, top_k=2, balance="softmax"):
+    """V3 MoE 的路由决策：返回 `(topi, gate, s_all)`。
+
+    与参考实现（`model_v3.py::MoEv3.forward` ①–③）逐条对应：
+
+        s_all = softmax(router(x), -1)          # 全专家 softmax（DeepSeek 口径）
+        sel   = s_all + b                       # ★ b 只影响**选择**
+        topi  = topk(sel, K)                    # 选择依据是 sel
+        gate  = gather(s_all, topi)             # ★ 门控用**原始 s**，不是 sel
+
+    `balance="quantile"`（K3 QB）时：`s = sigmoid(...)`，门控在选中集合内**重新归一化**。
+    两种口径都实现，因为配置里 `moe_balance` 可切换。
+    """
+    W = np.asarray(router_w, np.float32)
+    z = np.asarray(x, np.float32) @ W.T                      # (N, E)
+    if balance == "quantile":
+        s_all = 1.0 / (1.0 + np.exp(-z))
+        sel = s_all if expert_bias is None else s_all + np.asarray(expert_bias, np.float32)
+        topi = np.argsort(-sel, axis=-1, kind="stable")[:, :int(top_k)]
+        gsel = np.take_along_axis(s_all, topi, axis=-1)
+        den = np.maximum(gsel.sum(axis=-1, keepdims=True), 1e-9)
+        gate = gsel / den
+        return topi, gate, s_all
+
+    m = z.max(axis=-1, keepdims=True)
+    e = np.exp(z - m)
+    s_all = e / e.sum(axis=-1, keepdims=True)
+    sel = s_all if expert_bias is None else s_all + np.asarray(expert_bias, np.float32)
+    # torch.topk 默认降序；这里用 stable 排序 + 次级键下标，保证可复现
+    order = np.argsort(-sel, axis=-1, kind="stable")
+    topi = order[:, :int(top_k)]
+    gate = np.take_along_axis(s_all, topi, axis=-1)
+    return topi, gate, s_all
+
+
+def moe_update_bias(expert_bias, usage, gamma, top_k, n_experts, ema=None,
+                    ema_decay=0.9):
+    """偏置的**符号式**更新（参考实现 ④）：过载 `b -= γ`，欠载 `b += γ`。
+
+    `usage`：本步每专家被选中的比例（长度 E，和为 `top_k`）。
+    判定基准是"理想均匀负载"：每个专家应占 `top_k / E`。
+    """
+    b = np.array(expert_bias, np.float32, copy=True)
+    u = np.asarray(usage, np.float32)
+    ideal = float(top_k) / float(max(1, int(n_experts)))
+    if ema is not None:
+        u = ema_decay * np.asarray(ema, np.float32) + (1.0 - ema_decay) * u
+    b += np.where(u < ideal, float(gamma), -float(gamma))
+    return b
