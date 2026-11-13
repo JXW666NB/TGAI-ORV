@@ -70,3 +70,53 @@ V3 1.5B 的 E 是 8～16（`save_1_5b` 与 `save_1_5b_exp` 分别是 8 / 16 专�
 在三档（seq 512/1024/2048）+ 完整优化器跑通之前，**任何"ORV 比 PyTorch 快/省 N 倍"的说法都不成立**。
 目前只有一条同口径实测：V2.7 2.999B 的**前反向**（无优化器）seq512，
 ORV 0.688 s/步、峰值 14,666 MiB vs PyTorch 0.923 s/步、14,815 MiB —— 显存 0.99×、速度 1.34×。
+
+## 6. 续做清单（按顺序，每条都写清验收标准）
+
+### 6.1 给 ORV 加 `scatter_add` 张量实现
+
+**判定基准已就绪**：`python/tgai_go/train/v3_ops.py::scatter_add_numpy` /
+`scatter_add_backward_numpy`，四条断言在 `tests/test_v3_scatter_add.py`。
+
+要做的：
+
+* 前向：`out = zeros(n_rows, d); out[ids] += values`——CUDA 上可用 `cuMemcpy + kernel`，
+  CPU 上先走 numpy（`np.add.at`）；
+* 反向：`values.grad = out.grad[ids]`（**就是已有的取行**，不需要新内核）；
+* 接入 autograd：参照 `train/__init__.py::_sdpa_lowmem` 里 `Tensor._from_gpu(..., _parents=...)` 的写法。
+
+**验收**：上表四条断言全过 + 数值梯度对拍（`(f(x+ε)-f(x-ε))/2ε` 与反向一致）。
+
+### 6.2 用它做 MoE 分派（sorted 路径）
+
+`topi` → 按专家排序 → 每个专家只算自己那段 → `scatter_add` 回原位置 → 乘门控累加。
+
+**验收**：与"全算再筛"的 numpy 参考逐位一致（同权重同输入）。
+
+### 6.3 补齐 CSA 张量侧
+
+压缩池化（`csa_compress`，含 `seg` 分段）与因果 depthwise 卷积（`csa_conv_causal`）。
+**验收**：与 numpy 参考一致 + 两条泄漏回归（跨文档不混池、扰动位置 p 不影响 < p）。
+
+### 6.4 组装整模型并跑真实训练步
+
+嵌入（`weight[ids]`，**已可用**）→ N 层 → final norm → head → CE。
+**验收**：与 PyTorch 同权重同输入比 logits（相对误差 < 1e-3），
+再跑 ≥20 步完整训练步（AdamW，权重真更新），记录峰值显存 / 每步耗时 / tok/s / loss。
+
+### 6.5 两侧多组配置 → 曲线与倍数
+
+(batch, seq) 网格上各跑一轮，产出：
+**显存上升曲线**、**速度下降曲线**、**ORV/PyT 显存倍数**（红线：≤ 1.0）。
+
+### 6.6 读 `D:\DSH-Workspace\pytorch-src` 后优化 ORV
+
+先读 PyTorch 在显存/速度上的关键做法（分配器、checkpointing、融合），再逐项优化 ORV，
+每项都要有**优化前后实测对比**，否则不算完成。
+
+## 7. 现在的诚实结论
+
+* **PyTorch 侧**：0.5B = 9.12 GB / 3529.8 tok/s；1.5B = 29.20 GB / 1319.6 tok/s（均为真实训练步）。
+* **ORV 侧**：V3 的**训练步数据为零**。已对齐的是算子（1e-7~1e-4）与单层（<1e-4），
+  但整模型跑不起来 —— 缺 6.1 与 6.2，缺了就只能是单专家，而单专家的显存/速度**不代表 V3**。
+* 因此：**任何"ORV 与 PyTorch 的 V3 显存倍数/速度比"目前都不存在**，不要引用。
