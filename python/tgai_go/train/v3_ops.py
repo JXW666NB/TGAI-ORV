@@ -328,3 +328,44 @@ def csa_conv_causal(x, w):
         seg = xp[:, (k - 1 - j):(k - 1 - j + Tc), :]    # t-j
         out += seg * w[:, j][None, None, :]
     return out
+
+
+# ═══════════════════════════════════════════════════════════
+# GlobalAttention 的 ORV 张量实现
+# ═══════════════════════════════════════════════════════════
+
+def attention_orv(x, wq, wk, wv, wo, cos, sin, rot_dim, n_q, n_kv, causal=True):
+    """GlobalAttention 的 ORV 张量版（训练路径，`seg_mask` 暂不支持）。
+
+    形状约定：`x` `(B,T,d_model)`；权重 `(out,in)`；`cos/sin` `(T, rot_dim)`。
+    内部走 ORV 的 `scaled_dot_product_attention`，它接受 torch 风格的 `[B,H,S,Dh]`
+    并自动展平（见 `train/__init__.py::_Functional.scaled_dot_product_attention`）。
+
+    ★ 目前只支持 `causal=True/False`：ORV 的 SDPA 没有加性掩码入口，
+      打包训练需要的块对角 `seg_mask` 要另行扩展（下一步）。
+    """
+    B = int(x.shape[0])
+    # ★ 不能把局部变量叫 `T`：那会遮蔽模块别名 `T`（= tgai_go.train），后面 `T.cat` 就会炸
+    Tlen = int(x.shape[1])
+    n_q, n_kv = int(n_q), int(n_kv)
+    d_k = int(wq.shape[0]) // n_q
+
+    q = (x @ wq.transpose(0, 1)).reshape(B, Tlen, n_q, d_k).transpose(1, 2)
+    k = (x @ wk.transpose(0, 1)).reshape(B, Tlen, n_kv, d_k).transpose(1, 2)
+    v = (x @ wv.transpose(0, 1)).reshape(B, Tlen, n_kv, d_k).transpose(1, 2)
+
+    c = cos.reshape(1, 1, Tlen, int(rot_dim))
+    s = sin.reshape(1, 1, Tlen, int(rot_dim))
+    q = v3_rope(q, c, s)
+    k = v3_rope(k, c, s)
+
+    if n_kv != n_q:
+        # GQA：**交错**复制（第 h 个 q 头用第 h//rep 个 kv 头）。
+        # ORV 没有 expand/repeat_interleave，用 cat 逐头拼出来。
+        rep = n_q // n_kv
+        k = T.cat([k[:, h:h + 1] for h in range(n_kv) for _ in range(rep)], dim=1)
+        v = T.cat([v[:, h:h + 1] for h in range(n_kv) for _ in range(rep)], dim=1)
+
+    out = T.functional.scaled_dot_product_attention(q, k, v, causal=causal)
+    out = out.transpose(1, 2).reshape(B, Tlen, n_q * d_k)
+    return out @ wo.transpose(0, 1)
