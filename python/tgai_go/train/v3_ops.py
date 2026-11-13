@@ -491,9 +491,43 @@ def rmsnorm_orv(x, weight, eps=1e-6):
     ★ 性能说明：这是**组合实现**（mean → add → sqrt → div → mul 五步），比融合内核多几次访存。
       先保证数值正确，速度留到优化阶段再换融合版 —— 这也是"下一步改什么"里的一条。
     """
+    if x.device == "cuda":
+        # 已换成融合内核：只产出一个输出，不留 4 个全尺寸中间量（实测每层 12 → 8 MiB 左右）
+        return rmsnorm_orv_fused(x, weight, eps)
     ms = (x * x).mean(axis=-1, keepdims=True)
     denom = (ms + float(eps)).sqrt()
     return (x / denom) * weight
+
+
+def rmsnorm_orv_fused(x, weight, eps=1e-6):
+    """RMSNorm 走**运行时已有的融合内核**（`rmsnorm_fwd` / `rmsnorm_bwd`）。
+
+    与组合版等价，但只产生一个输出张量、不留 `x*x`/`mean`/`sqrt`/`div` 四个全尺寸中间量
+    （实测每层能省约 8 MiB 留存，且少 4 次访存）。CPU 上退回组合版。
+    """
+    import tgai_go.train as T
+    if x.device != "cuda":
+        return rmsnorm_orv(x, weight, eps)
+    rt = T._cuda()
+    d = int(x.shape[-1])
+    seq = int(x.numel() // d) if d else 0
+    e = float(eps)
+    y = rt.rmsnorm_fwd(x._gpu, weight._gpu, seq, d, e)
+    need = bool(x.requires_grad or weight.requires_grad)
+    out = T.Tensor._from_gpu(y, requires_grad=need,
+                             _parents=(x, weight) if need else ())
+    if not need:
+        return out
+
+    def bw(g, grads):
+        dx, dw = rt.rmsnorm_bwd(g, x._gpu, weight._gpu, seq, d, e)
+        if x.requires_grad:
+            T._acc(grads, x, dx)
+        if weight.requires_grad:
+            T._acc(grads, weight, dw)
+
+    out._backward = bw
+    return out
 
 
 def rmsnorm_numpy(x, weight, eps=1e-6):

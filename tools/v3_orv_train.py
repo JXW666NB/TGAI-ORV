@@ -141,8 +141,11 @@ def main():
             h = x + attn
             hn3 = V.rmsnorm_orv(h, L["ln2"])
             hn = hn3.reshape(a.seq, a.d)                  # MoE 按行分派，用二维视图
-            router = T.cat([L["W1"][e] for e in range(a.E)], dim=0)   # 占位：见 route_top1 注释
-            eids, g, _s = MOE.route_top1(hn, router)
+            # ★ 必须用真正的 router 参数（[E, d]）。原先这行用 `cat([W1[e]])` 当占位，
+            #   那会造出 [E·d_ff, d] = [16384, 512] 的矩阵，`hn @ routerᵀ` 得到 **[S, 16384]**，
+            #   softmax 与掩码各再一张 ⇒ 每层约 384 MiB 的纯浪费（S=2048 时）。
+            #   参考实现的 router 是 `nn.Linear(d_model, n_experts)`，只有 [E, d]。
+            eids, g, _s = MOE.route_top1(hn, L["router"])
             mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
             x = h + mo.reshape(1, a.seq, a.d)
         # head 是张量（vocab,d），不是模块 ⇒ 矩阵乘，别当函数调用

@@ -71,6 +71,18 @@ def _fwd_device_impl(qt, kt, vt, causal, cq, ck):
 
 
 def _bwd_device(qt, kt, vt, dot, lse_t, ot, causal, cq, ck):
+    """块化反向（**不建图**）：内部按 (query 块 × key 块) 逐对重算。
+
+    不建图很重要：块对数是 `(S/cq)²/2`，S=2048、64 块时约 528 对；若建图，
+    这些临时张量全部留到本函数返回，峰值随 seq **二次**增长 —— 实测表现为
+    ORV 的显存曲线在 512→2048 上呈超线性（+651、+1,855 MiB），而 PyT 只 +124 MiB。
+    """
+    import tgai_go.train as T
+    with T.no_grad():
+        return _bwd_device_impl(qt, kt, vt, dot, lse_t, ot, causal, cq, ck)
+
+
+def _bwd_device_impl(qt, kt, vt, dot, lse_t, ot, causal, cq, ck):
     """返回 (dq, dk, dv) 的 numpy。"""
     import tgai_go.train as T
     BH, S, D = (int(s) for s in qt.shape)
@@ -103,7 +115,15 @@ def _bwd_device(qt, kt, vt, dot, lse_t, ot, causal, cq, ck):
             ds = p * (dp - dsum)
             dq_b = dq_b + (ds @ kb) * scale
             dk_parts[ki // ck].append((ds.transpose(1, 2) @ qb) * scale)
+            if os.environ.get("FLASHDBG2") and qi == 1984:
+                _rt3 = T._cuda()
+                print("    [块内] qi=1984 ki=%4d live=%.1f MiB"
+                      % (ki, _rt3.pool_stats()["live_bytes"] / 2**20), flush=True)
         dq_parts.append(_np(dq_b))
+        if os.environ.get("FLASHDBG"):
+            _rt = T._cuda()
+            print("  qi=%3d live=%.0f MiB" % (qi, _rt.pool_stats()["live_bytes"] / 2**20),
+                  flush=True)
     dq = np.concatenate(dq_parts, axis=1)
     dk = np.zeros((BH, S, D), np.float32)
     dv = np.zeros((BH, S, D), np.float32)

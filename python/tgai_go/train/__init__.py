@@ -572,9 +572,27 @@ def _norm_shape(shape, total):
 class Tensor:
     """最小可用的张量：数据 + 梯度 + 反向闭包。"""
 
-    __slots__ = ("data", "grad", "requires_grad", "_parents", "_backward", "device", "_gpu",
+    __slots__ = ("data", "grad", "requires_grad", "_parents", "_bwd", "device", "_gpu",
                  "_lazy_T", "_lazy_shape")
     __array_priority__ = 1000        # 让 ndarray <op> Tensor 走我们的 __r*__
+
+    @property
+    def _backward(self):
+        """反向闭包。**受梯度开关控制**：no_grad 下赋值被丢弃。
+
+        原因：算子构造出输出后会 `out._backward = bw`，而 `bw` 捕获了输入张量。
+        若这里存下来，保留一个输出就把整条输入链钉住 —— 实测 no_grad 下每保留一个
+        131 KB 的输出，live 涨约 1.4 MB（祖先链）；flash 反向因此随 seq 二次增长
+        （75 → 228 → 869 MiB）。PyTorch 里对应的是 `GradMode` 关掉后根本不记录 grad_fn。
+        """
+        try:
+            return self._bwd
+        except AttributeError:
+            return None
+
+    @_backward.setter
+    def _backward(self, v):
+        self._bwd = v if _GRAD_ENABLED[0] else None
 
     def __init__(self, data, requires_grad=False, _parents=(), _backward=None, device=None, dtype=None):
         if device is not None and not isinstance(device, str):
@@ -615,8 +633,14 @@ class Tensor:
         #   没开梯度模式时一律不要求梯度 ⇒ 上层算子不会建图 ⇒ no_grad 才真的省内存。
         #   原先只信调用方传的值，导致 `with T.no_grad()` 形同虚设（实测：图照样建，
         #   显存与建图模式完全相同，检查点因此两次失败）。
-        obj.requires_grad = bool(requires_grad) and _GRAD_ENABLED[0]
-        obj._parents = _parents
+        # ★ 没开梯度模式时，**连 `_parents` 都不要记录**。
+        #   只把 requires_grad 置 False 是不够的：张量仍持有输入引用，
+        #   于是"保留一个输出"就把整条输入链钉住不放。
+        #   实测：no_grad 下保留 200 个 131 KB 的输出，live 涨 279.8 MB（每个拖 ~1.4 MB 的祖先）；
+        #   局部改法（保留 1 个/对）会让 flash 反向的峰值随 seq **二次**增长（75→228→869 MiB）。
+        _grad_on = _GRAD_ENABLED[0]
+        obj.requires_grad = bool(requires_grad) and _grad_on
+        obj._parents = _parents if (_grad_on and obj.requires_grad) else ()
         obj._backward = _backward
         obj._lazy_T = None
         obj._lazy_shape = None
