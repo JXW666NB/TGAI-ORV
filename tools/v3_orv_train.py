@@ -69,6 +69,7 @@ def build(cfg, rng):
             W1=[p(d_ff, d) for _ in range(E)],
             W2=[p(d_ff, d) for _ in range(E)],
             W3=[p(d, d_ff) for _ in range(E)],
+            S1=p(d_ff, d), S2=p(d_ff, d), S3=p(d, d_ff),     # 共享专家的 FFN（对齐 PyT 的 n_shared_experts=1）
         ))
     return P
 
@@ -101,7 +102,10 @@ def main():
                     help=">0 时用分块注意力（照 PyTorch mem-efficient 的思路：不物化 S×S）")
     ap.add_argument("--flash", action="store_true",
                     help="块化在线 softmax 注意力（不物化 S×S，反向重算）")
+    ap.add_argument("--no-shared", action="store_true",
+                    help="关闭共享专家。PyT 侧是 n_shared_experts=1，默认开启以保持同构")
     a = ap.parse_args()
+    a.shared = not a.no_shared          # 默认开启（与 PyT 对齐）
 
     T.set_default_device("cuda")
     base = int(subprocess.run(["nvidia-smi", "--query-gpu=memory.used",
@@ -147,6 +151,11 @@ def main():
             #   参考实现的 router 是 `nn.Linear(d_model, n_experts)`，只有 [E, d]。
             eids, g, _s = MOE.route_top1(hn, L["router"])
             mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
+            # ★ 共享专家：参考实现是 `n_activated=1, n_shared_experts=1`，即
+            #   路由专家 top_k=1 的加权和 **再加上** 一个对所有 token 都生效的 FFN。
+            #   之前 ORV 缺这一支，导致两侧参数不等（少 25.2 M），比较不是同构的。
+            if a.shared:
+                mo = mo + V.situ_glu_orv(hn, L["S1"], L["S2"], L["S3"])
             x = h + mo.reshape(1, a.seq, a.d)
         # head 是张量（vocab,d），不是模块 ⇒ 矩阵乘，别当函数调用
         logits = V.rmsnorm_orv(x, P["ln_f"]).reshape(a.seq, a.d) @ P["head"].transpose(0, 1)

@@ -32,6 +32,8 @@ def layer_fwd(x, L, cos, sin, d_k, n_q, n_kv):
     hn = V.rmsnorm_orv(h, L["ln2"]).reshape(Tlen, d)
     eids, g, _s = MOE.route_top1(hn, L["router"])
     mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
+    if "S1" in L:                                  # 共享专家（与 PyT 的 n_shared_experts=1 对齐）
+        mo = mo + V.situ_glu_orv(hn, L["S1"], L["S2"], L["S3"])
     return h + mo.reshape(1, Tlen, d)
 
 
