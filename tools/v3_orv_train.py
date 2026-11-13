@@ -58,6 +58,9 @@ def build(cfg, rng):
         P["layers"].append(dict(
             ln1=T.tensor(np.ones(d, np.float32), requires_grad=True),
             ln2=T.tensor(np.ones(d, np.float32), requires_grad=True),
+            # router 是**独立参数**（参考实现 `nn.Linear(d_model, n_experts)`），
+            # 不能每步用 cat([W1[e]…]) 现拼（既偏架构，又多拷 E×d_ff×d 个元素）
+            router=p(E, d),
             wq=p(n_q * d_k, d), wk=p(n_kv * d_k, d), wv=p(n_kv * d_k, d), wo=p(d, n_q * d_k),
             W1=p(E, d_ff, d), W2=p(E, d_ff, d), W3=p(E, d, d_ff),
         ))
@@ -84,6 +87,8 @@ def main():
                     help="注意力查询头数；d/n_q 即 dh。dh==64 时 sdpa_lowmem 可用")
     ap.add_argument("--lowmem", action="store_true",
                     help="走不物化 P 的注意力内核（需 dh==64 + causal + CUDA）")
+    ap.add_argument("--chunk", type=int, default=0,
+                    help=">0 时用分块注意力（照 PyTorch mem-efficient 的思路：不物化 S×S）")
     a = ap.parse_args()
 
     T.set_default_device("cuda")
@@ -110,10 +115,18 @@ def main():
         t0 = time.time()
         x = P["emb"][ids].reshape(1, a.seq, a.d)          # 嵌入（整数索引）→ (1,T,d)
         for L in P["layers"]:
-            h = x + V.attention_orv(V.rmsnorm_orv(x, L["ln1"]),
-                                    L["wq"], L["wk"], L["wv"], L["wo"],
-                                    cos, sin, a.d // cfg["n_q"], cfg["n_q"], cfg["n_kv"],
-                                    lowmem=a.lowmem)
+            if a.chunk > 0:
+                from tgai_go.train import v3_attn_chunked as CH
+                attn = CH.attention_orv_chunked(V.rmsnorm_orv(x, L["ln1"]),
+                                                L["wq"], L["wk"], L["wv"], L["wo"],
+                                                cos, sin, a.d // cfg["n_q"],
+                                                cfg["n_q"], cfg["n_kv"], chunk=a.chunk)
+            else:
+                attn = V.attention_orv(V.rmsnorm_orv(x, L["ln1"]),
+                                       L["wq"], L["wk"], L["wv"], L["wo"],
+                                       cos, sin, a.d // cfg["n_q"], cfg["n_q"], cfg["n_kv"],
+                                       lowmem=a.lowmem)
+            h = x + attn
             hn3 = V.rmsnorm_orv(h, L["ln2"])
             hn = hn3.reshape(a.seq, a.d)                  # MoE 按行分派，用二维视图
             router = T.cat([L["W1"][e] for e in range(a.E)], dim=0)   # 占位：见 route_top1 注释

@@ -1,0 +1,64 @@
+# 同口径对拍：两侧都开梯度检查点（2026-11-13）
+
+> 修正上一版的关键缺陷：先前 PyTorch 侧**没有开检查点**，与 ORV 的检查点版不同口径，
+> 比出来的差异不算数。本页是修正后的第一份**真正同口径**数据。
+
+## 0. 口径拉平了什么
+
+| 项 | PyTorch | ORV |
+| --- | --- | --- |
+| 优化器 | AdamW | AdamW |
+| 梯度检查点 | `model.enable_gradient_checkpointing(True)` | 手写层级重算 |
+| 触发条件 | 必须 `forward(ids, targets=ids)`（模型内部平移）| 每层 `y.backward(g)` |
+| 规模 | d=512 / 8 层 / 8 专家 / seq=2048 / B=1 / vocab=4096 | 同 |
+| 显存指标 | `torch.cuda.max_memory_allocated()` | `pool_stats().peak_live_bytes` |
+| 预热 | 丢弃第 0 步计时 | 同 |
+
+## 1. 结果（seq = 2048）
+
+| 指标 | PyTorch | ORV | ORV / PyT |
+| --- | --- | --- | --- |
+| **峰值显存** | **4645 MiB** | **16582 MiB** | **3.6× 更费** |
+| 每步耗时（稳态）| **0.33 s** | 1.55 s | 4.7× 慢 |
+| 吞吐 | **4740 tok/s** | 868 tok/s | 0.18× |
+
+## 2. 检查点各自带来了什么（这才是关键）
+
+| 侧 | 无检查点 | 有检查点 | 变化 |
+| --- | --- | --- | --- |
+| PyTorch | 6516 MiB / 0.32 s | **4645 MiB / 0.33 s** | **−29% 显存，速度不变** |
+| ORV（我的实现）| 11979 MiB / 1.53 s | 16582 MiB / 1.55 s | +38%（**反效果**）|
+
+**PyTorch 的检查点为什么又省又不掉速**：它省的是层间激活，而它**层内的注意力本来就不物化**
+（V100 上走 mem-efficient SDPA）。两层机制叠加才有这个效果。
+
+**ORV 为什么不行**：检查点只省层间；层内 `H·S²` 的分数矩阵（S=2048、8 头 ⇒ 134 MB/层）
+照样活到反向。而我这版编排还多花了显存（16.6 GB > 基线 12.0 GB），原因尚未定位。
+
+## 3. 旁证：引擎无泄漏（已排除一个假设）
+
+单层重复 `fwd/backward` 8 次，`live_bytes` **每轮恒定 1608 MiB**，不增长 ⇒ 图能正常释放。
+同时给出：**一层（attention + MoE，S=2048）≈ 1.6 GB 活跃**；8 层不检查点 ≈ 12.8 GB，
+与实测基线 11.98 GB 吻合 ⇒ **激活是主因**，不是权重（权重+梯度+Adam ≈ 3.8 GB）。
+
+## 4. 结论
+
+**ORV 在 V3 的长序列训练上落后 3.6× 显存、4.7× 速度**，症结是注意力物化 `S²`。
+PyTorch 在 V100 上没有 flash，用的是 mem-efficient（分块、不物化）——ORV 缺的正是这个内核。
+
+优化顺序（按收益）：
+
+1. **块内 online-softmax + 反向重算的注意力**（唯一能同时省显存与时间）
+2. 修我这版检查点的编排问题（它现在比不开还费）
+3. 修完再补 CSA / top_k=2 / BlockAttnRes，把"架构差异"从结果里剔除
+
+## 5. 复现
+
+```powershell
+# PyTorch（已含检查点）
+python tools/v3_pyt_train.py --d 512 --layers 8 --E 8 --seq 2048 --steps 3
+# ORV（层级检查点）
+python tools/v3_orv_train_ckpt.py --d 512 --layers 8 --E 8 --seq 2048 --steps 3
+# ORV（无检查点，作对照）
+python tools/v3_orv_train.py --d 512 --layers 8 --E 8 --n_q 8 --seq 2048 --steps 3
+```

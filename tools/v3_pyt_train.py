@@ -51,6 +51,11 @@ def main():
                          n_experts=a.E, n_activated=1, n_shared_experts=1,
                          max_seq_len=a.seq, moe_balance="sign")
     model = M.TGAIV3Model(cfg).cuda()
+    # ★ 与 ORV 侧同口径：PyTorch 也开梯度检查点
+    #   参考实现里检查点只在 `gradient_checkpointing and training and targets is not None`
+    #   时才生效 ⇒ 必须把 targets 传进 forward，否则等于没开（我上一版就是漏了这点）
+    model.enable_gradient_checkpointing(True)
+    model.train()
     n_par = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr)
 
@@ -67,11 +72,15 @@ def main():
         ids = torch.from_numpy(ids_all[step]).cuda()[None, :]
         tgt = ids[:, 1:].contiguous()
         t0 = time.time()
-        out = model(ids)
-        logits = out[0] if isinstance(out, (tuple, list)) else out
-        loss = torch.nn.functional.cross_entropy(
-            logits[:, :-1, :].reshape(-1, logits.shape[-1]).float(),
-            tgt.reshape(-1))
+        # 模型内部自己平移 targets（传等长 ids），与 train_v3.py 的用法一致
+        out = model(ids, targets=ids)
+        if isinstance(out, (tuple, list)):
+            logits, loss = out[0], out[1]
+        else:
+            logits = out
+            loss = torch.nn.functional.cross_entropy(
+                logits[:, :-1, :].reshape(-1, logits.shape[-1]).float(),
+                tgt.reshape(-1))
         opt.zero_grad(); loss.backward(); opt.step()
         torch.cuda.synchronize()
         times.append(time.time() - t0); losses.append(float(loss.item()))
