@@ -2740,20 +2740,21 @@ class _Functional:
 
     @staticmethod
     def scaled_dot_product_attention(q, k, v, causal=False, is_causal=None,
-                                   scale=None, lowmem=False):
+                                   scale=None, lowmem=False, attn_mask=None):
         """与 torch 的 `F.scaled_dot_product_attention` 兼容的入口。
 
         两种输入都可：
           * `[B*H, S, Dh]` —— 内部展平形式（原有用法，保持不变）
           * `[B, H, S, Dh]` —— **torch 的写法**，自动展平并在返回时还原
 
-        其它参数与 `_sdpa_impl` 完全一致。
+        其它参数与 `_sdpa_impl` 完全一致。`attn_mask` 为加性掩码（0 / -inf）。
         """
         rank = len(tuple(q.shape))
         if rank != 4:
             return _Functional._sdpa_impl(q, k, v, causal=causal,
                                           is_causal=is_causal,
-                                          scale=scale, lowmem=lowmem)
+                                          scale=scale, lowmem=lowmem,
+                                          attn_mask=attn_mask)
         B, H, S, Dh = (int(q.shape[0]), int(q.shape[1]),
                         int(q.shape[2]), int(q.shape[3]))
         qf = q.reshape(B * H, S, Dh)
@@ -2763,16 +2764,19 @@ class _Functional:
                           int(v.shape[3]))
         out = _Functional._sdpa_impl(qf, kf, vf, causal=causal,
                                      is_causal=is_causal,
-                                     scale=scale, lowmem=lowmem)
+                                     scale=scale, lowmem=lowmem,
+                                     attn_mask=attn_mask)
         return out.reshape(B, H, S, Dh)
 
     @staticmethod
     def _sdpa_impl(q: Tensor, k: Tensor, v: Tensor, causal=False, is_causal=None,
-                                     scale=None, lowmem=False):
+                                     scale=None, lowmem=False, attn_mask=None):
         """q,k,v: [B*H, S, Dh]（已展平 head）。causal=True 时做下三角掩码。
 
         lowmem=True 且设备是 CUDA、dh==64、causal 时，走不物化 P 的内核。
         其它情况（含 dh!=64、非 causal、CPU）回退到下面的物化实现。默认 lowmem=False。
+
+        `attn_mask`：加性掩码；**给出时强制走物化路径**（lowmem 内核不接受掩码）。
         """
         if is_causal is not None:
             causal = bool(is_causal)
@@ -2781,9 +2785,9 @@ class _Functional:
             scale = 1.0 / np.sqrt(dh)
         else:
             scale = float(scale)
-        if lowmem and _sdpa_lowmem_ok(q, k, v, causal, dh):
+        if attn_mask is None and lowmem and _sdpa_lowmem_ok(q, k, v, causal, dh):
             return _sdpa_lowmem(q, k, v, scale)
-        return _sdpa_materialized(q, k, v, causal, scale)
+        return _sdpa_materialized(q, k, v, causal, scale, attn_mask=attn_mask)
 
     @staticmethod
     def sdpa_lowmem(q: Tensor, k: Tensor, v: Tensor, causal=True, scale=None):
@@ -3131,8 +3135,12 @@ def _softmax_causal_cuda(x):
     return out
 
 
-def _sdpa_materialized(q, k, v, causal, scale):
-    """物化 scores/P 的 SDPA。默认路径，也是 lowmem 不合格时的回退。"""
+def _sdpa_materialized(q, k, v, causal, scale, attn_mask=None):
+    """物化 scores/P 的 SDPA。默认路径，也是 lowmem 不合格时的回退。
+
+    `attn_mask`：**加性**掩码（0 可见 / -inf 不可见），形状可广播到 `[BH, S, S]`。
+    打包训练必须用它：块对角掩码让不同文档互不可见（详见 `v3_masks`）。
+    """
     # ★ 转置乘走 cuBLAS 的 op=T，省掉 k 的一次真拷贝（旧写法 q @ k.swap_last2()）
     if (getattr(q, "device", "cpu") == "cuda" and q.ndim == 3
             and tuple(q.shape) == tuple(k.shape)):
@@ -3149,6 +3157,10 @@ def _sdpa_materialized(q, k, v, causal, scale):
     else:
         if causal:
             scores = scores + _causal_mask(scores.shape[-1], scores.device)
+        if attn_mask is not None:
+            # ★ 加性掩码：与因果掩码**叠加**（两者都可能出现）。
+            #   打包训练用它实现块对角（不同文档互不可见）。
+            scores = scores + attn_mask
         p = _Functional.softmax(scores, axis=-1)
     return p @ v
 

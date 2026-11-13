@@ -334,15 +334,17 @@ def csa_conv_causal(x, w):
 # GlobalAttention 的 ORV 张量实现
 # ═══════════════════════════════════════════════════════════
 
-def attention_orv(x, wq, wk, wv, wo, cos, sin, rot_dim, n_q, n_kv, causal=True):
-    """GlobalAttention 的 ORV 张量版（训练路径，`seg_mask` 暂不支持）。
+def attention_orv(x, wq, wk, wv, wo, cos, sin, rot_dim, n_q, n_kv, causal=True,
+                  attn_mask=None):
+    """GlobalAttention 的 ORV 张量版（训练路径）。
 
     形状约定：`x` `(B,T,d_model)`；权重 `(out,in)`；`cos/sin` `(T, rot_dim)`。
     内部走 ORV 的 `scaled_dot_product_attention`，它接受 torch 风格的 `[B,H,S,Dh]`
     并自动展平（见 `train/__init__.py::_Functional.scaled_dot_product_attention`）。
 
-    ★ 目前只支持 `causal=True/False`：ORV 的 SDPA 没有加性掩码入口，
-      打包训练需要的块对角 `seg_mask` 要另行扩展（下一步）。
+    `attn_mask`：**加性**掩码，形状 `(B,1,T,T)`（0 可见 / -inf 不可见），
+    由 `v3_masks.seg_additive` 造出来（已含因果）。给出时 `causal` 应传 False，
+    否则因果会被叠加两次（结果仍等价，但多一次无用计算）。
     """
     B = int(x.shape[0])
     # ★ 不能把局部变量叫 `T`：那会遮蔽模块别名 `T`（= tgai_go.train），后面 `T.cat` 就会炸
@@ -366,6 +368,16 @@ def attention_orv(x, wq, wk, wv, wo, cos, sin, rot_dim, n_q, n_kv, causal=True):
         k = T.cat([k[:, h:h + 1] for h in range(n_kv) for _ in range(rep)], dim=1)
         v = T.cat([v[:, h:h + 1] for h in range(n_kv) for _ in range(rep)], dim=1)
 
-    out = T.functional.scaled_dot_product_attention(q, k, v, causal=causal)
+    if attn_mask is not None:
+        # SDPA 内部把 q 展平成 [B*H, S, S] 的分数，掩码也必须跟着变成同样的 batch 维：
+        # (B,1,T,T) → (B,H,T,T) → (B*H,T,T)。ORV 没有 expand，用 cat 复制 H 份。
+        am = attn_mask
+        if am.shape[1] == 1 and n_q > 1:
+            am = T.cat([am] * n_q, dim=1)
+        am = am.reshape(B * n_q, int(am.shape[2]), int(am.shape[3]))
+        out = T.functional.scaled_dot_product_attention(q, k, v, causal=causal,
+                                                        attn_mask=am)
+    else:
+        out = T.functional.scaled_dot_product_attention(q, k, v, causal=causal)
     out = out.transpose(1, 2).reshape(B, Tlen, n_q * d_k)
     return out @ wo.transpose(0, 1)
