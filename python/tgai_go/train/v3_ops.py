@@ -63,3 +63,63 @@ def situ_glu_numpy(x, w1, w2, w3, beta1=4.0, beta2=25.0):
     gate = (beta1 * np.tanh(g / beta1)) * (1.0 / (1.0 + np.exp(-g)))
     up = beta2 * np.tanh(u / beta2)
     return (gate * up) @ w3.T
+
+
+# ═══════════════════════════════════════════════════════════
+# V3 RoPE（支持 **partial rotary**）
+# ═══════════════════════════════════════════════════════════
+
+def rotate_half_perm(rot_dim):
+    """构造"交错取反"的置换矩阵 `P`，使 `rotate_half(x) = x @ P`。
+
+    参考实现（`model_v3.py::RotaryPositionEmbedding._rotate_half`）：
+        (x1,x2,x3,x4) → (-x2,x1,-x4,x3)
+    交错语义 ⇒ 偶数位取负的奇数位、奇数位取偶数位：
+        out[2k]   = -x[2k+1]   ⇒ P[2k+1, 2k]   = -1
+        out[2k+1] =  x[2k]     ⇒ P[2k,   2k+1] =  1
+
+    用矩阵乘而不是原地切片赋值，因为 ORV 的张量不支持"对切片原地写"。
+    """
+    rd = int(rot_dim)
+    if rd % 2:
+        raise ValueError("rot_dim 必须是偶数，收到 %d。修法：partial 旋转的维数取偶数" % rd)
+    P = np.zeros((rd, rd), dtype=np.float32)
+    for k in range(rd // 2):
+        P[2 * k + 1, 2 * k] = -1.0
+        P[2 * k, 2 * k + 1] = 1.0
+    return P
+
+
+def rope_cos_sin(seq_len, rot_dim, theta, scaling=1.0):
+    """生成 `(seq_len, rot_dim)` 的 cos/sin 表（与参考实现同式）。
+
+    参考：`freqs = 1/(theta**(arange(0,rot_dim,2)/rot_dim))`，
+    `emb = outer(pos, freqs).repeat_interleave(2, dim=-1)`。
+    **注意分母是 rot_dim**（不是 dim），partial 旋转时这一点很关键。
+    """
+    rd = int(rot_dim)
+    j = np.arange(0, rd, 2, dtype=np.float32) / float(rd)
+    freqs = 1.0 / (float(theta) ** j)
+    pos = np.arange(int(seq_len), dtype=np.float32) / float(scaling)
+    emb = np.outer(pos, freqs).repeat(2, axis=1)          # (L, rd)
+    return np.cos(emb).astype(np.float32), np.sin(emb).astype(np.float32)
+
+
+def v3_rope(x, cos, sin, permit=None):
+    """对 `x`（形状 (..., rot_dim)）做交错 RoPE：`x*cos + rotate_half(x)*sin`。
+
+    `permit` 是 `rotate_half_perm(x.shape[-1])`，可由调用方缓存复用。
+    """
+    rd = int(x.shape[-1])
+    P = permit if permit is not None else rotate_half_perm(rd)
+    P = T.tensor(np.ascontiguousarray(P, np.float32))
+    return x * cos + (x @ P) * sin
+
+
+def v3_rope_numpy(x, cos, sin):
+    """同一公式的 numpy 版（交错 rotate_half），作为对拍基准。"""
+    rd = x.shape[-1]
+    rh = np.empty_like(x)
+    rh[..., ::2] = -x[..., 1::2]
+    rh[..., 1::2] = x[..., ::2]
+    return x * cos + rh * sin
