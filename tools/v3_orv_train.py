@@ -89,6 +89,8 @@ def main():
                     help="走不物化 P 的注意力内核（需 dh==64 + causal + CUDA）")
     ap.add_argument("--chunk", type=int, default=0,
                     help=">0 时用分块注意力（照 PyTorch mem-efficient 的思路：不物化 S×S）")
+    ap.add_argument("--flash", action="store_true",
+                    help="块化在线 softmax 注意力（不物化 S×S，反向重算）")
     a = ap.parse_args()
 
     T.set_default_device("cuda")
@@ -125,7 +127,7 @@ def main():
                 attn = V.attention_orv(V.rmsnorm_orv(x, L["ln1"]),
                                        L["wq"], L["wk"], L["wv"], L["wo"],
                                        cos, sin, a.d // cfg["n_q"], cfg["n_q"], cfg["n_kv"],
-                                       lowmem=a.lowmem)
+                                       lowmem=a.lowmem, flash=a.flash)
             h = x + attn
             hn3 = V.rmsnorm_orv(h, L["ln2"])
             hn = hn3.reshape(a.seq, a.d)                  # MoE 按行分派，用二维视图

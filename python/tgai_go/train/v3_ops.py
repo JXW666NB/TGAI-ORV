@@ -339,7 +339,7 @@ def csa_conv_causal(x, w):
 # ═══════════════════════════════════════════════════════════
 
 def attention_orv(x, wq, wk, wv, wo, cos, sin, rot_dim, n_q, n_kv, causal=True,
-                  attn_mask=None, lowmem=False):
+                  attn_mask=None, lowmem=False, flash=False):
 
     """GlobalAttention 的 ORV 张量版（训练路径）。
 
@@ -382,6 +382,12 @@ def attention_orv(x, wq, wk, wv, wo, cos, sin, rot_dim, n_q, n_kv, causal=True,
         am = am.reshape(B * n_q, int(am.shape[2]), int(am.shape[3]))
         out = T.functional.scaled_dot_product_attention(q, k, v, causal=causal,
                                                         attn_mask=am)
+    elif flash:
+        # 块化在线 softmax：不物化 S×S，反向重算（数值已验 1e-9~1e-8）
+        from tgai_go.train import v3_flash_op as _FO
+        o = _FO.flash_attn(q, k, v, causal=causal)
+        out = o.transpose(1, 2).reshape(B, Tlen, n_q * d_k) @ wo.transpose(0, 1)
+        return out
     elif lowmem:
         # ★ 不物化 P 的内核：需要 dh==64 + causal + CUDA（见 _sdpa_lowmem_ok）。
         #   长序列下这是显存的决定因素 —— 物化路径要存 B*H*S*S 的分数矩阵。
