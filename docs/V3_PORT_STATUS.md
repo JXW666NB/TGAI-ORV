@@ -75,15 +75,19 @@ ORV 0.688 s/步、峰值 14,666 MiB vs PyTorch 0.923 s/步、14,815 MiB —— �
 
 ### 6.1 给 ORV 加 `scatter_add` 张量实现
 
+> **2026-11-13 末次更新（缩小工作量）**：运行时里**已有内核**，不必从零写：
+>
+> * `train/cuda.py::scatter_add_rows(g, idx, n_src_rows, row_size, n_rows)` —— 按行累加；
+> * `train/cuda.py::scatter_add_flat(g, idx, n_src, n)` —— 扁平版；
+> * `train/cuda.py::gather_rows(src, idx, n_src_rows, row_size, n_rows)` —— 取行（前向已可用）；
+> * `train/cuda.py::emb_bwd(...)` —— 嵌入反向后向，就是"scatter 到词表"的特例。
+>
+> ⇒ 剩下的是 **Tensor 层包装 + autograd 接线**（估 ~20 行），不是新内核。
+> 接线写法可参照 `train/__init__.py::_sdpa_lowmem` 里
+> `Tensor._from_gpu(..., _parents=(...))` 加自定义 VJP 的既有模式。
+
 **判定基准已就绪**：`python/tgai_go/train/v3_ops.py::scatter_add_numpy` /
 `scatter_add_backward_numpy`，四条断言在 `tests/test_v3_scatter_add.py`。
-
-要做的：
-
-* 前向：`out = zeros(n_rows, d); out[ids] += values`——CUDA 上可用 `cuMemcpy + kernel`，
-  CPU 上先走 numpy（`np.add.at`）；
-* 反向：`values.grad = out.grad[ids]`（**就是已有的取行**，不需要新内核）；
-* 接入 autograd：参照 `train/__init__.py::_sdpa_lowmem` 里 `Tensor._from_gpu(..., _parents=...)` 的写法。
 
 **验收**：上表四条断言全过 + 数值梯度对拍（`(f(x+ε)-f(x-ε))/2ε` 与反向一致）。
 
