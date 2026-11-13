@@ -437,7 +437,12 @@ def situ_glu_orv(x, w1, w2, w3, beta1=4.0, beta2=25.0):
     """
     g = x @ w1.transpose(0, 1)
     u = x @ w2.transpose(0, 1)
-    gate = (_tanh(g * (1.0 / beta1)) * beta1) * _sigmoid(g)
+    # ★ 代数合并（与逐式等价，少一个 (N,d_ff) 临时量）：
+    #   (tg·β₁)·sigmoid(g) = (tg·β₁)·(0.5·sg+0.5) = (tg·(sg+1))·(β₁/2)
+    #   其中 tg = tanh(g/β₁)、sg = tanh(g/2)。每个 (N,d_ff) 临时量在多专家多层下会累积成 GB 级。
+    tg = _tanh(g * (1.0 / beta1))
+    sg = _tanh(g * 0.5)
+    gate = (tg * (sg + 1.0)) * (0.5 * beta1)
     up = _tanh(u * (1.0 / beta2)) * beta2
     return (gate * up) @ w3.transpose(0, 1)
 
