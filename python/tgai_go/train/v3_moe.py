@@ -190,7 +190,8 @@ def moe_dispatch_orv(x, eids_np, gate, W1, W2, W3, beta1=4.0, beta2=25.0):
     #   实测这一段 fwd+bwd 要 **25 ms**（整个分派 62 ms 里最大的一块）。
     from tgai_go.train import indexing as _idx
     xs = _idx.index_select(x, 0, order)
-    g_sorted = _idx.index_select(gate, 0, order)
+    # gate 是 1-D 且实测只值 0 ms，仍用原来的索引（设备 gather 对 1-D 的反向形状会出问题）
+    g_sorted = gate[order]
 
     # 专家权重可以是三维张量（W1[e] 会拷贝）或**列表**（不拷贝，推荐）。
     E = len(W1) if isinstance(W1, (list, tuple)) else int(W1.shape[0])
