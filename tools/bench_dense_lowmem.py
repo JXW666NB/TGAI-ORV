@@ -42,6 +42,11 @@ def bench_torch(iters=3, ckpt=True):
     import torch.nn.functional as F
 
     torch.manual_seed(0)
+    if os.environ.get("TORCHMATH", "0") == "1":
+        # 强制 torch 用 math 后端（物化注意力），与 ORV 的物化档同算法
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
     dev = "cuda"
     W = {}
     def p(*shape):
