@@ -1830,6 +1830,84 @@ extern "C" __global__ void gather_flat(
     dst[i] = __ldg(src + idx[i]);
 }
 
+/* ---- MoE 设备侧 permute / unpermute（免排序、免主机往返）-----------------
+ * 为什么需要：路由把专家下标拷回主机（`route_topk` 的 to_numpy）会同步，
+ *   **捕获期间不允许同步**，于是整步无法被 CUDA Graph 捕获（实测
+ *   rc=900 operation not permitted when stream is capturing）。
+ * 做法：每个专家预留固定 C 行（capacity），用 atomicAdd 领号写进槽位；
+ *   空槽 rowid = -1。全程只用设备数据，主机侧只提供 E/C/d 这些标量。
+ * 约束：调用方先把 counts 清零、xp/gp/rowid 分配好（xp 内容不要求清零，空槽靠 rowid 屏蔽）。
+ * rowid 里存的是 (row, slot) 的扁平号 row*k+slot，反向靠它还原。 */
+
+extern "C" __global__ void moe_permute(
+    const long long* __restrict__ eids, const float* __restrict__ x,
+    const float* __restrict__ gate, int* __restrict__ counts,
+    float* __restrict__ xp, float* __restrict__ gp, int* __restrict__ rowid,
+    int n_rows, int k, int d, int E, int C) {
+    long long pair = (long long)blockIdx.x;
+    long long total_pairs = (long long)n_rows * (long long)k;
+    if (pair >= total_pairs) return;
+    long long e = eids[pair];
+    if (e < 0 || e >= (long long)E) return;
+    int row = (int)(pair / k);
+    __shared__ int s_slot;
+    if (threadIdx.x == 0) {
+        int pos = atomicAdd(&counts[e], 1);
+        if (pos < C) {
+            int dst = (int)e * C + pos;
+            s_slot = dst;
+            rowid[dst] = (int)pair;
+            gp[dst] = gate[pair];
+        } else {
+            s_slot = -1;          /* 超出容量：丢弃（训练里容量按 1.5x 均值取，丢的很少） */
+        }
+    }
+    __syncthreads();
+    int dst = s_slot;
+    if (dst < 0) return;
+    for (int c = (int)threadIdx.x; c < d; c += (int)blockDim.x) {
+        xp[(long long)dst * d + c] = x[(long long)row * d + c];
+    }
+}
+
+extern "C" __global__ void moe_unpermute(
+    const float* __restrict__ yp, const int* __restrict__ rowid,
+    float* __restrict__ out, int d, int EC) {
+    int r = (int)blockIdx.x;
+    if (r >= EC) return;
+    int dst = rowid[r];
+    if (dst < 0) return;
+    for (int c = (int)threadIdx.x; c < d; c += (int)blockDim.x) {
+        out[(long long)dst * d + c] = yp[(long long)r * d + c];
+    }
+}
+
+/* 反向：dx 用 atomicAdd（同一 row 的两个 slot 会撞），dgate 每槽一个 warp 归约。 */
+extern "C" __global__ void moe_permute_bwd(
+    const float* __restrict__ dyp, const float* __restrict__ x,
+    const int* __restrict__ rowid, float* __restrict__ dx, float* __restrict__ dgate,
+    int d, int k, int EC) {
+    int r = (int)blockIdx.x;
+    if (r >= EC) return;
+    int dst = rowid[r];
+    if (dst < 0) return;
+    int row = dst / k;
+    float acc = 0.f;
+    for (int c = (int)threadIdx.x; c < d; c += (int)blockDim.x) {
+        float dy = dyp[(long long)r * d + c];
+        acc += dy * x[(long long)row * d + c];
+        atomicAdd(&dx[(long long)row * d + c], dy);
+    }
+    __shared__ float sbuf[256];
+    sbuf[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = ((int)blockDim.x) >> 1; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sbuf[threadIdx.x] += sbuf[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) dgate[dst] = sbuf[0];
+}
+
 extern "C" __global__ void scatter_add_flat(
     const float* __restrict__ g, const int* __restrict__ idx, float* __restrict__ out, int n) {
     int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
@@ -4470,6 +4548,36 @@ class CudaRuntime:
                 self._ptr(src), self._ptr(idx), self._ptr(out),
                 (n_rows, ctypes.c_int), (row_size, ctypes.c_int)])
         return out
+
+    def moe_permute(self, eids, x, gate, counts, xp, gp, rowid,
+                    n_rows, k, d, E, C):
+        """按专家把 (row, slot) 对写进容量 C 的槽位（设备侧，见 moe_permute 内核）。"""
+        total = int(n_rows) * int(k)
+        if total <= 0:
+            return
+        self.launch("moe_permute", (int(total), 1, 1), (256, 1, 1), [
+            self._ptr(eids), self._ptr(x), self._ptr(gate), self._ptr(counts),
+            self._ptr(xp), self._ptr(gp), self._ptr(rowid),
+            (int(n_rows), ctypes.c_int), (int(k), ctypes.c_int),
+            (int(d), ctypes.c_int), (int(E), ctypes.c_int),
+            (int(C), ctypes.c_int)])
+
+    def moe_unpermute(self, yp, rowid, out, d, EC):
+        """把槽位输出写回原 (row, slot) 位置（每槽唯一，无需原子）。"""
+        if int(EC) <= 0:
+            return
+        self.launch("moe_unpermute", (int(EC), 1, 1), (256, 1, 1), [
+            self._ptr(yp), self._ptr(rowid), self._ptr(out),
+            (int(d), ctypes.c_int), (int(EC), ctypes.c_int)])
+
+    def moe_permute_bwd(self, dyp, x, rowid, dx, dgate, d, k, EC):
+        """permute 的反向：dx 用原子加（同 row 的两个 slot 会撞），dgate 每槽归约。"""
+        if int(EC) <= 0:
+            return
+        self.launch("moe_permute_bwd", (int(EC), 1, 1), (256, 1, 1), [
+            self._ptr(dyp), self._ptr(x), self._ptr(rowid), self._ptr(dx),
+            self._ptr(dgate),
+            (int(d), ctypes.c_int), (int(k), ctypes.c_int), (int(EC), ctypes.c_int)])
 
     def scatter_add_rows(self, g, idx, n_src_rows, row_size, n_rows):
         """行 gather 的反向：先清零 [n_src_rows, row_size]，再把 g 的行按 idx atomicAdd 回去。"""
