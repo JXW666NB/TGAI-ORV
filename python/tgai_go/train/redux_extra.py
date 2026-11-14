@@ -44,12 +44,48 @@ def _norm_axis(axis, ndim):
     return ax
 
 
+def _rowwise_max_cuda(x, keepdims):
+    """末维 max：走引擎内核（一块一行 + warp 归约），不再 D2H + one-hot mask。
+
+    语义与 `_masked_reduce` 逐位等价（并列取第一个），但每次调用从
+    "1 次强制同步 + 全量 D2H + 全量 H2D" 变成 "1 次内核发射"。
+    块化注意力每对块要调 2 次，这条是它慢以及 CUDA Graph 无法捕获的根因。
+    """
+    rt = _cuda()
+    shape = tuple(int(s) for s in x.shape)
+    k = shape[-1]
+    nrows = int(x.numel()) // k if k else 0
+    val, idx = rt.rowwise_max(x._gpu)
+    out_shape = shape[:-1] + ((1,) if keepdims else ())
+    val_buf = rt.reshape(val, out_shape) if int(np.prod(out_shape)) == nrows else val
+    need = bool(x.requires_grad)
+    out = Tensor._from_gpu(val_buf, requires_grad=need, _parents=(x,) if need else ())
+    if not need:
+        return out
+
+    def bw(g, grads):
+        gflat = rt.reshape(g, (nrows,))
+        dx = rt.rowwise_max_bwd(gflat, idx, x.shape)
+        _acc_local(grads, x, dx)
+
+    out._backward = bw
+    return out
+
+
+def _acc_local(grads, node, g):
+    from . import _acc as _real_acc
+    _real_acc(grads, node, g)
+
+
 def _masked_reduce(self, axis, keepdims, pick):
     """用 one-hot mask 实现 max/min，使梯度只落到被选中的位置。"""
     self = _as_tensor(self)
-    xn = _host_values(self)
     shape = tuple(int(s) for s in self.shape)
     ax = _norm_axis(axis, len(shape))
+    if (getattr(self, "device", "cpu") == "cuda" and pick is np.argmax
+            and ax is not None and ax == len(shape) - 1 and len(shape) >= 2):
+        return _rowwise_max_cuda(self, keepdims)
+    xn = _host_values(self)
     mask = np.zeros_like(xn)
     if ax is None:
         flat = int(pick(xn))

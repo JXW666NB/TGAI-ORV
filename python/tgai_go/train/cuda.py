@@ -2077,6 +2077,61 @@ __device__ __forceinline__ float _warp_sum_f(float v) {
     return v;
 }
 
+/* ── 行内 max / argmax（一块一行，warp 归约）───────────────────────────
+ * 为什么要有它：`Tensor.max` 原先用 to_numpy() 取 argmax，再回传 one-hot mask，
+ * 每次调用 = **1 次强制同步 + 全量 D2H + 全量 H2D**。块化注意力每对块要调 2 次，
+ * S=2048 时一层几十次同步 —— 这是块化路径慢、也是 CUDA Graph 无法捕获的根因。
+ * 语义严格对齐 numpy：**并列时取第一个**（下标最小）。
+ */
+extern "C" __global__ void rowwise_max(const float* __restrict__ x, float* out, float* idx,
+                                       int rows, int k) {
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    int r = (int)blockIdx.x;
+    if (r >= rows || k <= 0) return;
+    const float* row = x + (long long)r * k;
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    const int nw = (nt + 31) >> 5;
+
+    float bv = -3.402823466e+38F;
+    int bi = 0;
+    for (int j = tid; j < k; j += nt) {
+        float v = row[j];
+        if (v > bv) { bv = v; bi = j; }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down_sync(0xffffffffu, bv, off);
+        int oi = __shfl_down_sync(0xffffffffu, bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    if ((tid & 31) == 0) { sv[tid >> 5] = bv; si[tid >> 5] = bi; }
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < nw) ? sv[tid] : -3.402823466e+38F;
+        int j = (tid < nw) ? si[tid] : 0;
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_down_sync(0xffffffffu, v, off);
+            int oi = __shfl_down_sync(0xffffffffu, j, off);
+            if (ov > v || (ov == v && oi < j)) { v = ov; j = oi; }
+        }
+        if (tid == 0) { out[r] = v; idx[r] = (float)j; }
+    }
+}
+
+/* 反向：梯度只落到 argmax 位置（与 one-hot mask 的前向语义逐位等价）。 */
+extern "C" __global__ void rowwise_max_bwd(const float* __restrict__ g, const float* __restrict__ idx,
+                                           float* dx, int rows, int k) {
+    int r = (int)blockIdx.x;
+    if (r >= rows || k <= 0) return;
+    float* row = dx + (long long)r * k;
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    for (int j = tid; j < k; j += nt) row[j] = 0.f;
+    __syncthreads();
+    if (tid == 0) row[(int)idx[r]] = g[r];
+}
+
 /* 因果掩码 + softmax，原地写 s。
  *
  * ★ 2026-11-13 重写：原版**每行一个线程、串行扫 k**，并行度差，
@@ -6405,6 +6460,31 @@ class CudaRuntime:
                     self._ptr(x), self._ptr(y), (n, ctypes.c_int),
                 ])
         return x
+
+    def rowwise_max(self, x):
+        """沿最后一维取 max 与 argmax。x 可任意维，末维为 k；返回 (值, 下标) 都是 float32。"""
+        k = int(x.shape[-1])
+        rows = int(x.n) // k if k else 0
+        val = self.empty((rows,) if rows else x.shape, dtype=np.float32)
+        idx = self.empty((rows,) if rows else x.shape, dtype=np.float32)
+        if rows > 0 and k > 0:
+            self.launch("rowwise_max", (rows, 1, 1), (256, 1, 1), [
+                self._ptr(x), self._ptr(val), self._ptr(idx),
+                (rows, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        return val, idx
+
+    def rowwise_max_bwd(self, g, idx, shape):
+        """把 g 散射回 argmax 位置，其余为 0；shape 与正向输入一致。"""
+        k = int(shape[-1])
+        rows = int(np.prod(shape[:-1])) if len(shape) > 1 else 1
+        dx = self.empty(shape, dtype=np.float32)
+        if rows > 0 and k > 0:
+            self.launch("rowwise_max_bwd", (rows, 1, 1), (256, 1, 1), [
+                self._ptr(g), self._ptr(idx), self._ptr(dx),
+                (rows, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        return dx
 
     def attn_mask_softmax_(self, s, causal=True, want_lse=False):
         """原地 causal-mask + softmax。s 是 [rows, k] 行主序；返回 (s, lse|None)。"""
