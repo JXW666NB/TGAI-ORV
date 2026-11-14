@@ -29,7 +29,7 @@ def main():
         tot = (time.perf_counter() - t0) / reps          # 含执行
         print("%-22s 入队 %.1f us   入队+执行 %.1f us" % (label, enq * 1e6, tot * 1e6))
 
-    bench("空内核(ewise_add n=4096)", lambda: rt.ewise_add(a, b, c))
+    bench("空内核(add_ n=4096)", lambda: rt.add_(a, b))
     bench("小 GEMM 128x128x128",
           lambda: rt._sgemm(0, 0, 128, 128, 128, a.ptr, 128, b.ptr, 128, c.ptr, 128))
     return 0
