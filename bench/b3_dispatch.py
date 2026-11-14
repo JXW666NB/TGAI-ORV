@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""b3：MoE 分派逐相位基准（真实 GPU 时间），前向与反向分别量。
+"""b3：MoE 分派逐相位基准（真实 GPU 流时间）。
 
-相位：gather → 按专家 gather → 8 专家 FFN → cat → scatter → （反向）。
-判据：把相位时间与理论最小值（FLOPs/带宽）比；差距以数量级计的相位就是病灶。
+每个相位先打印名字再执行，且单独捕获异常 —— 一次运行就能看清在哪一段炸/慢。
 """
 import sys
+import traceback
 
 import numpy as np
 
@@ -34,27 +34,27 @@ def main():
     counts = np.bincount(e_flat, minlength=E)
     bounds = np.cumsum(counts)
     tok = np.repeat(np.arange(N), K)
+    print("counts =", counts.tolist(), flush=True)
 
     x = T.tensor(rnd(N, d, seed=1))
     gate = T.tensor(rng.uniform(0.1, 1.0, (N * K,)).astype(np.float32))
-    x_rows = IDX.index_select(x, 0, tok) if hasattr(IDX, "index_select") else x[tok]
-    xs = IDX.index_select(x_rows, 0, order)
-    g_sorted = gate[order]
-
     rows_bytes = N * K * d * 4
 
-    print("=== 前向相位（真实 GPU 时间）===")
-    tm.report("① x[tok] 展开", lambda: x[tok], bytes_moved=rows_bytes)
-    tm.report("② index_select 按专家", lambda: IDX.index_select(x_rows, 0, order),
-              bytes_moved=rows_bytes)
+    def safe(label, fn, **kw):
+        print("→ " + label, flush=True)
+        try:
+            return tm.report(label, fn, **kw)
+        except Exception:
+            traceback.print_exc()
+            return None
 
-    parts = []
-    start = 0
-    for e in range(E):
-        end = int(bounds[e])
-        if end > start:
-            parts.append(V.situ_glu_orv(xs[start:end], W1[e], W2[e], W3[e]))
-        start = end
+    safe("① x[tok] 展开", lambda: x[tok], bytes_moved=rows_bytes)
+
+    x_rows = T.tensor(rnd(N * K, d, seed=2))
+    safe("② index_select 按专家", lambda: IDX.index_select(x_rows, 0, order),
+         bytes_moved=rows_bytes)
+    xs = IDX.index_select(x_rows, 0, order)
+    g_sorted = gate[order]
 
     def experts():
         out = []
@@ -66,14 +66,13 @@ def main():
             st = en
         return out
     flops_experts = 2 * N * K * d * d_ff * 3
-    tm.report("③ 8 专家 FFN", experts, flops=flops_experts)
+    safe("③ 8 专家 FFN", experts, flops=flops_experts)
 
-    tm.report("④ cat 8 份", lambda: T.cat(parts, dim=0), bytes_moved=rows_bytes)
+    parts = experts()
+    safe("④ cat 8 份", lambda: T.cat(parts, dim=0), bytes_moved=rows_bytes)
     ys = T.cat(parts, dim=0)
-    tm.report("⑤ scatter_add 散回", lambda: S.scatter_add(
+    safe("⑤ scatter_add 散回", lambda: S.scatter_add(
         ys * g_sorted.reshape(-1, 1), order, N * K), bytes_moved=rows_bytes)
-
-    print("=== 整条前向（串起来）===")
 
     def full_fwd():
         xr = x[tok]
@@ -88,7 +87,7 @@ def main():
             st = en
         y2 = T.cat(ps, dim=0)
         return S.scatter_add(y2 * gs2.reshape(-1, 1), order, N * K)
-    tm.report("整条分派 前向", full_fwd, flops=flops_experts, reps=10)
+    safe("⑥ 整条分派 前向", full_fwd, flops=flops_experts, reps=10)
     return 0
 
 
