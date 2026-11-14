@@ -29,7 +29,10 @@ def main():
     fn = rt.cublas.cublasSgemmGroupedBatched
     fn.restype = ctypes.c_int
     handle = rt.handle
-    print("handle=%r" % (handle,))
+    rt.h2d(np.zeros(4, np.float32))
+    rt.sync()                      # 触发惰性初始化，确保 handle 已创建
+    handle = rt.handle
+    print("handle=%r type=%s" % (handle, type(handle)))
 
     M = N = K = 32
     g = 2
