@@ -139,6 +139,9 @@ def moe_topk_orv(x, eids, gates, W1, W2, W3, beta1=4.0, beta2=25.0,
     `merged=False` 保留旧的逐槽路径，用于对拍与回退。
     """
     N, k = int(eids.shape[0]), int(eids.shape[1])
+    import os as _os
+    if _os.environ.get("TG_MOE_MERGED", "").strip().lower() in ("0", "false", "off"):
+        merged = False
     if k == 1 or not merged:
         out = None
         for slot in range(k):
