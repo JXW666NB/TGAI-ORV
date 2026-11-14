@@ -509,7 +509,7 @@ extern "C" __global__ void attn_fwd_stats(const float* __restrict__ Q, const flo
 // = 69632 bytes. Q/dO stride 72 cuts the dK/dV smem bank conflicts.
 // ---------------------------------------------------------------------------
 
-#define QSTR (DH + 8)
+#define QSTR (BT + 4)   // 实验：CUTLASS 式 padding（BT+4），原为 DH+8=72
 
 __device__ __forceinline__ void load_T72(const float* __restrict__ src, float* __restrict__ dst,
                                          int tok0, int h, int nh, int dh, int tid, int seq) {
