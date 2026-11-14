@@ -73,6 +73,9 @@ def main():
             print("一步总计 %.3f s（各部件 8 层累计）" % total)
             for k in sorted(acc, key=lambda z: -acc[z]):
                 print("  %-10s %.3f s  %4.1f%%" % (k, acc[k], 100 * acc[k] / total))
+            g = rt.graph_stats() if hasattr(rt, "graph_stats") else {}
+            print("累计内核发射 %s 次，cuBLAS 调用 %s 次"
+                  % (g.get("kernel_launches", "?"), g.get("blas_launches", "?")))
     return 0
 
 
