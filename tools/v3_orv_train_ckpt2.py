@@ -220,7 +220,7 @@ def main():
             # ★ 若图里有引用环（tensor → _backward 闭包 → tensor），`del` 不会立即释放，
             #   需要 gc.collect()。但**每层都 gc 很贵**（Python 大堆一次约 20–40 ms，
             #   8 层就 0.2–0.3 s/步）。改成每 4 层一次：残留最多累积 4 层，显存可控。
-            if i % 4 == 0:
+            if i % int(os.environ.get("TGAI_GC_EVERY", "4")) == 0:
                 gc.collect()
             rt.empty_cache()
             if os.environ.get("TGAI_CKPT_VERBOSE"):
