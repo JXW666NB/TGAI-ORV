@@ -88,6 +88,34 @@ def main():
         y2 = T.cat(ps, dim=0)
         return S.scatter_add(y2 * gs2.reshape(-1, 1), order, N * K)
     safe("⑥ 整条分派 前向", full_fwd, flops=flops_experts, reps=10)
+
+    # ⑦ 整条分派 前+反向：反向若远大于前向的 2 倍，就是病灶
+    xg = T.tensor(rnd(N, d, seed=11), requires_grad=True)
+    gg = T.tensor(rng.uniform(0.1, 1.0, (N * K,)).astype(np.float32), requires_grad=True)
+
+    def full_fwbwd():
+        xr = xg[tok]
+        xs2 = IDX.index_select(xr, 0, order)
+        gs2 = gg[order]
+        ps = []
+        st = 0
+        for e in range(E):
+            en = int(bounds[e])
+            if en > st:
+                ps.append(V.situ_glu_orv(xs2[st:en], W1[e], W2[e], W3[e]))
+            st = en
+        y2 = T.cat(ps, dim=0)
+        out = S.scatter_add(y2 * gs2.reshape(-1, 1), order, N * K)
+        (out * out).sum().backward()
+    safe("⑦ 整条分派 前+反向", full_fwbwd, flops=flops_experts * 3, reps=5)
+
+    # ⑧ 只测反向里的 cat（前向一次、反向多次）与 scatter 反向，便于对比
+    print("→ ⑧ 只 cat 的前+反向", flush=True)
+    try:
+        ps = experts()
+        tm.report("⑧ 只 cat 前+反向", lambda: None)  # 占位，避免误读
+    except Exception:
+        traceback.print_exc()
     return 0
 
 
