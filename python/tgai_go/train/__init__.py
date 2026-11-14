@@ -4744,6 +4744,18 @@ class MoE(Module):
         if grouped is not None:
             return grouped
         acc = None
+        # ★ 2026-11-15 实测定位（插件级的分配插桩，见 tools/probe_alloc_sites.py）：
+        #   这里原先对**每个专家**都 `_moe_scatter_rows_cuda(...)` 出一块完整的 (n,d)
+        #   再 `acc = acc + part` —— 36 个专家就是 36 次整块分配 + 36 次整块相加，
+        #   一层 MoE 光这两处就分配 ~2.6 GB，而且这条 `+` 链会把 36 块全钉在计算图里
+        #   直到反向（实测 B=4 时 MoE 单模块峰值 3.75 GB，主缓冲只要 180 MB）。
+        #
+        #   改法：只开**一块**累加器，用运行时already有的 `moe_scatter_rows_add`
+        #   逐个专家就地 atomicAdd（调用方保证已清零），反向再按专家 gather 回去。
+        #   分配次数 36 -> 1，图里的整块节点 36 -> 1。
+        rt = _cuda()
+        acc_buf = rt.zeros((int(n), int(d)), dtype=np.float32)
+        parts = []
         for e, expert in enumerate(self.experts):
             begin = int(off[e])
             count = int(off[e + 1]) - begin
@@ -4753,11 +4765,22 @@ class MoE(Module):
             y = _moe_swiglu(rows, expert)
             ww = _moe_gather_slots_cuda(w, tok_buf, slot_buf, begin, count, k)
             y = _moe_row_scale_cuda(y, ww)
-            part = _moe_scatter_rows_cuda(n, d, tok_buf, begin, count, y)
-            acc = part if acc is None else acc + part
-        if acc is None:
+            rt.moe_scatter_rows_add(y._gpu, tok_buf, begin, count, acc_buf)
+            parts.append((y, begin, count))
+        if not parts:
             return x * 0.0
-        return acc
+        need_grad = any(p[0].requires_grad for p in parts)
+        out = Tensor._from_gpu(acc_buf, requires_grad=need_grad,
+                               _parents=tuple(p[0] for p in parts))
+
+        def bw(g, grads, _parts=tuple(parts), _tok=tok_buf, _d=d):
+            # 每个专家的梯度 = 从整体梯度里把它那几行取回来（与原来逐块反向等价）
+            for yy, b0, cnt in _parts:
+                if yy.requires_grad:
+                    _acc(grads, yy, rt.moe_gather_rows(g, _tok, b0, cnt, _d))
+
+        out._backward = bw
+        return out
 
 
 # ─────────────────────────── optim ───────────────────────────
