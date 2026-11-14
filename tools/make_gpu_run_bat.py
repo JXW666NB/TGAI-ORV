@@ -11,10 +11,9 @@ import io
 
 
 BAT = r"""@echo off
-setlocal enabledelayedexpansion
-for /f "skip=1 tokens=1" %%p in ('nvidia-smi --query-compute-apps^=pid --format^=csv,noheader 2^>nul') do (
-  taskkill /f /pid %%p >nul 2>nul
-)
+rem 清掉所有 python（含反复拉起推理服务的那个守护），再跑给定命令。
+rem 本 bat 在目标 python 启动**之前**执行，所以不会杀掉自己。
+taskkill /f /im python.exe >nul 2>nul
 timeout /t 3 /nobreak >nul
 %*
 """
