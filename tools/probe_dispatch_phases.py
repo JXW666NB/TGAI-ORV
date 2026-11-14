@@ -42,7 +42,9 @@ def main():
 
         def mark(name, t0):
             rt.sync()
-            acc[name] = acc.get(name, 0.0) + (time.perf_counter() - t0)
+            dt = time.perf_counter() - t0
+            acc[name] = acc.get(name, 0.0) + dt
+            print("    %-24s %7.2f ms" % (name, dt * 1e3), flush=True)
 
         for _ in range(reps):
             t0 = time.perf_counter()
