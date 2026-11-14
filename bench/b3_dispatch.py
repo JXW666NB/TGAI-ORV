@@ -36,7 +36,7 @@ def main():
     tok = np.repeat(np.arange(N), K)
 
     x = T.tensor(rnd(N, d, seed=1))
-    gate = T.tensor(rng.uniform(0.1, 1.0, (N, K)).astype(np.float32))
+    gate = T.tensor(rng.uniform(0.1, 1.0, (N * K,)).astype(np.float32))
     x_rows = IDX.index_select(x, 0, tok) if hasattr(IDX, "index_select") else x[tok]
     xs = IDX.index_select(x_rows, 0, order)
     g_sorted = gate[order]
