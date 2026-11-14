@@ -155,12 +155,15 @@ def moe_topk_orv(x, eids, gates, W1, W2, W3, beta1=4.0, beta2=25.0,
     g_flat = gates.reshape(N * k)                    # 每行的门控值（设备张量）
     # ★ 2026-11-15：把"先按 token 展开再按专家排序"两次 gather 合成**一次**。
     #   `x[tok]` 后再 `[order]` 等于 `x[tok[order]]`；预合成置换后只搬一趟，
-    #   并省掉一份 (N·k, d) 的中间张量（实测前向因此从 0.125 s 降到更低）。
+    #   并省掉一份 (N·k, d) 的中间张量。
+    #   ★ 注意两个索引不是一回事：**gather 用 token 号**（tok[order]），
+    #     **散回原位用原位置**（order）。第一版把两者混用，实测前向差 0.92。
     from tgai_go.train import indexing as _idx
-    perm = tok[np.argsort(e_flat, kind="stable")]
-    x_perm = _idx.index_select(x, 0, perm)
+    order = np.argsort(e_flat, kind="stable")
+    src_tok = tok[order]                             # 每个排序后位置的源 token
+    x_perm = _idx.index_select(x, 0, src_tok)
     y = moe_dispatch_orv(x_perm, e_flat, g_flat, W1, W2, W3, beta1, beta2,
-                         _presorted=perm)
+                         _presorted=order)
     return y.reshape(N, k, d).sum(axis=1)
 
 
