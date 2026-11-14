@@ -25,20 +25,42 @@ def _rect_mask(rows, cols, q_offset):
     return np.where(c <= r, 0.0, -np.inf).astype(np.float32)[None, :, :]
 
 
+_DIAG = {}
+
+
+def _diag_mask(n, bh):
+    """对角块的方阵因果掩码（bh x n x n），按 n 缓存 —— 只有一块，不再逐块重建大掩码。"""
+    if n not in _DIAG:
+        m = np.repeat(_rect_mask(n, n, 0), bh, axis=0)
+        _DIAG[n] = T.tensor(np.ascontiguousarray(m))
+    return _DIAG[n]
+
+
 def chunked(q, k, v, chunk):
-    """q,k,v: [BH, S, DH]（3D，与 sdpa 一致）。按 query 块算，掩码矩形可加。"""
+    """q,k,v: [BH, S, DH]。按 query 块算，**不再为大块构造掩码**。
+
+    每块拆两段：
+      · 前面的键 [0, st)：对块内所有行都可见 -> causal=False，无掩码
+      · 对角键段 [st, en)：方阵因果 -> causal=True + 一个 n×n 的复用掩码
+    这样峰值只有 C*st + C*C，而不是 C*S，也不再逐块上传大掩码。
+    """
     BH, S, DH = q.shape
     outs = []
     C = int(chunk)
     for st in range(0, S, C):
         en = min(st + C, S)
         qb = q[:, st:en, :]
-        kb = k[:, :en, :]
-        vb = v[:, :en, :]
-        m = _rect_mask(en - st, en, st)                 # (1, rows, cols)
-        am = np.repeat(m, BH, axis=0)
-        ob = Fn.scaled_dot_product_attention(
-            qb, kb, vb, causal=False, attn_mask=T.tensor(np.ascontiguousarray(am)))
+        if st > 0:
+            head = Fn.scaled_dot_product_attention(
+                qb, k[:, :st, :], v[:, :st, :], causal=False)
+        else:
+            head = None
+        n = en - st
+        # 用 causal=False + 方阵掩码，避免依赖「causal 与 attn_mask 同时生效」的语义
+        diag = Fn.scaled_dot_product_attention(
+            qb, k[:, st:en, :], v[:, st:en, :], causal=False,
+            attn_mask=_diag_mask(n, BH))
+        ob = diag if head is None else head + diag
         outs.append(ob)
     return outs[0] if len(outs) == 1 else T.cat(outs, dim=1)
 
