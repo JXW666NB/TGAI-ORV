@@ -185,8 +185,12 @@ def moe_dispatch_orv(x, eids_np, gate, W1, W2, W3, beta1=4.0, beta2=25.0):
     n_rows = int(x.shape[0])
     eids = np.asarray(eids_np).reshape(-1).astype(np.int64)
     order = np.argsort(eids, kind="stable")           # 按专家分组
-    xs = x[order]                                     # gather（可反传）
-    g_sorted = gate[order]
+    # ★ 2026-11-15：改用 `indexing.index_select`（设备侧 gather，反向是
+    #   `rt.scatter_add_rows`）。原来的 `x[order]` 反向走 **D2H + np.add.at + H2D**，
+    #   实测这一段 fwd+bwd 要 **25 ms**（整个分派 62 ms 里最大的一块）。
+    from tgai_go.train import indexing as _idx
+    xs = _idx.index_select(x, 0, order)
+    g_sorted = _idx.index_select(gate, 0, order)
 
     # 专家权重可以是三维张量（W1[e] 会拷贝）或**列表**（不拷贝，推荐）。
     E = len(W1) if isinstance(W1, (list, tuple)) else int(W1.shape[0])
