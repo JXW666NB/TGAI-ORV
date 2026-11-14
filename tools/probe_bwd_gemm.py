@@ -49,6 +49,21 @@ def main():
                "sgemm_tn_strided_batched"):
         wrap(nm)
 
+    # 再按**内核名**统计（含逐元素/scatter/gather），找出非 GEMM 的大头
+    kstats = defaultdict(lambda: [0, 0.0])
+    _orig_launch = rt.launch
+
+    def _launch(name, grid, block, args, *a, **kw):
+        t0 = time.perf_counter()
+        r = _orig_launch(name, grid, block, args, *a, **kw)
+        rt.sync()
+        s = kstats[name]
+        s[0] += 1
+        s[1] += time.perf_counter() - t0
+        return r
+
+    rt.launch = _launch
+
     only_bwd = {"on": False}
 
     def fwd():
@@ -73,6 +88,7 @@ def main():
     fwd_t = time.time() - t0
     f0 = sum(v[1] for v in stats.values())
     stats.clear()
+    kstats.clear()
     t0 = time.time()
     loss.backward()
     rt.sync()
@@ -81,6 +97,10 @@ def main():
 
     print("前向总 %.3fs，其中 GEMM %.3fs；反向总 %.3fs，其中 GEMM %.3fs"
           % (fwd_t, f0, bwd_t, f1))
+    print("反向：按内核累计耗时 top12")
+    for k, v in sorted(kstats.items(), key=lambda kv: -kv[1][1])[:12]:
+        print("  %-34s n=%-6d %.3fs" % (k[:34], v[0], v[1]))
+    print("反向：内核发射总数 %d" % sum(v[0] for v in kstats.values()))
     print("按累计耗时 top10（反向）：")
     for k, v in sorted(stats.items(), key=lambda kv: -kv[1][1])[:10]:
         print("  %-46s n=%-5d %.3fs" % (k[:46], v[0], v[1]))
