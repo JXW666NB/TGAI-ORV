@@ -155,6 +155,43 @@ import tgai_go.train as T
 
 ---
 
+## 项目结构
+
+**主产物是 `python/tgai_go/train/` 这个 Python 包**（`pip install` 装的就是它）；
+其余目录是后端源码、构建脚本、文档与开发工具。
+
+```
+python/tgai_go/train/     ← 核心：自动微分 + 算子 + 优化器 + 训练循环
+  __init__.py              Tensor / autograd / nn / optim / 执行档位（约 24 万字符）
+  cuda.py                  CUDA 运行时 + 全部内核（NVRTC 源码字符串，约 35 万字符）
+  v3_ops.py / v3_moe.py    V3 模型的算子与 MoE 分派
+  v3_flash_op.py           分块注意力（flash 风格）
+  nn_ops.py / checkpoints.py / plugin.py / ops_plugin.py
+  dist.py / doctor.py      分布式 / 环境自检
+
+src/                       原生后端 C 源码（launcher、matmul、tgai_backend）
+cuda/                      .cu 后端（与 NVRTC 运行时并存的另一条路径）
+cpu/                       CPU 后端构建
+shaders/                   Vulkan compute shader（.comp 与编译产物 .spv）
+embedded/ tcc/ third_party/ 嵌入式运行时、TCC 工具链、Vulkan 依赖
+
+tests/                     测试（含 fixtures 与算子对拍）
+bench/                     逐模块微基准（一个模块一个文件，CUDA event 计时）
+tools/                     仓库维护脚本（发版、探针、远程运维）
+examples/                  可直接运行的示例
+scripts/                   一键上手脚本
+docs/                      设计文档、计划、实测报告
+.github/                   CI（单元测试 + 打包自检）
+```
+
+各平台的构建脚本在根目录：`build_cuda*.bat`、`build_vulkan*.bat`、`rebuild_cpu.bat`；
+发版用 `build_dist.bat` 与 `publish_pypi.bat`。
+
+> 只想用的话不需要碰 `src/` `cuda/` `shaders/`：`pip install` 装到的 Python 包已自带
+> NVRTC 与全部内核源码，运行时现编译。
+
+---
+
 ## 文档
 
 | 文件 | 内容 |
