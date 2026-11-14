@@ -76,18 +76,39 @@ def _section4():
         except Exception as exc:
             print("%s: 读取失败 %s" % (tag, exc))
     for base in (os.path.join(users, "Desktop"),
+                 os.path.join(users, "AppData", "Microsoft", "Internet Explorer",
+                              "Quick Launch"),
                  os.path.join(users, "AppData", "Roaming", "Microsoft", "Windows",
-                              "Start Menu", "Programs")):
+                              "Start Menu", "Programs"),
+                 os.path.join(os.environ.get("PUBLIC", r"C:\Users\Public"), "Desktop"),
+                 os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
+                              "Microsoft", "Windows", "Start Menu")):
+        if not os.path.isdir(base):
+            continue
         for root, _, files in os.walk(base):
             for f in files:
                 if not f.lower().endswith(".lnk"):
                     continue
                 p = os.path.join(root, f)
                 try:
-                    if b"2345" in io.open(p, "rb").read():
-                        print("命中 2345 快捷方式: %s" % p)
+                    raw = io.open(p, "rb").read()
                 except Exception:
-                    pass
+                    continue
+                if b"2345" in raw:
+                    print("命中 2345 快捷方式: %s" % p)
+                elif b"http" in raw and (b"edge" in raw.lower() or b"chrome" in raw.lower()
+                                         or b"iexplore" in raw.lower()):
+                    print("带 URL 参数的浏览器快捷方式: %s" % p)
+    # 装了哪些浏览器
+    print("--- 已安装浏览器 ---")
+    for cand in (r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                 r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                 r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                 r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                 r"C:\Program Files (x86)\2345Soft\2345Explorer\2345Explorer.exe",
+                 r"C:\Program Files (x86)\360\360se6\Application\360se.exe"):
+        if os.path.exists(cand):
+            print("  存在: %s" % cand)
     return 0
 
 
