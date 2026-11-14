@@ -26,8 +26,8 @@ def ref_softmax(a):
 def main():
     T.set_default_device("cuda")
     rng = np.random.default_rng(0)
-    for rows, n in ((256, 512), (512, 1024), (1024, 2048)):
-        a = rng.normal(0, 1, (rows, n)).astype(np.float32)
+    for bh, n in ((4, 512), (4, 1024), (4, 2048)):
+        a = rng.normal(0, 1, (bh, n, n)).astype(np.float32)
         p = _softmax_causal_cuda(T.tensor(a.copy()))
         err = float(np.abs(np.asarray(p.to_numpy(), np.float32) - ref_softmax(a)).max())
 
@@ -46,8 +46,8 @@ def main():
             tt = T.tensor(a.copy())
             T.functional.softmax(tt + mask_t, axis=-1)
         plain = (time.time() - s) / 5
-        print("rows=%-5d n=%-5d 误差=%.2e  融合=%.4fs  掩码+softmax=%.4fs  快 %.2fx"
-              % (rows, n, err, fused, plain, plain / max(fused, 1e-9)))
+        print("bh=%-3d n=%-5d 误差=%.2e  融合=%.4fs  掩码+softmax=%.4fs  快 %.2fx"
+              % (bh, n, err, fused, plain, plain / max(fused, 1e-9)))
     return 0
 
 
