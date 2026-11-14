@@ -123,12 +123,14 @@ def test_step_layers_matches_step_within_fp32_noise():
         return m.state_dict()
 
     a, b = run(False), run(True)
-    worst = 0.0
+    per_key = []
     scale = 0.0
     for k in a:
         x, y = np.asarray(a[k], np.float32), np.asarray(b[k], np.float32)
         if x.size:
-            worst = max(worst, float(np.abs(x - y).max()))
+            per_key.append((float(np.abs(x - y).max()), k, tuple(x.shape)))
+    per_key.sort(reverse=True)
+    worst = per_key[0][0] if per_key else 0.0
     # 更新量级：拿"更新前 vs 更新后"的差作为尺度
     for k, v0 in sd0.items():
         x = np.asarray(a[k], np.float32)
@@ -139,6 +141,13 @@ def test_step_layers_matches_step_within_fp32_noise():
     # 为什么不用绝对值：numpy 的 BLAS 多线程累加顺序会在不同运行间变化，
     # 绝对值阈值会偶发越界（实测过 1/16 概率），而相对判据天然稳健。
     assert scale > 0, "参数没有被更新，无法比较"
+    if worst > 0.01 * scale:
+        # 诊断：把偏差最大的几个参数打出来，便于判断是"求和顺序噪声"还是"漏更新/更新错对象"。
+        # 前者偏差均匀地小，后者会集中在个别张量上。
+        print("\n[Muon 诊断] 更新量尺度 %.3e，偏差 top3：" % scale)
+        for d, k, shp in per_key[:3]:
+            print("   %-40s shape=%-14s 偏差 %.3e（占尺度 %.2f%%）"
+                  % (k, str(shp), d, 100 * d / scale))
     assert worst <= 0.01 * scale, \
         "分层更新与统一更新差异过大：%.3e（更新量 %.3e，占比 %.2f%%）" % (worst, scale, 100 * worst / scale)
     # 实测该占比约 0.02%（2e-06 / 1e-2），远低于 1% 的判据。
