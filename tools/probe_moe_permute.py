@@ -25,7 +25,9 @@ def main():
     C = int(np.ceil(N * k / E * 1.5))          # 容量 = 1.5 倍均值
 
     # ---- 设备侧 ----
-    eids = rt.h2d(eids_h)
+    # ★ 坑：`rt.h2d` 的 dtype 默认是 **float32**，会静默把 int64 转成 float32。
+    #   内核按 long long 读就会拿到垃圾值（实测 4096 个 pair 只有 32 个被处理）。
+    eids = rt.h2d(eids_h, dtype=np.int64)
     x = rt.h2d(x_h)
     gate = rt.h2d(g_h)
     counts = rt.zeros((E,), dtype=np.int32)
