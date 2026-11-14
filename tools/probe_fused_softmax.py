@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""验收重写后的融合 attn_mask_softmax：数值 + 与"掩码+通用softmax"的耗时对比。"""
+"""验收重写后的融合 attn_mask_softmax：数值 + 与"掩码+通用softmax"的耗时对比。
+
+融合路径由 TG_SOFTMAX_CAUSAL=1 打开（_sdpa_materialized 内），本探针直接比较两条路。
+"""
 import sys
 import time
 
@@ -9,6 +12,7 @@ sys.path.insert(0, "D:/orv_pip_0962")
 sys.path.insert(0, "D:/orv_pip_0962/Lib/site-packages")
 
 import tgai_go.train as T  # noqa: E402
+from tgai_go.train import _softmax_causal_cuda  # noqa: E402
 
 
 def ref_softmax(a):
@@ -22,31 +26,28 @@ def ref_softmax(a):
 def main():
     T.set_default_device("cuda")
     rng = np.random.default_rng(0)
-    for n, rows in ((64, 64), (512, 256), (2048, 128)):
+    for rows, n in ((256, 512), (512, 1024), (1024, 2048)):
         a = rng.normal(0, 1, (rows, n)).astype(np.float32)
-        t = T.tensor(a.copy())
-        p = T.functional.attn_mask_softmax(t, causal=True)
-        q = np.asarray(p.to_numpy(), np.float32)
-        err = float(np.abs(q - ref_softmax(a)).max())
+        p = _softmax_causal_cuda(T.tensor(a.copy()))
+        err = float(np.abs(np.asarray(p.to_numpy(), np.float32) - ref_softmax(a)).max())
 
-        # 耗时：融合内核 vs 掩码+通用 softmax
-        t1 = T.tensor(a.copy()); T.functional.attn_mask_softmax(t1, causal=True)
+        mask_np = np.where(np.triu(np.ones((n, n), np.float32), 1) > 0, -1e30, 0.0).astype(np.float32)
+        mask_t = T.tensor(mask_np)
+
+        _softmax_causal_cuda(T.tensor(a.copy()))
         T._cuda().empty_cache()
         s = time.time()
         for _ in range(5):
-            tt = T.tensor(a.copy())
-            T.functional.attn_mask_softmax(tt, causal=True)
+            _softmax_causal_cuda(T.tensor(a.copy()))
         fused = (time.time() - s) / 5
 
         s = time.time()
         for _ in range(5):
             tt = T.tensor(a.copy())
-            mask = T.tensor(np.where(np.triu(np.ones((n, n), np.float32), 1) > 0,
-                                     -1e30, 0.0).astype(np.float32))
-            T.functional.softmax(tt + mask, axis=-1)
+            T.functional.softmax(tt + mask_t, axis=-1)
         plain = (time.time() - s) / 5
-        print("n=%-5d rows=%-4d 误差=%.2e  融合=%.4fs  掩码+softmax=%.4fs  快 %.2fx"
-              % (n, rows, err, fused, plain, plain / max(fused, 1e-9)))
+        print("rows=%-5d n=%-5d 误差=%.2e  融合=%.4fs  掩码+softmax=%.4fs  快 %.2fx"
+              % (rows, n, err, fused, plain, plain / max(fused, 1e-9)))
     return 0
 
 
