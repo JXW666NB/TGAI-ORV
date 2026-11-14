@@ -24,7 +24,9 @@ class Adapter:
 
     def forward(self, ids):
         P, S, d = self.P, self.S, self.d
-        x = P["emb"][ids].reshape(1, S, d)
+        # ORV 的切片只认一维整型数组；GraphStep 传进来的是 (1, S)，先摊平
+        flat = np.asarray(ids).reshape(-1)
+        x = P["emb"][flat].reshape(1, S, d)
         for L in P["layers"]:
             x = x + V.attention_orv(V.rmsnorm_orv(x, L["ln1"]), L["wq"], L["wk"],
                                     L["wv"], L["wo"], self.cos, self.sin,
