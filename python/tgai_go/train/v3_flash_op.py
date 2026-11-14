@@ -104,34 +104,37 @@ def _bwd_device_impl(qt, kt, vt, dot, lse_t, ot, causal, cq, ck):
             if causal:
                 sb = sb + _causal_mask(rows, cols, qi - ki)
             p = (sb - lb.reshape(BH, rows, 1)).exp()
-            # ★ 立刻折算到主机累加：原先 `.append(设备张量)` 会把 528 个分片
-            #   （S=2048、64 块时）全部留在显存里直到函数末尾，是随 seq **二次**增长的
-            #   那一项（实测反向额外 32 → 112 MiB）。主机侧累加只占 O(S·D)。
-            dv_acc[ki // ck] = dv_acc.get(ki // ck, 0) + _np(p.transpose(1, 2) @ db)
+            # ★ 2026-11-14：改回**设备侧累加**，但每块只保留一个累加器（不像最早那样
+            #   把 528 个分片全留着）。理由：`_np()` 是阻塞式 D2H，每对块两次，
+            #   S=2048/块 512 时一层 20 次同步，是反向的主要固定开销。
+            #   现在每层只留 (S/ck) 个累加器（4 MB 一个），末尾统一转一次。
+            dv_acc[ki // ck] = dv_acc.get(ki // ck, 0) + (p.transpose(1, 2) @ db)
             dp = db @ vb.transpose(1, 2)
             ds = p * (dp - dsum)
             dq_b = dq_b + (ds @ kb) * scale
-            dk_acc[ki // ck] = dk_acc.get(ki // ck, 0) + _np((ds.transpose(1, 2) @ qb) * scale)
+            dk_acc[ki // ck] = dk_acc.get(ki // ck, 0) + (ds.transpose(1, 2) @ qb) * scale
             if os.environ.get("FLASHDBG2") and qi == 1984:
                 _rt3 = T._cuda()
                 print("    [块内] qi=1984 ki=%4d live=%.1f MiB"
                       % (ki, _rt3.pool_stats()["live_bytes"] / 2**20), flush=True)
-        dq_parts.append(_np(dq_b))
+        dq_parts.append(dq_b)
         if os.environ.get("FLASHDBG"):
             _rt = T._cuda()
             print("  qi=%3d live=%.0f MiB" % (qi, _rt.pool_stats()["live_bytes"] / 2**20),
                   flush=True)
-    dq = np.concatenate(dq_parts, axis=1)
+    dq = _np(T.cat(dq_parts, dim=1)) if len(dq_parts) > 1 else _np(dq_parts[0])
     dk = np.zeros((BH, S, D), np.float32)
     dv = np.zeros((BH, S, D), np.float32)
     for bi, arr in dk_acc.items():
         ki = bi * ck
-        cols = arr.shape[1]
-        dk[:, ki:ki + cols, :] = arr
+        a = _np(arr)                      # 每块只转一次（原来是每对块转两次）
+        cols = a.shape[1]
+        dk[:, ki:ki + cols, :] = a
     for bi, arr in dv_acc.items():
         ki = bi * ck
-        cols = arr.shape[1]
-        dv[:, ki:ki + cols, :] = arr
+        a = _np(arr)
+        cols = a.shape[1]
+        dv[:, ki:ki + cols, :] = a
     return dq, dk, dv
 
 
