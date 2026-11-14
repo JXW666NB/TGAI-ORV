@@ -57,9 +57,25 @@ def main():
                 ref_gp[e, j] = g_h[row, slot]
                 ref_rowid[e, j] = row * k + slot
 
-    ok_id = np.array_equal(rowid_np, ref_rowid)
-    ok_g = np.allclose(gp_np, ref_gp, atol=0)
-    # 行的顺序由 atomicAdd 决定，可能与参考不同 → 按 rowid 对齐后比较
+    # 槽位顺序由 atomicAdd 决定，与串行参考不同 —— 所以按**集合**比较，不按位置
+    ok_id = True
+    for e in range(E):
+        got = np.sort(rowid_np[e][rowid_np[e] >= 0])
+        want = np.sort(ref_rowid[e][ref_rowid[e] >= 0])
+        if got.shape != want.shape or not np.array_equal(got, want):
+            ok_id = False
+    ok_g = True
+    for e in range(E):
+        for j in range(C):
+            r = rowid_np[e, j]
+            if r < 0:
+                continue
+            if abs(float(gp_np[e, j]) - float(g_h[int(r) // k, int(r) % k])) > 0:
+                ok_g = False
+    ok_cnt = np.array_equal(np.minimum(counts_np, C),
+                            np.array([min(int((eids_h == e).sum()), C)
+                                      for e in range(E)]))
+    # 逐槽对齐后比 xp（顺序不同也能比）
     max_dx = 0.0
     for e in range(E):
         for j in range(C):
@@ -68,7 +84,8 @@ def main():
                 continue
             row = int(r) // k
             max_dx = max(max_dx, float(np.abs(xp_np[e, j] - x_h[row]).max()))
-    print("rowid 完全一致: %s；gate 一致: %s；xp 最大差: %.3e" % (ok_id, ok_g, max_dx))
+    print("rowid 集合一致: %s；gate 一致: %s；counts 一致: %s；xp 最大差: %.3e"
+          % (ok_id, ok_g, ok_cnt, max_dx))
 
     # ---- unpermute ----
     yp_h = rng.normal(0, .3, (E * C, d)).astype(np.float32)
