@@ -234,7 +234,8 @@ def main():
             #   8 层就 0.2–0.3 s/步）。改成每 4 层一次：残留最多累积 4 层，显存可控。
             if i % int(os.environ.get("TGAI_GC_EVERY", "4")) == 0:
                 gc.collect()
-            rt.empty_cache()
+            if i % int(os.environ.get("TGAI_EMPTY_EVERY", "1")) == 0:
+                rt.empty_cache()
             if os.environ.get("TGAI_CKPT_VERBOSE"):
                 print("    layer %d done, live=%.0f MiB"
                       % (i, rt.pool_stats()["live_bytes"] / 2**20), flush=True)
