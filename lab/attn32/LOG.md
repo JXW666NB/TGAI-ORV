@@ -67,3 +67,9 @@ y/dq/dk/dv 与基线相对差 < 1e-5。
 - 窗口化后 loat4 读是否还成立：窗口是 [dim][row] 的 16 行 dim × BT 行，行步长改用 BT+4
   （CUTLASS 的做法），不是 72 —— **bank 冲突可能变差，但数值不变**
 - 第 3 步最容易漏：dK/dV 循环现在读的是**全 64 维**的 Q/dO，必须改造循环而不是只改下标
+## #2 head_dim 滑窗 —— **通过**并已进生产
+
+DCHUNK=16，新增 load_win / lash_qk_dp_win / ttn_bwd_flash_w（45056 B = 44 KB）。
+对拍：y 逐位相同，dq/dk/dv 相对 1.2e-7 / 1.7e-7 / 1.0e-7。
+48 KB 上限下自动启用；V100 仍走原内核（已用 probe_attn_kernel_choice 证明）。
+全套测试 18/18 与基线一致；守卫测试 3 passed（新增 48 KB 可用用例）。
