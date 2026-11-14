@@ -59,8 +59,7 @@ def main():
                         weight_decay=0.0)
     model = Adapter(P, cos, sin, d // n_q, n_q, n_kv, S, d, vocab)
 
-    gs = GraphStep(rt, model, opt, vocab, ids_shape=(1, S), tgt_shape=(1, S),
-                   arena_gib=8.0)
+    gs = GraphStep(model, opt, (1, S), (1, S), vocab, arena_gib=8.0)
 
     # 逐算子基准
     for _ in range(2):
