@@ -16,6 +16,16 @@
 //   Launch: grid (nh, ceil(seq/64), 1), block 256, dynamic smem 69632.
 
 #define BT 64
+// ── 计划（2026-11-15，尚未启用）：把**反向**的 query tile 从 64 行降到 32 行，
+//    使动态 smem 从 68 KB 降到 ≤48 KB，从而能在 sm_60（P100，单 block 48 KB 上限）编出来。
+//    当前 smem 账（反向 attn_bwd_flash）：Q 64*72 + dO 64*72 + K/V/P/dS 各 64*32
+//    = 4608*2 + 2048*4 = 17408 float = 69632 B。
+//    改造后：BTB=32 ⇒ Q/dO 各 2304；再把 dS 就地写在 P 上（dS = P*(dP-D)，P 之后不再用）
+//    ⇒ K/V/P 各 2048 ⇒ 2304*2 + 2048*3 = 10752 float = 43008 B（42 KB）。
+//    需要同时改：load_T72 的行数参数化（现在写死 1024 个 float4=64 行）、
+//    row0 = warp*8（4 个 warp × 8 行 = 32 行，block 256→128）、grid.y = ceil(seq/32)。
+#define BTB 32
+
 #define DH 64
 #define BC 32
 #define NEG (-1.0e30f)
