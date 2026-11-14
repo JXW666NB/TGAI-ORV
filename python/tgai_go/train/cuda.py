@@ -2521,6 +2521,10 @@ _ATTN_NOP_BQ = 64
 # 反向 atomic 按 query-tile 分组写到独立 plane，再加回 dK/dV，减轻 128 路冲突。
 _ATTN_FLASH_GROUPS = 8
 _ATTN_FLASH_SMEM = 69632
+# 2026-11-15：P100（sm_60，动态 smem 上限 48 KB）专用变体 attn_bwd_flash_w，
+# Q/dO 沿 head_dim 16 宽滑窗，只要 41472 B（40.5 KB）。数值与原版相差 < 1.1e-7（相对），
+# y 逐位相同。见 lab/attn32/LOG.md。V100 仍走原版（快 34%）。
+_ATTN_FLASH_WIN_SMEM = 41472
 # g2 在 69632 上再加 smDK/smDV（各 64*32 个 float）。
 _ATTN_FLASH_G2_SMEM = 86016
 _ATTN_FLASH_MAX_SMEM = 96 * 1024
@@ -7190,6 +7194,11 @@ class CudaRuntime:
         #   且不支持 opt-in，而这里要 68/84 KB ⇒ 之前会以 `cuFuncSetAttribute rc=1 invalid argument`
         #   这种看不懂的形式炸掉。现在**先查上限再设 opt-in**，把"为什么"和"怎么办"说清楚。
         _lim = self._device_smem_limit()
+        # 装不下常驻版（68 KB）但装得下窗口版（40.5 KB）时自动降级 —— P100 就是这种情况。
+        if (name == "attn_bwd_flash" and _lim and int(smem) > _lim
+                and _ATTN_FLASH_WIN_SMEM <= _lim):
+            name = "attn_bwd_flash_w"
+            smem = _ATTN_FLASH_WIN_SMEM
         if _lim and int(smem) > _lim:
             _cc = self._cc_arch().replace("compute_", "sm_")
             raise CudaError(

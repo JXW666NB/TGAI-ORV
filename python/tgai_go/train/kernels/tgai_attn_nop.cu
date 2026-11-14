@@ -16,6 +16,7 @@
 //   Launch: grid (nh, ceil(seq/64), 1), block 256, dynamic smem 69632.
 
 #define BT 64
+#define DCHUNK 16   // head_dim 窗口宽度（P100 变体用；CUTLASS: ThreadK*2）
 // ── 计划（2026-11-15，尚未启用）：把**反向**的 query tile 从 64 行降到 32 行，
 //    使动态 smem 从 68 KB 降到 ≤48 KB，从而能在 sm_60（P100，单 block 48 KB 上限）编出来。
 //    当前 smem 账（反向 attn_bwd_flash）：Q 64*72 + dO 64*72 + K/V/P/dS 各 64*32
@@ -511,6 +512,48 @@ extern "C" __global__ void attn_fwd_stats(const float* __restrict__ Q, const flo
 
 #define QSTR (DH + 8)
 
+// ── 窗口装载：把 src 的 [d0, d0+nd) 维、tok0 起 BT 行装进 dst（布局 [dl][row]）──
+__device__ __forceinline__ void load_win(const float* __restrict__ src, float* __restrict__ dst,
+                                         int tok0, int h, int nh, int dh, int tid, int seq,
+                                         int d0, int nd, int stride) {
+#pragma unroll 1
+    for (int e = tid; e < nd * BT; e += 256) {
+        int local = e / nd;
+        int dl = e - local * nd;
+        int tok = tok0 + local;
+        float v = 0.f;
+        if (tok < seq) v = src[((tok * nh + h) * dh) + d0 + dl];
+        dst[dl * stride + local] = v;
+    }
+}
+
+// 窗口版：把若干个 head_dim 窗口的 QK 与 dP 累加到调用者给的 sx/dp（不清零）。
+__device__ __forceinline__ void flash_qk_dp_win(const float* __restrict__ smQ,
+                                                const float* __restrict__ smDO,
+                                                const float* __restrict__ smK,
+                                                const float* __restrict__ smV,
+                                                int row0, int lane, int d0,
+                                                float sx[8], float dp[8]) {
+#pragma unroll 8
+    for (int dl = 0; dl < DCHUNK; ++dl) {
+        int d = d0 + dl;
+        float kv = smK[d * BC + lane];
+        float vv = smV[d * BC + lane];
+        float4 q0 = *reinterpret_cast<const float4*>(smQ + dl * QSTR + row0);
+        float4 q1 = *reinterpret_cast<const float4*>(smQ + dl * QSTR + row0 + 4);
+        float4 o0 = *reinterpret_cast<const float4*>(smDO + dl * QSTR + row0);
+        float4 o1 = *reinterpret_cast<const float4*>(smDO + dl * QSTR + row0 + 4);
+        sx[0] = fmaf(q0.x, kv, sx[0]); dp[0] = fmaf(o0.x, vv, dp[0]);
+        sx[1] = fmaf(q0.y, kv, sx[1]); dp[1] = fmaf(o0.y, vv, dp[1]);
+        sx[2] = fmaf(q0.z, kv, sx[2]); dp[2] = fmaf(o0.z, vv, dp[2]);
+        sx[3] = fmaf(q0.w, kv, sx[3]); dp[3] = fmaf(o0.w, vv, dp[3]);
+        sx[4] = fmaf(q1.x, kv, sx[4]); dp[4] = fmaf(o1.x, vv, dp[4]);
+        sx[5] = fmaf(q1.y, kv, sx[5]); dp[5] = fmaf(o1.y, vv, dp[5]);
+        sx[6] = fmaf(q1.z, kv, sx[6]); dp[6] = fmaf(o1.z, vv, dp[6]);
+        sx[7] = fmaf(q1.w, kv, sx[7]); dp[7] = fmaf(o1.w, vv, dp[7]);
+    }
+}
+
 __device__ __forceinline__ void load_T72(const float* __restrict__ src, float* __restrict__ dst,
                                          int tok0, int h, int nh, int dh, int tid, int seq) {
 #pragma unroll 1
@@ -667,6 +710,170 @@ attn_bwd_flash(const float* __restrict__ dO, const float* __restrict__ Q,
                 atomicAdd(dkrow + d, scale * ak);
                 atomicAdd(dvrow + d, av);
             }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        int tr = t0 + row0 + r;
+        if (tr < seq) {
+            float* rowp = dQ + qkv_at(tr, h, nh, dh);
+            rowp[lane] = scale * dq0[r];
+            rowp[lane + 32] = scale * dq1[r];
+        }
+    }
+}
+
+
+// ── P100（sm_60，动态 smem 上限 48 KB）专用变体：Q/dO 沿 head_dim 滑窗，
+//    动态 smem 41472 B（40.5 KB）。数值与上游 attn_bwd_flash 相差 < 1.1e-7（相对），
+//    y 逐位相同。V100 仍走上游版本（快 34%）。见 lab/attn32/LOG.md。
+
+extern "C" __global__ void __launch_bounds__(256, 1)
+attn_bwd_flash_w(const float* __restrict__ dO, const float* __restrict__ Q,
+               const float* __restrict__ K, const float* __restrict__ V,
+               const float* __restrict__ O,
+               const float* __restrict__ m_in, const float* __restrict__ l_in,
+               float* __restrict__ dQ, float* __restrict__ dK, float* __restrict__ dV,
+               int seq, int nh, int dh, float scale) {
+    const int h = (int)blockIdx.x;
+    const int t0 = (int)blockIdx.y * BT;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int row0 = warp * 8;
+    if (t0 >= seq || dh != DH) return;
+
+    float* smQ = smem;                     // [DCHUNK][QSTR] 窗口
+    float* smDO = smQ + DCHUNK * QSTR;     // [DCHUNK][QSTR] 窗口
+    float* smK = smDO + DCHUNK * QSTR;     // [DH][BC] 全维
+    float* smV = smK + 64 * BC;
+    float* smP = smV + 64 * BC;
+    float* smDS = smP + 64 * BC;
+
+
+    float m[8], l[8], D[8], dq0[8], dq1[8];
+    float Dpart[8];
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        int tr = t0 + row0 + r;
+        Dpart[r] = 0.f;
+        if (tr < seq) {
+            int mi = tr * nh + h;
+            m[r] = m_in[mi];
+            l[r] = l_in[mi];
+        } else {
+            m[r] = NEG;
+            l[r] = 0.f;
+        }
+        dq0[r] = 0.f;
+        dq1[r] = 0.f;
+    }
+    // D = rowsum(dO·O)：按 head_dim 窗口累加（原来一次读 64 维）
+#pragma unroll 1
+    for (int dc = 0; dc < DH / DCHUNK; ++dc) {
+        int d0 = dc * DCHUNK;
+        load_win(dO, smDO, t0, h, nh, dh, tid, seq, d0, DCHUNK, QSTR);
+        __syncthreads();
+        if (lane < DCHUNK) {
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                int tr = t0 + row0 + r;
+                if (tr < seq)
+                    Dpart[r] += smDO[lane * QSTR + row0 + r] * O[qkv_at(tr, h, nh, dh) + d0 + lane];
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < 8; ++r) {
+        D[r] = (t0 + row0 + r < seq) ? warp_sum(Dpart[r]) : 0.f;
+    }
+
+    int k_end = t0 + BT;
+    if (k_end > seq) k_end = seq;
+    int ntiles = (k_end + BC - 1) / BC;
+    // Consecutive query tiles start on different K tiles so the atomic wave
+    // is not all hammering K tile 0 at once.
+    int phase = ntiles > 0 ? ((int)blockIdx.y % ntiles) : 0;
+#pragma unroll 1
+    for (int step = 0; step < ntiles; ++step) {
+        int k0 = ((phase + step) % ntiles) * BC;
+        load_KT(K, smK, k0, h, nh, dh, tid, seq);
+        load_KT(V, smV, k0, h, nh, dh, tid, seq);
+        __syncthreads();
+
+        float sx[8], dp[8];
+#pragma unroll
+        for (int r = 0; r < 8; ++r) { sx[r] = 0.f; dp[r] = 0.f; }
+#pragma unroll 1
+        for (int dc = 0; dc < DH / DCHUNK; ++dc) {
+            int d0 = dc * DCHUNK;
+            load_win(Q, smQ, t0, h, nh, dh, tid, seq, d0, DCHUNK, QSTR);
+            load_win(dO, smDO, t0, h, nh, dh, tid, seq, d0, DCHUNK, QSTR);
+            __syncthreads();
+            flash_qk_dp_win(smQ, smDO, smK, smV, row0, lane, d0, sx, dp);
+            __syncthreads();
+        }
+        bool tile_full = (k0 + BC <= t0);
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            sx[r] *= scale;
+            int tr = t0 + row0 + r;
+            int u = k0 + lane;
+            bool ok = (tr < seq) && (u < seq) && (tile_full || (u <= tr));
+            if (!ok) sx[r] = NEG;
+            float p = prob_of(sx[r], m[r], l[r]);
+            float ds = p * (dp[r] - D[r]);
+            smP[(row0 + r) * BC + lane] = p;
+            smDS[(row0 + r) * BC + lane] = ds;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            float g0 = 0.f, g1 = 0.f;
+            int q = row0 + r;
+#pragma unroll
+            for (int k = 0; k < BC; ++k) {
+                float s = smDS[q * BC + k];
+                g0 = fmaf(s, smK[lane * BC + k], g0);
+                g1 = fmaf(s, smK[(lane + 32) * BC + k], g1);
+            }
+            dq0[r] += g0;
+            dq1[r] += g1;
+        }
+
+#pragma unroll 1
+        for (int dc = 0; dc < DH / DCHUNK; ++dc) {
+            int d0 = dc * DCHUNK;
+            load_win(Q, smQ, t0, h, nh, dh, tid, seq, d0, DCHUNK, QSTR);
+            load_win(dO, smDO, t0, h, nh, dh, tid, seq, d0, DCHUNK, QSTR);
+            __syncthreads();
+            // 每窗口 BC*DCHUNK = 512 个 (key, dim) 对，256 线程 ⇒ 2 轮
+#pragma unroll 1
+            for (int e = 0; e < (BC * DCHUNK) / 256; ++e) {
+                int idx = tid + e * 256;
+                int k = idx / DCHUNK;
+                int dl = idx - k * DCHUNK;
+                float ak = 0.f, av = 0.f;
+#pragma unroll 4
+                for (int q = 0; q < BT; ++q) {
+                    float s = smDS[q * BC + k];
+                    float p = smP[q * BC + k];
+                    ak = fmaf(s, smQ[dl * QSTR + q], ak);
+                    av = fmaf(p, smDO[dl * QSTR + q], av);
+                }
+                int tok = k0 + k;
+                if (tok < seq) {
+                    float* dkrow = dK + qkv_at(tok, h, nh, dh) + d0 + dl;
+                    float* dvrow = dV + qkv_at(tok, h, nh, dh) + d0 + dl;
+                    atomicAdd(dkrow, scale * ak);
+                    atomicAdd(dvrow, av);
+                }
+            }
+            __syncthreads();
         }
         __syncthreads();
     }
