@@ -2524,7 +2524,9 @@ _ATTN_FLASH_SMEM = 69632
 # 2026-11-15：P100（sm_60，动态 smem 上限 48 KB）专用变体 attn_bwd_flash_w，
 # Q/dO 沿 head_dim 16 宽滑窗，只要 41472 B（40.5 KB）。数值与原版相差 < 1.1e-7（相对），
 # y 逐位相同。见 lab/attn32/LOG.md。V100 仍走原版（快 34%）。
-_ATTN_FLASH_WIN_SMEM = 45056   # 临时：试探是否有越界
+_ATTN_FLASH_WIN_SMEM = 45056
+# 注：按切分算只有 41472 B，但实测 41472 会越界（rc=700），45056 稳定跑通且数值与上游一致。
+# 两者都 <= 48 KB（sm_60 上限），故取 45056 留余量。真实下界未逐点二分。
 # g2 在 69632 上再加 smDK/smDV（各 64*32 个 float）。
 _ATTN_FLASH_G2_SMEM = 86016
 _ATTN_FLASH_MAX_SMEM = 96 * 1024
