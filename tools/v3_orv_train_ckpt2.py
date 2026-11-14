@@ -29,6 +29,33 @@ TOP_K = [1]        # 由 --top_k 覆盖；默认 2 = 真实 V3（model_v3.py:145
 ATTN = ["flash"]   # "flash" | "materialized"，由 --attn 覆盖
 
 
+def layer_fwd_attn_ckpt(x, L, cos, sin, d_k, n_q, n_kv):
+    """**只对注意力**做梯度检查点，MoE 与共享专家保持 eager（不重算）。
+
+    依据实测：整步 74% 花在反向，而检查点会把**整层**前向重算一遍；
+    MoE 的激活很便宜（每层约 30 MiB），注意力的最贵（物化时 134 MiB/层）。
+    所以只重算注意力，省下 MoE 那部分重算时间。
+    """
+    def attn_block(h_in):
+        return V.attention_orv(V.rmsnorm_orv(h_in, L["ln1"]), L["wq"], L["wk"],
+                               L["wv"], L["wo"], cos, sin, d_k, n_q, n_kv,
+                               flash=(ATTN[0] == "flash"),
+                               lowmem=(ATTN[0] == "lowmem"))
+
+    h = x + T.checkpoint(attn_block, x)
+    Tlen = int(h.shape[1]); d = int(h.shape[2])
+    hn = V.rmsnorm_orv(h, L["ln2"]).reshape(Tlen, d)
+    if int(TOP_K[0]) == 1:
+        eids, g, _s = MOE.route_top1(hn, L["router"])
+        mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
+    else:
+        eids, gates, _s = MOE.route_topk(hn, L["router"], int(TOP_K[0]))
+        mo = MOE.moe_topk_orv(hn, eids, gates, L["W1"], L["W2"], L["W3"])
+    if "S1" in L:
+        mo = mo + V.situ_glu_orv(hn, L["S1"], L["S2"], L["S3"])
+    return h + mo.reshape(1, Tlen, d)
+
+
 def layer_fwd(x, L, cos, sin, d_k, n_q, n_kv):
     h = x + V.attention_orv(V.rmsnorm_orv(x, L["ln1"]), L["wq"], L["wk"], L["wv"],
                             L["wo"], cos, sin, d_k, n_q, n_kv,
@@ -65,6 +92,8 @@ def main():
                     help="注意力实现。lowmem = 引擎自带融合核（要求 d_k=64，即 n_q=8）")
     ap.add_argument("--checkpoint", default="policy", choices=["policy", "on", "off"],
                     help="梯度检查点。默认取策略值（policy），可显式覆盖")
+    ap.add_argument("--ckpt-mode", default="layer", choices=["layer", "attn"],
+                    help="检查点粒度：layer=整层重算（省最多），attn=只重算注意力（更快）")
     ap.add_argument("--tile", type=int, default=0,
                     help="块化注意力的块大小（0 = 用策略值）。块对数 ∝ (S/tile)²")
     ap.add_argument("--opt", default="adamw", choices=["adamw", "fp16mv", "bf16mv"],
@@ -104,11 +133,14 @@ def main():
         t0 = time.time()
         opt.zero_grad()
 
-        if not a.checkpoint:
-            # 不做检查点：直接建图前向 + 一次反向（最快、最费显存）
+        if (not a.checkpoint) or a.ckpt_mode == "attn":
+            # 不做整层检查点：
+            #   --checkpoint off  → 全部 eager（最快、最费显存）
+            #   --ckpt-mode attn  → 只对注意力做检查点，MoE 保持 eager（省重算）
+            _lf = layer_fwd_attn_ckpt if a.ckpt_mode == "attn" else layer_fwd
             x = P["emb"][ids].reshape(1, a.seq, a.d)
             for L in P["layers"]:
-                x = layer_fwd(x, L, cos, sin, d_k, a.n_q, cfg["n_kv"])
+                x = _lf(x, L, cos, sin, d_k, a.n_q, cfg["n_kv"])
             logits = V.rmsnorm_orv(x, P["ln_f"]).reshape(a.seq, a.d) @ P["head"].transpose(0, 1)
             loss = T.functional.cross_entropy(logits, tgt)
             lv = loss.to_numpy() if hasattr(loss, "to_numpy") else loss
