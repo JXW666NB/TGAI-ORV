@@ -50,7 +50,7 @@ ENTRY = """## [0.9.64] - 2026-11-15
 
 
 def main():
-    # 1) 版本号
+    # 1) 版本号（pyproject）
     p = "pyproject.toml"
     s = io.open(p, encoding="utf-8").read()
     s2 = re.sub(r'^version = "[0-9.]+"', 'version = "%s"' % NEW_VERSION, s,
@@ -60,7 +60,19 @@ def main():
     io.open(p, "w", encoding="utf-8", newline="\n").write(s2)
     print("版本 -> %s" % NEW_VERSION)
 
-    # 2) CHANGELOG 顶部插入
+    # 2) 回退版本号（源码里没装包时的字面量）
+    #    ★ 这一步以前漏过：CI 的 tests/test_version.py 直接抓到了
+    #      "pyproject 是 0.9.64，回退值是 0.9.63"。别再靠人记。
+    q = "python/tgai_go/__init__.py"
+    t = io.open(q, encoding="utf-8").read()
+    t2, n = re.subn(r'__version__ = "[0-9.]+"',
+                    '__version__ = "%s"' % NEW_VERSION, t)
+    if n == 0:
+        raise SystemExit("没在 %s 里找到 __version__ 字面量" % q)
+    io.open(q, "w", encoding="utf-8", newline="\n").write(t2)
+    print("回退版本号改动 %d 处 -> %s" % (n, NEW_VERSION))
+
+    # 3) CHANGELOG 顶部插入
     c = io.open("CHANGELOG.md", encoding="utf-8").read()
     if "[%s]" % NEW_VERSION in c:
         print("CHANGELOG 已有该版本，跳过")
