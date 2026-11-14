@@ -155,6 +155,7 @@ def moe_topk_orv(x, eids, gates, W1, W2, W3, beta1=4.0, beta2=25.0,
     e_flat = np.asarray(eids).reshape(N * k)
     g_flat = gates.reshape(N * k)                    # 每行的门控值（设备张量）
     y = moe_dispatch_orv(x_rows, e_flat, g_flat, W1, W2, W3, beta1, beta2)
+    from tgai_go.train import v3_scatter as S
     # ★ 2026-11-15：`moe_dispatch_orv` 返回的是**按输入行序**（即 (token,slot) 序）的结果，
     #   所以再按 `tok`（行 → token 号）散进 N 行，原子加天然完成 k 路求和，
     #   省掉原来的 reshape(N,k,d) + sum(axis=1)（多一趟 8 MB 读写与一份中间张量）。
