@@ -124,18 +124,35 @@ def route_topk(hn, router_w, k=2, bias=None):
     return eids, gates, s_all
 
 
-def moe_topk_orv(x, eids, gates, W1, W2, W3, beta1=4.0, beta2=25.0):
-    """top_k>1 的分派：每个槽各跑一次分派，再按该槽门控加权求和。
+def moe_topk_orv(x, eids, gates, W1, W2, W3, beta1=4.0, beta2=25.0,
+                 merged=True):
+    """top_k>1 的分派。
 
-    数学上等于 `Σ_k gate_k · FFN_{i_k}(x)`，与参考实现一致；
-    代价是 k 次分派（k=2 时约两倍），换来语义正确。
+    **合并路径（默认）**：把 (token, slot) 展平成 N*k 行，**一次**分派覆盖全部专家，
+    再对 slot 维求和。相对逐槽分派的收益：
+      · 专家权重只读一遍（原来是 k 遍）
+      · 每个专家的 GEMM 行数从 N/E 变成 k·N/E，小 GEMM 的利用率显著改善
+      · GEMM 发射次数从 k·E·3 降到 E·3
+    数学上等于 `Σ_k gate_k · FFN_{i_k}(x)`，与参考实现一致；只有求和顺序变了，
+    实测与逐槽路径的差异在 1e-6 量级（见 tools/probe_moe_merged.py）。
+
+    `merged=False` 保留旧的逐槽路径，用于对拍与回退。
     """
-    k = int(eids.shape[1])
-    out = None
-    for slot in range(k):
-        part = moe_dispatch_orv(x, eids[:, slot], gates[:, slot], W1, W2, W3, beta1, beta2)
-        out = part if out is None else out + part
-    return out
+    N, k = int(eids.shape[0]), int(eids.shape[1])
+    if k == 1 or not merged:
+        out = None
+        for slot in range(k):
+            part = moe_dispatch_orv(x, eids[:, slot], gates[:, slot], W1, W2, W3,
+                                    beta1, beta2)
+            out = part if out is None else out + part
+        return out
+    d = int(x.shape[1])
+    tok = np.repeat(np.arange(N), k)                 # 每行的源 token
+    x_rows = x[tok]                                  # (N*k, d) 一次 gather
+    e_flat = np.asarray(eids).reshape(N * k)
+    g_flat = gates.reshape(N * k)                    # 每行的门控值（设备张量）
+    y = moe_dispatch_orv(x_rows, e_flat, g_flat, W1, W2, W3, beta1, beta2)
+    return y.reshape(N, k, d).sum(axis=1)
 
 
 def moe_dispatch_numpy(x, eids, gate, W1, W2, W3, beta1=4.0, beta2=25.0):
