@@ -33,6 +33,7 @@ def norm(s):
 
 
 def main():
+    only = sys.argv[1] if len(sys.argv) > 1 else "all"
     print("### 1. 计划任务（非 Microsoft 路径）")
     out = run(["schtasks", "/query", "/fo", "csv", "/v"])
     rows = list(csv.reader(io.StringIO(out)))
@@ -65,19 +66,22 @@ def main():
             seen.add(key)
             print("%-42s | %-8s | %s" % (task[:42], stat[:8], runto[:110]))
     print()
-
+    if only not in ("all", "2"):
+        return 0
     print("### 2. 自启动项（注册表 Run + 启动文件夹）")
     print(ps("Get-CimInstance Win32_StartupCommand | "
              "ForEach-Object { '{0}|{1}|{2}' -f $_.Name,$_.Location,$_.Command }")[:4000])
     print()
-
+    if only not in ("all", "3"):
+        return 0
     print("### 3. 占内存最多的用户进程")
     print(ps("Get-Process | Where-Object {$_.Path -and $_.Path -notmatch 'Windows\\\\'} | "
              "Sort-Object WS -Descending | Select-Object -First 25 | "
              "ForEach-Object { '{0}|{1}|{2}MB|{3}' -f $_.Id,$_.ProcessName,"
              "[int]($_.WS/1MB),$_.Path }")[:4000])
     print()
-
+    if only not in ("all", "4"):
+        return 0
     print("### 4. 浏览器主页 / 快捷方式检查（2345）")
     for reg in (r"Software\Microsoft\Internet Explorer\Main",
                 r"Software\Microsoft\Edge\BLBeacon"):
