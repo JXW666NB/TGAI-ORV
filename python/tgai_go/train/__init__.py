@@ -502,20 +502,24 @@ _GRAD_ENABLED = [True]
 # 执行策略：显存 与 速度 的取舍（用户可切）
 # ═══════════════════════════════════════════════════════════════════════
 # 设计原则：**同一份代码，四组预设**，不复制实现。算子读这里的值决定行为。
-#   standard  默认：块化注意力 512 + 掩码缓存 + 不额外回收（与今天实测一致）
-#   speed     空间换速度：更大块、缓存一切可缓存的、允许额外 workspace
-#   extreme   极致：在 speed 的基础上再叠加"检查点 + 小工作集"，目标是
-#             显存 ≤ 标准 且 速度 ≥ PyTorch —— 需要融合内核到位后才可能达成
-#   memory    省显存优先：小块、频繁回收、检查点，速度让位
+# 实测基准（8 层、d=512、seq2048、top_k=2、共享专家；PyT 同构 = 4,655 MiB / 0.515 s）：
+#   speed   物化 + 不检查点  7,693 MiB / 0.53 s   ← 速度已与 PyT 持平，代价是 1.65× 显存
+#   extreme 物化 + 检查点    4,299 MiB / 0.98 s   ← 0.92× 显存、1.9× 慢（当前最优折中）
+#   memory  块化 + 检查点    3,998 MiB / 2.12 s   ← 0.86× 显存，换 4× 时间
+#   standard = extreme（用户判断：可被 2 取代；保留名字以备将来分化）
 _POLICY_PRESETS = {
-    "standard": dict(attn_tile=512, cache_masks=True, inplace_acc=True,
-                     fused_rope=True, empty_cache_every=0, checkpoint_hint=False),
-    "speed":    dict(attn_tile=1024, cache_masks=True, inplace_acc=True,
-                     fused_rope=True, empty_cache_every=0, checkpoint_hint=False),
-    "extreme":  dict(attn_tile=512, cache_masks=True, inplace_acc=True,
-                     fused_rope=True, empty_cache_every=8, checkpoint_hint=True),
-    "memory":   dict(attn_tile=128, cache_masks=True, inplace_acc=False,
-                     fused_rope=True, empty_cache_every=1, checkpoint_hint=True),
+    "standard": dict(attn="materialized", checkpoint=True, attn_tile=512,
+                     cache_masks=True, inplace_acc=True, fused_rope=True,
+                     empty_cache_every=0),
+    "speed":    dict(attn="materialized", checkpoint=False, attn_tile=1024,
+                     cache_masks=True, inplace_acc=True, fused_rope=True,
+                     empty_cache_every=0),
+    "extreme":  dict(attn="materialized", checkpoint=True, attn_tile=512,
+                     cache_masks=True, inplace_acc=True, fused_rope=True,
+                     empty_cache_every=0),
+    "memory":   dict(attn="flash", checkpoint=True, attn_tile=128,
+                     cache_masks=True, inplace_acc=False, fused_rope=True,
+                     empty_cache_every=1),
 }
 _POLICY = [dict(_POLICY_PRESETS["standard"])]
 _POLICY_NAME = ["standard"]

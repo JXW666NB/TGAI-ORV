@@ -42,6 +42,8 @@ def main():
     ap.add_argument("--steps", type=int, default=5)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--n_heads", type=int, default=4,
+                    help="注意力头数。d_k = d // n_heads；引擎原生融合核要求 d_k=64（即 8 头）")
     ap.add_argument("--top_k", type=int, default=2,
                     help="每 token 激活的专家数。真实 V3 是 2（model_v3.py:145），默认对齐")
     a = ap.parse_args()
@@ -49,7 +51,7 @@ def main():
     import model_v3 as M
 
     cfg = M.TGAIV3Config(vocab_size=4096, d_model=a.d, n_layers=a.layers,
-                         n_heads=4, n_kv_heads=2, d_ff=4 * a.d,
+                         n_heads=a.n_heads, n_kv_heads=2, d_ff=4 * a.d,
                          n_experts=a.E, n_activated=a.top_k, n_shared_experts=1,
                          max_seq_len=a.seq, moe_balance="sign")
     model = M.TGAIV3Model(cfg).cuda()

@@ -2067,39 +2067,102 @@ extern "C" __global__ void fused_add_ip(float* x, const float* y, int n) {
  * j > pos 的位置直接写 0 —— 等价于先 scores + mask 再 softmax，但省掉 mask 的构造与加法。
  * want_lse 非 0 时额外写出每行 logsumexp（m + log(sum)），供反向/诊断使用。
  */
+/* 行内并行归约的两个小工具（warp 内 shfl 折叠）。 */
+__device__ __forceinline__ float _warp_max_f(float v) {
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+    return v;
+}
+__device__ __forceinline__ float _warp_sum_f(float v) {
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+    return v;
+}
+
+/* 因果掩码 + softmax，原地写 s。
+ *
+ * ★ 2026-11-13 重写：原版**每行一个线程、串行扫 k**，并行度差，
+ *   实测反而比"掩码 + 通用 softmax"慢（0.800 → 0.893 s），所以一直被关着。
+ *   现在改成**一个 block 处理一行**：每线程按 stride 扫列，warp shfl 归约，
+ *   共享数组再做一次跨 warp 归约 —— 与 PyTorch 的 row-wise softmax 同构。
+ *   grid = rows，block = 256。
+ */
 extern "C" __global__ void attn_mask_softmax(float* s, int rows, int k, int causal,
                                              int want_lse, float* lse) {
-    int r = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    __shared__ float red[32];
+    int r = (int)blockIdx.x;
     if (r >= rows || k <= 0) return;
     float* row = s + (long long)r * k;
     int pos = causal ? (r % k) : (k - 1);
     if (pos > k - 1) pos = k - 1;
-    float m = -3.402823466e+38F;
-    for (int j = 0; j <= pos; ++j) m = fmaxf(m, row[j]);
-    float sum = 0.f;
-    for (int j = 0; j <= pos; ++j) {
+    const int n = pos + 1;
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    const int nw = (nt + 31) >> 5;
+    const float kNeg = -3.402823466e+38F;
+
+    float lm = kNeg;
+    for (int j = tid; j < n; j += nt) lm = fmaxf(lm, row[j]);
+    lm = _warp_max_f(lm);
+    if ((tid & 31) == 0) red[tid >> 5] = lm;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < nw) ? red[tid] : kNeg;
+        v = _warp_max_f(v);
+        if (tid == 0) red[0] = v;
+    }
+    __syncthreads();
+    float m = red[0];
+
+    float ls = 0.f;
+    for (int j = tid; j < n; j += nt) {
         float e = expf(row[j] - m);
         row[j] = e;
-        sum += e;
+        ls += e;
     }
-    for (int j = pos + 1; j < k; ++j) row[j] = 0.f;
+    for (int j = n + tid; j < k; j += nt) row[j] = 0.f;
+    ls = _warp_sum_f(ls);
+    if ((tid & 31) == 0) red[tid >> 5] = ls;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < nw) ? red[tid] : 0.f;
+        v = _warp_sum_f(v);
+        if (tid == 0) red[0] = v;
+    }
+    __syncthreads();
+    float sum = red[0];
     float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
-    for (int j = 0; j <= pos; ++j) row[j] *= inv;
-    if (want_lse && lse) lse[r] = (sum > 0.f) ? (m + logf(sum)) : m;
+    for (int j = tid; j < n; j += nt) row[j] *= inv;
+    if (want_lse && lse && tid == 0) lse[r] = (sum > 0.f) ? (m + logf(sum)) : m;
 }
 
 /* softmax 反向：dS = P * (dP - sum(dP*P, axis=-1, keepdim))。
- * 被 mask 掉的列 P 恒为 0，所以 dS 自动是 0，不需要再乘一次掩码。 */
+ * 被 mask 掉的列 P 恒为 0，所以 dS 自动是 0，不需要再乘一次掩码。
+ * 同样改成一块一行 + 归约。 */
 extern "C" __global__ void attn_mask_softmax_bwd(const float* dp, const float* p, float* ds,
                                                  int rows, int k) {
-    int r = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    __shared__ float red[32];
+    int r = (int)blockIdx.x;
     if (r >= rows || k <= 0) return;
     const float* drow = dp + (long long)r * k;
     const float* prow = p + (long long)r * k;
     float* orow = ds + (long long)r * k;
-    float dot = 0.f;
-    for (int j = 0; j < k; ++j) dot = __fadd_rn(dot, __fmul_rn(drow[j], prow[j]));
-    for (int j = 0; j < k; ++j) orow[j] = __fmul_rn(prow[j], __fsub_rn(drow[j], dot));
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    const int nw = (nt + 31) >> 5;
+
+    float ld = 0.f;
+    for (int j = tid; j < k; j += nt) ld = __fadd_rn(ld, __fmul_rn(drow[j], prow[j]));
+    ld = _warp_sum_f(ld);
+    if ((tid & 31) == 0) red[tid >> 5] = ld;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < nw) ? red[tid] : 0.f;
+        v = _warp_sum_f(v);
+        if (tid == 0) red[0] = v;
+    }
+    __syncthreads();
+    float dot = red[0];
+    for (int j = tid; j < k; j += nt)
+        orow[j] = __fmul_rn(prow[j], __fsub_rn(drow[j], dot));
 }
 """
 
@@ -6357,7 +6420,9 @@ class CudaRuntime:
         if want_lse:
             lse = self.empty((rows,), dtype=np.float32)
         lse_ptr = (0, ctypes.c_uint64) if lse is None else self._ptr(lse)
-        grid, block = self._ewise_grid(rows)
+        # 一块一行（块内并行归约），不再是"每行一个线程串行扫" —— 后者并行度差，
+        # 实测比"掩码 + 通用 softmax"还慢，所以融合路径以前一直被关着。
+        grid, block = (rows, 1, 1), (256, 1, 1)
         self.launch("attn_mask_softmax", grid, block, [
             self._ptr(s), (rows, ctypes.c_int), (k, ctypes.c_int),
             (1 if causal else 0, ctypes.c_int),
@@ -6375,7 +6440,7 @@ class CudaRuntime:
         ds = self.empty(dp.shape, dtype=np.float32)
         if rows <= 0 or k <= 0:
             return ds
-        grid, block = self._ewise_grid(rows)
+        grid, block = (rows, 1, 1), (256, 1, 1)
         self.launch("attn_mask_softmax_bwd", grid, block, [
             self._ptr(dp), self._ptr(p), self._ptr(ds),
             (rows, ctypes.c_int), (k, ctypes.c_int),

@@ -26,11 +26,14 @@ from v3_orv_train import build, params_of  # noqa: E402
 
 
 TOP_K = [1]        # 由 --top_k 覆盖；默认 2 = 真实 V3（model_v3.py:145）
+ATTN = ["flash"]   # "flash" | "materialized"，由 --attn 覆盖
 
 
 def layer_fwd(x, L, cos, sin, d_k, n_q, n_kv):
     h = x + V.attention_orv(V.rmsnorm_orv(x, L["ln1"]), L["wq"], L["wk"], L["wv"],
-                            L["wo"], cos, sin, d_k, n_q, n_kv, flash=True)
+                            L["wo"], cos, sin, d_k, n_q, n_kv,
+                            flash=(ATTN[0] == "flash"),
+                            lowmem=(ATTN[0] == "lowmem"))
     Tlen = int(h.shape[1]); d = int(h.shape[2])
     hn = V.rmsnorm_orv(h, L["ln2"]).reshape(Tlen, d)
     if int(TOP_K[0]) == 1:
@@ -57,10 +60,19 @@ def main():
     ap.add_argument("--policy", default="standard",
                     choices=["standard", "speed", "extreme", "memory"],
                     help="执行策略：显存与速度的取舍，见 T.set_policy")
+    ap.add_argument("--attn", default="policy",
+                    choices=["policy", "flash", "materialized", "lowmem"],
+                    help="注意力实现。lowmem = 引擎自带融合核（要求 d_k=64，即 n_q=8）")
+    ap.add_argument("--checkpoint", default="policy", choices=["policy", "on", "off"],
+                    help="梯度检查点。默认取策略值（policy），可显式覆盖")
     a = ap.parse_args()
     TOP_K[0] = int(a.top_k)
     T.set_default_device("cuda")
     T.set_policy(a.policy)
+    # 策略即默认值，命令行只在显式给出时覆盖
+    ATTN[0] = T.policy("attn", "flash") if a.attn == "policy" else a.attn
+    ck = bool(T.policy("checkpoint", True)) if a.checkpoint == "policy" else (a.checkpoint == "on")
+    a.checkpoint = ck
     rt = T._cuda()
     cfg = dict(d=a.d, d_ff=4 * a.d, E=a.E, layers=a.layers, n_q=a.n_q, n_kv=2,
                vocab=4096, seq=a.seq, steps=a.steps)
@@ -78,6 +90,23 @@ def main():
         tgt = np.roll(ids, -1)
         t0 = time.time()
         opt.zero_grad()
+
+        if not a.checkpoint:
+            # 不做检查点：直接建图前向 + 一次反向（最快、最费显存）
+            x = P["emb"][ids].reshape(1, a.seq, a.d)
+            for L in P["layers"]:
+                x = layer_fwd(x, L, cos, sin, d_k, a.n_q, cfg["n_kv"])
+            logits = V.rmsnorm_orv(x, P["ln_f"]).reshape(a.seq, a.d) @ P["head"].transpose(0, 1)
+            loss = T.functional.cross_entropy(logits, tgt)
+            lv = loss.to_numpy() if hasattr(loss, "to_numpy") else loss
+            lv = float(lv) if isinstance(lv, (int, float)) else float(np.asarray(lv).reshape(-1)[0])
+            loss.backward()
+            opt.step()
+            times.append(time.time() - t0)
+            losses.append(lv)
+            del x, logits, loss
+            print("step %d loss=%.4f %.2fs" % (step, lv, times[-1]), flush=True)
+            continue
 
         with T.no_grad():
             x = P["emb"][ids].reshape(1, a.seq, a.d)
