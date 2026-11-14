@@ -502,24 +502,22 @@ _GRAD_ENABLED = [True]
 # 执行策略：显存 与 速度 的取舍（用户可切）
 # ═══════════════════════════════════════════════════════════════════════
 # 设计原则：**同一份代码，四组预设**，不复制实现。算子读这里的值决定行为。
-# 实测基准（8 层、d=512、seq2048、top_k=2、共享专家；PyT 同构 = 4,655 MiB / 0.515 s）：
-#   speed   物化 + 不检查点  7,693 MiB / 0.53 s   ← 速度已与 PyT 持平，代价是 1.65× 显存
-#   extreme 物化 + 检查点    4,299 MiB / 0.98 s   ← 0.92× 显存、1.9× 慢（当前最优折中）
-#   memory  块化 + 检查点    3,998 MiB / 2.12 s   ← 0.86× 显存，换 4× 时间
+# 实测基准（V100 32GB；seq2048、8 层、d=512、8 头、top_k=2、共享专家、真训练步；
+#          同构 PyTorch = 4,633 MiB / 0.507 s，实测于 2026-11-15）：
+#   speed   物化 + 不检查点  8,329 MiB / 0.24 s   ← 比 PyT 快 2.1×，代价是 1.8× 显存
+#   extreme 物化 + 检查点    3,692 MiB / 0.47 s   ← 显存 0.80×、速度 0.93×，两轴同时赢
+#   memory  块化 + 检查点    3,169 MiB / 0.81 s   ← 显存 0.68×，速度 1.6×（换显存）
 #   standard = extreme（用户判断：可被 2 取代；保留名字以备将来分化）
+# 完整对比与上下文长度曲线见 docs/THREE_TARGETS.md。
 _POLICY_PRESETS = {
     "standard": dict(attn="materialized", checkpoint=True, attn_tile=512,
-                     cache_masks=True, inplace_acc=True, fused_rope=True,
-                     empty_cache_every=0),
+                     cache_masks=True, inplace_acc=True, fused_rope=True),
     "speed":    dict(attn="materialized", checkpoint=False, attn_tile=1024,
-                     cache_masks=True, inplace_acc=True, fused_rope=True,
-                     empty_cache_every=0),
+                     cache_masks=True, inplace_acc=True, fused_rope=True),
     "extreme":  dict(attn="materialized", checkpoint=True, attn_tile=512,
-                     cache_masks=True, inplace_acc=True, fused_rope=True,
-                     empty_cache_every=0),
-    "memory":   dict(attn="flash", checkpoint=True, attn_tile=128,
-                     cache_masks=True, inplace_acc=False, fused_rope=True,
-                     empty_cache_every=1),
+                     cache_masks=True, inplace_acc=True, fused_rope=True),
+    "memory":   dict(attn="flash", checkpoint=True, attn_tile=768,
+                     cache_masks=True, inplace_acc=False, fused_rope=True),
 }
 _POLICY = [dict(_POLICY_PRESETS["standard"])]
 _POLICY_NAME = ["standard"]
