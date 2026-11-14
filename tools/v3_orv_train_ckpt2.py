@@ -65,10 +65,14 @@ def main():
                     help="注意力实现。lowmem = 引擎自带融合核（要求 d_k=64，即 n_q=8）")
     ap.add_argument("--checkpoint", default="policy", choices=["policy", "on", "off"],
                     help="梯度检查点。默认取策略值（policy），可显式覆盖")
+    ap.add_argument("--tile", type=int, default=0,
+                    help="块化注意力的块大小（0 = 用策略值）。块对数 ∝ (S/tile)²")
     a = ap.parse_args()
     TOP_K[0] = int(a.top_k)
     T.set_default_device("cuda")
     T.set_policy(a.policy)
+    if int(a.tile) > 0:
+        T.set_policy_value("attn_tile", int(a.tile))
     # 策略即默认值，命令行只在显式给出时覆盖
     ATTN[0] = T.policy("attn", "flash") if a.attn == "policy" else a.attn
     ck = bool(T.policy("checkpoint", True)) if a.checkpoint == "policy" else (a.checkpoint == "on")
