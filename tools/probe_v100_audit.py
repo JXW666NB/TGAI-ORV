@@ -53,8 +53,12 @@ def _section(which):
 
 def _section4():
     print("### 4. 浏览器主页 / 快捷方式检查（2345）")
-    for reg in (r"Software\Microsoft\Internet Explorer\Main",):
-        print(run(["reg", "query", "HKCU\\" + reg]))
+    for reg in (r"HKCU\Software\Microsoft\Internet Explorer\Main",
+                r"HKLM\SOFTWARE\Policies\Microsoft\Edge",
+                r"HKCU\Software\Policies\Microsoft\Edge",
+                r"HKLM\SOFTWARE\Policies\Google\Chrome"):
+        print("--- %s ---" % reg)
+        print(run(["reg", "query", reg, "/v"]).strip()[:1200])
     users = os.path.expanduser("~")
     for tag, rel in (("Chrome", ("AppData", "Local", "Google", "Chrome", "User Data",
                                  "Default", "Preferences")),
