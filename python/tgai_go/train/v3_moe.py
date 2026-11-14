@@ -151,10 +151,16 @@ def moe_topk_orv(x, eids, gates, W1, W2, W3, beta1=4.0, beta2=25.0,
         return out
     d = int(x.shape[1])
     tok = np.repeat(np.arange(N), k)                 # 每行的源 token
-    x_rows = x[tok]                                  # (N*k, d) 一次 gather
     e_flat = np.asarray(eids).reshape(N * k)
     g_flat = gates.reshape(N * k)                    # 每行的门控值（设备张量）
-    y = moe_dispatch_orv(x_rows, e_flat, g_flat, W1, W2, W3, beta1, beta2)
+    # ★ 2026-11-15：把"先按 token 展开再按专家排序"两次 gather 合成**一次**。
+    #   `x[tok]` 后再 `[order]` 等于 `x[tok[order]]`；预合成置换后只搬一趟，
+    #   并省掉一份 (N·k, d) 的中间张量（实测前向因此从 0.125 s 降到更低）。
+    from tgai_go.train import indexing as _idx
+    perm = tok[np.argsort(e_flat, kind="stable")]
+    x_perm = _idx.index_select(x, 0, perm)
+    y = moe_dispatch_orv(x_perm, e_flat, g_flat, W1, W2, W3, beta1, beta2,
+                         _presorted=perm)
     return y.reshape(N, k, d).sum(axis=1)
 
 
@@ -173,10 +179,13 @@ def moe_dispatch_numpy(x, eids, gate, W1, W2, W3, beta1=4.0, beta2=25.0):
     return out
 
 
-def moe_dispatch_orv(x, eids_np, gate, W1, W2, W3, beta1=4.0, beta2=25.0):
+def moe_dispatch_orv(x, eids_np, gate, W1, W2, W3, beta1=4.0, beta2=25.0,
+                     _presorted=None):
     """ORV 张量版：gather → 逐专家 → cat → scatter_add 回原位。
 
     `eids_np` 是 `topi[:, 0]` 的 numpy 视图（路由下标本身不参与梯度，这是标准做法）。
+    `_presorted`：调用方**已经**把 x 按专家顺序 gather 好了时，传入那次 gather 用的
+    置换 `perm`；此时内部跳过 gather，只保留"散回原位"那一步（用 perm 作索引）。
     """
     import tgai_go.train as T
     from tgai_go.train import v3_ops as V
@@ -184,14 +193,19 @@ def moe_dispatch_orv(x, eids_np, gate, W1, W2, W3, beta1=4.0, beta2=25.0):
 
     n_rows = int(x.shape[0])
     eids = np.asarray(eids_np).reshape(-1).astype(np.int64)
-    order = np.argsort(eids, kind="stable")           # 按专家分组
-    # ★ 2026-11-15：改用 `indexing.index_select`（设备侧 gather，反向是
-    #   `rt.scatter_add_rows`）。原来的 `x[order]` 反向走 **D2H + np.add.at + H2D**，
-    #   实测这一段 fwd+bwd 要 **25 ms**（整个分派 62 ms 里最大的一块）。
-    from tgai_go.train import indexing as _idx
-    xs = _idx.index_select(x, 0, order)
-    # gate 是 1-D 且实测只值 0 ms，仍用原来的索引（设备 gather 对 1-D 的反向形状会出问题）
-    g_sorted = gate[order]
+    if _presorted is not None:
+        order = np.asarray(_presorted, np.int64)      # 只用于散回原位
+        xs = x
+        g_sorted = gate
+    else:
+        order = np.argsort(eids, kind="stable")       # 按专家分组
+        # ★ 2026-11-15：改用 `indexing.index_select`（设备侧 gather，反向是
+        #   `rt.scatter_add_rows`）。原来的 `x[order]` 反向走 **D2H + np.add.at + H2D**，
+        #   实测这一段 fwd+bwd 要 **25 ms**（整个分派 62 ms 里最大的一块）。
+        from tgai_go.train import indexing as _idx
+        xs = _idx.index_select(x, 0, order)
+        # gate 是 1-D 且实测只值 0 ms，仍用原来的索引（设备 gather 对 1-D 的反向形状会出问题）
+        g_sorted = gate[order]
 
     # 专家权重可以是三维张量（W1[e] 会拷贝）或**列表**（不拷贝，推荐）。
     E = len(W1) if isinstance(W1, (list, tuple)) else int(W1.shape[0])
