@@ -35,8 +35,11 @@ def main():
     acc = {}
 
     def tick(name, fn):
+        # GPU 是异步的：不同步就只会量到"入队时间"。这里显式同步，接受额外开销。
+        rt.sync()
         t0 = time.time()
         r = fn()
+        rt.sync()
         acc[name] = acc.get(name, 0.0) + (time.time() - t0)
         return r
 
