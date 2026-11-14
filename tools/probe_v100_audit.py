@@ -32,8 +32,65 @@ def norm(s):
     return (s or "").lower().replace("/", "\\")
 
 
+def _section(which):
+    """只跑某一节：2=自启动，3=进程，4=浏览器。"""
+    if which == "2":
+        print("### 2. 自启动项（注册表 Run + 启动文件夹）")
+        print(ps("Get-CimInstance Win32_StartupCommand | "
+                 "ForEach-Object { '{0}|{1}|{2}' -f $_.Name,$_.Location,$_.Command }"))
+        return 0
+    if which == "3":
+        print("### 3. 占内存最多的用户进程")
+        print(ps("Get-Process | Where-Object {$_.Path -and $_.Path -notmatch 'Windows\\\\'} | "
+                 "Sort-Object WS -Descending | Select-Object -First 25 | "
+                 "ForEach-Object { '{0}|{1}|{2}MB|{3}' -f $_.Id,$_.ProcessName,"
+                 "[int]($_.WS/1MB),$_.Path }"))
+        return 0
+    if which == "4":
+        return _section4()
+    return 0
+
+
+def _section4():
+    print("### 4. 浏览器主页 / 快捷方式检查（2345）")
+    for reg in (r"Software\Microsoft\Internet Explorer\Main",):
+        print(run(["reg", "query", "HKCU\\" + reg]))
+    users = os.path.expanduser("~")
+    for tag, rel in (("Chrome", ("AppData", "Local", "Google", "Chrome", "User Data",
+                                 "Default", "Preferences")),
+                     ("Edge", ("AppData", "Local", "Microsoft", "Edge", "User Data",
+                               "Default", "Preferences"))):
+        path = os.path.join(users, *rel)
+        if not os.path.exists(path):
+            print("%s: 未安装或无配置" % tag)
+            continue
+        try:
+            d = json.load(io.open(path, encoding="utf-8", errors="replace"))
+            print("%s: homepage=%r startup_urls=%r"
+                  % (tag, d.get("homepage", ""),
+                     d.get("session", {}).get("startup_urls", "")))
+        except Exception as exc:
+            print("%s: 读取失败 %s" % (tag, exc))
+    for base in (os.path.join(users, "Desktop"),
+                 os.path.join(users, "AppData", "Roaming", "Microsoft", "Windows",
+                              "Start Menu", "Programs")):
+        for root, _, files in os.walk(base):
+            for f in files:
+                if not f.lower().endswith(".lnk"):
+                    continue
+                p = os.path.join(root, f)
+                try:
+                    if b"2345" in io.open(p, "rb").read():
+                        print("命中 2345 快捷方式: %s" % p)
+                except Exception:
+                    pass
+    return 0
+
+
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if only not in ("all", "1"):
+        return _section(only)
     print("### 1. 计划任务（非 Microsoft 路径）")
     out = run(["schtasks", "/query", "/fo", "csv", "/v"])
     rows = list(csv.reader(io.StringIO(out)))
