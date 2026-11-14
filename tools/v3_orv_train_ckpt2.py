@@ -124,6 +124,8 @@ def main():
                     help="梯度检查点。默认取策略值（policy），可显式覆盖")
     ap.add_argument("--ckpt-mode", default="layer", choices=["layer", "attn", "moe"],
                     help="检查点粒度：layer=整层重算（省最多），attn=只重算注意力，moe=只重算 MoE")
+    ap.add_argument("--ckpt-head", action="store_true",
+                    help="对 head+CE 做检查点：省约 66 MiB 常驻 logits，代价是重算一次 GEMM")
     ap.add_argument("--tile", type=int, default=0,
                     help="块化注意力的块大小（0 = 用策略值）。块对数 ∝ (S/tile)²")
     ap.add_argument("--opt", default="adamw", choices=["adamw", "fp16mv", "bf16mv"],
@@ -172,7 +174,17 @@ def main():
             x = P["emb"][ids].reshape(1, a.seq, a.d)
             for L in P["layers"]:
                 x = _lf(x, L, cos, sin, d_k, a.n_q, cfg["n_kv"])
-            logits = V.rmsnorm_orv(x, P["ln_f"]).reshape(a.seq, a.d) @ P["head"].transpose(0, 1)
+            if a.ckpt_head:
+                # 头部检查点：logits 是 (seq, vocab) = 2048×4096×4 ≈ 33 MiB，
+                # 加上 CE 反向需要的那份，常驻约 66 MiB。用重算换掉它，
+                # 代价是反向时重跑一次 head 的 GEMM（8.6 GFLOP，约 2 ms）。
+                def _head(hh):
+                    return (V.rmsnorm_orv(hh, P["ln_f"]).reshape(a.seq, a.d)
+                            @ P["head"].transpose(0, 1))
+                logits = T.checkpoint(_head, x)
+            else:
+                logits = (V.rmsnorm_orv(x, P["ln_f"]).reshape(a.seq, a.d)
+                          @ P["head"].transpose(0, 1))
             loss = T.functional.cross_entropy(logits, tgt)
             lv = loss.to_numpy() if hasattr(loss, "to_numpy") else loss
             lv = float(lv) if isinstance(lv, (int, float)) else float(np.asarray(lv).reshape(-1)[0])
