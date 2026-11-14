@@ -61,7 +61,7 @@ def main():
                         weight_decay=0.0)
     model = Adapter(P, cos, sin, d // n_q, n_q, n_kv, S, d, vocab)
 
-    gs = GraphStep(model, opt, (1, S), (1, S), vocab, arena_gib=8.0)
+    gs = GraphStep(model, opt, (1, S), (1, S), vocab, arena_gib=4.0)
 
     # 逐算子基准
     for _ in range(2):
@@ -76,9 +76,13 @@ def main():
 
     # 捕获
     t0 = time.time()
-    nodes = gs.capture(warmup=2)
-    rt.sync()
-    print("捕获完成 nodes=%s 耗时 %.1f s" % (nodes, time.time() - t0))
+    try:
+        nodes = gs.capture(warmup=1)
+        print("捕获完成 nodes=%s 耗时 %.1f s" % (nodes, time.time() - t0), flush=True)
+    except Exception as exc:
+        print("捕获失败：%s" % (str(exc)[:400],), flush=True)
+        print("回退原因：%s" % (getattr(gs, "fallback_reason", None),), flush=True)
+        return 1
 
     # 图重放
     for _ in range(2):
