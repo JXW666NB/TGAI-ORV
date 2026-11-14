@@ -78,16 +78,20 @@ def main():
     B, S, NH, DH = 4, 2048, 12, 64
     BH = B * NH
     print("注意力形状：BH=%d S=%d DH=%d（B=4, 12 头）" % (BH, S, DH), flush=True)
-    bench("materialized", BH, S, DH)
-    try:
-        bench("fused", BH, S, DH)
-    except Exception as exc:
-        print("  fused              失败：%s" % str(exc)[:70], flush=True)
-    for c in (256, 512):
+    # ★ 一次进程只测一档：peak_live_bytes 单调不减，同进程先后测会继承前面的峰值。
+    what = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if what == "all":
+        print("（提示：一次进程只应测一档，见 docstring）", flush=True)
+    if what in ("materialized", "all"):
+        bench("materialized", BH, S, DH)
+    if what in ("fused", "all"):
         try:
-            bench("chunked", BH, S, DH, chunk=c)
+            bench("fused", BH, S, DH)
         except Exception as exc:
-            print("  chunked(C=%d)      失败：%s" % (c, str(exc)[:70]), flush=True)
+            print("  fused              失败：%s" % str(exc)[:70], flush=True)
+    if what.startswith("chunk"):
+        c = int(what.split("=")[1]) if "=" in what else 256
+        bench("chunked", BH, S, DH, chunk=c)
     return 0
 
 
