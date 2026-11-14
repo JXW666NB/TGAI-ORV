@@ -151,7 +151,13 @@ def moe_topk_orv(x, eids, gates, W1, W2, W3, beta1=4.0, beta2=25.0,
         return out
     d = int(x.shape[1])
     tok = np.repeat(np.arange(N), k)                 # 每行的源 token
-    x_rows = x[tok]                                  # (N*k, d) 一次 gather
+    from tgai_go.train import indexing as _idx
+    # ★ 2026-11-15：**外层 token 展开也必须走设备 gather**。
+    #   原来这里写 `x[tok]`，前向只要 0.07 ms，但它的反向是
+    #   `D2H + np.add.at + H2D`（主机往返）—— 实测整条分派前向 3.26 ms、
+    #   前+反向 26.3 ms，也就是反向 23 ms 里绝大部分是这一行。
+    #   换成 index_select 后反向是 `rt.scatter_add_rows`（设备原子加）。
+    x_rows = _idx.index_select(x, 0, tok)
     e_flat = np.asarray(eids).reshape(N * k)
     g_flat = gates.reshape(N * k)                    # 每行的门控值（设备张量）
     y = moe_dispatch_orv(x_rows, e_flat, g_flat, W1, W2, W3, beta1, beta2)
