@@ -115,7 +115,10 @@ def main():
                 x = layer_fwd(x, L, cos, sin, d_k, a.n_q, cfg["n_kv"])
                 bounds.append(x)
 
-        last = T.tensor(np.asarray(bounds[-1].to_numpy(), np.float32), requires_grad=True)
+        # ★ 边界保持**设备**张量：`_from_gpu` 包装同一块显存成新的叶子（无拷贝、无 D2H）。
+        #   原先每次 `to_numpy()` + `T.tensor()` 会带一次强制同步 + 两次 PCIe 往返，
+        #   8 层 × 2 遍 = 每步十几次同步，是检查点路径的最大固定开销之一。
+        last = T.Tensor._from_gpu(bounds[-1]._gpu, requires_grad=True)
         print("  前向(no_grad)完成 live=%.0f MiB" % (rt.pool_stats()["live_bytes"] / 2**20),
               flush=True)
         logits = V.rmsnorm_orv(last, P["ln_f"]).reshape(a.seq, a.d) @ P["head"].transpose(0, 1)
@@ -123,20 +126,20 @@ def main():
         lv = loss.to_numpy() if hasattr(loss, "to_numpy") else loss
         lv = float(lv) if isinstance(lv, (int, float)) else float(np.asarray(lv).reshape(-1)[0])
         loss.backward()
-        g_up = np.asarray(last.grad.to_numpy(), np.float32)
+        g_up = last.grad                     # 设备张量，直接往下一层传，不做 PCIe 往返
         print("  头部反传完成 live=%.0f MiB" % (rt.pool_stats()["live_bytes"] / 2**20),
               flush=True)
         del last, logits, loss
         rt.empty_cache()
 
         for i in range(len(P["layers"]) - 1, -1, -1):
-            xi = T.tensor(np.asarray(bounds[i].to_numpy(), np.float32), requires_grad=True)
+            xi = T.Tensor._from_gpu(bounds[i]._gpu, requires_grad=True)
             y = layer_fwd(xi, P["layers"][i], cos, sin, d_k, a.n_q, cfg["n_kv"])
             if step == 0 and i in (7, 4, 0):
                 print("      layer %d 建图后 live=%.0f MiB"
                       % (i, rt.pool_stats()["live_bytes"] / 2**20), flush=True)
-            y.backward(T.tensor(np.ascontiguousarray(g_up)))
-            g_up = np.asarray(xi.grad.to_numpy(), np.float32)
+            y.backward(g_up)
+            g_up = xi.grad                    # 同样是设备张量
             del xi, y
             # ★ 若图里有引用环（tensor → _backward 闭包 → tensor），`del` 不会立即释放，
             #   必须 gc.collect()。实测每层残留 ≈98 MB ≈ 6 个 (N, d_ff)，正是 MoE 的中间量。
