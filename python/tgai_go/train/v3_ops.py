@@ -338,6 +338,28 @@ def csa_conv_causal(x, w):
 # GlobalAttention 的 ORV 张量实现
 # ═══════════════════════════════════════════════════════════
 
+_ROPE_TABLES = {}
+
+
+def _rope_table(cos, sin, B, nh, Tlen, rot, kind):
+    """把 (Tlen, rot) 的 cos/sin 展开成 x 的形状并**缓存**。
+
+    `T.fused_rope` 要求 cos/sin 与 x 元素数相同；而 cos/sin 是常量，
+    展开一次供所有层复用（每份 B·nh·Tlen·rot·4B，本配置下约 4 MiB）。
+    """
+    import tgai_go.train as T
+    key = (kind, B, nh, Tlen, rot)
+    t = _ROPE_TABLES.get(key)
+    if t is None:
+        c = np.asarray(cos.to_numpy() if hasattr(cos, "to_numpy") else cos, np.float32)
+        s = np.asarray(sin.to_numpy() if hasattr(sin, "to_numpy") else sin, np.float32)
+        c = np.ascontiguousarray(np.broadcast_to(c.reshape(Tlen, rot), (B, nh, Tlen, rot)))
+        s = np.ascontiguousarray(np.broadcast_to(s.reshape(Tlen, rot), (B, nh, Tlen, rot)))
+        t = (T.tensor(c), T.tensor(s))
+        _ROPE_TABLES[key] = t
+    return t
+
+
 def attention_orv(x, wq, wk, wv, wo, cos, sin, rot_dim, n_q, n_kv, causal=True,
                   attn_mask=None, lowmem=False, flash=False):
 
@@ -361,10 +383,22 @@ def attention_orv(x, wq, wk, wv, wo, cos, sin, rot_dim, n_q, n_kv, causal=True,
     k = (x @ wk.transpose(0, 1)).reshape(B, Tlen, n_kv, d_k).transpose(1, 2)
     v = (x @ wv.transpose(0, 1)).reshape(B, Tlen, n_kv, d_k).transpose(1, 2)
 
-    c = cos.reshape(1, 1, Tlen, int(rot_dim))
-    s = sin.reshape(1, 1, Tlen, int(rot_dim))
-    q = v3_rope(q, c, s)
-    k = v3_rope(k, c, s)
+    # ★ RoPE：优先走引擎的融合核（fwd/bwd 各 1 个 kernel），否则用组合实现。
+    #   组合版是 1 个 matmul + 3 个 elementwise；融合版在整模型上每步省约 2.1 GiB 流量。
+    #   融合核要求 cos/sin 与 x 同形 ⇒ 先把常量表展开并缓存（全层复用）。
+    _use_fused_rope = (getattr(q, "device", "cpu") == "cuda"
+                       and int(rot_dim) == d_k
+                       and bool(__import__("tgai_go.train", fromlist=["x"]).policy("fused_rope", True)))
+    if _use_fused_rope:
+        cq, sq = _rope_table(cos, sin, B, n_q, Tlen, int(rot_dim), "q")
+        q = T.fused_rope(q, cq, sq)
+        ck_, sk_ = _rope_table(cos, sin, B, n_kv, Tlen, int(rot_dim), "k")
+        k = T.fused_rope(k, ck_, sk_)
+    else:
+        c = cos.reshape(1, 1, Tlen, int(rot_dim))
+        s = sin.reshape(1, 1, Tlen, int(rot_dim))
+        q = v3_rope(q, c, s)
+        k = v3_rope(k, c, s)
 
     if n_kv != n_q:
         # GQA：**交错**复制（第 h 个 q 头用第 h//rep 个 kv 头）。
