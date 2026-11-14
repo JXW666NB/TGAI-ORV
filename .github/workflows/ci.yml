@@ -22,13 +22,21 @@ jobs:
           python -m pip install -U pip
           # safetensors: 检查点用例要现场造一个迷你 HF 权重目录
           # transformers: rope_scaling 对拍要用官方 LlamaForCausalLM 当参照物
-          python -m pip install numpy pytest build safetensors transformers
+          # numpy 锁版本：不同 Python 版本会装到不同 numpy，BLAS 累加顺序随之不同，
+          # 数值对拍会偶发越界（实测 3.10 与 3.12 不一致）。锁定后两边环境一致。
+          python -m pip install numpy==2.2.6 pytest build safetensors transformers
           # gguf 是选装的：装不上就跳过那一 个用例（不要因为它整文件跳过）
           python -m pip install gguf || echo "gguf 未安装，对应用例会跳过"
           # CPU 版 torch：让 7 个 importorskip("torch") 的模块真正运行。
           # 之前 CI 里 117 项中有 71 项根本没被收集 —— 数值对齐等于没有门禁。
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
       - name: 单元测试（纯 CPU，不需要 GPU）
+        # 数值对拍类测试必须单线程：多线程 BLAS 的归约顺序会导致
+        # 同一算法两次运行结果不同，从而偶发失败。
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+          OMP_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
         run: python -m pytest tests -q
       - name: 打包并做发布前自检（文件齐 / 语法净 / 干净 venv 可 import / .cu 随包）
         run: |
