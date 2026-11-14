@@ -58,7 +58,7 @@ def _section4():
                 r"HKCU\Software\Policies\Microsoft\Edge",
                 r"HKLM\SOFTWARE\Policies\Google\Chrome"):
         print("--- %s ---" % reg)
-        print(run(["reg", "query", reg, "/v"]).strip()[:1200])
+        print(run(["reg", "query", reg]).strip()[:1200])
     users = os.path.expanduser("~")
     for tag, rel in (("Chrome", ("AppData", "Local", "Google", "Chrome", "User Data",
                                  "Default", "Preferences")),
