@@ -19,11 +19,16 @@ sys.path.insert(0, "D:/orv_pip_0962")
 sys.path.insert(0, "D:/orv_pip_0962/Lib/site-packages")
 
 
-def compute():
+def compute(limit_kb=None):
     import tgai_go.train as T
     from tgai_go.train import functional as Fn
 
     T.set_default_device("cuda")
+    if limit_kb:
+        # 强制设备动态 smem 上限，用于验证"按上限选内核"的降级分支
+        rt = T._cuda()
+        rt._device_smem_limit = lambda: int(limit_kb) * 1024
+        print("强制 smem 上限 %d KB" % int(limit_kb), flush=True)
     BH, S, DH = 6, 2000, 64          # 2000 不是 32 的整数倍，顺带覆盖尾部边界
     rng = np.random.default_rng(0)
     q = T.tensor(rng.normal(0, .3, (BH, S, DH)).astype(np.float32), requires_grad=True)
@@ -41,11 +46,11 @@ def compute():
     }
 
 
-def do_run(out, cu):
+def do_run(out, cu, limit_kb=None):
     if cu:
         os.environ["TGAI_ATTN_NOP_CU"] = os.path.abspath(cu)
         print("内核覆盖: %s" % os.environ["TGAI_ATTN_NOP_CU"], flush=True)
-    res = compute()
+    res = compute(limit_kb)
     for kk, arr in res.items():
         np.save("%s_%s.npy" % (out, kk), arr)
     print("已保存 %s_*.npy  y 和 %.6f  dq 和 %.6f"
@@ -73,13 +78,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cu", default=None, help="实验内核路径（不填则用生产内核）")
     ap.add_argument("--out", default=None, help="输出前缀")
+    ap.add_argument("--limit-kb", type=int, default=None, help="强制动态 smem 上限")
     ap.add_argument("--compare", nargs=2, default=None, metavar=("A", "B"))
     args = ap.parse_args()
     if args.compare:
         return do_compare(args.compare[0], args.compare[1])
     if not args.out:
         ap.error("要么给 --out，要么给 --compare A B")
-    return do_run(args.out, args.cu)
+    return do_run(args.out, args.cu, args.limit_kb)
 
 
 if __name__ == "__main__":
