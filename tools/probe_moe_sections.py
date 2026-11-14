@@ -39,9 +39,11 @@ def main():
     eids = rng.integers(0, E, N * K).astype(np.int64)
     order = np.argsort(eids, kind="stable")
     gate0 = rng.uniform(0.1, 1.0, N * K).astype(np.float32)
+    # 合并路径里 x 已经是 N*K 行（先按 token 展开），order 也在 [0, N*K)
+    x4 = rng.normal(0, .3, (N * K, D)).astype(np.float32)
 
     def mk_gather():
-        x = T.tensor(x0, requires_grad=True)
+        x = T.tensor(x4, requires_grad=True)
         def f():
             y = x[order]
             (y * y).sum().backward()
@@ -55,7 +57,7 @@ def main():
         return f
 
     def mk_cat():
-        parts = [T.tensor(x0, requires_grad=True) for _ in range(E)]
+        parts = [T.tensor(x4[:512], requires_grad=True) for _ in range(E)]
         def f():
             y = T.cat(parts, dim=0)
             (y * y).sum().backward()
@@ -80,7 +82,7 @@ def main():
         return f
 
     def mk_scatter():
-        ys = T.tensor(x0, requires_grad=True)
+        ys = T.tensor(x4, requires_grad=True)
         def f():
             y = S.scatter_add(ys, order, N * K)
             (y * y).sum().backward()
