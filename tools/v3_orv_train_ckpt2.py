@@ -11,6 +11,7 @@
 import argparse
 import gc
 import json
+import os
 import subprocess
 import sys
 import time
@@ -217,11 +218,14 @@ def main():
             g_up = xi.grad                    # 同样是设备张量
             del xi, y
             # ★ 若图里有引用环（tensor → _backward 闭包 → tensor），`del` 不会立即释放，
-            #   必须 gc.collect()。实测每层残留 ≈98 MB ≈ 6 个 (N, d_ff)，正是 MoE 的中间量。
-            gc.collect()
+            #   需要 gc.collect()。但**每层都 gc 很贵**（Python 大堆一次约 20–40 ms，
+            #   8 层就 0.2–0.3 s/步）。改成每 4 层一次：残留最多累积 4 层，显存可控。
+            if i % 4 == 0:
+                gc.collect()
             rt.empty_cache()
-            print("    layer %d done, live=%.0f MiB"
-                  % (i, rt.pool_stats()["live_bytes"] / 2**20), flush=True)
+            if os.environ.get("TGAI_CKPT_VERBOSE"):
+                print("    layer %d done, live=%.0f MiB"
+                      % (i, rt.pool_stats()["live_bytes"] / 2**20), flush=True)
 
         opt.step()
         times.append(time.time() - t0); losses.append(lv)
