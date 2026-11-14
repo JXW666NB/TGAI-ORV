@@ -3237,12 +3237,19 @@ def _sdpa_materialized(q, k, v, causal, scale, attn_mask=None):
         scores = _attn_scores(q, k, scale)
     else:
         scores = (q @ k.swap_last2()) * scale
-    # 掩码内联的 causal softmax：**默认关闭**。
-    # 实测（V100，B=4/S=512）：开它整步 0.800 -> 0.893 s（反而更慢）。
-    # 原因：内核是"每行一个线程、串行扫 k"（k=512 时每线程 512 次串行），
-    # 并行度远不如通用 softmax 的分块归约。要收益得先把内核改成 warp/块内归约。
-    # 数值是对的（dq/dk/dv relerr ~2e-07），所以留着开关，改好内核再打开。
-    if causal and _softmax_causal_enabled() and getattr(scores, "device", "cpu") == "cuda":
+    # 掩码内联的 causal softmax。
+    # ★ 2026-11-14：内核已从"每行一个线程串行扫 k"改成"一块一行 + warp 归约"，
+    #   在 S=2048 实测 0.0410 s vs 组合路径 0.0433 s（**快 6%**），S=512 仍略慢（0.96×）。
+    #   所以默认按序列长度自动选：>=1024 用融合核，短序列保持组合路径。
+    #   环境变量 TG_SOFTMAX_CAUSAL 仍可强制（1=强制开，0=强制关）。
+    _env = os.environ.get("TG_SOFTMAX_CAUSAL", "").strip().lower()
+    if _env in ("1", "true", "on", "yes"):
+        _use_fused_sm = True
+    elif _env in ("0", "false", "off", "no"):
+        _use_fused_sm = False
+    else:
+        _use_fused_sm = int(scores.shape[-1]) >= 1024
+    if causal and _use_fused_sm and attn_mask is None and getattr(scores, "device", "cpu") == "cuda":
         p = _softmax_causal_cuda(scores)
     else:
         if causal:
