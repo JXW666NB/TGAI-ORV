@@ -84,6 +84,9 @@ def main():
                 continue
             row = int(r) // k
             max_dx = max(max_dx, float(np.abs(xp_np[e, j] - x_h[row]).max()))
+    print("counts =", counts_np.tolist())
+    print("期望   =", [int((eids_h == e).sum()) for e in range(E)])
+    print("槽位非空数 =", [int((rowid_np[e] >= 0).sum()) for e in range(E)])
     print("rowid 集合一致: %s；gate 一致: %s；counts 一致: %s；xp 最大差: %.3e"
           % (ok_id, ok_g, ok_cnt, max_dx))
 
