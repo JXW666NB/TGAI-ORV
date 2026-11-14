@@ -21,19 +21,22 @@ def main():
     q = T.tensor(q0); k = T.tensor(q0); v = T.tensor(q0)
 
     # 预热（首次含 NVRTC / 内核加载）
-    FO._fwd_device(q._gpu, k._gpu, v._gpu, True, 512, 512)
+    FO._fwd_device(q, k, v, True, 512, 512)
     rt.sync()
 
     for tile in (512, 1024):
         t0 = time.time()
         for _ in range(3):
-            out = FO._fwd_device(q._gpu, k._gpu, v._gpu, True, tile, tile)
+            out = FO._fwd_device(q, k, v, True, tile, tile)
         rt.sync()
         inner = (time.time() - t0) / 3
 
+        q4 = q.reshape(1, BH, S, D)
+        k4 = q4.reshape(1, BH, S, D)
+        v4 = q4.reshape(1, BH, S, D)
         t0 = time.time()
         for _ in range(3):
-            o = FO.flash_attn(q.reshape(1, 1, S, D) if False else q, k, v, causal=True)
+            o = FO.flash_attn(q4, k4, v4, causal=True, cq=tile, ck=tile)
         rt.sync()
         outer = (time.time() - t0) / 3
         print("tile=%-5d 只看块循环 %.4f s   完整 flash_attn %.4f s" % (tile, inner, outer))
