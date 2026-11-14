@@ -21,9 +21,9 @@ from tgai_go.train import functional as Fn  # noqa: E402
 
 
 def bench_orv(BH, S, DH, lowmem, reps=5):
-    q = T.tensor(np.random.default_rng(0).normal(0, .3, (BH, S, DH)).astype(np.float32))
-    k = T.tensor(np.random.default_rng(1).normal(0, .3, (BH, S, DH)).astype(np.float32))
-    v = T.tensor(np.random.default_rng(2).normal(0, .3, (BH, S, DH)).astype(np.float32))
+    q = T.tensor(np.random.default_rng(0).normal(0, .3, (BH, S, DH)).astype(np.float32), requires_grad=True)
+    k = T.tensor(np.random.default_rng(1).normal(0, .3, (BH, S, DH)).astype(np.float32), requires_grad=True)
+    v = T.tensor(np.random.default_rng(2).normal(0, .3, (BH, S, DH)).astype(np.float32), requires_grad=True)
     rt = T._cuda()
 
     def one():
