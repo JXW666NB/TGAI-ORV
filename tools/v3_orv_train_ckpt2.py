@@ -67,6 +67,8 @@ def main():
                     help="梯度检查点。默认取策略值（policy），可显式覆盖")
     ap.add_argument("--tile", type=int, default=0,
                     help="块化注意力的块大小（0 = 用策略值）。块对数 ∝ (S/tile)²")
+    ap.add_argument("--opt", default="adamw", choices=["adamw", "fp16mv"],
+                    help="优化器：adamw（fp32 动量）或 fp16mv（fp16 动量，省一半状态显存）")
     a = ap.parse_args()
     TOP_K[0] = int(a.top_k)
     T.set_default_device("cuda")
@@ -85,7 +87,13 @@ def main():
     d_k = a.d // a.n_q
     cos, sin = V.rope_cos_sin(a.seq, d_k, 10000.0)
     cos, sin = T.tensor(cos), T.tensor(sin)
-    opt = T.optim.AdamW(params_of(P), lr=3e-4)
+    if a.opt == "fp16mv":
+        # fp16 动量：Adam 状态从 2 份 fp32 变 2 份 fp16，显存减半；
+        # 引擎的融合内核按 half→float→half 计算，算术序列与 fp32 路径逐条相同。
+        from tgai_go.train.opt_fp16mv import Fp16MomAdamW
+        opt = Fp16MomAdamW(params_of(P), lr=3e-4, betas=(0.9, 0.999), weight_decay=1e-2)
+    else:
+        opt = T.optim.AdamW(params_of(P), lr=3e-4)
     ids_all = rng.integers(0, 4096, (a.steps + 1, a.seq)).astype(np.int64)
 
     times, losses = [], []
