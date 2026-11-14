@@ -1960,6 +1960,51 @@ extern "C" __global__ void adamw_update_multi_f16(
     float step = __fdiv_rn(__fmul_rn(lr, mh), denom);
     p[j] = __fsub_rn(pi, step);
 }
+
+/* ---- 多张量 AdamW（**bf16 动量**）----
+ * 与 f16 版的唯一差别：动量按 bf16 存。为什么需要它 ——
+ *   fp16 的最小正规数是 6.1e-5，而二阶动量 v 在训练早期常是 1e-8 量级，
+ *   直接存 fp16 会下溢成 0，于是 denom = sqrt(0)+eps = eps，步长被放大几个数量级。
+ *   **实测：fp16 动量在 8 层 V3 上 6 步把 loss 从 8.42 推到 552.98（发散）。**
+ *   bf16 与 fp32 指数位相同（下限 ~1.2e-38），不会下溢；尾数 8 位对动量足够。
+ * 舍入：RTNE，与 cast_f32_to_bf16 的主机侧公式逐位一致。 */
+extern "C" __global__ void adamw_update_multi_bf16(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* ms, const unsigned long long* vs,
+    const int* offs, int ntensors, int total,
+    float b1, float omb1, float b2, float omb2,
+    float lr, float wd_lr, float eps, float bc1, float bc2, int do_wd) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= total) return;
+    int lo = 0;
+    int hi = ntensors - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (offs[mid] <= i) lo = mid; else hi = mid - 1;
+    }
+    int j = i - offs[lo];
+    float* p = (float*)(unsigned long long)ps[lo];
+    const float* g = (const float*)(unsigned long long)gs[lo];
+    unsigned short* m = (unsigned short*)(unsigned long long)ms[lo];
+    unsigned short* v = (unsigned short*)(unsigned long long)vs[lo];
+    float gi = g[j];
+    float pi = p[j];
+    if (do_wd) pi = __fsub_rn(pi, __fmul_rn(wd_lr, pi));
+    float mj = __uint_as_float((unsigned int)m[j] << 16);
+    float vj = __uint_as_float((unsigned int)v[j] << 16);
+    float mi = __fadd_rn(__fmul_rn(b1, mj), __fmul_rn(omb1, gi));
+    float g2 = __fmul_rn(gi, gi);
+    float vi = __fadd_rn(__fmul_rn(b2, vj), __fmul_rn(omb2, g2));
+    unsigned int um = __float_as_uint(mi);
+    unsigned int uv = __float_as_uint(vi);
+    m[j] = (unsigned short)((um + 0x7FFFu + ((um >> 16) & 1u)) >> 16);
+    v[j] = (unsigned short)((uv + 0x7FFFu + ((uv >> 16) & 1u)) >> 16);
+    float mh = __fdiv_rn(mi, bc1);
+    float vh = __fdiv_rn(vi, bc2);
+    float denom = __fadd_rn(sqrtf(vh), eps);
+    float step = __fdiv_rn(__fmul_rn(lr, mh), denom);
+    p[j] = __fsub_rn(pi, step);
+}
 """
 
 
@@ -6655,6 +6700,52 @@ class CudaRuntime:
         _, ps, gs, ms, vs, of, ntensors, total = tb
         grid, block = self._ewise_grid(total)
         self.launch("adamw_update_multi_f16", grid, block, [
+            self._ptr(ps), self._ptr(gs), self._ptr(ms), self._ptr(vs), self._ptr(of),
+            (int(ntensors), ctypes.c_int), (int(total), ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (float(eps), ctypes.c_float),
+            (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+            (1 if do_wd else 0, ctypes.c_int),
+        ])
+
+    def adamw_multi_bf16(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):
+        """一次发射更新全部参数，动量是 **bf16**（uint16 位模式）。
+
+        与 `adamw_multi_f16` 只差动量类型。选它是因为 fp16 存二阶动量会下溢
+        （实测 6 步发散到 loss 552.98），而 bf16 与 fp32 同指数范围，不会下溢。
+        """
+        if not entries:
+            return
+        for p, g, m, v in entries:
+            self._split_forget_ptr(p)
+            self._split_forget_ptr(m)
+            self._split_forget_ptr(v)
+        key = tuple(id(x) for ent in entries for x in ent)
+        tb = getattr(self, "_adamw_table_bf16", None)
+        if tb is None or tb[0] != key:
+            sizes = [int(ent[0].n) for ent in entries]
+            offs = [0]
+            for n in sizes:
+                offs.append(offs[-1] + n)
+            total = offs[-1]
+            if total > 2147483647:
+                raise CudaError("fused AdamW(bf16) 元素总数 %d 超过 int32" % total + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            ps = self.h2d(np.array([int(ent[0].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            gs = self.h2d(np.array([int(ent[1].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            ms = self.h2d(np.array([int(ent[2].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            vs = self.h2d(np.array([int(ent[3].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            of = self.h2d(np.array(offs[:-1], np.int32), dtype=np.int32)
+            tb = (key, ps, gs, ms, vs, of, len(entries), total)
+            self._adamw_table_bf16 = tb
+        _, ps, gs, ms, vs, of, ntensors, total = tb
+        grid, block = self._ewise_grid(total)
+        self.launch("adamw_update_multi_bf16", grid, block, [
             self._ptr(ps), self._ptr(gs), self._ptr(ms), self._ptr(vs), self._ptr(of),
             (int(ntensors), ctypes.c_int), (int(total), ctypes.c_int),
             (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),

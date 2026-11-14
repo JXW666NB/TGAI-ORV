@@ -22,17 +22,26 @@ def _rt():
 
 
 class Fp16MomAdamW(object):
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, fp32_state=False):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1,
+                 fp32_state=False, state="fp16"):
         self.params = list(params)
         self.lr, (self.b1, self.b2) = float(lr), (float(betas[0]), float(betas[1]))
         self.eps, self.wd = float(eps), float(weight_decay)
         self.t = 0
         rt = _rt()
         self.fp32_state = bool(fp32_state)
+        # state: "fp16"（默认）| "bf16" | "fp32"（等价 fp32_state=True）
+        #   fp16 存二阶动量会下溢：fp16 最小正规数 6.1e-5，而 v 常为 1e-8 量级
+        #   ⇒ denom=sqrt(0)+eps=eps，步长被放大几个数量级（实测 6 步 loss 8.42→552.98）。
+        #   bf16 与 fp32 同指数范围，不会下溢，同样 2 字节。
+        self.state = "fp32" if self.fp32_state else str(state)
+        if self.state not in ("fp16", "bf16", "fp32"):
+            raise ValueError("state 只能是 fp16/bf16/fp32，收到 %r" % (state,) +
+                             "。修法：改 opt_fp16mv.Fp16MomAdamW(..., state='bf16')")
         self.m16, self.v16 = [], []
         for p in self.params:
             n = int(p.numel())
-            if self.fp32_state:
+            if self.state == "fp32":
                 self.m16.append(rt.zeros((n,)))
                 self.v16.append(rt.zeros((n,)))
             else:
@@ -44,7 +53,7 @@ class Fp16MomAdamW(object):
         fp16 动量 = 2 × 2 = 4 字节；fp32 动量 = 2 × 4 = 8 字节。
         （曾经写成 2.0 / 4.0，把 3B 的 11.1 GiB 算成了 5.5 GiB。）
         """
-        return 8.0 if self.fp32_state else 4.0
+        return 8.0 if self.state == "fp32" else 4.0
 
     def state_bytes(self):
         """优化器状态总占用（字节）。3B 上用来判断"装不装得下"。"""
@@ -77,8 +86,9 @@ class Fp16MomAdamW(object):
             if p.grad is None or not getattr(p, "requires_grad", True):
                 continue
             ents.append((p._gpu, p.grad._gpu, self.m16[i], self.v16[i]))
-        rt.adamw_multi_f16(ents, b1, 1.0 - b1, b2, 1.0 - b2, self.lr, self.lr * self.wd,
-                           self.eps, bc1, bc2, 1)
+        _launch = rt.adamw_multi_bf16 if self.state == "bf16" else rt.adamw_multi_f16
+        _launch(ents, b1, 1.0 - b1, b2, 1.0 - b2, self.lr, self.lr * self.wd,
+                self.eps, bc1, bc2, 1)
         # 参数已更新 ⇒ 旧的 fp16 权重影子作废（AMP 缓存，见 cuda.py f16_cache_*）
         try:
             rt.f16_cache_clear()
