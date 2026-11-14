@@ -32,8 +32,17 @@ def main():
     out = run(["schtasks", "/query", "/fo", "csv", "/v"])
     rows = list(csv.reader(io.StringIO(out)))
     hdr = [h.strip().lower() for h in rows[0]]
-    i_name = hdr.index("taskname")
-    i_run = hdr.index("task to run") if "task to run" in hdr else -1
+
+    def idx(*names):
+        for n in names:
+            if n in hdr:
+                return hdr.index(n)
+        return -1
+
+    i_name = idx("taskname", "任务名", "任務名")
+    if i_name < 0:
+        i_name = 0                      # 兜底：第一列就是任务名
+    i_run = idx("task to run", "要运行的任务", "要執行的任務")
     bk = r"D:\_task_backup"
     os.makedirs(bk, exist_ok=True)
     keep = []
