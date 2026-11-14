@@ -20,7 +20,7 @@ def main():
     T.set_default_device("cuda")
     rt = T._cuda()
     rng = np.random.default_rng(0)
-    d, S = 512, 1024
+    d, S = 512, (int(sys.argv[2]) if len(sys.argv) > 2 else 1024)
     n_q = int(sys.argv[1]) if len(sys.argv) > 1 else 8
     n_kv, d_k = 2, d // (int(sys.argv[1]) if len(sys.argv) > 1 else 8)
     W = lambda *s: T.tensor(rng.normal(0, .02, s).astype(np.float32), requires_grad=True)
