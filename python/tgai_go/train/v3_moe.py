@@ -198,8 +198,8 @@ def moe_dispatch_orv(x, eids_np, gate, W1, W2, W3, beta1=4.0, beta2=25.0,
     eids = np.asarray(eids_np).reshape(-1).astype(np.int64)
     if _presorted is not None:
         order = np.asarray(_presorted, np.int64)      # 只用于散回原位
-        xs = x
-        g_sorted = gate
+        xs = x                                        # 调用方已按 order 排好
+        g_sorted = gate[order]                        # 门控也必须照样重排（1-D，几乎免费）
     else:
         order = np.argsort(eids, kind="stable")       # 按专家分组
         # ★ 2026-11-15：改用 `indexing.index_select`（设备侧 gather，反向是
