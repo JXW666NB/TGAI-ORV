@@ -27,11 +27,13 @@ import tgai_go.train as T  # noqa: E402
 
 
 def _caller_key(frames):
-    """栈里第一个不在 cuda.py 的帧（从最内层往外找）。"""
+    """栈里第一个既不在 cuda.py、也不是本探针自己的帧（从最内层往外找）。"""
     for f in reversed(frames):
-        if "cuda.py" not in (f.filename or ""):
-            base = f.filename.replace("\\", "/").rsplit("/", 1)[-1]
-            return "%s:%d %s" % (base, f.lineno, f.name)
+        fn = f.filename or ""
+        if "cuda.py" in fn or "probe_alloc_sites" in fn:
+            continue
+        base = fn.replace("\\", "/").rsplit("/", 1)[-1]
+        return "%s:%d %s" % (base, f.lineno, f.name)
     f = frames[-1]
     base = f.filename.replace("\\", "/").rsplit("/", 1)[-1]
     return "%s:%d %s" % (base, f.lineno, f.name)
