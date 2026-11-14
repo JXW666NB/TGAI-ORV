@@ -63,9 +63,46 @@ static_assert(kQueriesPerBlock % kNumWarpsPerBlock == 0, "");
 2. 若还超，再考虑 dS 与 P 的 union 复用（需一次 `__syncthreads()` 保证读完 P）
 3. **不要动 BT**（除非同时按 `BT < warps*32` 与整除关系重排线程映射）
 
-## 5. 未找到 / 未验证（不要当事实）
+### 5.1 第二轮调查补充（源码级，摘要）
 
-- `sizeof(SharedStorage)` 的**精确字节数没有公开值**；文中 22/25/42 KB 是按源码形状**手算**
-- `MemoryEfficientAttentionSharedStorage` / `kSharedStorageSize` 这两个符号在 pytorch 中**不存在**
-- epilogue 的 smem 字节数未核对（bwd 的 42 KB 有数 KB 不确定度）
-- 想拿真值：`cuobjdump --dump-resource-usage libtorch_cuda.so | grep -A2 fmha_cutlassB_f32_aligned_64x64_k64_sm70`
+**线程映射公式（硬约束，比第一版更精确）**
+
+`cpp
+static_assert(kQueriesPerBlock % 32 == 0, "");
+static_assert(kKeysPerBlock  % 32 == 0, "");
+kNumWarpsPerBlock = kQueriesPerBlock * kKeysPerBlock / (32*32);   // 64x64 -> 4 warps
+`
+
+⇒ 64×64 与 32×128 都是 **4 warps = 128 线程**；64×128 才是 8 warps。
+**我们的内核用 256 线程 + 8 warps × 8 行的映射，与 CUTLASS 完全不同 —— 所以"照抄 BT"没有意义，要照抄的是"按 warps 分行"这套映射规则。**
+
+**反向的块参数**
+
+`python
+bi_values = [64]
+if sm >= 80 or (sm >= 70 and is_half):      # fp32 永远进不来
+    if max_k > 64: bi_values.append(128)
+bj = 128 if (preload_mmas and max_k > 64) else 64
+`
+⇒ fp32 反向恒为 **(64, 64)**；128 那一档只给 sm≥80 或半精度。
+
+**f32 反向的三条关键常量**
+
+| 常量 | f32 取值 | 含义 |
+| --- | --- | --- |
+| kIsHalf | **false** | sizeof_bits<=16 判定 |
+| kOutputInRF | **false**（因 kIsHalf false）| dK/dV **不在寄存器**，每扫完一个 query 块写回 gmem，下一块 gmem += accum |
+| kEnableSplitKeys | sm >= 70 | **V100 开、P100 关** ⇒ V100 需要 dQ workspace + 锁，**P100 不需要** |
+
+最后一条很重要：**P100 上 dQ 可以完全留在寄存器里**，比 V100 路径更简单 —— 我们的内核对两种卡用同一套逻辑，反而可能做了多余的事。
+
+**kAlignLSE = 32**：logsumexp 尾部按 32 补齐，反向省掉边界检查（我们目前是逐行判 	r < seq）。
+
+**sm70 的两个专属特判**（都说明 sm70 是一等公民，没有被排除）：
+- kKernelComputesDelta = kIsHalf && (kOutputInRF || cc != 70) —— **sm70 且非 RF 时不算 delta**，绕 V100 编译器 bug（可复现 shape (1,1,1,136)）
+- kEnableSplitKeys = cc >= 70 —— nvcc 12.4 在 sm52 上有正确性问题，所以从 sm70 起才开
+
+**本机可用资源**：完整 PyTorch 源码 checkout 在 D:\DSH-Workspace\pytorch-src（shallow，含 ten/src/ATen/native/transformers/cuda/），以后读源码直接读它，不用抓网络。
+（注意：本机 torch 是 **2.13.0+cpu**，无 CUDA、无 cutlass 头，**不能编译也不能求 sizeof**。）
+
+## 5. 未找到 / 未验证（不要当事实）
