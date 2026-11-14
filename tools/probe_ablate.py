@@ -16,7 +16,7 @@ from v3_orv_train import build  # noqa: E402
 def main():
     T.set_default_device("cuda")
     rt = T._cuda()
-    d, S, E, L, n_q, n_kv = 512, 2048, 8, 8, 8, 2
+    d, S, E, L, n_q, n_kv = 512, (int(sys.argv[1]) if len(sys.argv) > 1 else 2048), 8, 8, 8, 2
     d_k = d // n_q
     cfg = dict(d=d, d_ff=4 * d, E=E, layers=L, n_q=n_q, n_kv=n_kv, vocab=4096,
                seq=S, steps=1)
