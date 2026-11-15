@@ -5,7 +5,7 @@
   "api_version": "1.0",
   "namespace": "svs",
   "summary": "虚拟歌手（DDSP/STFT）训练所需算子：谱变换、扫描、填充、损失",
-  "description": "为歌声合成项目（DDSP + 残差向量量化 + 流匹配 GAN）补齐 ORV 缺失的音频算子。全部为组合式实现，梯度由 autograd 自动给出。每个算子都与 PyTorch 做过逐项数值对拍（tools/verify_svs_ops.py，39 项全过，相对误差 ~1e-7）。",
+  "description": "为歌声合成项目（DDSP + 残差向量量化 + 流匹配 GAN）补齐 ORV 缺失的音频算子。全部为组合式实现，梯度由 autograd 自动给出。每个算子都与 PyTorch 做过逐项数值对拍（tools/verify_svs_ops.py，51 项全过，相对误差 ~2e-07）。已知性能缺口：组合式 stft_mag 比 cuFFT 慢 33×（171.9 ms vs 5.2 ms），差距来自算子调度次数；追平需做成带反向的原生算子。",
   "author": "JXW",
   "license": "MIT",
   "homepage": "https://github.com/JXW666NB/TGAI-ORV",

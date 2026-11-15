@@ -100,5 +100,9 @@ python tools/build_bundle.py examples/bundles/svs-ops     # → dist/svs-ops-0.2
 python tools/smoke_svs_bundle.py                          # 一行安装 + 与 torch 对拍
 ```
 
-实测（V100）：元信息通过 → 12 个算子安装 → `stft_mag` 与 `torch.stft` 形状一致、
+实测（V100）：元信息通过 → **18 个算子**安装 → `stft_mag` 与 `torch.stft` 形状一致、
 相对差 **1.99e-07**；`cumsum` 正确。
+
+**已知性能缺口**：组合式 `stft_mag` 比 cuFFT 慢 33×（171.9 ms vs 5.2 ms，
+B=2、L=96000、6 档分辨率、前向+反向）。差距来自算子调度次数（一次 STFT≈40 次调用），
+不是数学量；追平需要把 STFT 做成带反向的原生算子（cuFFT）。
