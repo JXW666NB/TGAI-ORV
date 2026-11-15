@@ -191,3 +191,46 @@ attn_bwd_flash_w(const float* dO, const float* Q, const float* K, const float* V
 相对 62.9 ms 的原子开销，净收益上限约 58 ms/层。
 
 **当前状态：规格已定，实现未做**（需要完整上下文一次改完内核+启动端+归约，并做数值对拍）。
+
+
+---
+
+## 十、发版流程（0.9.74 事故后新增，必须遵守）
+
+### 事故回顾
+
+0.9.74 给内核加 plane 偏移时，插入锚点匹配到了**常驻版** ttn_bwd_flash（文件里有多个
+相似函数），导致 identifier "dK" is undefined ⇒ 整个 	gai_attn_nop.cu 编译失败
+⇒ sdpa_lowmem_ready() 变 False ⇒ **所有卡静默回退物化路径**（P100 前向 11.7 -> 30.3 ms）。
+本机 pytest 全程 788 passed，**完全没拦住** —— 因为本机无 GPU，pytest 不编译 CUDA。
+
+### 本机为什么没法预检
+
+- 
+vcc 存在但缺 cl.exe（MSVC 宿主编译器）⇒ 无法编译
+- 
+vrtc64_*.dll 未安装（本机只有 cudart）⇒ 无法用 NVRTC 编译
+
+⇒ **编译检查必须在有 GPU 的机器上做。**
+
+### 发版清单（缺一不可）
+
+1. 全套 pytest 0 failed
+2. python tools/verify_release.py（版本一致性 + 全套；有 GPU 时还会查内核）
+3. **在真机上装好后立刻跑内核探针**：
+
+   `python
+   import tgai_go.train as T
+   T.set_default_device("cuda")
+   print(T.functional.sdpa_lowmem_ready())      # 必须是 True/句柄，不能是 False
+   print(T.functional.scaled_dot_product_attention)  # 再跑一次真实形状，看耗时是否回到正常
+   `
+
+   判据：P100 上 attention 前向应约 11 ms；若变成 30 ms 左右，就是**回退到物化**了。
+4. 只有上面都过，才对外宣布该版本可用
+
+### 改内核时的额外规则
+
+- 文件里有多个结构相似的内核（ttn_bwd_flash / ttn_bwd_flash_w / ttn_bwd_flash_g2），
+  **禁止用裸函数体片段当锚点**；必须先用函数名定位，再在该函数范围内找锚点
+- 每次只改一处，改完立刻在真机验证 sdpa_lowmem_ready()，不要攒着一起发
