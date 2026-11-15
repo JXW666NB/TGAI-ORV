@@ -2865,7 +2865,7 @@ class _Functional:
 
     @staticmethod
     def scaled_dot_product_attention(q, k, v, causal=False, is_causal=None,
-                                   scale=None, lowmem=False, attn_mask=None):
+                                   scale=None, lowmem=None, attn_mask=None):
         """与 torch 的 `F.scaled_dot_product_attention` 兼容的入口。
 
         两种输入都可：
@@ -2895,11 +2895,11 @@ class _Functional:
 
     @staticmethod
     def _sdpa_impl(q: Tensor, k: Tensor, v: Tensor, causal=False, is_causal=None,
-                                     scale=None, lowmem=False, attn_mask=None):
+                                     scale=None, lowmem=None, attn_mask=None):
         """q,k,v: [B*H, S, Dh]（已展平 head）。causal=True 时做下三角掩码。
 
         lowmem=True 且设备是 CUDA、dh==64、causal 时，走不物化 P 的内核。
-        其它情况（含 dh!=64、非 causal、CPU）回退到下面的物化实现。默认 lowmem=False。
+        其它情况（含 dh!=64、非 causal、CPU）回退到下面的物化实现。默认 None = 自动（能融合就融合，不行自动回退）。
 
         `attn_mask`：加性掩码；**给出时强制走物化路径**（lowmem 内核不接受掩码）。
         """
@@ -2910,7 +2910,7 @@ class _Functional:
             scale = 1.0 / np.sqrt(dh)
         else:
             scale = float(scale)
-        if attn_mask is None and lowmem and _sdpa_lowmem_ok(q, k, v, causal, dh):
+        if attn_mask is None and (lowmem is not False) and _sdpa_lowmem_ok(q, k, v, causal, dh):
             return _sdpa_lowmem(q, k, v, scale)
         return _sdpa_materialized(q, k, v, causal, scale, attn_mask=attn_mask)
 
