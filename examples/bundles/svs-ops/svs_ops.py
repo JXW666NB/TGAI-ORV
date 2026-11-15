@@ -406,6 +406,42 @@ def gather_last(x, index_np):
     return y.reshape(tuple(list(x.shape[:-1]) + [1]))
 
 
+def _gather_last_pos(x, idx_np):
+    """y[..., k] = x[..., idx[..., k]]（索引逐位置，故按输出位置循环）。"""
+    import tgai_go.train as T
+    n = int(x.shape[-1])
+    lead = tuple(int(v) for v in x.shape[:-1])
+    idx = np.asarray(idx_np, np.int64)
+    m = int(idx.shape[-1])
+    parts = []
+    for k in range(m):
+        sel = idx[..., k].reshape(-1)
+        oh = np.zeros((sel.size, n), np.float32)
+        oh[np.arange(sel.size), sel] = 1.0
+        oh = oh.reshape(lead + (n,))
+        parts.append((x * _tv(oh)).sum(axis=-1).reshape(lead + (1,)))
+    return T.cat(parts, dim=-1) if m > 1 else parts[0]
+
+
+def gather_dim(x, dim, index_np):
+    """沿任意维按索引取值（等价 torch.gather）。
+
+    索引是**逐位置**的，所以不能用一个置换矩阵乘；这里按输出位置循环，
+    每步 one-hot 乘 + 沿末维求和。SGR 里 gather 的输出宽度都不大（谐波取样 1、抖动搜索 512），
+    代价可接受；真要做大规模求值应换原生索引内核。
+    """
+    nd = int(x.ndim)
+    d = int(dim) + (nd if int(dim) < 0 else 0)
+    if d == nd - 1:
+        return _gather_last_pos(x, index_np)
+    order = [i for i in range(nd) if i != d] + [d]
+    y = x.permute(*order)
+    # 索引也必须按同一 order 换轴，否则位置对不上（这是上一版算错的原因）
+    g = _gather_last_pos(y, np.transpose(np.asarray(index_np, np.int64), order))
+    inv = [order.index(i) for i in range(nd)]
+    return g.permute(*inv)
+
+
 def isfinite_np(x):
     """不可导掩码：返回 float32 的 0/1（主机侧算，与 torch.isfinite 一致）。"""
     return _tv(np.isfinite(np.asarray(x, np.float32)).astype(np.float32))

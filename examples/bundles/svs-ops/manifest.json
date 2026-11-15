@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "svs-ops",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "api_version": "1.0",
   "namespace": "svs",
   "summary": "虚拟歌手（DDSP/STFT）训练所需算子：谱变换、扫描、填充、损失",
@@ -242,6 +242,17 @@
       "impl": {
         "module": "svs_ops.py",
         "python": "searchsorted_np"
+      }
+    },
+    {
+      "name": "gather_dim",
+      "arity": 2,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "沿任意维按索引取值（等价 torch.gather；已对拍 4 组含 4 维/非末维全过）",
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "gather_dim"
       }
     }
   ]
