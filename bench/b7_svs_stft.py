@@ -59,8 +59,7 @@ def main():
     a = (rng.normal(0, 0.3, (B, 1, L))).astype(np.float32)
     b = (a + rng.normal(0, 0.05, (B, 1, L))).astype(np.float32)
 
-    plugin.load("examples/plugins/svs_audio_ops.py")
-    plugin.activate("svs-ops")
+    T.plugin.install("examples/bundles/svs-ops", replace=True)
     S = T.svs
     T.set_default_device("cuda")
     rt = T._cuda()

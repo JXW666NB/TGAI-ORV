@@ -22,8 +22,8 @@ RESULT = []
 
 
 def load_plugin():
-    plugin.load("examples/plugins/svs_audio_ops.py")
-    plugin.activate("svs-ops")
+    # 直接装插件包（与用户用法一致），这样拿到的是包里的算子集合
+    T.plugin.install("examples/bundles/svs-ops", replace=True)
     return T.svs
 
 
