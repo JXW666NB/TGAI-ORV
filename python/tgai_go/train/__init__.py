@@ -786,6 +786,12 @@ class Tensor:
             # ★ 消费完立刻释放：否则所有中间梯度在反向期间常驻，峰值≈2 倍
             if not is_leaf:
                 grads.pop(id(node), None)
+            # ★ 2026-11-15 真机 P100 定位：反向消费完就把这个节点的图引用拆掉。
+            #   以前不清 _parents/_backward，整张图靠 Python GC 回收引用环，
+            #   实测一步训练后仍留 3.65 GB（模型+优化器 5.23 GB，稳态 live 8.88 GB）。
+            #   PyTorch 在 backward 结束即销毁图，这就是我们比它多吃显存的主体。
+            node._parents = ()
+            node._backward = None
 
     def zero_grad(self):
         self.grad = None
@@ -1220,6 +1226,12 @@ class Tensor:
                 #   峰值 ≈ 激活 + 同尺寸梯度 = 2 倍（子智能体台账：中间梯度 11.23 GiB）。
                 #   PyTorch 对应 node.h::release_variables。叶子已在上面挂进 .grad，不删。
                 grads.pop(id(node), None)
+            # ★ 2026-11-15 真机 P100 定位：反向消费完就把这个节点的图引用拆掉。
+            #   以前不清 _parents/_backward，整张图靠 Python GC 回收引用环，
+            #   实测一步训练后仍留 3.65 GB（模型+优化器 5.23 GB，稳态 live 8.88 GB）。
+            #   PyTorch 在 backward 结束即销毁图，这就是我们比它多吃显存的主体。
+            node._parents = ()
+            node._backward = None
         # 捕获期间不能同步（cuStreamSynchronize 在 capture 中返回 rc=900）。
         # 图重放本身会保证顺序，所以捕获时跳过这一步是安全的。
         if not getattr(rt, "_capturing", False):
