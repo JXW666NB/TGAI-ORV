@@ -64,12 +64,14 @@ def main():
     T.set_default_device("cuda")
     rt = T._cuda()
 
+    print('[1/3] ORV 预热中…', flush=True)
     # ---- ORV ----
     xo = T.from_numpy(a); xo.requires_grad = True
     xho = T.from_numpy(b); xho.requires_grad = True
     for _ in range(2):
         lo = orv_loss(S, xo, xho); rt.sync()
     rt.sync()
+    print('[2/3] ORV 计时中…', flush=True)
     t0 = time.time()
     N = 5
     for _ in range(N):
@@ -79,6 +81,7 @@ def main():
     orv_ms = (time.time() - t0) / N * 1000.0
     orv_val = float(lo.to_numpy())
 
+    print('[3/3] PyTorch 计时中…', flush=True)
     # ---- PyTorch ----
     xt = torch.tensor(a, device="cuda", requires_grad=True)
     xht = torch.tensor(b, device="cuda", requires_grad=True)
