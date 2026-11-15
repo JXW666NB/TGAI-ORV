@@ -7274,12 +7274,17 @@ class CudaRuntime:
                 + "。修法：改用 lowmem=False（默认，走物化注意力，多花显存但能出结果）；"
                   "或减小 seq / batch。Pascal 消费卡（sm_61 等）上限 48 KB 且不支持 opt-in，"
                   "该路径在那些卡上不可用；V100（sm_70）可 opt-in 到 96 KB 正常使用")
-        ready = getattr(self, "_attn_flash_names", None)
-        if ready is None:
-            ready = self._attn_flash_names = set()
-        if name not in ready:
-            self._attn_set_dyn_smem(name, _ATTN_FLASH_MAX_SMEM)
-            ready.add(name)
+        # ★ 2026-11-15 真机 P100 定位：这里以前**无条件**把动态 smem 上限设成 96 KB
+        #   （_ATTN_FLASH_MAX_SMEM），而实际启动只用到 smem（滑窗版 39.5 KB）。
+        #   结果：V100 上限 96 KB 能过，P100（申报 48 KB）直接被拒 rc=1 ——
+        #   和"44 KB ≤ 48 KB 所以能跑"的推断完全不是一回事。
+        #   现在按**真正要用的值**设，并且按 name 记住已设到多少，需要更多时才再抬。
+        have = getattr(self, "_attn_flash_smem_set", None)
+        if have is None:
+            have = self._attn_flash_smem_set = {}
+        if int(smem) > int(have.get(name, 0)):
+            self._attn_set_dyn_smem(name, int(smem))
+            have[name] = int(smem)
         gy = (int(seq) + tile - 1) // tile
         if gy < 1:
             gy = 1

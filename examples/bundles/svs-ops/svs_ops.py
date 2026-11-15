@@ -335,13 +335,15 @@ def _interp_weights(n_in, n_out, mode):
     if key in _CACHE:
         return _CACHE[key]
     W = np.zeros((n_out, n_in), np.float32)
+    # ★ 必须用 **float32** 算：torch 的 F.interpolate 就是 float32 取整，
+    #   用 float64 会在边界上差 1 格（实测 96256->189 相对差 0.84）。
+    scale32 = np.float32(n_in) / np.float32(n_out)
     if mode == "nearest":
-        idx = np.floor(np.arange(n_out, dtype=np.float64) * (n_in / n_out)).astype(np.int64)
+        idx = np.floor(np.arange(n_out, dtype=np.float32) * scale32).astype(np.int64)
         idx = np.clip(idx, 0, n_in - 1)
         W[np.arange(n_out), idx] = 1.0
     elif mode == "linear":
-        scale = n_in / n_out
-        src = (np.arange(n_out, dtype=np.float64) + 0.5) * scale - 0.5
+        src = (np.arange(n_out, dtype=np.float32) + np.float32(0.5)) * scale32 - np.float32(0.5)
         src = np.clip(src, 0.0, n_in - 1)
         lo = np.floor(src).astype(np.int64)
         hi = np.minimum(lo + 1, n_in - 1)
@@ -354,7 +356,7 @@ def _interp_weights(n_in, n_out, mode):
     return W
 
 
-def interpolate1d_UNVERIFIED(x, size=None, scale_factor=None, mode="linear"):
+def interpolate1d(x, size=None, scale_factor=None, mode="linear"):
     """沿**最后一维**插值到 `size`（或按 `scale_factor` 放大）。
 
     与 `torch.nn.functional.interpolate(..., size=n, mode=mode)` 等价（`align_corners=False`）。

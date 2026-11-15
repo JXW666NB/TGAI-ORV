@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "svs-ops",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "api_version": "1.0",
   "namespace": "svs",
   "summary": "虚拟歌手（DDSP/STFT）训练所需算子：谱变换、扫描、填充、损失",
@@ -220,6 +220,17 @@
       "impl": {
         "module": "svs_ops.py",
         "python": "isfinite_np"
+      }
+    },
+    {
+      "name": "interpolate1d",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "沿最后一维插值（linear/nearest，与 F.interpolate 等价，已对拍到 3e-8）",
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "interpolate1d"
       }
     }
   ]
