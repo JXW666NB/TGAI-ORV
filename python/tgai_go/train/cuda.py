@@ -2541,7 +2541,11 @@ _ATTN_FLASH_SMEM = _attn_smem_for_bc(_ATTN_BC)
 # 注意：滑窗版的 smem **不等于**公式值 —— 实测是 40448 B，而 4*64*BC + 2*DCHUNK*QSTR
 # 只能解释 37,376 B，说明它另有约 3 KB 的额外缓冲。所以这里保留字面量，
 # 不随 TG_ATTN_BC 变化；非默认 BC 时应确保走常驻版（见 _attn_flash_launch 的选择顺序）。
-_ATTN_FLASH_WIN_SMEM = 40448
+# 滑窗版 smem 的**两点标定**：DCHUNK=8 -> 40,448；DCHUNK=16 -> 45,056。
+# 差值 4,608 = 2*8*72*4，正好是公式里 2*DCHUNK*QSTR*4 的 DCHUNK 项，
+# 所以可用线性式外推（基数 40,448 已含滑窗版那约 3 KB 的额外缓冲）。
+_ATTN_DCHUNK = int(os.environ.get("TG_ATTN_DCHUNK", "8") or "8")
+_ATTN_FLASH_WIN_SMEM = 40448 + 2 * (_ATTN_DCHUNK - 8) * 72 * 4
 # 注：按切分算只有 41472 B，但实测 41472 会越界（rc=700），45056 稳定跑通且数值与上游一致。
 # 两者都 <= 48 KB（sm_60 上限），故取 45056 留余量。真实下界未逐点二分。
 # g2 在 69632 上再加 smDK/smDV（各 64*32 个 float）。
@@ -7156,6 +7160,8 @@ class CudaRuntime:
         path = attn_nop_source_path()
         with open(path, encoding="utf-8") as fh:
             src = fh.read()
+        if _ATTN_DCHUNK != 8:
+            src = re.sub(r"#define\s+DCHUNK\s+\d+", "#define DCHUNK %d" % _ATTN_DCHUNK, src, count=1)
         if _ATTN_BC != 32:
             # 只在非默认时替换，避免影响既有编译结果
             src = re.sub(r"#define\s+BC\s+\d+", "#define BC %d" % _ATTN_BC, src, count=1)
