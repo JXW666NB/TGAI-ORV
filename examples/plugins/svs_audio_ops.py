@@ -151,10 +151,12 @@ def _pad_const(x, pl, pr):
 def _mm_last(perm, seg):
     """perm:[n,n] 作用在 seg 的最后一维。seg 一维直接乘，二维则逐行乘。"""
     import tgai_go.train as T
+    n = int(perm.shape[0])
     if seg.ndim == 1:
-        return T.matmul(perm, seg)
+        return T.matmul(perm, seg.reshape(1, n)).reshape(n)
     b = int(seg.shape[0])
-    return T.stack([T.matmul(perm, seg[i]) for i in range(b)], dim=0)
+    rows = [T.matmul(perm, seg[i].reshape(1, n)) for i in range(b)]
+    return T.cat(rows, dim=0)
 
 
 def pad1d(x, pad_left, pad_right, mode="constant"):
