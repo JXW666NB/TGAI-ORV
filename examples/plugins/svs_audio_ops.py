@@ -153,10 +153,11 @@ def _mm_last(perm, seg):
     import tgai_go.train as T
     n = int(perm.shape[0])
     if seg.ndim == 1:
-        return T.matmul(perm, seg.reshape(1, n)).reshape(n)
+        return T.matmul(perm, seg.reshape(n, 1)).reshape(n)
     b = int(seg.shape[0])
-    rows = [T.matmul(perm, seg[i].reshape(1, n)) for i in range(b)]
-    return T.cat(rows, dim=0)
+    # 每行当成列向量 [n,1] 再按列拼成 [n,b]，转置回 [b,n]
+    cols = [T.matmul(perm, seg[i].reshape(n, 1)) for i in range(b)]
+    return T.cat(cols, dim=1).T
 
 
 def pad1d(x, pad_left, pad_right, mode="constant"):
