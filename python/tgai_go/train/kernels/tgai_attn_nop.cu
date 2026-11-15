@@ -26,9 +26,6 @@
 //    需要同时改：load_T72 的行数参数化（现在写死 1024 个 float4=64 行）、
 //    row0 = warp*8（4 个 warp × 8 行 = 32 行，block 256→128）、grid.y = ceil(seq/32)。
 #define BTB 32
-#ifndef GROUP_DK
-#define GROUP_DK 1   // dK/dV 的 plane 数；1 = 直写（与旧行为逐位一致）
-#endif
 
 #define DH 64
 #define BC 32
@@ -322,14 +319,6 @@ extern "C" __global__ void attn_fwd_nop(const float* __restrict__ Q, const float
     const int warp = tid >> 5;
     const int row0 = warp * 8;
     if (t0 >= seq || dh != DH) return;
-
-    // ★ 2026-11-15：dK/dV 的原子累加按 query tile 分到 GROUP_DK 个 plane，
-    //   以减少 atomic 冲突（实测该段占反向 81% 的时间）。GROUP_DK=1 时偏移为 0，
-    //   与旧行为逐位一致。
-    const int gpl = (GROUP_DK > 1) ? ((int)blockIdx.y % GROUP_DK) : 0;
-    const long gpsz = (long)nh * seq * dh;
-    float* const dKP = dK + (long)gpl * gpsz;
-    float* const dVP = dV + (long)gpl * gpsz;
 
     float* smQ = smem;
     float* smK = smem + (BT * DH);
@@ -878,8 +867,8 @@ attn_bwd_flash_w(const float* __restrict__ dO, const float* __restrict__ Q,
                 }
                 int tok = k0 + k;
                 if (tok < seq) {
-                    float* dkrow = dKP + qkv_at(tok, h, nh, dh) + d0 + dl;
-                    float* dvrow = dVP + qkv_at(tok, h, nh, dh) + d0 + dl;
+                    float* dkrow = dK + qkv_at(tok, h, nh, dh) + d0 + dl;
+                    float* dvrow = dV + qkv_at(tok, h, nh, dh) + d0 + dl;
                     atomicAdd(dkrow, scale * ak);
                     atomicAdd(dvrow, av);
                 }

@@ -1,3 +1,32 @@
+## [0.9.75] - 2026-11-15
+
+### 回滚 0.9.74 的内核改动（它把常驻版改坏了）
+
+0.9.74 想给 dK/dV 的原子写加 plane 分片，但插入用的锚点在文件里匹配到了**常驻版**
+ttn_bwd_flash 而不是滑窗版，导致 dK/dV 未定义的编译错误：
+	gai_attn_nop.cu(331): error: identifier dK is undefined。
+
+后果：整个 	gai_attn_nop.cu 模块编译失败 ⇒ sdpa_lowmem_ready() 返回 False
+⇒ **所有卡都回退到物化注意力**，P100 上前向从 11.7 ms 变 30.3 ms、整步变慢。
+
+本版把内核完全回滚到 0.9.73 的状态（git checkout，GROUP_DK 零残留），其余代码未动。
+
+教训（已记入 docs）：改这种多份相似函数的内核文件，**必须先用唯一锚点确认改的是哪一支**，
+并在发版前验证 sdpa_lowmem_ready() 为 True —— 只跑 pytest 是发现不了的（本地无 GPU）。
+
+## [0.9.74] - 2026-11-15
+
+### 内核：dK/dV 的原子写支持 plane 分片（默认 1 = 行为不变）
+
+内核阶段隔离实测（docs/P100_ATTN_BWD_BOTTLENECK.md 第九节）表明：ttn_bwd_flash_w
+的 77.6 ms 里有 **62.9 ms（81%）花在 dK/dV 的 atomicAdd**，计算只占 0.54 ms。
+
+本版只做**第一步**：给内核加 GROUP_DK 宏与 plane 偏移（gpl = blockIdx.y % GROUP_DK），
+GROUP_DK=1 时偏移为 0，**与旧版逐位一致**。启动端的 plane 分配与归约尚未实现，
+所以本版没有性能变化 —— 目的是把「结构」先安全落地，再单独验证归约。
+
+全套 788 passed / 0 failed。
+
 ## [0.9.73] - 2026-11-15
 
 ### 滑窗宽度默认改为 16（真机实测反向 -6%）
