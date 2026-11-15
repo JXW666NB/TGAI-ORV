@@ -159,11 +159,11 @@ def pad1d(x, pad_left, pad_right, mode="constant"):
         parts = []
         if pl > 0:
             edge = x[:, 0:1] if x.ndim == 2 else x[..., 0:1]
-            parts.append(edge.repeat_interleave(pl) if pl > 1 else edge)
+            parts.append(T.cat([edge] * pl, dim=-1) if pl > 1 else edge)
         parts.append(x)
         if pr > 0:
             edge = x[:, -1:] if x.ndim == 2 else x[..., -1:]
-            parts.append(edge.repeat_interleave(pr) if pr > 1 else edge)
+            parts.append(T.cat([edge] * pr, dim=-1) if pr > 1 else edge)
         return T.cat(parts, dim=-1)
     if mode == "reflect":
         # abcd -> cb|abcd|cb（不含边界点）

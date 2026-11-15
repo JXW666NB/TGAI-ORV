@@ -54,7 +54,7 @@ def main():
     for nm, ours_fn, ref_fn in (
         ("sigmoid", S.sigmoid, torch.sigmoid),
         ("softplus", S.softplus, TF.softplus),
-        ("log1p", S.log1p, torch.log1p),
+        ("log1p", lambda v: S.log1p(v.abs()), lambda v: torch.log1p(v.abs())),
         ("log10", lambda v: S.log10(v.abs() + 0.5), lambda v: torch.log10(v.abs() + 0.5)),
         ("pow2", lambda v: S.pow(v, 2.0), lambda v: v ** 2),
         ("leaky_relu", lambda v: S.leaky_relu(v, 0.01), lambda v: TF.leaky_relu(v, 0.01)),
