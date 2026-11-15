@@ -16,7 +16,7 @@
 //   Launch: grid (nh, ceil(seq/64), 1), block 256, dynamic smem 69632.
 
 #define BT 64
-#define DCHUNK 16   // head_dim 窗口宽度（P100 变体用；CUTLASS: ThreadK*2）
+#define DCHUNK 8   // head_dim 窗口宽度（P100 变体用；CUTLASS: ThreadK*2）
 // ── 计划（2026-11-15，尚未启用）：把**反向**的 query tile 从 64 行降到 32 行，
 //    使动态 smem 从 68 KB 降到 ≤48 KB，从而能在 sm_60（P100，单 block 48 KB 上限）编出来。
 //    当前 smem 账（反向 attn_bwd_flash）：Q 64*72 + dO 64*72 + K/V/P/dS 各 64*32
