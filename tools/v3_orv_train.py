@@ -116,6 +116,10 @@ def main():
                     help="关闭共享专家。PyT 侧是 n_shared_experts=1，默认开启以保持同构")
     ap.add_argument("--top_k", type=int, default=2,
                     help="每 token 激活专家数。真实 V3 是 2（model_v3.py:145），默认对齐")
+    ap.add_argument("--attn-res", dest="attn_res", action="store_true",
+                    help="BlockAttnRes 深度注意力残差（K3）。层循环尚未接线，打开会明确报错")
+    ap.add_argument("--attn-res", dest="attn_res", action="store_true",
+                    help="BlockAttnRes 深度注意力残差（K3）。层循环尚未接线，打开会明确报错")
     a = ap.parse_args()
     a.shared = not a.no_shared          # 默认开启（与 PyT 对齐）
 
@@ -123,10 +127,21 @@ def main():
     base = int(subprocess.run(["nvidia-smi", "--query-gpu=memory.used",
                                "--format=csv,noheader,nounits"],
                               capture_output=True, text=True).stdout.splitlines()[0])
+    if a.attn_res:
+        raise SystemExit(
+            "--attn-res 还没有接线到层循环：参数能建，但循环仍是普通残差，直接跑会"训了个假模型"。"
+            "修法：把 main() 的层循环换成 v3_attnres.run_attn_res_layers（该函数已实现并数值验证 1.9e-06），"
+            "再用本开关")
     cfg = dict(d=a.d, d_ff=4 * a.d, E=a.E, layers=a.layers,
-               n_q=a.n_q, n_kv=2, vocab=4096, seq=a.seq, steps=a.steps)
+               n_q=a.n_q, n_kv=2, vocab=4096, seq=a.seq, steps=a.steps,
+               attn_res=bool(a.attn_res), attn_res_block=2)
 
     rng = np.random.default_rng(0)
+    if a.attn_res:
+        raise SystemExit(
+            "--attn-res 还没有接线到层循环：参数能建，但循环仍是普通残差，直接跑等于训了个假模型。"
+            "修法：把 main() 的层循环换成 v3_attnres.run_attn_res_layers"
+            "（该函数已实现并数值验证 max_abs_err 1.9e-06），再接本开关。")
     P = build(cfg, rng)
     cos, sin = V.rope_cos_sin(a.seq, a.d // cfg["n_q"], 10000.0)
     cos, sin = T.tensor(cos), T.tensor(sin)
