@@ -46,7 +46,8 @@ def main():
     y = T.from_numpy(np.ones((2, 3), np.float32))
     check("add tensor", (xt + y).to_numpy(), A.T + np.ones((2, 3), np.float32))
     # matmul（文档说会走 gemm_nt）
-    check("matmul", T.matmul(xt, y).to_numpy(), A.T @ np.ones((2, 3), np.float32))
+    y2 = T.from_numpy(np.ones((3, 4), np.float32))
+    check("matmul", T.matmul(xt, y2).to_numpy(), A.T @ np.ones((3, 4), np.float32))
     # 反向
     xg = T.from_numpy(a)
     xg.requires_grad = True
