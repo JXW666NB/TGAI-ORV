@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "svs-ops",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "api_version": "1.0",
   "namespace": "svs",
   "summary": "虚拟歌手（DDSP/STFT）训练所需算子：谱变换、扫描、填充、损失",
@@ -165,6 +165,61 @@
       "impl": {
         "module": "svs_ops.py",
         "python": "avg_pool1d"
+      }
+    },
+    {
+      "name": "pow",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "幂运算（整数/半整数走专用写法）",
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "pow_"
+      }
+    },
+    {
+      "name": "leaky_relu",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "LeakyReLU",
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "leaky_relu"
+      }
+    },
+    {
+      "name": "bce",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "二元交叉熵（概率输入）",
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "bce"
+      }
+    },
+    {
+      "name": "gather_last",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "沿最后一维按索引取值",
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "gather_last"
+      }
+    },
+    {
+      "name": "isfinite_np",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "有限值掩码（主机侧算，不可导）",
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "isfinite_np"
       }
     }
   ]
