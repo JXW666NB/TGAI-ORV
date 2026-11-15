@@ -136,6 +136,45 @@ def my_op(x):
 
 能力不足时**必须报错**而不是静默降级。细节见 `docs/`。
 
+### 插件包：一个文件装下整个环境
+
+`.tgop` 就是一个 zip（改后缀），根目录一份 `manifest.json`，里面可以放 **任意多个插件**。
+用户只要**一行**：
+
+```python
+import tgai_go.train as T
+
+T.plugin.install("svs-ops-0.2.0.tgop")   # ← 一行，装完整的包
+T.svs.stft_mag(wav, 1024, hop_length=256)
+```
+
+开发期也可以直接指向目录：`T.plugin.install("examples/bundles/svs-ops")`。
+
+### 看信息、卸载
+
+```python
+T.plugin.list()          # 装了什么：名字 / 版本 / 后端 / 算子数 / 命名空间
+T.plugin.info("svs-ops") # 单个包的详细信息（元信息 + 它装了哪些算子）
+T.plugin.uninstall("svs-ops")   # 卸载：注销算子 + 移除 T.svs
+```
+
+元信息是**强制**的：`name`、语义化 `version`、`api_version`、`backends` 缺一不可，
+非法值在注册时就报错并给出修法 —— 不是写在文档里的口头约定。
+
+### 插件的反向：两种都支持
+
+```python
+# ① 组合式：用已有算子拼，梯度由 autograd 自动给出（不用写反向）
+ops_plugin.register("my_softplus", lambda x: (x.exp() + 1.0).log())
+
+# ② 自带反向：给前向 + 解析反向（适合需要精确数值或原生实现时）
+ops_plugin.register_numpy("my_gelu", gelu_fwd, gelu_bwd)
+```
+
+组合式能写完就别写反向；确实需要时（精确 erf、原生内核、不可导的近似）再用 ②。
+三档可移植性（组合式 / DSL 声明式 / 后端原生）与「C 档必须带回退」的纪律见
+[`docs/PLUGIN_SPEC.md`](docs/PLUGIN_SPEC.md)。
+
 ---
 
 ## 从 PyTorch 迁移

@@ -270,6 +270,12 @@ ative：交给 plugin_manifest.load_manifest（它读的是原生库 + JSON 声�
                 if fn is not None:
                     members[op["name"]] = fn
             setattr(_T, ns_name, types.SimpleNamespace(**members))
+        # 记录已装清单，供 T.plugin.list() / info() / uninstall() 使用
+        _INSTALLED[meta["name"]] = {
+            "meta": meta,
+            "ops": installed,
+            "namespace": meta.get("namespace"),
+        }
         if verbose:
             print("已安装 %s %s：%s" % (meta["name"], meta["version"], ", ".join(installed)))
         return meta
@@ -293,3 +299,62 @@ def _load_callable(pyfile, fn_name):
             "实现文件 %s 里没有 %r。修法：manifest 的 impl.python 要写文件里真实存在的函数名"
             % (os.path.basename(pyfile), fn_name))
     return fn
+
+
+#: 已安装的插件包：name -> {meta, ops, namespace}
+_INSTALLED = {}
+
+
+def list_plugins():
+    """列出已装的插件包，返回 list[dict]（name/version/backends/ops_count/namespace）。"""
+    out = []
+    for name, rec in sorted(_INSTALLED.items()):
+        m = rec["meta"]
+        out.append({
+            "name": name,
+            "version": m.get("version"),
+            "summary": m.get("summary", ""),
+            "backends": list(m.get("backends") or []),
+            "ops_count": len(rec["ops"]),
+            "namespace": rec.get("namespace"),
+        })
+    return out
+
+
+def info(name):
+    """看某个插件包的详细信息（元信息 + 它装了哪些算子）。"""
+    rec = _INSTALLED.get(name)
+    if rec is None:
+        raise PluginMetaError(
+            "没有装过插件包 %r。修法：先 T.plugin.install(路径)；已装的有 %s"
+            % (name, [r["name"] for r in _INSTALLED.values()] or "（空）"))
+    m = dict(rec["meta"])
+    m["ops"] = list(rec["ops"])
+    m["namespace"] = rec.get("namespace")
+    return m
+
+
+def uninstall(name):
+    """卸载插件包：注销它装过的算子，并移除 T.<namespace>。
+
+    返回被注销的算子名列表。没装过就报错（带已装列表）。
+    """
+    from tgai_go.train import ops_plugin
+    import tgai_go.train as _T
+
+    rec = _INSTALLED.get(name)
+    if rec is None:
+        raise PluginMetaError(
+            "没有装过插件包 %r。修法：T.plugin.list() 看已装的有哪些" % (name,))
+    removed = []
+    for op in rec["ops"]:
+        try:
+            ops_plugin.unregister(op)
+            removed.append(op)
+        except Exception:      # noqa: BLE001  已被别的插件覆盖/手动注销
+            pass
+    ns = rec.get("namespace")
+    if ns and hasattr(_T, ns):
+        delattr(_T, ns)
+    del _INSTALLED[name]
+    return removed
