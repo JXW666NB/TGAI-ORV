@@ -726,6 +726,53 @@ extern "C" __global__ void silu_bwd_da(const float* g, const float* a, float* da
     }
 }
 
+
+/* ★ 2026-11-15：float4 版本。逐分量仍走 silu32_pair + __fmul_rn，结果与标量版逐位相同，
+   只是访存宽度变成 16 B。真机实测标量版比 torch 慢 11.6 倍，这里是主因。 */
+extern "C" __global__ void silu_mul_fwd_v4(float4* a, const float4* b, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        float4 y = b[i];
+        float4 r;
+        float s, d;
+        silu32_pair(x.x, &s, &d); r.x = __fmul_rn(s, y.x);
+        silu32_pair(x.y, &s, &d); r.y = __fmul_rn(s, y.y);
+        silu32_pair(x.z, &s, &d); r.z = __fmul_rn(s, y.z);
+        silu32_pair(x.w, &s, &d); r.w = __fmul_rn(s, y.w);
+        a[i] = r;
+    }
+}
+
+extern "C" __global__ void silu_fwd_inplace_v4(float4* a, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        float4 r;
+        float s, d;
+        silu32_pair(x.x, &s, &d); r.x = s;
+        silu32_pair(x.y, &s, &d); r.y = s;
+        silu32_pair(x.z, &s, &d); r.z = s;
+        silu32_pair(x.w, &s, &d); r.w = s;
+        a[i] = r;
+    }
+}
+
+extern "C" __global__ void silu_bwd_da_v4(const float4* g, const float4* a, float4* da, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        float4 gg = g[i];
+        float4 r;
+        float s, d;
+        silu32_pair(x.x, &s, &d); r.x = __fmul_rn(gg.x, d);
+        silu32_pair(x.y, &s, &d); r.y = __fmul_rn(gg.y, d);
+        silu32_pair(x.z, &s, &d); r.z = __fmul_rn(gg.z, d);
+        silu32_pair(x.w, &s, &d); r.w = __fmul_rn(gg.w, d);
+        da[i] = r;
+    }
+}
+
 extern "C" __global__ void emb_gather_fwd(float* out, const float* emb, const int* ids,
                                           int seq, int d, int vocab, int unk) {
     int t = (int)blockIdx.x;
@@ -6494,6 +6541,13 @@ class CudaRuntime:
             raise CudaError("silu_mul 长度不同: %s vs %s" % (a.n, b.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         if a.n:
             self._split_forget_ptr(a)
+            if self._vec4_ok(a.n, a, b):
+                n4 = int(a.n) >> 2
+                grid, block = self._ewise_grid(n4)
+                self.launch("silu_mul_fwd_v4", grid, block, [
+                    self._ptr(a), self._ptr(b), (n4, ctypes.c_int),
+                ])
+                return a
             grid, block = self._ewise_grid(a.n)
             self.launch("silu_mul_fwd", grid, block, [
                 self._ptr(a), self._ptr(b), (int(a.n), ctypes.c_int),
@@ -6504,6 +6558,13 @@ class CudaRuntime:
         """原地 a[i] = silu(a[i])。b 恒为 1 时用这个，省掉一份全 1。"""
         if a.n:
             self._split_forget_ptr(a)
+            if self._vec4_ok(a.n, a):
+                n4 = int(a.n) >> 2
+                grid, block = self._ewise_grid(n4)
+                self.launch("silu_fwd_inplace_v4", grid, block, [
+                    self._ptr(a), (n4, ctypes.c_int),
+                ])
+                return a
             grid, block = self._ewise_grid(a.n)
             self.launch("silu_fwd_inplace", grid, block, [
                 self._ptr(a), (int(a.n), ctypes.c_int),
@@ -6517,6 +6578,13 @@ class CudaRuntime:
         da = self.empty(a.shape, dtype=np.float32)
         n = int(a.n)
         if n:
+            if self._vec4_ok(n, g, a, da):
+                n4 = n >> 2
+                grid, block = self._ewise_grid(n4)
+                self.launch("silu_bwd_da_v4", grid, block, [
+                    self._ptr(g), self._ptr(a), self._ptr(da), (n4, ctypes.c_int),
+                ])
+                return da
             grid, block = self._ewise_grid(n)
             self.launch("silu_bwd_da", grid, block, [
                 self._ptr(g), self._ptr(a), self._ptr(da), (n, ctypes.c_int),
