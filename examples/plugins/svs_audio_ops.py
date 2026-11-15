@@ -147,6 +147,16 @@ def _pad_const(x, pl, pr):
     return T.cat(parts, dim=-1) if len(parts) > 1 else x
 
 
+
+def _mm_last(perm, seg):
+    """perm:[n,n] 作用在 seg 的最后一维。seg 一维直接乘，二维则逐行乘。"""
+    import tgai_go.train as T
+    if seg.ndim == 1:
+        return T.matmul(perm, seg)
+    b = int(seg.shape[0])
+    return T.stack([T.matmul(perm, seg[i]) for i in range(b)], dim=0)
+
+
 def pad1d(x, pad_left, pad_right, mode="constant"):
     """沿最后一维填充。mode: constant / replicate / reflect。"""
     import tgai_go.train as T
@@ -170,12 +180,12 @@ def pad1d(x, pad_left, pad_right, mode="constant"):
         parts = []
         if pl > 0:
             seg = x[..., 1:pl + 1]
-            parts.append(T.matmul(_reverse_last(seg.shape[-1]), seg))
+            parts.append(_mm_last(_reverse_last(int(seg.shape[-1])), seg))
         parts.append(x)
         if pr > 0:
             n = int(x.shape[-1])
             seg = x[..., n - pr - 1:n - 1]
-            parts.append(T.matmul(_reverse_last(seg.shape[-1]), seg))
+            parts.append(_mm_last(_reverse_last(int(seg.shape[-1])), seg))
         return T.cat(parts, dim=-1)
     raise ValueError("pad1d 不支持的 mode=%r。修法：constant / replicate / reflect" % (mode,))
 
