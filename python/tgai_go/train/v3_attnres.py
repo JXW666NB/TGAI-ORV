@@ -64,3 +64,38 @@ def block_attn_res_numpy(blocks, partial_block, w, norm_w, eps=1e-6):
     e = np.exp(logits - logits.max(0, keepdims=True))
     p = e / e.sum(0, keepdims=True)
     return np.einsum("nbt,nbtd->btd", p, V)
+
+
+def run_attn_res_layers(x, layers, attn_res, mlp_res, block_size=2):
+    """BlockAttnRes 的整栈前向，严格照 model_v3.py:1356-1389 的循环。
+
+    layers：长度 n_layers，每项是 (attn_part, mlp_part) 两个可调用对象，
+            都接收 [B,T,D] 返回 [B,T,D]。
+    attn_res / mlp_res：长度 n_layers，每项是 (w, norm_w) 二元组，
+            分别用于 attn 前 / mlp 前的深度注意力。
+
+    循环语义（官方伪代码，逐行照搬）：
+        partial = x; blocks = []
+        for i:
+            h = attn_res[i](blocks, partial); a = attn_part(h)
+            new_partial = partial + a
+            if (i+1) % block_size == 0: blocks.append(new_partial)
+            partial = new_partial
+            h = mlp_res[i](blocks, partial); m = mlp_part(h)
+            partial = partial + m
+        return partial
+    """
+    partial = x
+    blocks = []
+    for i, (attn_part, mlp_part) in enumerate(layers):
+        w, gw = attn_res[i]
+        h = block_attn_res(blocks, partial, w, gw)
+        a = attn_part(h)
+        new_partial = partial + a
+        if (i + 1) % int(block_size) == 0:
+            blocks.append(new_partial)
+        partial = new_partial
+        w, gw = mlp_res[i]
+        h = block_attn_res(blocks, partial, w, gw)
+        partial = partial + mlp_part(h)
+    return partial
