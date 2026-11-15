@@ -285,27 +285,28 @@ def stft_mag_fast(x, n_fft, hop_length=None, win_length=None, window=None,
         # 段内是局部坐标：基矩阵永远取前 hop 列（不是 [s*hop:(s+1)*hop]）
         cs = cos_b[:, 0:hop]                       # [F, hop]
         sn = sin_b[:, 0:hop]
+        # ★ 两个操作数都是 2D：一次 matmul 就够（[F,hop] @ [hop,nframes]）。
+        #   早期版本用逐帧循环，光 Python 调度就要 3000 次矩阵乘，慢在这里。
         As, Bs = [], []
         for i in range(b):
-            As.append(_rowwise_mm(cs, seg[i]))     # [nframes, F]
-            Bs.append(_rowwise_mm(sn, seg[i]))
-        A = As[0] if b == 1 else T.cat([a.reshape(1, nframes, nfreq) for a in As], dim=0)
-        Bq = Bs[0] if b == 1 else T.cat([v.reshape(1, nframes, nfreq) for v in Bs], dim=0)
-        if b == 1:
-            A = A.reshape(1, nframes, nfreq)
-            Bq = Bq.reshape(1, nframes, nfreq)
+            segT = seg[i].T                        # [hop, nframes]，走 gemm_nt 不拷贝
+            As.append(T.matmul(cs, segT))           # [F, nframes]
+            Bs.append(T.matmul(sn, segT))
+        A = As[0].reshape(1, nfreq, nframes) if b == 1 else \
+            T.cat([a.reshape(1, nfreq, nframes) for a in As], dim=0)
+        Bq = Bs[0].reshape(1, nfreq, nframes) if b == 1 else \
+            T.cat([v.reshape(1, nfreq, nframes) for v in Bs], dim=0)
 
         theta = 2.0 * np.pi * np.arange(nfreq, dtype=np.float64)[:, None] * (s * hop) / n_fft
-        cph = _tv(np.cos(theta).astype(np.float32)).reshape(1, 1, nfreq)
-        sph = _tv((-np.sin(theta)).astype(np.float32)).reshape(1, 1, nfreq)
+        cph = _tv(np.cos(theta).astype(np.float32)).reshape(1, nfreq, 1)
+        sph = _tv((-np.sin(theta)).astype(np.float32)).reshape(1, nfreq, 1)
 
         pre = cph * A - sph * Bq
         pim = cph * Bq + sph * A
         re = pre if re is None else re + pre
         im = pim if im is None else im + pim
 
-    mag = (re * re + im * im + 1.0e-12).sqrt()     # [B, nframes, F]
-    return mag.transpose(1, 2)                     # -> [B, F, nframes]
+    return (re * re + im * im + 1.0e-12).sqrt()    # [B, F, nframes]
 
 def cumsum(x, dim=-1):
     """沿最后一维累加（三角矩阵乘）。"""
