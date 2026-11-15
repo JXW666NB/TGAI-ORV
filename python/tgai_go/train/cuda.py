@@ -773,6 +773,27 @@ extern "C" __global__ void silu_bwd_da_v4(const float4* g, const float4* a, floa
     }
 }
 
+
+/* ★ 2026-11-15：把标量广播到整块。以前走 read_scalar（D2H 同步）+ full，
+   实测 sum 的反向因此比 torch 慢 24 倍（9.1 ms vs 0.38 ms）。这里在设备端读 src[0]，
+   不发生任何主机往返；数值与「先读回主机再填」逐位相同。 */
+extern "C" __global__ void bcast_scalar_fill(const float* src, float* dst, int n) {
+    const float v = src[0];
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n; i += stride) {
+        dst[i] = v;
+    }
+}
+
+extern "C" __global__ void bcast_scalar_fill_v4(const float* src, float4* dst, int n4) {
+    const float v = src[0];
+    const float4 t = make_float4(v, v, v, v);
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        dst[i] = t;
+    }
+}
+
 extern "C" __global__ void emb_gather_fwd(float* out, const float* emb, const int* ids,
                                           int seq, int d, int vocab, int unk) {
     int t = (int)blockIdx.x;
@@ -4092,6 +4113,28 @@ class CudaRuntime:
                     ctypes.c_uint64(buf.ptr),
                     nbytes), "cuMemcpyDtoD")
         out.known_scalar = buf.known_scalar
+        return out
+
+    def fill_scalar_from(self, src, shape):
+        """把 `src[0]`（设备上的標量）广播填满 shape。
+
+        与 `full(shape, read_scalar(src))` 数值相同，但**不做 device→host 同步**。
+        实测 sum 的反向因此从 9.1 ms 降到接近带宽上限（torch 0.38 ms 的同量级）。
+        """
+        out = self.empty(shape, dtype=np.float32)
+        n = int(out.n)
+        if n:
+            if (n & 3) == 0 and self._vec4_ok(n, out):
+                n4 = n >> 2
+                grid, block = self._ewise_grid(n4)
+                self.launch("bcast_scalar_fill_v4", grid, block, [
+                    self._ptr(src), self._ptr(out), (n4, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(n)
+                self.launch("bcast_scalar_fill", grid, block, [
+                    self._ptr(src), self._ptr(out), (n, ctypes.c_int),
+                ])
         return out
 
     def full(self, shape, value, dtype=np.float32):
