@@ -74,3 +74,41 @@ def scatter_add(values, ids, n_rows):
 
     out._backward = bw
     return out
+
+
+def index_add(acc, ids, src, dim=0):
+    """`acc.index_add(dim, ids, src)` 的等价实现（只支持 dim=0）。
+
+    V3 的 CSA 与统计计数用的就是这条（model_v3.py:675 与 :899）。
+    语义：out = acc.clone(); out[ids[i]] += src[i]，梯度同时回到 acc 与 src。
+
+    **不新造内核**：scatter_add 已经在用运行时的 scatter_add_rows，
+    这里只是 acc + scatter_add(src, ids, n_rows) —— 加法由 Tensor.__add__ 承担，
+    梯度分发也由它负责，所以 acc 与 src 都能拿到正确梯度。
+
+    一维输入（occ.scatter_add_(0, take_ok, ok_tok)）会自动升成 (n,1) 再降回来，
+    因为运行时原语只接受二维。
+    """
+    if dim != 0:
+        raise NotImplementedError(
+            "index_add 目前只支持 dim=0（V3 只用这一种）。修法：先 transpose 到第 0 维再调用")
+    shape = tuple(acc.shape)
+    if len(shape) == 1:
+        flat = scatter_add(src.reshape(-1, 1), ids, int(shape[0]))
+        return acc + flat.reshape(shape)
+    if len(shape) != 2:
+        raise ValueError(
+            "index_add 的 acc 必须是 1 维或 2 维，收到 %s。修法：先 reshape 成二维" % (shape,))
+    return acc + scatter_add(src, ids, int(shape[0]))
+
+
+def index_add_numpy(acc_np, ids, src_np):
+    """参考实现（CPU / 对拍用）：与 index_add 同语义。"""
+    out = np.array(acc_np, dtype=np.float32, copy=True)
+    ids = np.asarray(ids).reshape(-1)
+    src = np.asarray(src_np, dtype=np.float32)
+    if out.ndim == 1:
+        np.add.at(out, ids, src.reshape(-1))
+    else:
+        np.add.at(out, ids, src)
+    return out
