@@ -229,8 +229,10 @@ def stft_mag(x, n_fft, hop_length=None, win_length=None, window=None,
     cos_b, sin_b = _dft_basis(n_fft)
     nf = int(frames.shape[2])
     flat = frames.reshape(b, n_fft, nf)
-    re = T.stack([T.matmul(cos_b, flat[i]) for i in range(b)], dim=0)
-    im = T.stack([T.matmul(sin_b, flat[i]) for i in range(b)], dim=0)
+    # T.stack 在 CUDA 上未实现，改用 cat + reshape
+    nfreq = int(cos_b.shape[0])
+    re = T.cat([T.matmul(cos_b, flat[i]).reshape(1, nfreq, nf) for i in range(b)], dim=0)
+    im = T.cat([T.matmul(sin_b, flat[i]).reshape(1, nfreq, nf) for i in range(b)], dim=0)
     return (re * re + im * im + 1.0e-12).sqrt()
 
 
