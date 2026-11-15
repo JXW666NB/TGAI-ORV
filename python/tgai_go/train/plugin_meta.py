@@ -149,6 +149,10 @@ def validate(meta):
     ops = out.get("ops") or []
     if not isinstance(ops, list):
         raise PluginMetaError("ops 必须是列表。修法：每个算子一项")
+    if not ops:
+        raise PluginMetaError(
+            "插件 %r 没有声明任何算子。修法：ops 至少写一项（一个包什么也不提供，几乎肯定是漏写了）"
+            % (name,))
     seen = set()
     for i, op in enumerate(ops):
         if not isinstance(op, dict):
@@ -172,8 +176,11 @@ def validate(meta):
                 "dsl 给 {\"expr\": \"...\", \"inputs\": [...]}；native 给 {\"backends\": {...}}" % (nm,))
 
     # 纪律：C 档（native）必须同时有 A 或 B 档回退，否则别的后端上等于不存在
-    has_fallback = any(o.get("form") in ("composed", "dsl") for o in ops) or \
-        bool(out.get("fallback"))
+    # 回退的三种形态：另有 composed/dsl 算子、顶层的 fallback、或 native 算子自带的 impl.fallback
+    has_fallback = (any(o.get("form") in ("composed", "dsl") for o in ops)
+                    or bool(out.get("fallback"))
+                    or any(o.get("form") == "native" and (o.get("impl") or {}).get("fallback")
+                           for o in ops))
     for op in ops:
         if op.get("form") == "native" and not has_fallback:
             raise PluginMetaError(
@@ -250,12 +257,35 @@ ative：交给 plugin_manifest.load_manifest（它读的是原生库 + JSON 声�
                 installed.append(op["name"])
             elif form == "native":
                 lib = impl.get("library") or impl.get("backends", {}).get("cuda", {}).get("source")
-                if not lib:
-                    raise PluginMetaError(
-                        "算子 %r 是 native 但没给 library/source。修法：补 impl.library" % (op["name"],))
-                _plugin.load_manifest(os.path.join(root, lib), replace=replace) \
-                    if os.path.exists(os.path.join(root, lib)) else None
-                installed.append(op["name"])
+                fb_name = impl.get("fallback")
+                mod_name = impl.get("module")
+                fast_name = impl.get("python")
+                if fb_name:
+                    # ★ 轮椅档：原生快路径 + 可微等价实现 ⇒ 反向自动导出，不用写 bwd
+                    if not (mod_name and fast_name):
+                        raise PluginMetaError(
+                            "算子 %r 声明了 fallback，但缺少 module/python（快路径入口）。修法：写成 "
+                            '{"module": "impl.py", "python": "forward", "fallback": "fallback_fn"}'
+                            % (op["name"],))
+                    mpath = os.path.join(root, mod_name)
+                    fwd = _load_callable(mpath, fast_name)
+                    fbk = _load_callable(mpath, fb_name)
+                    ops_plugin.register_auto(
+                        op["name"], fwd, fbk,
+                        check=bool(op.get("check", True)),
+                        rtol=float(op.get("rtol", 2e-3)),
+                        kind=op.get("kind", "functional"),
+                        doc=op.get("doc", ""), replace=replace)
+                    installed.append(op["name"])
+                else:
+                    if not lib:
+                        raise PluginMetaError(
+                            "算子 %r 是 native 但没给 library/source，也没给 fallback。"
+                            "修法：要么补 impl.library（低层 C 绑定），"
+                            "要么补 impl.fallback + module/python（自动反向，推荐）" % (op["name"],))
+                    if os.path.exists(os.path.join(root, lib)):
+                        _plugin.load_manifest(os.path.join(root, lib), replace=replace)
+                    installed.append(op["name"])
 
         # 若 manifest 声明了 namespace，就把它装成 `T.<namespace>`，一行导入即可用
         ns_name = meta.get("namespace")
@@ -358,3 +388,45 @@ def uninstall(name):
         delattr(_T, ns)
     del _INSTALLED[name]
     return removed
+
+
+def install_all(root_dir, *, replace=False, verbose=False):
+    """**一条命令装完整个环境**：把目录下所有 `.tgop` 与含 manifest.json 的子目录都装上。
+
+    顺序：先按名字排序装 `.tgop` 与目录。任何一个包的元信息/实现有问题都会报错并指出是哪个包，
+    不会静默跳过（静默跳过在"环境没配好"的场景里最难查）。
+
+    返回已安装的元信息列表。
+    """
+    import glob
+
+    if not os.path.isdir(root_dir):
+        raise PluginMetaError(
+            "不是目录：%s。修法：给一个存放插件包的目录" % (root_dir,))
+    targets = []
+    for p in sorted(glob.glob(os.path.join(root_dir, "*.tgop"))):
+        targets.append(p)
+    for p in sorted(glob.glob(os.path.join(root_dir, "*.zip"))):
+        if p not in targets:
+            targets.append(p)
+    for name in sorted(os.listdir(root_dir)):
+        d = os.path.join(root_dir, name)
+        if os.path.isdir(d) and os.path.exists(os.path.join(d, "manifest.json")):
+            targets.append(d)
+
+    if not targets:
+        raise PluginMetaError(
+            "目录里没有可装的插件包：%s。修法：放 .tgop 文件，或含 manifest.json 的子目录"
+            % (root_dir,))
+
+    out = []
+    for t in targets:
+        try:
+            out.append(install(t, replace=replace, verbose=verbose))
+        except Exception as e:                      # noqa: BLE001
+            raise PluginMetaError(
+                "装 %s 失败：%s。修法：先单独装这个包（T.plugin.install）看完整报错，"
+                "按它给的修法改好再整目录装" % (os.path.basename(t), e)) from e
+    if verbose:
+        print("共装好 %d 个插件包" % len(out))
+    return out

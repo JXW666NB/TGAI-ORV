@@ -119,6 +119,37 @@ ops_plugin.register_auto(
 前向对参考值、反向对解析式、no_grad 不建图且不走 fallback、两份实现不一致时**报错**、
 多输入 + 广播的梯度、以及「训练路径确实用 forward 而不是 fallback」的计数断言。
 
+### 原生算子也可以不写反向（`impl.fallback`）
+
+`form: "native"` 的算子只要在 `impl` 里多声明一个 `fallback`，`install()` 就会用
+`register_auto` 装它 —— **前向走你的原生快路径，反向由 fallback 自动导出**：
+
+```json
+{
+  "name": "my_kernel",
+  "form": "native",
+  "impl": {
+    "module": "impl.py",
+    "python": "fast",          // 快路径（module 里调 .dll/.so 的函数）
+    "fallback": "fallback_fn"  // 与 fast 数学等价、用 ORV 算子写
+  }
+}
+```
+
+* 训练：前向 `fast`，反向把 `fallback_fn` 重算一遍再反传（梯度精确，代价是多一次 fallback 前向）
+* 推理 / `no_grad`：只走 `fast`，不建图
+* 默认 `check=true`：首次反向比对两者输出，超 `rtol`（默认 2e-3，可在算子项里覆盖）直接报错
+
+这条也满足「C 档必须有回退」的纪律 —— 校验器现在把 `impl.fallback` 视为合法回退。
+
+### 一条命令装完整个环境
+
+```python
+T.plugin.install_all("bundles/")     # 装目录下所有 .tgop / .zip / 含 manifest.json 的子目录
+```
+
+任一个包出错会**指出是哪个包**并带上原始错误（不静默跳过 —— "环境没配好"最难查的就是静默）。
+
 ## 六、第一个包：`svs-ops`
 
 虚拟歌手（DDSP/STFT）项目缺的音频算子，已打成本仓第一个插件包：

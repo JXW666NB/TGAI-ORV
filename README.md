@@ -180,6 +180,16 @@ ops_plugin.register_numpy("my_gelu", gelu_fwd, gelu_bwd)
 
 ---
 
+### 一条命令装完整个环境
+
+```python
+T.plugin.install_all("bundles/")     # 目录下所有插件包一次装完
+```
+
+原生算子也**不用写反向**：manifest 里给 `form: "native"` 加一个 `impl.fallback`
+（一份用已有算子写的等价实现），ORV 就自动把反向导出 —— 前向仍是你编译好的原生 kernel。
+详见 [`docs/PLUGIN_SPEC.md`](docs/PLUGIN_SPEC.md)。
+
 ## 从 PyTorch 迁移
 
 四步：换 import → 搬权重 → 改自定义 `forward` → 接训练循环。

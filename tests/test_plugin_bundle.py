@@ -59,8 +59,18 @@ def shift(x, k=1.0):
 
 def test_validate_accepts_minimal_meta():
     m = plugin_meta.default_meta("ok-name", version="1.2.3", backends=["cpu"])
+    # 规范要求至少声明一个算子（空包几乎肯定是漏写）
+    m["ops"] = [{"name": "an_op", "form": "composed",
+                 "impl": {"module": "impl.py", "python": "an_op"}}]
     out = plugin_meta.validate(m)
     assert out["name"] == "ok-name" and out["version"] == "1.2.3"
+
+
+def test_validate_rejects_empty_ops():
+    m = plugin_meta.default_meta("ok-name", version="1.0.0", backends=["cpu"])
+    with pytest.raises(plugin_meta.PluginMetaError) as ei:
+        plugin_meta.validate(m)
+    assert "算子" in str(ei.value)
 
 
 @pytest.mark.parametrize("bad,field", [

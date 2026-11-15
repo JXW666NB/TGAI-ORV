@@ -47,6 +47,7 @@ from . import dispatch as _disp
 from .plugin_meta import install, validate as validate_meta          # noqa: E402,F401
 from .plugin_meta import load_manifest_file as load_bundle_manifest  # noqa: E402,F401
 from .plugin_meta import info, uninstall                          # noqa: E402,F401
+from .plugin_meta import install_all                               # noqa: E402,F401
 from .plugin_meta import list_plugins as list_installed            # noqa: E402,F401
 # 注意：**不要**在这里把内置名 list 遮蔽掉 —— 本模块内部大量使用 list(...)，
 #       一旦遮蔽会在 activate() 等处炸掉（2026-11-15 踩过）。对外 API 叫 list_installed。
