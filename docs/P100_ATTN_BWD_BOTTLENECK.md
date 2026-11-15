@@ -155,3 +155,39 @@ cuda.py 里有 _ATTN_FLASH_GROUPS = 8，注释说「反向 atomic 按 query-tile
 
 预期：反向从 77.6 ms 降到 20–30 ms，整步再省 0.9–1.1 s —— 足以让 ② 追平甚至反超 torch。
 风险：归约本身要占显存（G=8 时约 300 MB），需与 pool_stats 一起核算。
+
+
+### 实施规格（内核签名已确认，可直接照做）
+
+当前签名（kernels/tgai_attn_nop.cu:733）：
+
+`c
+extern C __global__ void __launch_bounds__(256, 1)
+attn_bwd_flash_w(const float* dO, const float* Q, const float* K, const float* V,
+                 const float* O, const float* m_in, const float* l_in,
+                 float* dQ, float* dK, float* dV,
+                 int seq, int nh, int dh, float scale);
+`
+
+改造步骤：
+
+1. **内核**：加 #define GROUPS 1（可被 TG_ATTN_GROUPS 替换成 2/4/8/16）。
+   entry 里算 const int gid = (int)(blockIdx.y);            // query tile 下标
+   const int pl = (GROUPS > 1) ? (gid % GROUPS) : 0;
+   const long psz = (long)nh * seq * dh;
+   loat* dKp = dK + (long)pl * psz;、loat* dVp = dV + (long)pl * psz;
+   把原来的 tomicAdd(dK + ..., v) / tomicAdd(dV + ..., v) 改成写 dKp / dVp。
+   **注意**：GROUPS=1 时指针偏移为 0，行为与现在完全一致（可作为回归保证）。
+
+2. **启动端**（cuda.py 的 _attn_flash_launch）：GROUPS>1 时
+   - 多分配 GROUPS * 2 * psz * 4 字节的临时缓冲（G=8、nh=72、seq=2048、dh=64 时约 302 MB）
+   - 把临时缓冲指针当 dK/dV 传进去
+   - 启动一个归约内核（或复用现有 dd_）把 G 份 plane 累加到真正的 dK/dV
+   - 释放临时缓冲
+
+3. **验收**：先测 TG_ATTN_GROUPS=1 必须与当前 77.6 ms 一致且数值逐位相同；再扫 2/4/8/16。
+
+预算提示：G=8 的归约是 2 × 72×2048×64 × 4 B × 7 ≈ 528 MB 读写，约 5 ms；
+相对 62.9 ms 的原子开销，净收益上限约 58 ms/层。
+
+**当前状态：规格已定，实现未做**（需要完整上下文一次改完内核+启动端+归约，并做数值对拍）。
