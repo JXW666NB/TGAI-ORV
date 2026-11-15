@@ -53,7 +53,7 @@ C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin\cufft64_11.dll
 把分帧结果直接送进 cuFFT，STFT 就能接近 torch 的速度。
 分帧也要改掉恒等卷积（改成按帧切片 + `cat`，把 O(n²) 降到 O(L)）。
 
-## 五、顺带发现的引擎 BUG（重要，未修）
+## 五、顺带发现的引擎 BUG（重要，**已修复**）
 
 **ORV 的惰性转置 `_lazy_T` 会被绝大多数算子忽略，静默给出错数据。**
 
