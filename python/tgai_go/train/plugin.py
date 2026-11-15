@@ -43,6 +43,9 @@ import os
 
 from . import ops_plugin as _ops
 from . import dispatch as _disp
+# 一行装完整个插件包：T.plugin.install("xxx.tgop" 或含 manifest.json 的目录)
+from .plugin_meta import install, validate as validate_meta          # noqa: E402,F401
+from .plugin_meta import load_manifest_file as load_bundle_manifest  # noqa: E402,F401
 
 #: 已登记的后端：(name -> {"factory", "caps"})
 _BACKENDS = {}

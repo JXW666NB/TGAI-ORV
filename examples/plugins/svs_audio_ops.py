@@ -239,9 +239,13 @@ def stft_mag(x, n_fft, hop_length=None, win_length=None, window=None,
 
 
 # ── 扫描 / 索引 ───────────────────────────────────────────────────────
-def stft_mag_fast(x, n_fft, hop_length=None, win_length=None, window=None,
+def stft_mag_fast_UNVERIFIED(x, n_fft, hop_length=None, win_length=None, window=None,
                   center=True, pad_mode="reflect"):
-    """|STFT(x)| 的快路径（hop 块分解，无分帧卷积）。返回 [B, n_fft//2+1, n_frames]。"""
+    """★未通过数值对拍，**不要使用**（保留代码供后续修正）。
+
+    2026-11-15 实测：与 torch.stft 相比前向相对误差 0.7–0.9，说明相位/分段推导有错。
+    已从 T.svs 命名空间摘除；修好并通过 tools/verify_svs_ops.py 后才能注册回去。
+    """
     import tgai_go.train as T
 
     n_fft = int(n_fft)
@@ -365,7 +369,6 @@ _OPS = {
     "sigmoid": sigmoid, "softplus": softplus, "log1p": log1p, "log10": log10,
     "pow": pow_, "leaky_relu": leaky_relu,
     "pad1d": pad1d, "hann_window": hann_window, "stft_mag": stft_mag,
-    "stft_mag_fast": stft_mag_fast,
     "cumsum": cumsum, "gather_last": gather_last, "isfinite_np": isfinite_np,
     "l1_loss": l1_loss, "mse_loss": mse_loss,
     "bce_with_logits": bce_with_logits, "bce": bce, "avg_pool1d": avg_pool1d,

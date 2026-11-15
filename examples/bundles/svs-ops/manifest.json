@@ -1,0 +1,113 @@
+{
+  "schema": 1,
+  "name": "svs-ops",
+  "version": "0.2.0",
+  "api_version": "1.0",
+  "namespace": "svs",
+  "summary": "虚拟歌手（DDSP/STFT）训练所需算子：谱变换、扫描、填充、损失",
+  "description": "为歌声合成项目（DDSP + 残差向量量化 + 流匹配 GAN）补齐 ORV 缺失的音频算子。全部为组合式实现，梯度由 autograd 自动给出。每个算子都与 PyTorch 做过逐项数值对拍（tools/verify_svs_ops.py，39 项全过，相对误差 ~1e-7）。",
+  "author": "JXW",
+  "license": "MIT",
+  "homepage": "https://github.com/JXW666NB/TGAI-ORV",
+  "tags": ["audio", "stft", "ddsp", "svs"],
+  "requires": {"orv": ">=0.9.65"},
+  "backends": ["cpu", "cuda", "vulkan"],
+  "ops": [
+    {
+      "name": "stft_mag",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "|STFT(x)|，无需复数张量：conv1d 分帧 + DFT 基矩阵乘",
+      "impl": {"module": "svs_ops.py", "python": "stft_mag"}
+    },
+    {
+      "name": "hann_window",
+      "arity": 0,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "周期 Hann 窗（与 torch.hann_window 默认一致）",
+      "impl": {"module": "svs_ops.py", "python": "hann_window"}
+    },
+    {
+      "name": "pad1d",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "沿最后一维填充：constant / replicate / reflect",
+      "impl": {"module": "svs_ops.py", "python": "pad1d"}
+    },
+    {
+      "name": "cumsum",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "沿最后一维累加（三角矩阵乘）",
+      "impl": {"module": "svs_ops.py", "python": "cumsum"}
+    },
+    {
+      "name": "sigmoid",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "1/(1+e^-x)，用 tanh 表达以保证数值稳定",
+      "impl": {"module": "svs_ops.py", "python": "sigmoid"}
+    },
+    {
+      "name": "softplus",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "log(1+e^x) 的稳定写法",
+      "impl": {"module": "svs_ops.py", "python": "softplus"}
+    },
+    {
+      "name": "log1p",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "log(1+x)",
+      "impl": {"module": "svs_ops.py", "python": "log1p"}
+    },
+    {
+      "name": "log10",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "以 10 为底的对数",
+      "impl": {"module": "svs_ops.py", "python": "log10"}
+    },
+    {
+      "name": "l1_loss",
+      "arity": 2,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "L1 损失",
+      "impl": {"module": "svs_ops.py", "python": "l1_loss"}
+    },
+    {
+      "name": "mse_loss",
+      "arity": 2,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "均方误差",
+      "impl": {"module": "svs_ops.py", "python": "mse_loss"}
+    },
+    {
+      "name": "bce_with_logits",
+      "arity": 2,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "带 logits 的二元交叉熵",
+      "impl": {"module": "svs_ops.py", "python": "bce_with_logits"}
+    },
+    {
+      "name": "avg_pool1d",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "一维平均池化",
+      "impl": {"module": "svs_ops.py", "python": "avg_pool1d"}
+    }
+  ]
+}
