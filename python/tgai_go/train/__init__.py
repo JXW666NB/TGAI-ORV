@@ -1978,7 +1978,13 @@ def _acc(grads, node, g):
     if getattr(node, "device", "cpu") == "cuda":
         rt = _cuda()
         old = grads.get(id(node))
-        grads[id(node)] = g if old is None else rt.add(old, g)
+        if old is None:
+            grads[id(node)] = g
+        else:
+            # ★ 2026-11-15：就地累加。以前每次 rt.add 都分配新缓冲 + 拷一遍，
+            #   一个多消费者的节点一次反向就要多一次 37.7 MB 级往返。
+            #   add_ 是现成的向量化原地核（cuda.py:6602）。
+            rt.add_(old, g)
         return
     g = np.asarray(g, dtype=np.float32)
     old = grads.get(id(node))

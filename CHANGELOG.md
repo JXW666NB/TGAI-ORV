@@ -1,3 +1,41 @@
+## [0.9.70] - 2026-11-15
+
+### 梯度累加改为就地：省掉每个多消费者节点一次分配与拷贝
+
+_acc 以前用 
+t.add(old, g)：每次累加都分配新缓冲再拷一遍。真机上单个 [8192,1152] 累加
+就是 37.7 MB 的往返。现在改用现成的向量化原地核 
+t.add_(old, g)（cuda.py:6602）。
+inplace_acc 这个策略项自声明起从未被读取（死旋钮），本版让它真正生效。
+
+### 修：__version__ 两处字面量不一致
+
+0.9.69 的 python/tgai_go/__init__.py 只更新了第一处 __version__，退回字面量仍是 0.9.68，
+导致 	ests/test_version.py 失败。本版两处一并改为 0.9.70，守卫测试通过。
+（教训：改版本号必须用 replace-all，且发版前必须跑全套。）
+
+全套 788 passed / 56 skipped / 0 failed。
+
+## [0.9.69] - 2026-11-15
+
+### 低显存注意力改为默认：P100 上显存 11.33 -> 7.14 GB（比 torch 还低）
+
+真机定位：ench_p100_full.py:149 硬编码 lowmem=False，注释理由是「sm_60 需要 68 KB smem > 48 KB」。
+但该限制已随滑窗反向内核（40,448 B）消失。于是所有对比都在测**物化注意力**：
+它同时驻留 3 份 [B,H,S,S]（scores / softmax clone / dS），H=18 时约 3.4 GB。
+
+实测（B=4、同模型、fp32）：
+
+| 配置 | s/step | tok/s | 峰值 |
+| --- | --- | --- | --- |
+| lowmem=False | 4.47 | 1,832 | 11.33 GB |
+| lowmem=True | 4.26 | 1,923 | 7.14 GB |
+| torch fp32 | 3.33 | 2,458 | 7.37 GB |
+
+本版把 scaled_dot_product_attention 与 _sdpa_impl 的 lowmem 默认从 False 改为 None
+（自动）：满足 dh==64 / causal / CUDA / 内核可用时走融合，否则自动回退物化，行为与旧版一致。
+显式传 lowmem=False 仍可强制物化。全套 788 passed / 0 failed。
+
 ## [0.9.68] - 2026-11-15
 
 ### 反向走完即拆图：一步训练后不再残留约 3.65 GB
