@@ -148,16 +148,19 @@ def _pad_const(x, pl, pr):
 
 
 
-def _mm_last(perm, seg):
-    """perm:[n,n] 作用在 seg 的最后一维。seg 一维直接乘，二维则逐行乘。"""
+def _rowwise_mm(mat, x):
+    """mat:[m,n] 作用在 x 的**最后一维**（x 可多维）：返回 [..., m]。
+
+    ORV 的 matmul 只吃 2D，所以把前置维展平、逐行按列向量乘、再按列拼回并转置。
+    """
     import tgai_go.train as T
-    n = int(perm.shape[0])
-    if seg.ndim == 1:
-        return T.matmul(perm, seg.reshape(n, 1)).reshape(n)
-    b = int(seg.shape[0])
-    # 每行当成列向量 [n,1] 再按列拼成 [n,b]，转置回 [b,n]
-    cols = [T.matmul(perm, seg[i].reshape(n, 1)) for i in range(b)]
-    return T.cat(cols, dim=1).T
+    n = int(mat.shape[1])
+    m = int(mat.shape[0])
+    lead = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
+    flat = x.reshape(lead, n)
+    cols = [T.matmul(mat, flat[i].reshape(n, 1)) for i in range(lead)]
+    y = T.cat(cols, dim=1).T            # [lead, m]
+    return y.reshape(tuple(list(x.shape[:-1]) + [m]))
 
 
 def pad1d(x, pad_left, pad_right, mode="constant"):
@@ -183,12 +186,12 @@ def pad1d(x, pad_left, pad_right, mode="constant"):
         parts = []
         if pl > 0:
             seg = x[..., 1:pl + 1]
-            parts.append(_mm_last(_reverse_last(int(seg.shape[-1])), seg))
+            parts.append(_rowwise_mm(_reverse_last(int(seg.shape[-1])), seg))
         parts.append(x)
         if pr > 0:
             n = int(x.shape[-1])
             seg = x[..., n - pr - 1:n - 1]
-            parts.append(_mm_last(_reverse_last(int(seg.shape[-1])), seg))
+            parts.append(_rowwise_mm(_reverse_last(int(seg.shape[-1])), seg))
         return T.cat(parts, dim=-1)
     raise ValueError("pad1d 不支持的 mode=%r。修法：constant / replicate / reflect" % (mode,))
 
@@ -238,11 +241,7 @@ def cumsum(x, dim=-1):
     if dim not in (-1, x.ndim - 1):
         raise ValueError("cumsum 只支持最后一维。修法：先 permute 把该维移到最后")
     n = int(x.shape[-1])
-    L = _tri(n)
-    lead = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
-    flat = x.reshape(lead, n)
-    y = T.stack([T.matmul(L, flat[i]) for i in range(lead)], dim=0)
-    return y.reshape(tuple(x.shape))
+    return _rowwise_mm(_tri(n), x)
 
 
 def gather_last(x, index_np):
@@ -250,11 +249,9 @@ def gather_last(x, index_np):
     import tgai_go.train as T
     n = int(x.shape[-1])
     idx = np.asarray(index_np, np.int64).reshape(-1)
-    lead = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
     oh = np.zeros((idx.size, n), np.float32)
     oh[np.arange(idx.size), idx] = 1.0
-    flat = x.reshape(lead, n)
-    y = T.stack([T.matmul(_tv(oh), flat[i]) for i in range(lead)], dim=0)
+    y = _rowwise_mm(_tv(oh), x)          # [..., m]
     return y.reshape(tuple(list(x.shape[:-1]) + [1]))
 
 
