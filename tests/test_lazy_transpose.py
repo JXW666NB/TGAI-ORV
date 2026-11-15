@@ -88,9 +88,9 @@ def test_add_two_tensors():
 
 
 def test_matmul_still_correct():
-    a, _x, t = _pair()
-    y = T.from_numpy(np.ones((2, 4), np.float32))
-    assert np.allclose(T.matmul(t, y).to_numpy(), a.T @ np.ones((2, 4), np.float32))
+    a, _x, t = _pair()                    # t: [2, 3]
+    y = T.from_numpy(np.ones((3, 4), np.float32))
+    assert np.allclose(T.matmul(t, y).to_numpy(), a.T @ np.ones((3, 4), np.float32))
 
 
 def test_grad_through_transpose():
@@ -106,8 +106,10 @@ def test_matmul_with_transposed_rhs_does_not_copy():
     """`.T` 的省拷贝优化必须还在：`a @ b.T` 不应把 b.T 物化。"""
     T.set_default_device("cuda")
     rt = T._cuda()
-    a = T.from_numpy(np.random.rand(8, 16).astype(np.float32))
-    b = T.from_numpy(np.random.rand(4, 16).astype(np.float32))
+    # 必须绕开"精确 GEMM"路径（M,N<=64 且 K<=16 走 numpy 对齐的朴素内核，那条本就要物化），
+    # 否则测不到 gemm_nt 的省拷贝
+    a = T.from_numpy(np.random.rand(129, 256).astype(np.float32))
+    b = T.from_numpy(np.random.rand(97, 256).astype(np.float32))
     bt = b.T
     calls = {"n": 0}
     orig = rt.transpose2d
