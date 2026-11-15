@@ -71,6 +71,16 @@ def build(cfg, rng):
             W3=[p(d, d_ff) for _ in range(E)],
             S1=p(d_ff, d), S2=p(d_ff, d), S3=p(d, d_ff),     # 共享专家的 FFN（对齐 PyT 的 n_shared_experts=1）
         ))
+        # BlockAttnRes 的参数：每层两组（attn 前 / mlp 前），各一个伪查询 w 与 RMSNorm 的 γ。
+        # 对应 model_v3.py 的 `attn_res_proj[i]` / `mlp_res_proj[i]`（各含 proj.weight + norm.weight）。
+        # 只在 cfg 打开 attn_res 时才建，默认不建 ⇒ 与改动前的参数集合完全一致。
+        if cfg.get("attn_res"):
+            P["layers"][-1].update(
+                res_w_attn=p(d),
+                res_gn_attn=T.tensor(np.ones(d, np.float32), requires_grad=True),
+                res_w_mlp=p(d),
+                res_gn_mlp=T.tensor(np.ones(d, np.float32), requires_grad=True),
+            )
     return P
 
 
