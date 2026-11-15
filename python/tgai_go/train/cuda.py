@@ -7154,19 +7154,61 @@ class CudaRuntime:
         return mod
 
     def _attn_set_dyn_smem(self, name, smem):
-        """4090 上超过 48KB 的动态 smem 必须先抬高上限，并偏向 shared carveout。"""
+        """抬高动态 smem 上限并偏向 shared carveout。
+
+        ★ 2026-11-15（真机 P100 实测）：`cuFuncSetAttribute(..., 8, 45056)` 会返回
+          rc=1 invalid argument —— 即使 45056 看起来 <= 该卡申报的 48 KB。以前这里
+          直接 `_chk` 抛异常，表现成「一个属性设置失败 ⇒ 整个训练步硬崩」，且报错只有
+          `rc=1` 看不出怎么办。现在：
+            * 失败时把「请求值 / 设备申报上限 / 可选出路」一次性写清楚；
+            * 记下本进程这张卡在哪个 (kernel, smem) 上失败过，后续同组合**快速失败**，
+              不再反复尝试（避免每步都撞一次驱动）；
+            * 置 `_attn_flash_bwd_limited`，供上层决定是否回退物化注意力。
+        """
         fn = self._fn_module(self._attn_mod, name)
         cu = self.cu
         if not hasattr(cu, "_fnattr_ready"):
             cu.cuFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
             cu.cuFuncSetAttribute.restype = ctypes.c_int
             cu._fnattr_ready = True
+
+        bad = getattr(self, "_attn_smem_rejected", None) or ()
+        if (name, int(smem)) in bad:
+            raise CudaError(self._smem_reject_msg(name, smem)
+                            + "。修法：设 TGAI_ATTN_FLASH=0 走物化注意力，或换 V100 及以上")
+
         # 8 = CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
         # 9 = CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT（百分数）
-        self._chk(cu.cuFuncSetAttribute(fn, 8, int(smem)),
-                  "cuFuncSetAttribute(%s maxdyn)" % name)
+        rc = cu.cuFuncSetAttribute(fn, 8, int(smem))
+        if rc != 0:
+            self._attn_smem_rejected = tuple(bad) + ((name, int(smem)),)
+            self._attn_flash_bwd_limited = (name, int(smem), int(rc))
+            raise CudaError(self._smem_reject_msg(name, smem, rc=rc)
+                            + "。修法：设 TGAI_ATTN_FLASH=0 走物化注意力，或换 V100 及以上")
         self._chk(cu.cuFuncSetAttribute(fn, 9, 100),
                   "cuFuncSetAttribute(%s carveout)" % name)
+
+    def _smem_reject_msg(self, name, smem, rc=None):
+        """把「属性设不上」翻译成能照着做的说明。"""
+        lim = 0
+        try:
+            lim = int(self._device_smem_limit() or 0)
+        except Exception:            # noqa: BLE001  查询失败也不能掩盖原始错误
+            lim = 0
+        head = ("内核 %s 申请 %d B（%d KB）动态共享内存被驱动拒绝"
+                % (name, int(smem), int(smem) // 1024))
+        if rc is not None:
+            head += "（cuFuncSetAttribute rc=%d）" % int(rc)
+        return (
+            head
+            + "；本设备申报上限 %d B（%d KB）。" % (lim, lim // 1024)
+            + "修法（按代价从小到大）："
+              "① 关掉融合反向、走物化注意力 —— 设环境变量 TGAI_ATTN_FLASH=0，"
+              "或调用时传 lowmem=False（多花显存但结果正确）；"
+              "② 减小 batch/seq 让同一内核的内存需求降到上限内；"
+              "③ 换 V100（sm_70）及以上，可 opt-in 到 96 KB。"
+              "注意：本卡（Pascal 类，sm_60/61）上限 48 KB 且不支持 opt-in，"
+              "融合反向的大 smem 变体在它上面本来就用不了")
 
     def _attn_nop_launch(self, name, seq, nh, dh, args):
         """grid=(nh, ceil(seq/64), 1)，block=256，dynamic smem=32KB。
