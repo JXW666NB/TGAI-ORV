@@ -649,6 +649,30 @@ extern "C" __global__ void reduce_sum(const float* a, float* out, int n) {
     }
     if (threadIdx.x == 0) out[0] = smem[0];
 }
+
+/* 多 block 部分归约。以前全归约只启 1 个 block（56 个 SM 只用一个），21M 元素实测
+   8.5 GB/s，torch 约 65 GB/s。这里 G 个 block 各归约一段**连续**区间写入 part[G]
+   （连续切分保证合并访存），再由 reduce_sum 把 part[G] 归约成标量。 */
+extern "C" __global__ void reduce_sum_partial(const float* a, float* part, int n) {
+    __shared__ float smem[256];
+    const int nb = (int)gridDim.x;
+    const int bid = (int)blockIdx.x;
+    const int chunk = (n + nb - 1) / nb;
+    const int lo = bid * chunk;
+    int hi = lo + chunk;
+    if (hi > n) hi = n;
+    float local = 0.f;
+    for (int i = lo + (int)threadIdx.x; i < hi; i += (int)blockDim.x) {
+        local += a[i];
+    }
+    smem[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) part[bid] = smem[0];
+}
 """
 
 # 下面几段从 training/kernels/tgai_fwd.cu、tgai_bwd.cu 原样摘出来。
@@ -6479,6 +6503,17 @@ class CudaRuntime:
                 ctypes.c_uint64(out.ptr),
                 zero.ctypes.data_as(ctypes.c_void_p),
                 ctypes.c_size_t(4)), "cuMemcpyHtoD(sum0)")
+            return out
+        if n > (1 << 20):
+            # 大张量：两遍式。每块至少约 64K 元素，块数上限 1024。
+            nb = min(1024, (n + 65535) // 65536)
+            part = self.empty((nb,), dtype=np.float32)
+            self.launch("reduce_sum_partial", (nb, 1, 1), (256, 1, 1), [
+                self._ptr(buf), self._ptr(part), (n, ctypes.c_int),
+            ])
+            self.launch("reduce_sum", (1, 1, 1), (256, 1, 1), [
+                self._ptr(part), self._ptr(out), (nb, ctypes.c_int),
+            ])
             return out
         self.launch("reduce_sum", (1, 1, 1), (256, 1, 1), [
             self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
