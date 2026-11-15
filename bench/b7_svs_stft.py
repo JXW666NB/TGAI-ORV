@@ -29,8 +29,9 @@ def orv_loss(S, x, xh):
     total = None
     for fft, hop in zip(FFT_SIZES, HOPS):
         win = S.hann_window(fft)
-        a = S.stft_mag(x, fft, hop_length=hop, window=win)
-        b = S.stft_mag(xh, fft, hop_length=hop, window=win)
+        fn = getattr(S, "stft_mag_fast", S.stft_mag)
+        a = fn(x, fft, hop_length=hop, window=win)
+        b = fn(xh, fft, hop_length=hop, window=win)
         sc = ((a - b) * (a - b)).mean()
         la = (a.clamp(min=1e-4)).log()
         lb = (b.clamp(min=1e-4)).log()

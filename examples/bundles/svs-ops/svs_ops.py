@@ -239,12 +239,12 @@ def stft_mag(x, n_fft, hop_length=None, win_length=None, window=None,
 
 
 # ── 扫描 / 索引 ───────────────────────────────────────────────────────
-def stft_mag_fast_UNVERIFIED(x, n_fft, hop_length=None, win_length=None, window=None,
+def stft_mag_fast(x, n_fft, hop_length=None, win_length=None, window=None,
                   center=True, pad_mode="reflect"):
-    """★未通过数值对拍，**不要使用**（保留代码供后续修正）。
+    """|STFT(x)| 的快路径：hop 块分解，**不做分帧卷积**。
 
-    2026-11-15 实测：与 torch.stft 相比前向相对误差 0.7–0.9，说明相位/分段推导有错。
-    已从 T.svs 命名空间摘除；修好并通过 tools/verify_svs_ops.py 后才能注册回去。
+    一帧 = nseg 个连续 hop 块；块内用**局部坐标 u=0..hop-1** 的基矩阵，
+    段间再乘相位 e^{-2πi·k·s·hop/n}。（2026-11-15 修：原先误用全局列索引，等于算了两遍相位。）
     """
     import tgai_go.train as T
 
@@ -281,8 +281,9 @@ def stft_mag_fast_UNVERIFIED(x, n_fft, hop_length=None, win_length=None, window=
     for s in range(nseg):
         wseg = window[s * hop:(s + 1) * hop].reshape(1, 1, hop)
         seg = blocks[:, s:s + nframes, :] * wseg   # [B, nframes, hop]
-        cs = cos_b[:, s * hop:(s + 1) * hop]       # [F, hop]
-        sn = sin_b[:, s * hop:(s + 1) * hop]
+        # 段内是局部坐标：基矩阵永远取前 hop 列（不是 [s*hop:(s+1)*hop]）
+        cs = cos_b[:, 0:hop]                       # [F, hop]
+        sn = sin_b[:, 0:hop]
         As, Bs = [], []
         for i in range(b):
             As.append(_rowwise_mm(cs, seg[i]))     # [nframes, F]

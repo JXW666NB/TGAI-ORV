@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "svs-ops",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "api_version": "1.0",
   "namespace": "svs",
   "summary": "虚拟歌手（DDSP/STFT）训练所需算子：谱变换、扫描、填充、损失",
@@ -9,9 +9,20 @@
   "author": "JXW",
   "license": "MIT",
   "homepage": "https://github.com/JXW666NB/TGAI-ORV",
-  "tags": ["audio", "stft", "ddsp", "svs"],
-  "requires": {"orv": ">=0.9.65"},
-  "backends": ["cpu", "cuda", "vulkan"],
+  "tags": [
+    "audio",
+    "stft",
+    "ddsp",
+    "svs"
+  ],
+  "requires": {
+    "orv": ">=0.9.65"
+  },
+  "backends": [
+    "cpu",
+    "cuda",
+    "vulkan"
+  ],
   "ops": [
     {
       "name": "stft_mag",
@@ -19,7 +30,21 @@
       "kind": "functional",
       "form": "composed",
       "doc": "|STFT(x)|，无需复数张量：conv1d 分帧 + DFT 基矩阵乘",
-      "impl": {"module": "svs_ops.py", "python": "stft_mag"}
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "stft_mag"
+      }
+    },
+    {
+      "name": "stft_mag_fast",
+      "arity": 1,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "|STFT(x)| 快路径：hop 块分解，无分帧卷积",
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "stft_mag_fast"
+      }
     },
     {
       "name": "hann_window",
@@ -27,7 +52,10 @@
       "kind": "functional",
       "form": "composed",
       "doc": "周期 Hann 窗（与 torch.hann_window 默认一致）",
-      "impl": {"module": "svs_ops.py", "python": "hann_window"}
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "hann_window"
+      }
     },
     {
       "name": "pad1d",
@@ -35,7 +63,10 @@
       "kind": "functional",
       "form": "composed",
       "doc": "沿最后一维填充：constant / replicate / reflect",
-      "impl": {"module": "svs_ops.py", "python": "pad1d"}
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "pad1d"
+      }
     },
     {
       "name": "cumsum",
@@ -43,7 +74,10 @@
       "kind": "functional",
       "form": "composed",
       "doc": "沿最后一维累加（三角矩阵乘）",
-      "impl": {"module": "svs_ops.py", "python": "cumsum"}
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "cumsum"
+      }
     },
     {
       "name": "sigmoid",
@@ -51,7 +85,10 @@
       "kind": "functional",
       "form": "composed",
       "doc": "1/(1+e^-x)，用 tanh 表达以保证数值稳定",
-      "impl": {"module": "svs_ops.py", "python": "sigmoid"}
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "sigmoid"
+      }
     },
     {
       "name": "softplus",
@@ -59,7 +96,10 @@
       "kind": "functional",
       "form": "composed",
       "doc": "log(1+e^x) 的稳定写法",
-      "impl": {"module": "svs_ops.py", "python": "softplus"}
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "softplus"
+      }
     },
     {
       "name": "log1p",
@@ -67,7 +107,10 @@
       "kind": "functional",
       "form": "composed",
       "doc": "log(1+x)",
-      "impl": {"module": "svs_ops.py", "python": "log1p"}
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "log1p"
+      }
     },
     {
       "name": "log10",
@@ -75,7 +118,10 @@
       "kind": "functional",
       "form": "composed",
       "doc": "以 10 为底的对数",
-      "impl": {"module": "svs_ops.py", "python": "log10"}
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "log10"
+      }
     },
     {
       "name": "l1_loss",
@@ -83,7 +129,10 @@
       "kind": "functional",
       "form": "composed",
       "doc": "L1 损失",
-      "impl": {"module": "svs_ops.py", "python": "l1_loss"}
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "l1_loss"
+      }
     },
     {
       "name": "mse_loss",
@@ -91,7 +140,10 @@
       "kind": "functional",
       "form": "composed",
       "doc": "均方误差",
-      "impl": {"module": "svs_ops.py", "python": "mse_loss"}
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "mse_loss"
+      }
     },
     {
       "name": "bce_with_logits",
@@ -99,7 +151,10 @@
       "kind": "functional",
       "form": "composed",
       "doc": "带 logits 的二元交叉熵",
-      "impl": {"module": "svs_ops.py", "python": "bce_with_logits"}
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "bce_with_logits"
+      }
     },
     {
       "name": "avg_pool1d",
@@ -107,7 +162,10 @@
       "kind": "functional",
       "form": "composed",
       "doc": "一维平均池化",
-      "impl": {"module": "svs_ops.py", "python": "avg_pool1d"}
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "avg_pool1d"
+      }
     }
   ]
 }
