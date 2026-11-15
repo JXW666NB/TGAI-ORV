@@ -22,11 +22,20 @@ FFT = [64, 128, 256, 512, 1024, 2048]
 HOP = [s // 4 for s in FFT]
 
 
+_WIN = {}
+
+
+def win(S, f):
+    if f not in _WIN:
+        _WIN[f] = S.hann_window(f)
+    return _WIN[f]
+
+
 def orv_loss(S, x, xh, use_fast=True):
     fn = S.stft_mag_fast if use_fast else S.stft_mag
     tot = None
     for f, h in zip(FFT, HOP):
-        w = S.hann_window(f)
+        w = win(S, f)
         a = fn(x, f, hop_length=h, window=w)
         b = fn(xh, f, hop_length=h, window=w)
         p = ((a - b) * (a - b)).mean()
