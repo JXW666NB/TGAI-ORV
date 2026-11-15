@@ -374,6 +374,18 @@ def interpolate1d(x, size=None, scale_factor=None, mode="linear"):
     return _rowwise_mm(W, x)
 
 
+def searchsorted_np(sorted_np, values_np, right=False):
+    """按已排序序列查插入位置（等价 torch.searchsorted，**不可导**，主机侧算）。
+
+    SGR 的 _build_step_f0 用它把音符边界映射到帧索引（trainer.py:50，AE 路径上），
+    输出是索引、不参与求导，所以放在主机侧用 numpy 做最省事也最稳。
+    """
+    import numpy as _np
+    a = _np.asarray(sorted_np, _np.float64)
+    v = _np.asarray(values_np, _np.float64)
+    return _np.searchsorted(a, v, side=("right" if right else "left")).astype(_np.int64)
+
+
 def cumsum(x, dim=-1):
     """沿最后一维累加（三角矩阵乘）。"""
     import tgai_go.train as T

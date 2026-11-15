@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "svs-ops",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "api_version": "1.0",
   "namespace": "svs",
   "summary": "虚拟歌手（DDSP/STFT）训练所需算子：谱变换、扫描、填充、损失",
@@ -231,6 +231,17 @@
       "impl": {
         "module": "svs_ops.py",
         "python": "interpolate1d"
+      }
+    },
+    {
+      "name": "searchsorted_np",
+      "arity": 2,
+      "kind": "functional",
+      "form": "composed",
+      "doc": "按排序序列查插入位置（等价 torch.searchsorted，不可导、主机侧算；已对拍 6 组全过）",
+      "impl": {
+        "module": "svs_ops.py",
+        "python": "searchsorted_np"
       }
     }
   ]
