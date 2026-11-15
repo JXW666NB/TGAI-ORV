@@ -73,7 +73,8 @@ def main():
 
     # ---------- pad ----------
     for mode in ("constant", "replicate", "reflect"):
-        pad = (37, 41)
+        # torch 要求 reflect 的 pad < 该维长度，所以 reflect 用小一点
+        pad = (5, 7) if mode == "reflect" else (37, 41)
         xo = T.from_numpy(x)
         xo.requires_grad = True
         yo = S.pad1d(xo, pad[0], pad[1], mode=mode)
