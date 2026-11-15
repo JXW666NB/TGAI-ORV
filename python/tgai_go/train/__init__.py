@@ -629,7 +629,7 @@ def _norm_shape(shape, total):
 class Tensor:
     """最小可用的张量：数据 + 梯度 + 反向闭包。"""
 
-    __slots__ = ("data", "grad", "requires_grad", "_parents", "_bwd", "device", "_gpu",
+    __slots__ = ("data", "grad", "requires_grad", "_parents", "_bwd", "device", "_gpu_raw",
                  "_lazy_T", "_lazy_shape")
     __array_priority__ = 1000        # 让 ndarray <op> Tensor 走我们的 __r*__
 
@@ -1095,6 +1095,31 @@ class Tensor:
 
         out._backward = bw
         return out
+
+    # ---- 惰性转置的统一出口 -------------------------------------------
+    # `_transpose_cuda` 不物化，只打 `_lazy_T` 标记（为 2D matmul 的 gemm_nt 省一次拷贝）。
+    # 但除 matmul / to_numpy 之外的算子都直接读缓冲，会静默拿到**未转置**的数据。
+    # 所以把 `_gpu` 做成属性：谁读缓冲，谁就先触发物化。
+    @property
+    def _gpu(self):
+        if self._lazy_T is not None:
+            self._materialize_inplace()
+        return self._gpu_raw
+
+    @_gpu.setter
+    def _gpu(self, value):
+        self._gpu_raw = value
+
+    def _materialize_inplace(self):
+        """把本张量从"惰性转置视图"变成真正的转置数据（就地，图不变）。"""
+        rt = _cuda()
+        base = self._lazy_T
+        if base is None:
+            return self
+        self._gpu_raw = rt.transpose2d(base._gpu)
+        self._lazy_T = None
+        self._lazy_shape = None
+        return self
 
     def _matmul_cuda_nd(self, other):
         """最后两维 matmul，前导维广播。反向先乘再 unbroadcast 回原形状。"""
