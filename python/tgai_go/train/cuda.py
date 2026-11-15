@@ -18,6 +18,7 @@ from __future__ import annotations
 import glob
 import ctypes
 import os
+import re
 import sys
 
 import numpy as np
@@ -2520,10 +2521,26 @@ _ATTN_NOP_BQ = 64
 # attn_bwd_flash：Q/dO stride 72，K/V/P/dS 各 64*32。见 tgai_attn_nop.cu。
 # 反向 atomic 按 query-tile 分组写到独立 plane，再加回 dK/dV，减轻 128 路冲突。
 _ATTN_FLASH_GROUPS = 8
-_ATTN_FLASH_SMEM = 69632
+# ★ 2026-11-15：key 分块宽 BC 改为可配置（TG_ATTN_BC），以便装不进 96 KB 的卡
+#   （如 P100，48 KB）仍能用**常驻**内核而不是滑窗版。公式已用 45,056 / 40,448
+#   两个实测点反推验证：
+#       smem = 4*64*BC*4 + 2*64*(DH+8)*4
+#   BC=32 -> 69,632（默认，与旧版一致）；BC=11 -> 48,128（P100 可用）。
+_ATTN_BC = int(os.environ.get("TG_ATTN_BC", "32") or "32")
+
+
+def _attn_smem_for_bc(bc):
+    """常驻反向内核的 smem（字节）。"""
+    return 4 * 64 * int(bc) * 4 + 2 * 64 * (64 + 8) * 4
+
+
+_ATTN_FLASH_SMEM = _attn_smem_for_bc(_ATTN_BC)
 # 2026-11-15：P100（sm_60，动态 smem 上限 48 KB）专用变体 attn_bwd_flash_w，
 # Q/dO 沿 head_dim 16 宽滑窗，只要 41472 B（40.5 KB）。数值与原版相差 < 1.1e-7（相对），
 # y 逐位相同。见 lab/attn32/LOG.md。V100 仍走原版（快 34%）。
+# 注意：滑窗版的 smem **不等于**公式值 —— 实测是 40448 B，而 4*64*BC + 2*DCHUNK*QSTR
+# 只能解释 37,376 B，说明它另有约 3 KB 的额外缓冲。所以这里保留字面量，
+# 不随 TG_ATTN_BC 变化；非默认 BC 时应确保走常驻版（见 _attn_flash_launch 的选择顺序）。
 _ATTN_FLASH_WIN_SMEM = 40448
 # 注：按切分算只有 41472 B，但实测 41472 会越界（rc=700），45056 稳定跑通且数值与上游一致。
 # 两者都 <= 48 KB（sm_60 上限），故取 45056 留余量。真实下界未逐点二分。
@@ -7139,6 +7156,9 @@ class CudaRuntime:
         path = attn_nop_source_path()
         with open(path, encoding="utf-8") as fh:
             src = fh.read()
+        if _ATTN_BC != 32:
+            # 只在非默认时替换，避免影响既有编译结果
+            src = re.sub(r"#define\s+BC\s+\d+", "#define BC %d" % _ATTN_BC, src, count=1)
         arch = self._cc_arch()
         ptx = self._compile(arch, source=src, cu_name=b"tgai_attn_nop.cu")
         mod = ctypes.c_void_p()
