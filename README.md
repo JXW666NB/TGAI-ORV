@@ -161,19 +161,22 @@ T.plugin.uninstall("svs-ops")   # 卸载：注销算子 + 移除 T.svs
 元信息是**强制**的：`name`、语义化 `version`、`api_version`、`backends` 缺一不可，
 非法值在注册时就报错并给出修法 —— 不是写在文档里的口头约定。
 
-### 插件的反向：两种都支持
+### 插件的反向：三档，总能挑一档
 
 ```python
 # ① 组合式：用已有算子拼，梯度由 autograd 自动给出（不用写反向）
 ops_plugin.register("my_softplus", lambda x: (x.exp() + 1.0).log())
 
-# ② 自带反向：给前向 + 解析反向（适合需要精确数值或原生实现时）
+# ② 半自动：前向走原生快路径，反向自动导出 —— 只需要一份"数学等价的可微实现"
+ops_plugin.register_auto("my_kernel", forward=native_call, fallback=composed_version)
+
+# ③ 全手写：追求极致性能时给前向 + 解析反向
 ops_plugin.register_numpy("my_gelu", gelu_fwd, gelu_bwd)
 ```
 
-组合式能写完就别写反向；确实需要时（精确 erf、原生内核、不可导的近似）再用 ②。
-三档可移植性（组合式 / DSL 声明式 / 后端原生）与「C 档必须带回退」的纪律见
-[`docs/PLUGIN_SPEC.md`](docs/PLUGIN_SPEC.md)。
+② 是**不想写反向**的人用的：训练时前向仍是原生的，反向把 `fallback` 重算一遍再反传
+（所以梯度精确，不是差分近似）；推理时完全不建图。默认还带一致性检查 ——
+两份实现数学不一致会直接报错，而不是悄悄算错。
 
 ---
 

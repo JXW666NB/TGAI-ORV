@@ -83,6 +83,42 @@ T.svs.stft_mag(wav, 1024, hop_length=256)
 这样做的原因：**规范先稳定，引擎再跟上**。否则每加一种实现形态就要改一遍格式，
 用户写好的包就废了。
 
+## 七、内核的反向：三档阶梯（2026-11-15 新增 register_auto）
+
+**问题**：原生 kernel 是编译后的机器码，没有源码级 AD，解析反向**不可能自动推导**。
+以前只有两条路 —— 用已有算子拼（自动可导但慢），或手写反向（快但门槛高）。
+「不是所有人有精力开发反向算子」这句话是对的，所以补了中间一档：
+
+| 档 | 写法 | 前向 | 反向 | 适用 |
+| --- | --- | --- | --- | --- |
+| ① 组合式 | register(name, fn) | 已有算子 | autograd 自动 | 能拼出来就用这个 |
+| ② **半自动** | **register_auto(name, forward, fallback)** | **原生快路径** | **fallback 重算导出** | 有原生 kernel、写得出一份可微等价实现 |
+| ③ 全手写 | register_numpy(name, fwd, bwd) | 任意 | 你手写的解析式 | 追极致性能 |
+
+### ② 的机制（不是有限差分）
+
+`python
+ops_plugin.register_auto(
+    "my_kernel",
+    forward=lambda x: my_cuda_lib.my_kernel(x),   # 快路径
+    fallback=lambda x: (x.exp() + 1.0).log(),     # 数学等价、用 ORV 算子写
+)
+`
+
+* 训练时：**前向仍走 forward**，反向把 fallback 用同样输入重算一遍、以传入梯度为种子反传。
+  梯度与 fallback 的数学**逐位一致**，代价是每次反向多一次 fallback 前向。
+* 推理时（不需要梯度 / no_grad）：只走 forward，**完全不建图**。
+* check=True（默认）会在**首次反向**时比对 forward 与 fallback 的输出，
+  差异超过 rtol 直接报错 —— 专防「两份实现数学不一致」这种最难查的错。
+
+**纪律**：fallback 必须与 forward 算**同一个函数**。梯度完全来自 fallback，
+两者不一致就是**静默算错**（所以默认开着一致性检查）。
+
+### 已验证（tests/test_ops_register_auto.py，6 项全过）
+
+前向对参考值、反向对解析式、no_grad 不建图且不走 fallback、两份实现不一致时**报错**、
+多输入 + 广播的梯度、以及「训练路径确实用 forward 而不是 fallback」的计数断言。
+
 ## 六、第一个包：`svs-ops`
 
 虚拟歌手（DDSP/STFT）项目缺的音频算子，已打成本仓第一个插件包：
