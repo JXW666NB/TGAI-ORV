@@ -7153,6 +7153,29 @@ class CudaRuntime:
         self._attn_flash_ready = False
         return mod
 
+    def attn_flash_bwd_supported(self):
+        """本卡能否为**融合反向**设上所需的动态 smem（结果缓存，只探一次）。
+
+        为什么要事前探：属性设置失败发生在 backward 的内核启动时，前向看不出问题，
+        于是整步在 backward 里硬崩（真机 P100 就是这样）。先试一次，就能在**选择路径**
+        的时候决定要不要走融合，避免半路炸。
+        """
+        cached = getattr(self, "_attn_flash_bwd_ok", None)
+        if cached is not None:
+            return bool(cached)
+        ok = True
+        try:
+            self.ensure_attn_nop()
+            lim = int(self._device_smem_limit() or 0)
+            if lim and _ATTN_FLASH_WIN_SMEM <= lim < _ATTN_FLASH_SMEM:
+                self._attn_set_dyn_smem("attn_bwd_flash_w", _ATTN_FLASH_WIN_SMEM)
+            else:
+                self._attn_set_dyn_smem("attn_bwd_flash", _ATTN_FLASH_SMEM)
+        except Exception:            # noqa: BLE001  探测失败就当不支持，走物化（正确性优先）
+            ok = False
+        self._attn_flash_bwd_ok = ok
+        return ok
+
     def _attn_set_dyn_smem(self, name, smem):
         """抬高动态 smem 上限并偏向 shared carveout。
 

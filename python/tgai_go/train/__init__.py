@@ -3285,6 +3285,9 @@ def _sdpa_materialized(q, k, v, causal, scale, attn_mask=None):
     return p @ v
 
 
+_ATTN_FLASH_WARNED = False
+
+
 def _sdpa_lowmem_ok(q, k, v, causal, dh):
     """内核契约：CUDA、causal、dh==64、三维同形状 [BH, S, Dh]。"""
     if not causal or dh != 64:
@@ -3296,7 +3299,23 @@ def _sdpa_lowmem_ok(q, k, v, causal, dh):
     if q.ndim != 3 or tuple(k.shape) != tuple(q.shape) or tuple(v.shape) != tuple(q.shape):
         return False
     bh, seq, _dh = q.shape
-    return int(bh) > 0 and int(seq) > 0
+    if int(bh) <= 0 or int(seq) <= 0:
+        return False
+    # 本卡若设不上融合反向需要的动态 smem（如 P100 / sm_60），现在就改走物化，
+    # 而不是等到 backward 里 rc=1 把整个训练步炸掉。
+    try:
+        if not _cuda().attn_flash_bwd_supported():
+            global _ATTN_FLASH_WARNED
+            if not _ATTN_FLASH_WARNED:
+                _ATTN_FLASH_WARNED = True
+                import warnings as _w
+                _w.warn("本卡的融合注意力反向用不了（动态共享内存设不上），已自动改用"
+                        "物化注意力：结果正确，但显存与速度都会差一些。"
+                        "想要融合路径请换 V100（sm_70）及以上。", RuntimeWarning)
+            return False
+    except Exception:            # noqa: BLE001  探测本身出错也不能影响正确性
+        return False
+    return True
 
 
 def _sdpa_lowmem(q, k, v, scale):
