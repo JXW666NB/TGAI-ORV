@@ -21,16 +21,12 @@ def main():
     print("x      :", x.to_numpy().tolist())
     xt = x.T
     print("x.T    :", xt.to_numpy().tolist(), "形状", xt.shape)
-    print("期望 reshape(4):", np.asarray(xt.to_numpy()).reshape(4).tolist())
-    got = xt.reshape(4)
-    print("ORV reshape(4) :", got.to_numpy().tolist(), "形状", got.shape)
-    got2 = xt.contiguous().reshape(4)
+    want = np.asarray(xt.to_numpy(), np.float32).reshape(8)
+    print("期望 reshape(8):", want.tolist())
+    print("ORV reshape(8) :", xt.reshape(8).to_numpy().tolist())
+    got2 = xt.contiguous().reshape(8)
     print("先 contiguous :", got2.to_numpy().tolist())
-    print("contiguous 后是否仍正确:", np.allclose(got2.to_numpy(), np.asarray(xt.to_numpy()).reshape(4)))
-
-    # 再看 reshape 到别的形状
-    print("期望 reshape(2,4):", np.asarray(xt.to_numpy()).reshape(2, 4).tolist())
-    print("ORV reshape(2,4) :", xt.reshape(2, 4).to_numpy().tolist())
+    print("contiguous 是否正确:", bool(np.allclose(got2.to_numpy(), want)))
     return 0
 
 
