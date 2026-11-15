@@ -143,6 +143,21 @@ def main():
               np.array(mo.shape), np.array(mt.shape), 1e-9)
         check("stft_mag[%d/%d] 反向" % (n_fft, hop), xo.grad.to_numpy(), xt4.grad.numpy(), 5e-5)
 
+    # ---------- STFT 快路径（hop 块分解）----------
+    for n_fft, hop in ((1024, 256), (512, 128), (2048, 512), (256, 64)):
+        win = torch.hann_window(n_fft)
+        xo = T.from_numpy(wav); xo.requires_grad = True
+        mo = S.stft_mag_fast(xo, n_fft, hop_length=hop, window=S.hann_window(n_fft))
+        (mo * mo).sum().backward()
+        xt5 = torch.tensor(wav, requires_grad=True)
+        spec = torch.stft(xt5, n_fft, hop, n_fft, win, center=True,
+                          pad_mode="reflect", return_complex=True)
+        mt = spec.abs()
+        (mt * mt).sum().backward()
+        check("fast[%d/%d] 形状" % (n_fft, hop), np.array(mo.shape), np.array(mt.shape), 1e-9)
+        check("fast[%d/%d] 前向" % (n_fft, hop), mo.to_numpy(), mt.detach().numpy(), 5e-5)
+        check("fast[%d/%d] 反向" % (n_fft, hop), xo.grad.to_numpy(), xt5.grad.numpy(), 5e-5)
+
     bad = [r for r in RESULT if not r[1]]
     print("\n=== 汇总：%d 项，失败 %d ===" % (len(RESULT), len(bad)))
     for nm, _ok, r, note in bad:

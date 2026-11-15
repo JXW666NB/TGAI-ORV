@@ -239,6 +239,68 @@ def stft_mag(x, n_fft, hop_length=None, win_length=None, window=None,
 
 
 # ── 扫描 / 索引 ───────────────────────────────────────────────────────
+def stft_mag_fast(x, n_fft, hop_length=None, win_length=None, window=None,
+                  center=True, pad_mode="reflect"):
+    """|STFT(x)| 的快路径（hop 块分解，无分帧卷积）。返回 [B, n_fft//2+1, n_frames]。"""
+    import tgai_go.train as T
+
+    n_fft = int(n_fft)
+    hop = int(hop_length or n_fft // 4)
+    win = int(win_length or n_fft)
+    if win != n_fft:
+        raise ValueError("stft_mag_fast 要求 win_length == n_fft。修法：把窗补零到 n_fft")
+    if n_fft % hop != 0:
+        return stft_mag(x, n_fft, hop, win, window, center, pad_mode)   # 退回通用路径
+    nseg = n_fft // hop
+
+    if x.ndim == 3:
+        x = x[:, 0] if int(x.shape[1]) == 1 else x.reshape(int(x.shape[0]), -1)
+    if window is None:
+        window = hann_window(n_fft)
+    if center:
+        x = pad1d(x, win // 2, win // 2, mode=pad_mode)
+
+    b, ln = int(x.shape[0]), int(x.shape[1])
+    nblocks_needed = (ln - n_fft) // hop + 1 + nseg - 1
+    total = nblocks_needed * hop
+    if ln < total:
+        x = pad1d(x, 0, total - ln, mode="constant")
+        ln = total
+    nframes = (ln - n_fft) // hop + 1
+    nb = ln // hop
+
+    blocks = x.reshape(b, nb, hop)                 # [B, nb, hop]
+    cos_b, sin_b = _dft_basis(n_fft)               # [F, n]
+    nfreq = int(cos_b.shape[0])
+
+    re = im = None
+    for s in range(nseg):
+        wseg = window[s * hop:(s + 1) * hop].reshape(1, 1, hop)
+        seg = blocks[:, s:s + nframes, :] * wseg   # [B, nframes, hop]
+        cs = cos_b[:, s * hop:(s + 1) * hop]       # [F, hop]
+        sn = sin_b[:, s * hop:(s + 1) * hop]
+        As, Bs = [], []
+        for i in range(b):
+            As.append(_rowwise_mm(cs, seg[i]))     # [nframes, F]
+            Bs.append(_rowwise_mm(sn, seg[i]))
+        A = As[0] if b == 1 else T.cat([a.reshape(1, nframes, nfreq) for a in As], dim=0)
+        Bq = Bs[0] if b == 1 else T.cat([v.reshape(1, nframes, nfreq) for v in Bs], dim=0)
+        if b == 1:
+            A = A.reshape(1, nframes, nfreq)
+            Bq = Bq.reshape(1, nframes, nfreq)
+
+        theta = 2.0 * np.pi * np.arange(nfreq, dtype=np.float64)[:, None] * (s * hop) / n_fft
+        cph = _tv(np.cos(theta).astype(np.float32)).reshape(1, 1, nfreq)
+        sph = _tv((-np.sin(theta)).astype(np.float32)).reshape(1, 1, nfreq)
+
+        pre = cph * A - sph * Bq
+        pim = cph * Bq + sph * A
+        re = pre if re is None else re + pre
+        im = pim if im is None else im + pim
+
+    mag = (re * re + im * im + 1.0e-12).sqrt()     # [B, nframes, F]
+    return mag.transpose(1, 2)                     # -> [B, F, nframes]
+
 def cumsum(x, dim=-1):
     """沿最后一维累加（三角矩阵乘）。"""
     import tgai_go.train as T
@@ -303,6 +365,7 @@ _OPS = {
     "sigmoid": sigmoid, "softplus": softplus, "log1p": log1p, "log10": log10,
     "pow": pow_, "leaky_relu": leaky_relu,
     "pad1d": pad1d, "hann_window": hann_window, "stft_mag": stft_mag,
+    "stft_mag_fast": stft_mag_fast,
     "cumsum": cumsum, "gather_last": gather_last, "isfinite_np": isfinite_np,
     "l1_loss": l1_loss, "mse_loss": mse_loss,
     "bce_with_logits": bce_with_logits, "bce": bce, "avg_pool1d": avg_pool1d,
