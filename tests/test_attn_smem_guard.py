@@ -58,12 +58,12 @@ def test_lowmem_reports_smem_limit_clearly():
 
     orig = rt._device_smem_limit
     try:
-        rt._device_smem_limit = lambda: 40 * 1024   # 模拟"连窗口版都装不下"的卡
+        rt._device_smem_limit = lambda: 38 * 1024   # 模拟"连窗口版都装不下"的卡
         rt._attn_flash_names = set()                # 逼它重新检查
         with pytest.raises(CudaError) as ei:
             o.backward(g)
         msg = str(ei.value)
-        assert "40" in msg, "报错要写明本卡上限，实际: %s" % msg[:200]
+        assert "38" in msg, "报错要写明本卡上限，实际: %s" % msg[:200]
         assert "修法" in msg, "报错必须带修法"
         assert "lowmem=False" in msg, "修法要给出可执行替代方案"
         assert ("Pascal" in msg) or ("sm_61" in msg), "要指出这是哪类卡的限制"
