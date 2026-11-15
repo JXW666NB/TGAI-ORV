@@ -1433,7 +1433,7 @@ class Tensor:
 
         def bw(g, grads):
             if self.requires_grad:
-                _acc(grads, self, rt.fill_scalar_from(g, in_shape))
+                _acc(grads, self, rt.full(in_shape, rt.read_scalar(g)))
         out._backward = bw
         return out
 
@@ -1452,7 +1452,7 @@ class Tensor:
 
             def bw_all(g, grads):
                 if self.requires_grad:
-                    _acc(grads, self, rt.fill_scalar_from(g, shape))
+                    _acc(grads, self, rt.full(shape, rt.read_scalar(g)))
             out._backward = bw_all
             return out
         ax = int(axis)
