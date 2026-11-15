@@ -2544,7 +2544,9 @@ _ATTN_FLASH_SMEM = _attn_smem_for_bc(_ATTN_BC)
 # 滑窗版 smem 的**两点标定**：DCHUNK=8 -> 40,448；DCHUNK=16 -> 45,056。
 # 差值 4,608 = 2*8*72*4，正好是公式里 2*DCHUNK*QSTR*4 的 DCHUNK 项，
 # 所以可用线性式外推（基数 40,448 已含滑窗版那约 3 KB 的额外缓冲）。
-_ATTN_DCHUNK = int(os.environ.get("TG_ATTN_DCHUNK", "8") or "8")
+# 默认 16：真机实测反向 82.8 -> 77.6 ms（-6%），且 45,056 B 仍装得进 48 KB。
+# 保持滑窗而非常驻，是因为 BC=32 的常驻版要 69,632 B，48 KB 卡装不下。
+_ATTN_DCHUNK = int(os.environ.get("TG_ATTN_DCHUNK", "16") or "16")
 _ATTN_FLASH_WIN_SMEM = 40448 + 2 * (_ATTN_DCHUNK - 8) * 72 * 4
 # 注：按切分算只有 41472 B，但实测 41472 会越界（rc=700），45056 稳定跑通且数值与上游一致。
 # 两者都 <= 48 KB（sm_60 上限），故取 45056 留余量。真实下界未逐点二分。
