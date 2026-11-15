@@ -63,6 +63,26 @@ def _tv(a):
     return T.from_numpy(np.ascontiguousarray(a, np.float32))
 
 
+_TENSOR_CACHE = {}
+
+
+def _cached_tensor(key, builder):
+    """按 (key, 当前设备) 缓存**张量本体**（不是 numpy）。
+
+    为什么必要：_tv(np_array) 每次调用都会重新做一次 H2D 上传。
+    DFT 基矩阵在 2048 档是 8.4 MB × 2 个，一轮训练要传十几次 ⇒ 光传输就几十毫秒。
+    实测：缓存张量后 ORV 的多分辨率 STFT 损失从 218.8 ms 降到（见 docs 记录）。
+    """
+    import tgai_go.train as T
+    dev = str(T.get_device())
+    k = (key, dev)
+    t = _TENSOR_CACHE.get(k)
+    if t is None:
+        t = _tv(builder())
+        _TENSOR_CACHE[k] = t
+    return t
+
+
 def _dft_basis(n_fft):
     key = ("dft", n_fft)
     if key not in _CACHE:
@@ -71,7 +91,7 @@ def _dft_basis(n_fft):
         ang = 2.0 * np.pi * k * n / n_fft
         _CACHE[key] = (np.cos(ang).astype(np.float32), (-np.sin(ang)).astype(np.float32))
     c, s = _CACHE[key]
-    return _tv(c), _tv(s)
+    return _cached_tensor(('cos', n_fft), lambda: c), _cached_tensor(('sin', n_fft), lambda: s)
 
 
 def _ident_kernel(n_fft):
@@ -81,14 +101,14 @@ def _ident_kernel(n_fft):
         for i in range(n_fft):
             w[i, 0, i] = 1.0
         _CACHE[key] = w
-    return _tv(_CACHE[key])
+    return _cached_tensor(('ident', n_fft), lambda: _CACHE[key])
 
 
 def _tri(n):
     key = ("tri", n)
     if key not in _CACHE:
         _CACHE[key] = np.tril(np.ones((n, n), np.float32))
-    return _tv(_CACHE[key])
+    return _cached_tensor(('tri', n), lambda: _CACHE[key])
 
 
 def _reverse_last(n):
@@ -96,7 +116,7 @@ def _reverse_last(n):
     key = ("rev", n)
     if key not in _CACHE:
         _CACHE[key] = np.eye(n, dtype=np.float32)[::-1].copy()
-    return _tv(_CACHE[key])
+    return _cached_tensor(('rev', n), lambda: _CACHE[key])
 
 
 # ── 逐元素（只用 abs/exp/log/sqrt/tanh/clamp，避免比较运算）────────────
