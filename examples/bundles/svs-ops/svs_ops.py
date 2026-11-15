@@ -265,13 +265,14 @@ def stft_mag_fast(x, n_fft, hop_length=None, win_length=None, window=None,
         x = pad1d(x, win // 2, win // 2, mode=pad_mode)
 
     b, ln = int(x.shape[0]), int(x.shape[1])
-    nblocks_needed = (ln - n_fft) // hop + 1 + nseg - 1
-    total = nblocks_needed * hop
+    # ★ 帧数必须锚定在**原始信号长度**上（与 torch 的 center 语义一致）。
+    #   后面为了凑成 hop 的整数倍会再补零，但那是给 reshape 用的，不能改变帧数。
+    nframes = (ln - n_fft) // hop + 1
+    nb = max(nframes + nseg - 1, (ln + hop - 1) // hop)
+    total = nb * hop
     if ln < total:
         x = pad1d(x, 0, total - ln, mode="constant")
         ln = total
-    nframes = (ln - n_fft) // hop + 1
-    nb = ln // hop
 
     blocks = x.reshape(b, nb, hop)                 # [B, nb, hop]
     cos_b, sin_b = _dft_basis(n_fft)               # [F, n]
