@@ -158,8 +158,10 @@ def _rowwise_mm(mat, x):
     m = int(mat.shape[0])
     lead = int(np.prod(x.shape[:-1])) if x.ndim > 1 else 1
     flat = x.reshape(lead, n)
-    cols = [T.matmul(mat, flat[i].reshape(n, 1)) for i in range(lead)]
-    y = T.cat(cols, dim=1).T            # [lead, m]
+    # 注意：不能用 cat(...).T.reshape(...) —— ORV 的惰性转置(_lazy_T)不被 reshape 识别，
+    # 会静默给出未转置的数据。改为逐行 reshape 成 [1, m] 再按 dim=0 拼。
+    rows = [T.matmul(mat, flat[i].reshape(n, 1)).reshape(1, m) for i in range(lead)]
+    y = T.cat(rows, dim=0) if lead > 1 else rows[0]
     return y.reshape(tuple(list(x.shape[:-1]) + [m]))
 
 
