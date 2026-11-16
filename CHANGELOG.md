@@ -1,3 +1,22 @@
+## [0.9.82] - 2026-11-16
+
+### 修 BlockAttnRes 在 CUDA 上崩溃：stack 同样未实现
+
+0.9.81 的 lock_attn_res 用了 T.stack，CPU 上跑通（2.384e-07），但 **V100 上
+NotImplementedError: CUDA stack 尚未实现（__init__.py:2453）** —— 和 einsum、	opk
+一样，stack 也只有 CPU 实现。CPU 测试完全掩盖了这个问题。
+
+改成不 stack 的写法（顺带避开 maximum）：
+
+    logits_i = (rms_norm(V_i).reshape(B*T,D) @ w.reshape(D,1)).reshape(B,T)
+    e_i = exp(logits_i);  s = sum_i e_i;  out = sum_i (e_i / s) * V_i
+
+用到的 matmul / exp / 除法 / 广播乘 / add 全都有 CUDA 内核（ewise_exp_v4 等）。
+softmax 不减最大值：w 初值 std=0.02、norm 后量级很小不会溢出，且减同一常数对归一化
+结果无影响（numpy 参考里减了，两者等价）。
+
+CPU 数值验收仍为 2.384e-07 / 1.907e-06，3 个守卫测试全过，全套 791 passed。
+
 ## [0.9.81] - 2026-11-16
 
 ### V3 移植：补上 BlockAttnRes 与 AttnRes 层循环

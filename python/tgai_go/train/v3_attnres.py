@@ -36,19 +36,25 @@ def block_attn_res(blocks, partial_block, w, norm_w, eps=1e-6):
     D = int(partial_block.shape[-1])
     B, Tn = int(partial_block.shape[0]), int(partial_block.shape[1])
 
-    # 逐块归一化（与"先 stack 再 norm"数学等价，但省一份 fp32 副本）
-    Ks = [nn_ops.rms_norm(t, norm_w, eps) for t in list(blocks) + [partial_block]]
     Vs = list(blocks) + [partial_block]
-    n = len(Vs)
-
-    K = T.stack(Ks, dim=0)                      # [n, B, T, D]
-    V = T.stack(Vs, dim=0)                      # [n, B, T, D]
-
     w2 = w.reshape(D, 1)                                   # (D,1)
-    logits = (K.reshape(n * B * Tn, D) @ w2).reshape(n, B, Tn)   # [n,B,T]
-    p = T.functional.softmax(logits, axis=0)               # 沿 block 维
-    h = (p.reshape(n, B * Tn, 1) * V.reshape(n, B * Tn, D)).sum(axis=0)
-    return h.reshape(B, Tn, D)
+
+    # ★ 不 stack：ORV 的 CUDA stack 未实现（__init__.py:2453 抛 NotImplementedError），
+    #   CPU 上跑得通会把这个问题完全掩盖掉 —— 2026-11-16 在 V100 上实测到的。
+    #   改成逐块算 logits，再用逐元素 max/exp/sum 做 softmax。
+    logits = [(nn_ops.rms_norm(t, norm_w, eps).reshape(B * Tn, D) @ w2).reshape(B, Tn)
+              for t in Vs]
+    # softmax over blocks，逐元素完成。不减最大值：w 初值 std=0.02、norm 后量级很小，
+    # exp 不会溢出；且减去同一常数对归一化后的结果没有影响（numpy 参考里减了，两者等价）。
+    es = [lg.exp() for lg in logits]
+    s = es[0]
+    for e in es[1:]:
+        s = s + e
+    out = None
+    for e, V_t in zip(es, Vs):
+        term = (e / s).reshape(B, Tn, 1) * V_t
+        out = term if out is None else out + term
+    return out
 
 
 def block_attn_res_numpy(blocks, partial_block, w, norm_w, eps=1e-6):
