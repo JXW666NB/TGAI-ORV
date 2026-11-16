@@ -1,0 +1,613 @@
+{
+ "args": {
+  "d": 128,
+  "layers": 2,
+  "E": 4,
+  "seq": 32,
+  "vocab": 1024,
+  "n_q": 4,
+  "d_ff": 256,
+  "top_k": 2,
+  "csa": 2,
+  "steps": 20,
+  "lr": 0.001,
+  "betas": [
+   0.9,
+   0.999
+  ],
+  "eps": 1e-08,
+  "weight_decay": 0.01,
+  "seed": 0,
+  "stage": "optstep",
+  "bisect": false,
+  "json": "D:\\orv_src\\tools\\optstep.json"
+ },
+ "alignment": [
+  [
+   "attn_qk_norm",
+   "True (default)",
+   "False",
+   "ORV Global layers have no q/k RMSNorm params; CSA disabled via csa_cfg to match"
+  ],
+  [
+   "moe_balance",
+   "'quantile' (default)",
+   "'sign'",
+   "ORV route_topk = softmax over all experts + raw affinity gate"
+  ],
+  [
+   "moe_post_norm",
+   "True (default)",
+   "False",
+   "ORV MoE has no post-aggregation RMSNorm"
+  ],
+  [
+   "tie_embeddings",
+   "True (default)",
+   "False",
+   "ORV build() keeps emb/head independent"
+  ],
+  [
+   "attn_res_enabled",
+   "True (default)",
+   "False",
+   "ORV AttnRes lives in tools/ loop, not CLI forward"
+  ],
+  [
+   "pad_token_id",
+   "256 (default)",
+   "None",
+   "padding_idx zeroes that row's grad; ORV has no such semantics"
+  ],
+  [
+   "dropout",
+   "0.0",
+   "0.0",
+   "identical"
+  ],
+  [
+   "gradient_checkpointing",
+   "off",
+   "off",
+   "reference default False; CLI loop has none"
+  ],
+  [
+   "ce_chunk",
+   "0",
+   "0",
+   "same (non-chunked) CE code path"
+  ],
+  [
+   "dtype",
+   "float32",
+   "float32",
+   "both fp32; ORV fp16_gemm stays False"
+  ]
+ ],
+ "versions": {
+  "torch": "2.6.0+cu124",
+  "orv": "0.9.84",
+  "orv_path": "D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py"
+ },
+ "cfg": {
+  "kinds": [
+   "csa",
+   "global"
+  ],
+  "d": 128,
+  "layers": 2,
+  "E": 4,
+  "seq": 32,
+  "vocab": 1024,
+  "n_q": 4,
+  "d_ff": 256,
+  "top_k": 2,
+  "csa": 2,
+  "csa_cfg": "CSAConfig(d_model=128, n_heads=4, n_kv=4, d_k=32, latent=64, c=4, k=3, local_win=32, seg_isolate=True, causal_conv=True, qk_norm=False, rot_dim=32)"
+ },
+ "params": {
+  "n_params": 51,
+  "n_tensors": 51
+ },
+ "warmup_s": 0.0312502384185791,
+ "replica_check": {
+  "max_abs": 0.0,
+  "max_rel": 0.0,
+  "ref_scale": 0.8975552916526794,
+  "mean_abs": 0.0,
+  "finite": true,
+  "reshaped": false
+ },
+ "forward_logits": {
+  "max_abs": 2.980232238769531e-07,
+  "max_rel": 3.320388466856447e-07,
+  "ref_scale": 0.8975552916526794,
+  "mean_abs": 5.5363834405852685e-08,
+  "finite": true,
+  "reshaped": false
+ },
+ "step0_loss": {
+  "torch": 7.021252155303955,
+  "orv_matched": 7.021252155303955,
+  "orv_cli_style": 7.013873100280762,
+  "abs_diff": 0.0,
+  "rel_diff": 0.0,
+  "cli_style_abs_diff": 0.007379055023193359,
+  "cli_style_rel_diff": 0.0010509599797835368
+ },
+ "optimizer": {
+  "torch": {
+   "lr": 0.001,
+   "betas": [
+    0.9,
+    0.999
+   ],
+   "eps": 1e-08,
+   "weight_decay": 0.01,
+   "impl": "torch.optim.AdamW"
+  },
+  "orv": {
+   "lr": 0.001,
+   "betas": [
+    0.9,
+    0.999
+   ],
+   "eps": 1e-08,
+   "weight_decay": 0.01,
+   "impl": "tgai_go.train.optim.AdamW"
+  }
+ },
+ "grads": {
+  "worst_rel": 8.553475760221186e-07,
+  "worst_10": [
+   {
+    "max_abs": 2.9685907065868378e-09,
+    "max_rel": 8.553475760221186e-07,
+    "ref_scale": 0.003470625029876828,
+    "mean_abs": 5.327760455031694e-10,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.1.router",
+    "orv_norm": 0.020796241238713264,
+    "torch_norm": 0.020796241238713264
+   },
+   {
+    "max_abs": 3.4924596548080444e-09,
+    "max_rel": 8.039870037108824e-07,
+    "ref_scale": 0.0043439255096018314,
+    "mean_abs": 7.356870668218107e-10,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.0.router",
+    "orv_norm": 0.02894270047545433,
+    "torch_norm": 0.028942694887518883
+   },
+   {
+    "max_abs": 8.149072527885437e-10,
+    "max_rel": 7.749045179258109e-07,
+    "ref_scale": 0.0010516227921471,
+    "mean_abs": 8.149072527885437e-10,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.0.csa.gate",
+    "orv_norm": 0.0010516219772398472,
+    "torch_norm": 0.0010516227921471
+   },
+   {
+    "max_abs": 8.149072527885437e-10,
+    "max_rel": 7.677280470358459e-07,
+    "ref_scale": 0.0010614530183374882,
+    "mean_abs": 1.8944769432980397e-11,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.1.W1.3",
+    "orv_norm": 0.011795872822403908,
+    "torch_norm": 0.01179586909711361
+   },
+   {
+    "max_abs": 3.725290298461914e-09,
+    "max_rel": 7.32311831559491e-07,
+    "ref_scale": 0.0050870273262262344,
+    "mean_abs": 1.973590040986505e-10,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.0.W1.1",
+    "orv_norm": 0.11862719804048538,
+    "torch_norm": 0.11862718313932419
+   },
+   {
+    "max_abs": 5.820766091346741e-10,
+    "max_rel": 6.720149198064435e-07,
+    "ref_scale": 0.0008661661995574832,
+    "mean_abs": 1.9555356592714732e-11,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.1.W2.3",
+    "orv_norm": 0.011628035455942154,
+    "torch_norm": 0.011628031730651855
+   },
+   {
+    "max_abs": 8.731149137020111e-10,
+    "max_rel": 6.635354282355912e-07,
+    "ref_scale": 0.0013158527435734868,
+    "mean_abs": 8.211095869128113e-11,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.0.csa.wq",
+    "orv_norm": 0.028595667332410812,
+    "torch_norm": 0.028595667332410812
+   },
+   {
+    "max_abs": 4.0745362639427185e-10,
+    "max_rel": 6.152881165714318e-07,
+    "ref_scale": 0.0006622159853577614,
+    "mean_abs": 1.7360125116164767e-11,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.1.W3.3",
+    "orv_norm": 0.010117088444530964,
+    "torch_norm": 0.010117086581885815
+   },
+   {
+    "max_abs": 1.5133991837501526e-09,
+    "max_rel": 6.030684866840622e-07,
+    "ref_scale": 0.0025094980373978615,
+    "mean_abs": 1.0663442958497305e-10,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.0.csa.wk",
+    "orv_norm": 0.027043642476201057,
+    "torch_norm": 0.02704363875091076
+   },
+   {
+    "max_abs": 7.8580342233181e-10,
+    "max_rel": 5.956096947610612e-07,
+    "ref_scale": 0.0013193261111155152,
+    "mean_abs": 8.452692771049775e-11,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.1.wk",
+    "orv_norm": 0.021946992725133896,
+    "torch_norm": 0.021946992725133896
+   }
+  ],
+  "n_missing": 0,
+  "global_norm_orv": 5.642614439024947,
+  "global_norm_torch": 5.6426141872761475,
+  "requested": {
+   "emb": {
+    "max_abs": 1.4901161193847656e-07,
+    "max_rel": 5.044263411435345e-07,
+    "ref_scale": 0.29540807008743286,
+    "mean_abs": 2.685193178919576e-10,
+    "finite": true,
+    "reshaped": false,
+    "name": "emb",
+    "orv_norm": 2.6111488342285156,
+    "torch_norm": 2.6111485958099365
+   },
+   "layers.0.ln1": {
+    "max_abs": 7.450580596923828e-09,
+    "max_rel": 4.163388431962791e-07,
+    "ref_scale": 0.017895473167300224,
+    "mean_abs": 1.1925749276997522e-09,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.0.ln1",
+    "orv_norm": 0.04940251633524895,
+    "torch_norm": 0.04940250888466835
+   },
+   "layers.0.csa.wo": {
+    "max_abs": 3.725290298461914e-08,
+    "max_rel": 1.9662234274734894e-07,
+    "ref_scale": 0.1894642412662506,
+    "mean_abs": 3.613291388315787e-09,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.0.csa.wo",
+    "orv_norm": 2.123317241668701,
+    "torch_norm": 2.123317241668701
+   },
+   "layers.1.wo": {
+    "max_abs": 2.9802322387695312e-08,
+    "max_rel": 3.024193700816215e-07,
+    "ref_scale": 0.0985463410615921,
+    "mean_abs": 2.783674316227114e-09,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.1.wo",
+    "orv_norm": 1.5186246633529663,
+    "torch_norm": 1.5186246633529663
+   },
+   "layers.1.W1.0": {
+    "max_abs": 2.3283064365386963e-09,
+    "max_rel": 3.4810544308810185e-07,
+    "ref_scale": 0.00668850913643837,
+    "mean_abs": 1.7295106635766477e-10,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.1.W1.0",
+    "orv_norm": 0.09118213504552841,
+    "torch_norm": 0.09118213504552841
+   },
+   "head": {
+    "max_abs": 3.725290298461914e-08,
+    "max_rel": 2.9304980803479276e-07,
+    "ref_scale": 0.12712140381336212,
+    "mean_abs": 3.7379534096966993e-10,
+    "finite": true,
+    "reshaped": false,
+    "name": "head",
+    "orv_norm": 2.0141754150390625,
+    "torch_norm": 2.0141754150390625
+   },
+   "layers.0.csa.conv": {
+    "max_abs": 1.7695128917694092e-08,
+    "max_rel": 3.3186590381757577e-07,
+    "ref_scale": 0.05332011729478836,
+    "mean_abs": 2.289046581912165e-09,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.0.csa.conv",
+    "orv_norm": 0.1180335059762001,
+    "torch_norm": 0.11803348362445831,
+    "raw_max_rel": 0.9379881747445157,
+    "basis_change": "flip kernel axis (same physical operator)"
+   },
+   "layers.0.csa.gate": {
+    "max_abs": 8.149072527885437e-10,
+    "max_rel": 7.749045179258109e-07,
+    "ref_scale": 0.0010516227921471,
+    "mean_abs": 8.149072527885437e-10,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.0.csa.gate",
+    "orv_norm": 0.0010516219772398472,
+    "torch_norm": 0.0010516227921471
+   },
+   "layers.0.router": {
+    "max_abs": 3.4924596548080444e-09,
+    "max_rel": 8.039870037108824e-07,
+    "ref_scale": 0.0043439255096018314,
+    "mean_abs": 7.356870668218107e-10,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.0.router",
+    "orv_norm": 0.02894270047545433,
+    "torch_norm": 0.028942694887518883
+   },
+   "layers.0.csa.ln": {
+    "max_abs": 6.51925802230835e-09,
+    "max_rel": 2.4240159309097283e-07,
+    "ref_scale": 0.026894452050328255,
+    "mean_abs": 1.3504859452950768e-09,
+    "finite": true,
+    "reshaped": false,
+    "name": "layers.0.csa.ln",
+    "orv_norm": 0.03851240873336792,
+    "torch_norm": 0.03851240500807762
+   }
+  }
+ },
+ "optstep": {
+  "same_torch_grads": {
+   "worst_rel": 1.7084973739968237e-07,
+   "top": [
+    [
+     "head",
+     1.7084973739968237e-07,
+     1.4901161193847656e-08
+    ],
+    [
+     "layers.0.W1.3",
+     1.6891095841935829e-07,
+     1.4901161193847656e-08
+    ],
+    [
+     "layers.0.S3",
+     1.5764217747986908e-07,
+     1.4901161193847656e-08
+    ],
+    [
+     "layers.0.ln1",
+     1.1909138513165492e-07,
+     1.1920928955078125e-07
+    ],
+    [
+     "layers.0.ln2",
+     1.1909138513165492e-07,
+     1.1920928955078125e-07
+    ],
+    [
+     "layers.0.csa.gate",
+     1.1641644116802013e-07,
+     1.1641532182693481e-10
+    ]
+   ]
+  },
+  "same_orv_grads": {
+   "worst_rel": 1.6891095841935829e-07,
+   "top": [
+    [
+     "layers.0.W1.3",
+     1.6891095841935829e-07,
+     1.4901161193847656e-08
+    ],
+    [
+     "layers.0.ln1",
+     1.1909138513165492e-07,
+     1.1920928955078125e-07
+    ],
+    [
+     "layers.0.ln2",
+     1.1909138513165492e-07,
+     1.1920928955078125e-07
+    ],
+    [
+     "layers.0.csa.gate",
+     1.1641644116802013e-07,
+     1.1641532182693481e-10
+    ],
+    [
+     "layers.0.csa.conv",
+     1.037375820927356e-07,
+     5.960464477539063e-08
+    ],
+    [
+     "layers.0.csa.wv",
+     1.0046934253364593e-07,
+     7.450580596923828e-09
+    ]
+   ]
+  },
+  "own_grads": {
+   "worst_rel": 0.0006950768900256779,
+   "top": [
+    [
+     "layers.0.S2",
+     0.0006950768900256779,
+     5.5829063057899475e-05
+    ],
+    [
+     "layers.1.wk",
+     0.0004187454188415695,
+     3.342144191265106e-05
+    ],
+    [
+     "layers.0.W3.1",
+     0.0003689672340236588,
+     3.7828460335731506e-05
+    ],
+    [
+     "layers.0.S1",
+     0.00035924888727030047,
+     3.2823532819747925e-05
+    ],
+    [
+     "layers.0.W1.1",
+     0.00023502932380051452,
+     1.9429251551628113e-05
+    ],
+    [
+     "layers.1.W1.2",
+     0.00021272215541343623,
+     1.766439527273178e-05
+    ]
+   ]
+  },
+  "amplification": {
+   "k1": 0.001,
+   "c2": 1.0,
+   "formula": "dw = lr*g/(|g|+eps) at step 1",
+   "d_dw_dg_at_eps": 25000.0,
+   "top": [
+    [
+     "layers.0.S2",
+     8.18213671065125e-05,
+     5.5829063057899475e-05
+    ],
+    [
+     "layers.0.S1",
+     7.219114367994495e-05,
+     3.2823532819747925e-05
+    ],
+    [
+     "layers.1.wv",
+     4.984920568976179e-05,
+     7.900409400463104e-06
+    ],
+    [
+     "layers.0.W3.1",
+     4.175274851539922e-05,
+     3.7828460335731506e-05
+    ],
+    [
+     "layers.0.S3",
+     3.870101025238222e-05,
+     2.000853419303894e-05
+    ],
+    [
+     "layers.1.wk",
+     3.454746796298519e-05,
+     3.342144191265106e-05
+    ]
+   ],
+   "note": "predicted |dw diff| from grad diff alone"
+  },
+  "element_level": [
+   {
+    "name": "layers.0.S2",
+    "index": [
+     115,
+     66
+    ],
+    "g_orv": 4.655872132275363e-09,
+    "g_torch": 5.961896309969461e-09,
+    "dg": -1.3060241776940984e-09,
+    "w0_orv": 0.017010454088449478,
+    "w0_torch": 0.017010454088449478,
+    "w0_diff": 0.0,
+    "dw_orv": -0.00031784921884536743,
+    "dw_torch": -0.0003736782819032669,
+    "dw_orv_pred": -0.00031784974108889363,
+    "dw_torch_pred": -0.0003736781260311496,
+    "actual_dw": 5.5829063057899475e-05
+   },
+   {
+    "name": "layers.0.W3.1",
+    "index": [
+     25,
+     217
+    ],
+    "g_orv": -1.0375571513066006e-09,
+    "g_torch": -5.951792947378465e-10,
+    "dg": -4.4237785656875417e-10,
+    "w0_orv": 0.019028497859835625,
+    "w0_torch": 0.019028497859835625,
+    "w0_diff": 0.0,
+    "dw_orv": 9.381212294101715e-05,
+    "dw_torch": 5.5983662605285645e-05,
+    "dw_orv_pred": 9.381214119989767e-05,
+    "dw_torch_pred": 5.598425234456389e-05,
+    "actual_dw": 3.7828460335731506e-05
+   },
+   {
+    "name": "layers.1.wk",
+    "index": [
+     10,
+     51
+    ],
+    "g_orv": -3.3688879463866783e-10,
+    "g_torch": -7.067809670857628e-10,
+    "dg": 3.6989217244709494e-10,
+    "w0_orv": 0.002691495930776,
+    "w0_torch": 0.002691495930776,
+    "w0_diff": 0.0,
+    "dw_orv": 3.256392665207386e-05,
+    "dw_torch": 6.598536856472492e-05,
+    "dw_orv_pred": 3.25640126719734e-05,
+    "dw_torch_pred": 6.598554660673271e-05,
+    "actual_dw": -3.342144191265106e-05
+   },
+   {
+    "name": "layers.0.S1",
+    "index": [
+     149,
+     50
+    ],
+    "g_orv": 1.199351817859906e-08,
+    "g_torch": 1.0512684056607213e-08,
+    "dg": 1.4808341219918475e-09,
+    "w0_orv": -0.019601386040449142,
+    "w0_torch": -0.019601386040449142,
+    "w0_diff": 0.0,
+    "dw_orv": -0.0005451254546642303,
+    "dw_torch": -0.0005123019218444824,
+    "dw_orv_pred": -0.0005451245701955584,
+    "dw_torch_pred": -0.0005123007431508293,
+    "actual_dw": -3.2823532819747925e-05
+   }
+  ]
+ },
+ "elapsed_s": 1.3789937496185303
+}
