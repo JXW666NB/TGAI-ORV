@@ -116,6 +116,10 @@ def main():
                     help="关闭共享专家。PyT 侧是 n_shared_experts=1，默认开启以保持同构")
     ap.add_argument("--top_k", type=int, default=2,
                     help="每 token 激活专家数。真实 V3 是 2（model_v3.py:145），默认对齐")
+    ap.add_argument("--d_ff", type=int, default=0,
+                    help="每专家的中间维度。真实 V3 是 2816（model_v3.py:97）；0 = 用 4*d（旧行为）")
+    ap.add_argument("--vocab", type=int, default=4096,
+                    help="词表大小。真实 V3 是 96000（model_v3.py:93）；小值便于冒烟")
     ap.add_argument("--attn-res", dest="attn_res", action="store_true",
                     help="BlockAttnRes 深度注意力残差（K3）。层循环尚未接线，打开会明确报错")
     a = ap.parse_args()
@@ -127,8 +131,8 @@ def main():
                               capture_output=True, text=True).stdout.splitlines()[0])
     if a.attn_res:
         from v3_orv_attnres_loop import run_layers_attn_res   # 同目录脚本，直接导入
-    cfg = dict(d=a.d, d_ff=4 * a.d, E=a.E, layers=a.layers,
-               n_q=a.n_q, n_kv=2, vocab=4096, seq=a.seq, steps=a.steps,
+    cfg = dict(d=a.d, d_ff=(a.d_ff or 4 * a.d), E=a.E, layers=a.layers,
+               n_q=a.n_q, n_kv=2, vocab=a.vocab, seq=a.seq, steps=a.steps,
                attn_res=bool(a.attn_res), attn_res_block=2)
 
     rng = np.random.default_rng(0)
