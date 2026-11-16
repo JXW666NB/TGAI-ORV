@@ -832,6 +832,26 @@ def build_arg_parser():
                    help=">0 时用这个步数；=0 时用 --warmup-ratio 乘 --steps")
     g.add_argument("--warmup-ratio", type=float, default=0.01)
     g.add_argument("--wd", type=float, default=0.1, help="AdamW weight decay（参考实现 0.1）")
+    g.add_argument("--opt", default="adamw",
+                   choices=["adamw", "muon", "fp16mom", "adafactor", "int8"],
+                   help="优化器。状态显存（每参数）：adamw 8B / muon(fp16 动量) 2B / fp16mom 4B "
+                        "/ adafactor 因子化 O(n+m) / int8 约 1-2B。"
+                        "★ 注意：非 adamw 时 checkpoint 的优化器状态暂不支持续训（会明确拒绝）")
+    g.add_argument("--amp", default="off", choices=["off", "gemm", "mlp", "both"],
+                   help="混合精度。gemm=仅 GEMM 输入 fp16（参数/激活/梯度仍 fp32）；"
+                        "mlp=MLP 内激活存 fp16（省带宽，带梯度缩放）；both=两者都开。"
+                        "★ 实测：V100 上 fp16 张量核峰值 125 TFLOPS vs fp32 15.7，"
+                        "但小配置下 cast 开销可能盖过收益，必须在目标配置上实测。")
+    g.add_argument("--amp-no-cache", dest="amp_no_cache", action="store_true",
+                   help="AMP 时不启用 fp16 权重影子缓存。1.5B 模型影子要 3 GB，"
+                        "开 --amp gemm 可能 OOM；关掉则每次重新 cast（慢一点但省 3 GB）。")
+    g.add_argument("--muon-lr", type=float, default=0.02,
+                   help="Muon 自己的学习率（默认 0.02，与 AdamW 的 1e-3 不同量级；用 --opt muon 时生效）")
+    g.add_argument("--muon-momentum", type=float, default=0.95)
+    g.add_argument("--muon-fp16-mom", action="store_true", default=True,
+                   help="Muon 动量存 fp16（默认开，每参数 2B；关掉则 fp32 动量）")
+    g.add_argument("--muon-fp32-mom", dest="muon_fp16_mom", action="store_false",
+                   help="Muon 动量存 fp32（更准，但每参数 4B）")
     g.add_argument("--beta1", type=float, default=0.9)
     g.add_argument("--beta2", type=float, default=0.999)
     g.add_argument("--eps", type=float, default=1e-8)
@@ -988,8 +1008,60 @@ def main(argv=None):
         cos, sin = T.tensor(cos), T.tensor(sin)
 
     # ---- 优化器 / 调度器 ----
-    opt = T.optim.AdamW(params, lr=float(a.lr), betas=(float(a.beta1), float(a.beta2)),
+    if a.opt == "adamw":
+        opt = T.optim.AdamW(params, lr=float(a.lr), betas=(float(a.beta1), float(a.beta2)),
+                            eps=float(a.eps), weight_decay=float(a.wd))
+    elif a.opt == "muon":
+        # Muon：Newton-Schulz 正交化动量。lr 是它自己的量级（0.02，不是 AdamW 的 1e-3），
+        # 所以走 --muon-lr；--lr 对它不生效（避免误用 AdamW 的量级把权重打飞）。
+        opt = T.optim.Muon(params, lr=float(a.muon_lr), momentum=float(a.muon_momentum),
+                           weight_decay=float(a.wd), fp16_mom=bool(a.muon_fp16_mom))
+    elif a.opt == "fp16mom":
+        from tgai_go.train.opt_fp16mv import Fp16MomAdamW
+        opt = Fp16MomAdamW(params, lr=float(a.lr), betas=(float(a.beta1), float(a.beta2)),
+                           eps=float(a.eps), weight_decay=float(a.wd), state="fp16")
+    elif a.opt == "adafactor":
+        opt = T.optim.Adafactor(params, lr=float(a.lr), weight_decay=float(a.wd))
+    elif a.opt == "int8":
+        from tgai_go.train.int8_adamw import Int8AdamW
+        opt = Int8AdamW(params, lr=float(a.lr), betas=(float(a.beta1), float(a.beta2)),
                         eps=float(a.eps), weight_decay=float(a.wd))
+    else:
+        raise SystemExit("未知的 --opt=%r。修法：用 adamw / fp16mom / adafactor / int8"
+                         % (a.opt,))
+    # checkpoint 的优化器状态目前只实现了 AdamW 的 (t, m/v) 落盘。
+    # 别的优化器不是"存不下"，而是存了也不能正确续训 —— 必须明确拒绝，不能静默错。
+    if a.opt != "adamw" and (a.ckpt_every > 0 or a.resume):
+        raise SystemExit(
+            "--opt=%s 目前不支持 checkpoint 续训：优化器状态落盘只实现了 AdamW 的 (t, m/v)。"
+            "修法：要么用 --opt adamw 跑长训练；要么去掉 --ckpt-every/--resume "
+            "只做显存与吞吐验证。" % (a.opt,))
+    # ---- 混合精度（AMP）----
+    # gemm: 只把 GEMM 输入 cast 成 fp16（参数/激活/梯度仍 fp32，不需要 GradScaler）
+    # mlp : MLP 块内激活存 fp16（省带宽，自带梯度缩放）
+    # both: 两者都开
+    _AMP = {"gemm": a.amp in ("gemm", "both"), "mlp": a.amp in ("mlp", "both")}
+    if _AMP["gemm"]:
+        T.amp_on(dtype="fp16", weight_cache=not bool(a.amp_no_cache))
+        # ★ 只把**参数**地址登记给 fp16 影子缓存：参数整步不变，缓存安全；
+        #   激活/中间量不登记 ⇒ 每次现 cast，不可能读到池子复用留下的旧影子。
+        try:
+            ptrs = []
+            for p_ in params:
+                g = getattr(p_, "_gpu", None) or getattr(p_, "gpu", None)
+                pv = int(getattr(g, "ptr", 0) or 0)
+                if pv:
+                    ptrs.append(pv)
+            n_pin = rt.f16_cache_pin(ptrs) if ptrs else 0
+            print("[amp] 已登记 %d 个参数地址给 fp16 影子缓存" % n_pin, flush=True)
+        except Exception as _e:
+            print("[amp] 参数登记失败（缓存将不生效，只影响速度）：%r" % (_e,), flush=True)
+    if _AMP["mlp"]:
+        from tgai_go.train import amp_mlp
+        amp_mlp.enable()
+    if a.amp != "off":
+        print("[amp] mode=%s state=%r" % (a.amp, T.amp_state()), flush=True)
+
     sc = _sched_cfg(a, int(a.steps))
     sched = T.optim.lr_scheduler.CosineLR(
         opt, T_max=sc["t_max"], eta_min=sc["eta_min"],
@@ -1066,6 +1138,20 @@ def main(argv=None):
                 aborted = ("grad_norm", gnorm, step, ids, labels, seg)
                 break
             opt.step()
+            # ★ 权重已更新 ⇒ 必须让 fp16 权重影子失效，否则下一步会用上一步的 fp16 权重。
+            #   `cuda.py` 写明"缓存失效责任在调用方"；只 amp_on 不失效是静默错误。
+            if _AMP["gemm"]:
+                T.amp_invalidate()
+                # ★ 还要清运行时层的 fp16 权重影子缓存：`cuda.py` 里那份 `_f16_cache`
+                #   只有 Fp16MomAdamW 会主动清，`T.amp_invalidate()` 清的是模块级影子。
+                #   不清就会用上一步的 fp16 权重做前向 ⇒ 梯度与当前权重不匹配（实测
+                #   grad_norm 从 12.49 飙到 145775，训练直接坏掉）。
+                try:
+                    rt.f16_cache_clear()
+                except Exception:
+                    pass
+            if _AMP["mlp"]:
+                amp_mlp.invalidate()
             rt.sync()
             dt = _now() - t0
             losses.append(lv)

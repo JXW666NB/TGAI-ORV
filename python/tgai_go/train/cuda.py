@@ -3481,6 +3481,14 @@ class CudaRuntime:
             if self._in_arena(ptr):
                 return                      # arena 内存不归池管，直接跳过
             self._pool_release(int(ptr or 0), token)
+            # ★ 2026-11-16 修（实测：全尺寸配置下反向梯度爆炸 4130 倍）：
+            #   `_cast_f16_cached` 按**裸指针**缓存 fp16 影子。权重永不释放，缓存安全；
+            #   但**激活值**的地址会被池子复用 —— 同一地址在一步之内先后装不同张量，
+            #   反向时就会命中前向留下的旧 fp16 拷贝 ⇒ GEMM 读到别人的数据 ⇒ 梯度全错。
+            #   实测：缓存开 gnorm=3.3056e+04，缓存关 gnorm=8.0060e+00（fp32 基线 8.0039）。
+            #   修法：块一旦归还池子就丢掉它的影子。这样"地址复用"自动失效，
+            #   而权重（从不归还）继续享受缓存带来的速度。
+            self._f16_cache_drop_ptr(ptr)
         except Exception:
             if token is None:
                 raise
@@ -5564,23 +5572,62 @@ class CudaRuntime:
         return out
 
     def _cast_f16_cached(self, src_ptr, count):
-        """带缓存的 fp32→fp16 cast（供 fp16 GEMM 复用权重影子）。
+        """带缓存的 fp32→fp16 cast（供 fp16 GEMM 复用**参数**影子）。
 
         为什么要缓存：实测 nl=8/seq=512 时 `TG_FP16=1` 反而慢 31%（171.9 → 226.0 ms），
-        因为每次 GEMM 都把权重重新 cast 一遍。权重在一个 step 内不变，缓存后 cast 只发生一次。
-        **失效责任在调用方**：优化器更新参数后必须 `f16_cache_clear()`，否则会用到旧影子。
+        因为每次 GEMM 都把权重重新 cast 一遍。
+
+        ★★ 2026-11-16 重做（原实现有严重正确性缺陷）★★
+        原实现**按裸指针缓存任意操作数**，注释假设"权重在一个 step 内不变"。
+        但 `_sgemm_f16` 的两个操作数里也有**激活值**，而激活值的地址会被内存池复用 ——
+        同一地址在一步之内先后装不同张量，反向就命中前向留下的旧 fp16 拷贝。
+        实测（csa=4 / d=1024 / seq=512）：缓存开 gnorm=3.3056e+04，
+        缓存关 gnorm=8.0060e+00（fp32 基线 8.0039）⇒ 梯度全错。
+
+        现在的规则：**只缓存显式注册过的地址**（`f16_cache_pin`，优化器把自己的参数注册进来）。
+        参数在一个 step 内不变，缓存安全；激活/中间量一律现 cast，不可能读到陈旧数据。
+        未注册时缓存形同关闭 —— 正确性优先于那 31%。
         """
         cache = getattr(self, "_f16_cache", None)
+        pinned = getattr(self, "_f16_pinned", None)
+        p = int(src_ptr)
+        if not pinned or p not in pinned:
+            # 没有登记 ⇒ 内容随时可能变，只能现 cast
+            return self._cast_flat_ptr(p, count, True)
         if cache is None:
             cache = {}
             self._f16_cache = cache
-        key = (int(src_ptr), int(count))
+        key = (p, int(count))
         hit = cache.get(key)
         if hit is not None:
             return hit
-        buf = self._cast_flat_ptr(src_ptr, count, True)
+        buf = self._cast_flat_ptr(p, count, True)
         cache[key] = buf
         return buf
+
+    def f16_cache_pin(self, ptrs):
+        """登记「整步内容不变」的地址（参数缓冲），让 fp16 影子缓存只对它们生效。
+
+        优化器在 build 之后调用一次即可；`f16_cache_clear()` 不会清掉登记表。
+        """
+        self._f16_pinned = set(int(x) for x in ptrs)
+        return len(self._f16_pinned)
+
+    def _f16_cache_drop_ptr(self, ptr):
+        """丢掉这个地址上的所有 fp16 影子（地址被归还池子时调用）。
+
+        空缓存时立刻返回，fp32 路径零开销。这是 `_cast_f16_cached` 正确性的前提：
+        缓存只能覆盖"内容在一个 step 内不变"的操作数（权重），
+        而"同一地址装不同张量"必须让缓存失效，否则反向会读到前向的旧影子。
+        """
+        cache = getattr(self, "_f16_cache", None)
+        if not cache:
+            return
+        p = int(ptr or 0)
+        if not p:
+            return
+        for k in [k for k in cache if int(k[0]) == p]:
+            del cache[k]
 
     def f16_cache_enable(self, on=True):
         """打开/关闭 fp16 GEMM 的权重影子缓存。关闭时清空。"""
