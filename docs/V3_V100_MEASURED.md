@@ -100,3 +100,33 @@ GPU 上与 numpy 参考 **max_abs_err 1.788e-07**（CPU 上 2.384e-07）。
 
 **覆盖范围**：只测了 FFN 块。**未测**：RoPE 约定（用错会 rel≈0.44 且不报错）、
 GQA 头顺序、因果掩码边界、MoE top-k 并列、整模型端到端。
+
+
+## 八、V100 通道的真实限制（2026-11-16 实测，别再重复踩）
+
+python tgai_ops.py v100py '<code>' 是唯一能跑 Python 的通道（100py 用 C:\Python311\python.exe，
+注意**不是** D:\orv_pip_0962 那个 venv；要跑 venv 必须用 subprocess 指名路径）。
+
+### 8.1 单条命令能承载的 base64 只有约 1 KB
+
+| 内容大小 | 结果 |
+| --- | --- |
+| ~600 B（runner 脚本）| 成功（多次）|
+| 5.7 KB（3_attnres.py）| 失败（EXISTS False）|
+| 9 KB（训练脚本）| 失败 |
+| 14.8 KB（0.9.83 训练脚本）| 失败（文件不存在）|
+
+**推论**：不要指望用 base64 传文件。**正确做法是把要在远端跑的东西做成 	gai_go.train 的模块**，
+随 wheel 发版过去（pip install 会带上）。	ools/ 目录**不在 wheel 里**，所以本文件所在仓库的
+	ools/v3_orv_train.py 到不了 V100。
+
+### 8.2 镜像延迟
+
+每次发新版到 PyPI 后，清华镜像需要一段时间才同步（0.9.81 约 15-20 分钟）。
+同步前 pip install tgai-orv==X 报 ERROR: No matching distribution found。
+**用户开代理后**可用默认 PyPI 源直连安装（已验证 RC 0），不必等镜像。
+
+### 8.3 响应可能滞后一步
+
+100py 偶尔返回**上一条命令**的输出（print(1+1) 的 2 被重复返回过）。判断方法：
+让每条命令输出一个**唯一标记**，看到旧标记就说明拿到的是滞后响应。
