@@ -3628,7 +3628,6 @@ class CudaRuntime:
                 chain.append(ptr)
             self._pool_cached_bytes += int(size)
             self._pool_note()
-            self._pool_shed_ready()
             return
         ev = self._pool_ev_acquire()
         if self.ctx is not None:
@@ -3641,18 +3640,29 @@ class CudaRuntime:
         chain.append((ptr, ev))
         self._pool_cached_bytes += int(size)
         self._pool_note()
-        self._pool_shed_ready()
 
     def _pool_frozen(self):
         """捕获中或图还活着时，不能 cuMemFree：图里记的是这些地址。"""
         return bool(self._capturing or self._graph_exec)
 
-    def _pool_shed_ready(self):
-        """占用超过 12.6 GiB 时，每个尺寸只留 2 个已完成的空闲块，其余还给驱动。
+    def _pool_shed_ready(self, force=False):
+        """显存真不够时，每个尺寸只留 2 个已完成的空闲块，其余还给驱动。
 
         旧逻辑把缓存压到 256 MiB，梯度缓冲区每步都被拆掉。全留着又会超过 13 GiB。
-        热尺寸（32MiB/16MiB）留 2 个就能复用，冷块才释放。不在这里同步整条流。
+        热尺寸（32MiB/16MiB）留 2 个就能复用，冷块才释放。
+
+        ★ 2026-11-17 重要改动：**不再从 `free()` 里主动调用**，只在 `_alloc`
+          真的分配失败时以 `force=True` 兜底。
+          原因（实测，1.5B / 24 层 / seq512）：`free()` 一步调用 11573 次，
+          即便有 `& 63` 节流，显存一旦低于 2 GiB 仍有约 180 次/步真正走到 trim，
+          而 trim 对裸指针必须先 `cuCtxSynchronize`（**整设备同步**）+ 逐块 `cuMemFree`。
+          实测这一步把本函数从 0.029 s/步 抬到 0.189 s/步，
+          连带 `_alloc` 从 0.033 抬到 0.201 s/步 —— 正好等于慢步多出的 0.35 s。
+          trim 只是"提前腾地方"的优化，真缺显存时 `_alloc` 的失败路径会兜底，
+          所以去掉主动路径不影响 OOM 的正确性。
         """
+        if not force:
+            return
         if self._pool_frozen():
             return
         if self.cu is None or getattr(self, "_pool_trimming", False):
@@ -3956,7 +3966,9 @@ class CudaRuntime:
                 try:
                     self._activate()
                     self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize(alloc-low)")
-                    self._pool_shed_ready()
+                    # 这里是**分配失败**的兜底路径（且上面已整设备同步过），
+                    # 所以显式要求 trim。主动 trim 已从 free() 移除，见 _pool_shed_ready 文档。
+                    self._pool_shed_ready(force=True)
                     ptr = self._pool_take(bucket)
                 finally:
                     self._alloc_retry = False
