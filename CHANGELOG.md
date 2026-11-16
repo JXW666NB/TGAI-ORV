@@ -1,3 +1,33 @@
+## [0.9.84] - 2026-11-16
+
+### CSA + 真 V3 混合注意力 + 训练脚本进包
+
+1. **3_csa.py（新）**：CompressedSparseAttention 的 ORV 实现，GPU 可跑 + autograd。
+   只用组合算子（不碰 CUDA 上未实现的 einsum/	opk/stack）；
+   分段池化/分段卷积改成纯取行（gather）形式以便自动微分。
+   实测：前向 vs PyTorch 参考 **max_abs 2.384e-07 / max_rel 2.895e-07**；反向 10/10 权重有梯度。
+2. **3_train_cli.py（进包）**：训练脚本变成 python -m tgai_go.train.v3_train_cli，
+   随 wheel 到达远端（此前 V100 靠中继传文件，单条命令仅约 1 KB）。
+   新增 --d_ff / --vocab / --attn-res / --fp16-gemm（默认关）。
+3. **--csa N（新）**：真 V3 的 **3:1 混合注意力**。层判定照 model_v3.py:215-222
+   的 (i % N) == (N-1)（0-based）⇒ N=4 时 1-based 第 4/8/12/16/20 层为 Global，其余 CSA。
+   --csa 打开时 Global 层用 MHA + θ=500000（与真 V3 一致）；默认路径逐位不变（323 个参数指纹全等）。
+4. 	ools/v3_orv_train.py 变薄封装，re-export uild/params_of/main/build_arg_parser
+   （11 个探针脚本依赖这些名字）。
+5. 	ools/v3_pyt_train.py 补 --d_ff / --vocab，否则 PyTorch 侧跑不了真 V3 尺寸。
+
+V100 实测（d=1024/L=20/E=4/d_ff=2816/vocab=96000/n_q=16/fp32/AdamW）：
+
+| seq | 20 Global | 15 CSA + 5 Global |
+| ---: | ---: | ---: |
+| 256 | 0.5175 s | 0.5425 s |
+| 512 | 0.59 s | 0.62 s |
+| 1024 | 0.77 s | 0.79 s |
+
+CSA 代价随 seq 递减（+5.8%→+2.6%），显存 +0.57→+1.97 GiB（scores 物化，已记录为已知限制）。
+
+全套 791 passed。
+
 ## [0.9.83] - 2026-11-16
 
 ### V3 训练脚本支持真 V3 的两个关键尺寸
