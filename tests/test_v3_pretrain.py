@@ -248,9 +248,31 @@ def test_optimizer_roundtrip_cpu(tmp_path):
     n = M.save_optimizer(d, opt)
     assert n == len(params)
 
+    # 默认按 fp16 落盘（checkpoint 从 18 GB 降到 12 GB），所以往返有 fp16 量级误差
     opt2 = T.optim.AdamW(params, lr=0.01)
     M.load_optimizer(d, opt2)
     assert opt2.t == 17
+    for a, b in zip(opt.m, opt2.m):
+        assert np.allclose(a, b, rtol=2e-3, atol=2e-3), "m 往返误差超过 fp16 量级"
+    for a, b in zip(opt.v, opt2.v):
+        assert np.allclose(a, b, rtol=2e-3, atol=2e-3), "v 往返误差超过 fp16 量级"
+
+
+def test_optimizer_roundtrip_fp32_exact(tmp_path):
+    """half=False 时必须**逐位**相等（给需要逐位复现的场景留一条路）。"""
+    P = _fake_P(n_layers=1)
+    params = CLI.params_of(P)
+    opt = T.optim.AdamW(params, lr=0.01)
+    rng = np.random.default_rng(5)
+    for i in range(len(opt.m)):
+        opt.m[i] = rng.normal(0, 1, opt.m[i].shape).astype(np.float32)
+        opt.v[i] = rng.normal(0, 1, opt.v[i].shape).astype(np.float32)
+    opt.t = 3
+    d = str(tmp_path / "opt32")
+    M.save_optimizer(d, opt, half=False)
+    opt2 = T.optim.AdamW(params, lr=0.01)
+    M.load_optimizer(d, opt2)
+    assert opt2.t == 3
     for a, b in zip(opt.m, opt2.m):
         assert np.array_equal(a, b)
     for a, b in zip(opt.v, opt2.v):

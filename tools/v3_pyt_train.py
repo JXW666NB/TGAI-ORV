@@ -48,6 +48,8 @@ def main():
                     help="每 token 激活的专家数。真实 V3 是 2（model_v3.py:145），默认对齐")
     ap.add_argument("--d_ff", type=int, default=0,
                     help="每专家中间维度。真实 V3 是 2816（model_v3.py:97）；0 = 4*d")
+    ap.add_argument("--amp", action="store_true",
+                    help="PyTorch autocast fp16 + GradScaler（与 ORV 的 --amp gemm 同口径对照用）")
     ap.add_argument("--vocab", type=int, default=4096,
                     help="词表大小。真实 V3 是 96000（model_v3.py:93）")
     a = ap.parse_args()
@@ -66,6 +68,7 @@ def main():
     model.train()
     n_par = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr)
+    scaler = torch.amp.GradScaler("cuda", enabled=bool(a.amp)) if a.amp else None
 
     base = int(subprocess.run(["nvidia-smi", "--query-gpu=memory.used",
                                "--format=csv,noheader,nounits"],
@@ -81,7 +84,8 @@ def main():
         tgt = ids[:, 1:].contiguous()
         t0 = time.time()
         # 模型内部自己平移 targets（传等长 ids），与 train_v3.py 的用法一致
-        out = model(ids, targets=ids)
+        with torch.amp.autocast("cuda", dtype=torch.float16, enabled=bool(a.amp)):
+            out = model(ids, targets=ids)
         if isinstance(out, (tuple, list)):
             logits, loss = out[0], out[1]
         else:
@@ -89,7 +93,11 @@ def main():
             loss = torch.nn.functional.cross_entropy(
                 logits[:, :-1, :].reshape(-1, logits.shape[-1]).float(),
                 tgt.reshape(-1))
-        opt.zero_grad(); loss.backward(); opt.step()
+        opt.zero_grad()
+        if scaler is not None:
+            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+        else:
+            loss.backward(); opt.step()
         torch.cuda.synchronize()
         times.append(time.time() - t0); losses.append(float(loss.item()))
         print("step %d loss=%.4f %.2fs" % (step, losses[-1], times[-1]), flush=True)

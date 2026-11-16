@@ -614,18 +614,32 @@ def _load_into_buffer(buf, arr):
         T._cuda().copy_h2d_into(buf, arr)
 
 
-def save_optimizer(dirpath, opt):
-    """AdamW 的 `(t, m/v 逐张量)` 落盘（目录名与 `ckpt` 的 `opt/` 约定一致）。"""
+def save_optimizer(dirpath, opt, half=True):
+    """AdamW 的 `(t, m/v 逐张量)` 落盘（目录名与 `ckpt` 的 `opt/` 约定一致）。
+
+    ★ 2026-11-16：默认按 **fp16** 存 m/v。原因（实测）：1.5B 模型一个 checkpoint
+      是 params 6 GB + m 6 GB + v 6 GB = **18 GB**，三次滚动就 54 GB，
+      把 V100 的 D 盘（剩余 46 GB）写满并报 `OSError: ... 0 written`。
+      Adam 的一阶/二阶矩降到 fp16 是业界常规做法（相对误差 ~5e-4，远小于 lr 本身），
+      换来 checkpoint 从 18 GB 降到 **12 GB**。需要逐位复现时用 `half=False`。
+    """
     os.makedirs(dirpath, exist_ok=True)
     n = len(opt.params)
     if len(opt.m) != n or len(opt.v) != n:
         raise SystemExit("优化器状态长度与参数数不符（%d/%d vs %d）。修法：优化器被换过？"
                          % (len(opt.m), len(opt.v), n))
     for i in range(n):
-        np.save(os.path.join(dirpath, "%06d_m" % i), _buffer_to_np(opt.m[i]))
-        np.save(os.path.join(dirpath, "%06d_v" % i), _buffer_to_np(opt.v[i]))
+        m = _buffer_to_np(opt.m[i])
+        v = _buffer_to_np(opt.v[i])
+        if half:
+            m = m.astype(np.float16)
+            v = v.astype(np.float16)
+        np.save(os.path.join(dirpath, "%06d_m" % i), m)
+        np.save(os.path.join(dirpath, "%06d_v" % i), v)
     with open(os.path.join(dirpath, "t.txt"), "w", encoding="utf-8") as f:
         f.write("%d\n" % int(getattr(opt, "t", 0)))
+    with open(os.path.join(dirpath, "dtype.txt"), "w", encoding="utf-8") as f:
+        f.write("float16\n" if half else "float32\n")
     return n
 
 
@@ -637,8 +651,9 @@ def load_optimizer(dirpath, opt):
         raise SystemExit("优化器状态个数不一致：checkpoint %d/%d，当前参数 %d。"
                          "修法：同一模型才能续训" % (len(mfiles), len(vfiles), n))
     for i in range(n):
-        _load_into_buffer(opt.m[i], np.load(mfiles[i]))
-        _load_into_buffer(opt.v[i], np.load(vfiles[i]))
+        # 兼容 fp16 / fp32 两种落盘：统一升回 fp32 再灌进设备缓冲
+        _load_into_buffer(opt.m[i], np.load(mfiles[i]).astype(np.float32))
+        _load_into_buffer(opt.v[i], np.load(vfiles[i]).astype(np.float32))
     tp = os.path.join(dirpath, "t.txt")
     opt.t = int(open(tp, encoding="utf-8").read().strip()) if os.path.exists(tp) else 0
     return n

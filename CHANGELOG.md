@@ -1,3 +1,35 @@
+## [0.9.88] - 2026-11-16
+
+### checkpoint 缩小 1/3：优化器状态按 fp16 落盘
+
+**问题**（V100 实测）：1.5B 模型一个 checkpoint = params 6 GB + m 6 GB + v 6 GB = **18 GB**。
+`--keep 2` 滚动三次就要 54 GB，把 D 盘（剩余 46 GB）写满，
+报 `OSError: 3407872 requested and 0 written`（看起来像代码 bug，其实是磁盘满）。
+
+**改动**：`save_optimizer(..., half=True)` 默认把 m/v 存成 **float16** ——
+Adam 矩降到 fp16 是业界常规做法（相对误差 ~5e-4，远小于 lr 本身），
+checkpoint 从 18 GB 降到 **12 GB**。`load_optimizer` 兼容 fp16/fp32 两种落盘，
+统一升回 fp32 灌进设备缓冲。需要逐位复现时传 `half=False`。
+
+新增测试：`test_optimizer_roundtrip_cpu` 改为 fp16 容差（rtol/atol 2e-3），
+另加 `test_optimizer_roundtrip_fp32_exact` 钉住 `half=False` 的逐位相等。
+
+### 1.5B 真语料预训练 + 续训验证（V100 实测）
+
+`d=1024 / 24 层 / 16 头 / E=4 / d_ff=3328 / vocab=96000 / seq=512 / csa=4`
+（1,500,681,490 参数，真语料 202M tokens / 99 shards）：
+
+| 项 | 值 |
+| --- | ---: |
+| 参数量 | 1,500,681,490 |
+| loss | **11.716139 → 11.389412** |
+| s/step（稳态）| 0.990 |
+| tok/s | 517 |
+| 峰值（池 live）| 27.08 GiB |
+| **续训一致性** | **\|d\| = 0.000e+00**（step 3: A 11.38941193 vs B 11.38941193）|
+
+全套 814 passed。
+
 ## [0.9.87] - 2026-11-16
 
 ### 修 fp16 影子缓存的严重正确性缺陷（反向梯度错到 4130 倍）
