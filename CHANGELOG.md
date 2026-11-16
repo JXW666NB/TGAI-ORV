@@ -1,3 +1,52 @@
+## [0.9.89] - 2026-11-17
+
+### 重大性能修复：embedding 反向从 CPU 中转改成 GPU scatter（一步快 1.53×）
+
+**现象**：20 层 / seq512 / 1.13B 的 V3 训练，一步 0.647 s，`tok/s` 只有 792。
+同配置 PyTorch 是 0.831 s，看起来 ORV 只快 1.28×，而每层边际成本本应便宜 3×。
+
+**定位过程**（CUDA event 级归因，不再靠墙钟猜）：
+
+| 阶段 | GPU 时间 | 墙钟时间 |
+| --- | ---: | ---: |
+| forward | 2.5 ms | 13.6 ms |
+| backward | 3.8 ms | **185.4 ms** |
+| opt.step | 8.5 ms | 8.7 ms |
+
+⇒ 一步 97% 是 **CPU**，不是 GPU。再用 cProfile 定位到
+`numpy.array`（0.105 s/步）+ `h2d`（0.145 s/步），并抓住调用的数组形状：
+`((96000, 1024), float32) × 2` —— **每步把 393 MB 的嵌入表主机→显存搬两次**。
+
+**根因**：`Tensor.__getitem__` 的反向（`__init__.py:1815`）走的是 CPU 中转：
+
+```python
+g_np = np.asarray(g.to_numpy(), ...)      # D2H 梯度
+full = np.zeros(shape, ...)               # 在主机上分配整块 (96000,1024) = 393 MB
+np.add.at(full, arr, g_np.reshape(...))   # CPU 上散射（np.add.at 极慢）
+_acc(grads, self, rt.h2d(full))           # 整块 393 MB H2D 回显存
+```
+
+而库内**早就有 GPU 版 atomic scatter**（`cuda.py::scatter_add_rows`，`indexing.py` 一直在用）。
+
+**修法**：形状能摊平成 `(n_src, row_size)` 时改走 GPU `scatter_add_rows`，
+其余情况保留原 CPU 路径（不改变任何语义）。
+
+**数值验证**：`scatter_add_rows` vs `np.add.at` 逐元素 **max_abs = 0.000e+00 / max_rel = 0.000e+00**，
+含重复索引场景同样逐位相等。全套 814 passed。
+
+**A/B 实测（V100，真语料，8 步取后 3 步）**：
+
+| 配置 | 修改前 | 修改后 | PyTorch | 对比 |
+| --- | ---: | ---: | ---: | --- |
+| 20 层 / seq512 | 0.647 s (792 tok/s) | **0.422 s (1213 tok/s)** | 0.831 s (616 tok/s) | ORV 快 **1.97×** |
+| 4 层 / seq512 | 0.264 s (1940 tok/s) | **0.111 s (4600 tok/s)** | 0.160 s | ORV 快 **1.4×**（此前是慢 2×）|
+
+**顺带确认的两个负面结论**（避免以后重复踩）：
+1. **fp16 GEMM 在任何门控阈值下都无净收益**（262144 / 1e6 / 4e6 全试过）；
+   把门控全关后耗时≈fp32，说明慢在 fp16 GEMM 本身而非影子缓存。
+2. `cublasSgemmGroupedBatched`（`grouped_*`）在这套 cuBLAS 上不可用，
+   调用报 "parameter number 2 had an illegal value"。
+
 ## [0.9.88] - 2026-11-16
 
 ### checkpoint 缩小 1/3：优化器状态按 fp16 落盘
