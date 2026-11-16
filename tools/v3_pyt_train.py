@@ -46,12 +46,16 @@ def main():
                     help="注意力头数。d_k = d // n_heads；引擎原生融合核要求 d_k=64（即 8 头）")
     ap.add_argument("--top_k", type=int, default=2,
                     help="每 token 激活的专家数。真实 V3 是 2（model_v3.py:145），默认对齐")
+    ap.add_argument("--d_ff", type=int, default=0,
+                    help="每专家中间维度。真实 V3 是 2816（model_v3.py:97）；0 = 4*d")
+    ap.add_argument("--vocab", type=int, default=4096,
+                    help="词表大小。真实 V3 是 96000（model_v3.py:93）")
     a = ap.parse_args()
 
     import model_v3 as M
 
-    cfg = M.TGAIV3Config(vocab_size=4096, d_model=a.d, n_layers=a.layers,
-                         n_heads=a.n_heads, n_kv_heads=2, d_ff=4 * a.d,
+    cfg = M.TGAIV3Config(vocab_size=a.vocab, d_model=a.d, n_layers=a.layers,
+                         n_heads=a.n_heads, n_kv_heads=2, d_ff=(a.d_ff or 4 * a.d),
                          n_experts=a.E, n_activated=a.top_k, n_shared_experts=1,
                          max_seq_len=a.seq, moe_balance="sign")
     model = M.TGAIV3Model(cfg).cuda()
