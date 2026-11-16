@@ -128,6 +128,7 @@ QK-Clip 与 dropout（参考里 `qk_clip_tau` 会改权重、dropout 默认 0）
 """
 import argparse
 import json
+import os
 import subprocess
 import threading
 import time
@@ -803,7 +804,12 @@ def forward_logits(P, cfg, kinds, plan, cos, sin, ids, opts=None,
         # 分支逐行对应：attn 前深度注意力 → 残差 → 边界收块 → mlp 前深度注意力）
         x = AR.run_attn_res_layers(x, layers, attn_res, mlp_res, block_size=bs)
     else:
-        use_ckpt = bool(cfg.get("grad_ckpt"))
+        # ★ 也接受环境变量 TG_GRAD_CKPT=1：
+        #   `v3_pretrain.main()` 走的是 `_expand_cfg(a)`，不经过 CLI 的那份 cfg 构造，
+        #   实测 `--grad-ckpt` 因此没生效（时间/显存逐位不变）。用环境变量兜住，
+        #   保证这个开关在任何调用路径下都能打开。
+        use_ckpt = (bool(cfg.get("grad_ckpt"))
+                    or (os.environ.get("TG_GRAD_CKPT", "") not in ("", "0", "false", "False")))
         for i, L in enumerate(P["layers"]):
             if use_ckpt:
                 # ★ 2026-11-17：梯度重算（用算力换显存）。前向不建图、只留层输入；
