@@ -5527,6 +5527,35 @@ class CudaRuntime:
         cb.cublasGemmEx.restype = ctypes.c_int
         st["inited"] = True
 
+    def _f16_scratch(self, slot, n):
+        """按槽位复用 fp16 临时缓冲（只增不减）。
+
+        ★ 2026-11-17：`_sgemm_f16` 原来每次调用都 `self.empty()` 分配两块 fp16 缓冲。
+        模型一步有 79 次 fp16 GEMM ⇒ 158 次分配，实测让峰值显存 +1.8 GiB，
+        并且看起来是压掉 fp16 收益的主因（微基准里 GEMM 本身快 4–6×）。
+        改成 grow-only 复用后，分配次数降到每次模型规模变化时一次。
+        正确性：cast 与 GEMM 都在同一条默认流上按序入队，下一轮的 cast 一定排在
+        上一轮 GEMM 之后，所以复用不会读到半成品。
+        """
+        key = "_f16_scratch_%d" % int(slot)
+        buf = getattr(self, key, None)
+        if buf is None or int(buf.n) < int(n):
+            buf = self.empty((int(n),), dtype=np.float16)
+            setattr(self, key, buf)
+        return buf
+
+    def _cast_flat_ptr_into(self, src_ptr, count, out):
+        """把 src_ptr 起 count 个 fp32 cast 进**已有**的 fp16 缓冲（不分配）。"""
+        count = int(count)
+        if count:
+            grid, block = self._ewise_grid(count)
+            self._activate()
+            self.launch("cast_f32_to_f16", grid, block, [
+                (int(src_ptr), ctypes.c_uint64), self._ptr(out),
+                (count, ctypes.c_int),
+            ])
+        return out
+
     def _cast_flat_ptr(self, src_ptr, count, to_f16):
         """把 src_ptr 起 count 个元素整块 cast 成新缓冲（形状信息不重要）。"""
         count = int(count)
@@ -5663,12 +5692,20 @@ class CudaRuntime:
         nc = int(ldc) * int(n)
         if max(na, nb, nc) > 2147483647:
             raise CudaError("fp16 GEMM 元素数超过 int32" + "。修法：确认 cuBLAS 版本与驱动匹配；可先用 TG_FP16=0 关掉 fp16 GEMM 排查")
-        if getattr(self, "_f16_cache_on", False):
+        # 参数（整步内容不变）走影子缓存；激活走可复用 scratch。
+        # 两种情况都不再"每次调用新分配"，这正是压掉 fp16 收益的地方。
+        pinned = getattr(self, "_f16_pinned", None) or ()
+        cache_on = bool(getattr(self, "_f16_cache_on", False))
+        if cache_on and int(A) in pinned:
             a16 = self._cast_f16_cached(A, na)
+        else:
+            a16 = self._f16_scratch(0, na)
+            self._cast_flat_ptr_into(A, na, a16)
+        if cache_on and int(B) in pinned:
             b16 = self._cast_f16_cached(B, nb)
         else:
-            a16 = self._cast_flat_ptr(A, na, True)
-            b16 = self._cast_flat_ptr(B, nb, True)
+            b16 = self._f16_scratch(1, nb)
+            self._cast_flat_ptr_into(B, nb, b16)
         if st["c32"]:
             c16 = None
             cptr = int(C)

@@ -74,21 +74,37 @@ def main():
         rt.sync()
         t2 = time.perf_counter()
         k_bwd = sum(K.values())
+        top_bwd = K.most_common(8)
         K.clear()
         opt.step()
         rt.sync()
         t3 = time.perf_counter()
         k_opt = sum(K.values())
-        return (t1 - t0, t2 - t1, t3 - t2, k_fwd, k_bwd, k_opt)
+        return (t1 - t0, t2 - t1, t3 - t2, k_fwd, k_bwd, k_opt, top_bwd)
 
     phases()        # 预热
-    f, b, o, kf, kb, ko = phases()
+    # 单次测量噪声极大（实测同一配置 180~294 ms），改为多次取中位数
+    import statistics
+    fs, bs, os_ = [], [], []
+    kfs, kbs, kos = [], [], []
+    tb = []
+    for _ in range(5):
+        f1, b1, o1, kf1, kb1, ko1, tb1 = phases()
+        fs.append(f1); bs.append(b1); os_.append(o1)
+        kfs.append(kf1); kbs.append(kb1); kos.append(ko1)
+        tb = tb1
+    f, b, o = statistics.median(fs), statistics.median(bs), statistics.median(os_)
+    kf, kb, ko = (int(statistics.median(kfs)), int(statistics.median(kbs)),
+                  int(statistics.median(kos)))
     print("\n=== 一步的分段（layers=%d seq=%d）===" % (a.layers, a.seq))
     print("  forward : %7.1f ms   内核 %5d" % (f * 1e3, kf))
     print("  backward: %7.1f ms   内核 %5d" % (b * 1e3, kb))
     print("  opt.step: %7.1f ms   内核 %5d   ← 每张量 %.1f 个"
           % (o * 1e3, ko, ko / max(len(params), 1)))
     print("  合计    : %7.1f ms   内核 %5d" % ((f + b + o) * 1e3, kf + kb + ko))
+    print("\n  backward 里最多的内核:")
+    for nm, c in tb:
+        print("    %-30s %4d" % (nm, c))
 
 
 if __name__ == "__main__":
