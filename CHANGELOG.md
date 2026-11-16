@@ -1,3 +1,20 @@
+## [0.9.81] - 2026-11-16
+
+### V3 移植：补上 BlockAttnRes 与 AttnRes 层循环
+
+- 3_attnres.py：lock_attn_res（K3 深度注意力残差）+ 
+un_attn_res_layers（四段式整栈循环）+ numpy 参考实现。
+  **不照抄官方伪代码**：ORV 的 einsum 在 CUDA 上抛 NotImplementedError，故换成
+  matmul + 广播 + softmax + sum(axis)，只换写法不换数学。
+- 3_scatter.index_add：复用运行时 scatter_add_rows 内核（1-D/2-D），CSA 与计数用。
+- 	ools/v3_orv_train.py：新增 --attn-res（默认关，旧路径逐字不变）；uild() 按需分配
+  每层两组 AttnRes 参数；层循环改成 or L in ([] if a.attn_res else P[layers]) 的形式接入，
+  **不做任何缩进重排**以降低改坏风险。
+- 	ools/v3_orv_attnres_loop.py：四段式层循环独立成文件，接入只需一个 if。
+
+数值验收：lock_attn_res 与 numpy 参考 **max_abs_err 2.384e-07**；整栈循环 **1.907e-06**。
+全套 791 passed / 0 failed。
+
 ## [0.9.80] - 2026-11-15
 
 ### 全归约改两遍式：大张量不再只用一个 block
