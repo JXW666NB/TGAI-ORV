@@ -102,3 +102,26 @@ def test_conv_matches_naive_loop():
                 if t - j >= 0:
                     want[b, t] += w[:, j] * x[b, t - j]
     assert np.abs(got - want).max() < 1e-6
+
+def test_chunk_layout_handles_many_short_documents():
+    """回归测试：分段模式下 chunk 数可远超 ceil(T/c)。
+
+    真语料分片（多文档、大量短文档）上实测崩过：
+    旧实现按 ceil(T/c) 分配槽位，但每个文档边界都会新开 chunk，
+    于是 `np.bincount(..., minlength=B*Tc)` 因越界 slot 返回更长的数组，
+    随后 `slot_doc` 与 `new_doc` 长度不一致：
+        ValueError: could not broadcast input array from shape (128,) into shape (127,)
+    """
+    import numpy as np
+
+    from tgai_go.train import v3_csa as C
+
+    B, T, c = 1, 32, 4
+    # 每个 token 自成一个文档 ⇒ chunk 数 = T = 32，而 ceil(T/c) = 8
+    seg = np.arange(T, dtype=np.int32)[None, :]
+    out = C._chunk_layout(seg, c)
+
+    assert int(out["n_chunk"].max()) == T, "每个 token 一篇文档时应产生 T 个 chunk"
+    assert int(out["Tc"]) >= T, "Tc 必须放大到实际 chunk 数，否则槽位越界"
+    assert out["cnt"].shape[0] == B * int(out["Tc"]), "cnt 长度必须等于 B*Tc"
+    assert out["slot_doc"].shape[0] == B * int(out["Tc"]), "slot_doc 长度必须等于 B*Tc"

@@ -1,3 +1,39 @@
+## [0.9.86] - 2026-11-16
+
+### 修 CSA 分段池化在真实多文档分片上的崩溃
+
+**现象**（真语料 packed512/s512 上实测，1.595B 模型、seq=512）：
+`
+File v3_csa.py, line 329, in _chunk_layout
+    new_doc[1:] = slot_doc[1:] != slot_doc[:-1]
+ValueError: could not broadcast input array from shape (128,) into shape (127,)
+`
+
+**根因**：Tc 取 ceil(T/c)（数学下界），但**分段模式会额外开 chunk** ——
+文档边界的 seg[b,t] != seg[b,t-1] 也会置 nd=1，所以总 chunk 数
+= Σ_docs ceil(doc_len/c)，**可以远大于** ceil(T/c)（一篇 1 token 的文档就占一个 chunk）。
+于是越界的 slot 让 
+p.bincount(..., minlength=B*Tc) 返回更长的数组，
+slot_doc（长 B*Tc+1）与 
+ew_doc（长 B*Tc）长度不一致。
+
+**修法**：Tc = max(ceil(T/c), n_chunk.max())。
+
+**为什么之前没发现**：numpy 参考实现与 GPU 对拍都用 seg=None（固定切分），
+走不到这条路径。**只有真实分片（多文档）才会触发。** 已补回归测试
+	est_chunk_layout_handles_many_short_documents（每 token 一篇文档 ⇒ chunk 数 = T）。
+
+### 同时记录的显存边界（V100 32GB / fp32 / batch 1 实测）
+
+| 模型 | seq=512 | seq=1024 | seq=2048 |
+| --- | --- | --- | --- |
+| 1.60B（24 层 / d_ff 3584） | ✅ 28.59 GiB / 0.97 s/step / 529 tok/s | ❌ OOM | ❌ OOM |
+| 1.13B（20 层 / d_ff 2816） | ✅ | ✅ 25.15 GiB / 1.24 s / 825 tok/s | ❌ OOM |
+
+根因：fp32 的 16 字节/参数（权重 4 + 梯度 4 + Adam m/v 8），1.6B 就占 25.6 GB。
+
+全套 813 passed。
+
 ## [0.9.85] - 2026-11-16
 
 ### 真 V3 架构对齐（6 项）+ 预训练管线

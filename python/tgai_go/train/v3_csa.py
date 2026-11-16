@@ -296,6 +296,17 @@ def _chunk_layout(seg, c):
     cid = np.where(valid, cid_raw, 0)
     n_chunk = np.where(valid, cid_raw + 1, 0).max(axis=1).astype(np.int64)
 
+    # ★ 2026-11-16 修（真实分片上实测崩过）：分段模式会额外开 chunk。
+    #   文档边界处的 `seg[b,t] != seg[b,t-1]` 也会置 bnd=1，所以「总 chunk 数」
+    #   = Σ_docs ceil(doc_len/c)，**可以远大于** ceil(T/c)（一篇 1 token 的文档
+    #   就占一个 chunk）。若仍按 ceil(T/c) 分配 `B*Tc` 个槽位，越界的 slot 会让
+    #   `np.bincount(..., minlength=B*Tc)` 返回更长的数组，随后
+    #   `slot_doc`（长 B*Tc+1）与 `new_doc`（长 B*Tc）长度不一致，
+    #   报 "could not broadcast input array from shape (128,) into shape (127,)"。
+    #   修法：Tc 取「数学下界」与「实际用到的 chunk 数」的较大者。
+    if n_chunk.size:
+        Tc = int(max(Tc, int(n_chunk.max())))
+
     # valid token 的平坦下标（升序）与「每篇文档的序号」
     vpos = np.nonzero(valid.reshape(-1))[0].astype(np.int64)
     doc_start = np.zeros((B, Tlen), bool)
