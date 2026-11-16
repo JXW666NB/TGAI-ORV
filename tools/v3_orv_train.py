@@ -126,10 +126,7 @@ def main():
                                "--format=csv,noheader,nounits"],
                               capture_output=True, text=True).stdout.splitlines()[0])
     if a.attn_res:
-        raise SystemExit(
-            "--attn-res 还没有接线到层循环：参数能建，但循环仍是普通残差，直接跑等于训出一个假模型。"
-            "修法：把 main() 的层循环换成 v3_attnres.run_attn_res_layers（该函数已实现并数值验证 1.9e-06），"
-            "再用本开关")
+        from v3_orv_attnres_loop import run_layers_attn_res   # 同目录脚本，直接导入
     cfg = dict(d=a.d, d_ff=4 * a.d, E=a.E, layers=a.layers,
                n_q=a.n_q, n_kv=2, vocab=4096, seq=a.seq, steps=a.steps,
                attn_res=bool(a.attn_res), attn_res_block=2)
@@ -150,7 +147,10 @@ def main():
         tgt = np.roll(ids, -1)
         t0 = time.time()
         x = P["emb"][ids].reshape(1, a.seq, a.d)          # 嵌入（整数索引）→ (1,T,d)
-        for L in P["layers"]:
+        if a.attn_res:
+            # BlockAttnRes 走四段式循环（attn 前/后各一次深度注意力），已数值验证 1.9e-06
+            x = run_layers_attn_res(x, P, cfg, cos, sin, a)
+        for L in ([] if a.attn_res else P["layers"]):
             if a.chunk > 0:
                 from tgai_go.train import v3_attn_chunked as CH
                 attn = CH.attention_orv_chunked(V.rmsnorm_orv(x, L["ln1"]),
