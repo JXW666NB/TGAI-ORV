@@ -3795,6 +3795,28 @@ class CudaRuntime:
             return
         self._pool_trim_to(_POOL_IDLE_KEEP, sync=False)
 
+    def _device_total_bytes(self):
+        """设备总显存（**只查一次**并缓存）。
+
+        `cuMemGetInfo` 实测约 77 µs/次，属于驱动调用，绝不能放在分配热路径上。
+        返回 0 表示查不到（调用方按"未知"处理，保持保守行为）。
+        """
+        tot = getattr(self, "_dev_total_bytes", None)
+        if tot is not None:
+            return int(tot)
+        info = (getattr(self.cu, "cuMemGetInfo_v2", None)
+                or getattr(self.cu, "cuMemGetInfo", None))
+        val = 0
+        if info is not None:
+            try:
+                free_b, total_b = ctypes.c_size_t(), ctypes.c_size_t()
+                if info(ctypes.byref(free_b), ctypes.byref(total_b)) == 0:
+                    val = int(total_b.value)
+            except Exception:
+                val = 0
+        self._dev_total_bytes = val
+        return val
+
     def free_device_bytes(self):
         """设备当前可用字节；查不到返回 None。"""
         info = getattr(self.cu, "cuMemGetInfo_v2", None) or getattr(self.cu, "cuMemGetInfo", None)
@@ -3919,7 +3941,16 @@ class CudaRuntime:
             #   改成看**设备真实空闲显存**：真不够（< 本次申请 + 1 GiB 余量）才同步回收。
             #   正常情况直接 cuMemAlloc；失败路径下面仍有 empty_cache + 重试兜底。
             need = int(bucket) + (1 << 30)
-            free_b = self.free_device_bytes()
+            # ★ 2026-11-17 性能修复：只在**接近显存上限**时才问驱动。
+            #   `free_device_bytes()` 是一次 `cuMemGetInfo`，实测约 77 µs/次。
+            #   1.5B 训练一步池未命中约 500 次 ⇒ 光这一项就白烧约 38 ms CPU
+            #   （cProfile：free_device_bytes 496 次 / 0.038 s）。
+            #   而它只在"要不要同步+回收集群"这个决策里用到，显存宽裕时毫无意义。
+            #   做不到判断时（总量未知）保持原行为，绝不牺牲 OOM 兜底。
+            tot = self._device_total_bytes()
+            _occupied = int(self._pool_live_bytes + self._pool_cached_bytes)
+            _near = (tot <= 0) or (_occupied + int(bucket) > int(tot * 0.88))
+            free_b = self.free_device_bytes() if _near else None
             if free_b is not None and free_b < need and self._pool_cached_bytes:
                 self._alloc_retry = True
                 try:
