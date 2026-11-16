@@ -888,6 +888,8 @@ def build_arg_parser():
     g.add_argument("--resume", default=None,
                    help="checkpoint 目录（或 --out 根目录，取最新的）")
     g.add_argument("--no-final-save", action="store_true", help="结束时不再存（大模型省盘）")
+    g.add_argument("--grad-ckpt", dest="grad_ckpt", action="store_true",
+                   help="梯度重算：每层前向不建图、反向重跑（省激活显存，多花约一层的前向时间）")
     g.add_argument("--reschedule", action="store_true",
                    help="允许续训时改 LR 计划（默认严格校验一致）")
     # ---- 其它 ----
@@ -935,6 +937,10 @@ def _vram_peak(stop, base, out):
 def _expand_cfg(a):
     cfg = dict(d=a.d, d_ff=(a.d_ff or 4 * a.d), E=a.E, layers=a.layers,
                n_q=a.n_q, n_kv=2, vocab=a.vocab, seq=a.seq)
+    if getattr(a, "grad_ckpt", False):
+        # 梯度重算：用算力换显存（每层前向不建图，反向重跑）。
+        # 原型实测梯度逐位等价；默认关闭，只有显式 --grad-ckpt 才开。
+        cfg["grad_ckpt"] = True
     if int(a.csa) > 0:
         cfg.update(csa=int(a.csa), n_kv_attn=a.n_q, rope_theta=500000.0,
                    csa_compress=4, csa_conv_kernel=3, csa_local_window=0)

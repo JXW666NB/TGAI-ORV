@@ -733,6 +733,34 @@ def _mlp_part(h, i, L, cfg, opts, state=None):
     return mo.reshape(1, seq, d)
 
 
+def _checkpoint_layer(fn, x):
+    """梯度重算：`fn(x)` 前向不建图，反向时用原始 `x` 重跑再反传。
+
+    原型已验证梯度**逐位等价**（`lab/prof/ckpt_proto.py`，max_abs = 0.000e+00）。
+    注意 `Tensor.detach()` 在 ORV 上是**拷贝**不是视图（实测 ptr 不同），
+    所以这里会多一份层输入（seq512 下约 2 MB/层），这是重算的必要代价。
+
+    只在 `cfg["grad_ckpt"]` 打开时使用；默认路径完全不走这里。
+    """
+    Tn = T.Tensor
+    if not isinstance(x, Tn) or not x.requires_grad:
+        return fn(x)
+    out = fn(x.detach())                     # 不建图，中间量随即释放
+    res = Tn._from_gpu(out._gpu, requires_grad=True, _parents=(x,))
+
+    def bw(g, grads):
+        sub = fn(x)                          # 用原始输入重跑，建图
+        x.grad = None
+        sub.backward(g)                      # 子图反传（写自己那些参数的 .grad）
+        if x.grad is not None:
+            from . import _acc as _acc_fn
+            _acc_fn(grads, x, x.grad._gpu)
+            x.grad = None
+
+    res._backward = bw
+    return res
+
+
 def forward_logits(P, cfg, kinds, plan, cos, sin, ids, opts=None,
                    counts=None, state=None):
     """整栈前向 → `logits (T, vocab)`。**训练步与对拍脚本共用这一条**。
@@ -775,10 +803,22 @@ def forward_logits(P, cfg, kinds, plan, cos, sin, ids, opts=None,
         # 分支逐行对应：attn 前深度注意力 → 残差 → 边界收块 → mlp 前深度注意力）
         x = AR.run_attn_res_layers(x, layers, attn_res, mlp_res, block_size=bs)
     else:
+        use_ckpt = bool(cfg.get("grad_ckpt"))
         for i, L in enumerate(P["layers"]):
-            attn = _attn_part(x, i, L, cfg, kinds, plan, cos, sin, opts, counts)
-            h = x + attn
-            x = h + _mlp_part(h, i, L, cfg, opts, state)
+            if use_ckpt:
+                # ★ 2026-11-17：梯度重算（用算力换显存）。前向不建图、只留层输入；
+                #   反向时用原始输入重跑这一层再反传。原型已实测梯度**逐位等价**
+                #   （`lab/prof/ckpt_proto.py`：max_abs = 0.000e+00）。
+                def _layer(x, i=i, L=L):
+                    attn = _attn_part(x, i, L, cfg, kinds, plan, cos, sin, opts, counts)
+                    h = x + attn
+                    return h + _mlp_part(h, i, L, cfg, opts, state)
+
+                x = _checkpoint_layer(_layer, x)
+            else:
+                attn = _attn_part(x, i, L, cfg, kinds, plan, cos, sin, opts, counts)
+                h = x + attn
+                x = h + _mlp_part(h, i, L, cfg, opts, state)
     # head 是张量（vocab,d），不是模块 ⇒ 矩阵乘，别当函数调用
     xf = V.rmsnorm_orv(x, P["ln_f"])
     return xf.reshape(seq, d) @ P["head"].transpose(0, 1)
