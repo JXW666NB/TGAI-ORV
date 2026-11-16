@@ -638,7 +638,15 @@ def make_plan(cfg, B, Tlen, seg=None, cache=True):
     plan = CSAPlan(cfg, B, Tlen, seg)
     if key is not None:
         plan._n["_cfg_hold"] = cfg           # 防止 id(cfg) 被复用
-        if len(_PLAN_CACHE) > 16:
+        if seg is not None:
+            # ★ 2026-11-17：`seg` 随 batch 变化 ⇒ 这条 plan **下一步不会再命中**，
+            #   但 plan 会在 GPU 上懒建并缓存张量（`_t`），攒到 16 条就白占显存。
+            #   实测 1.5B / seq1024 只差几十 MB 装不下，正是这类"用不到的缓存"。
+            #   这里只保留**最近一条**按 seg 建的 plan（同一 forward 内 18 个 CSA 层
+            #   共用同一份，命中不受影响），静态 plan（seg is None）仍然留在字典里跨步复用。
+            for _k in [k for k in _PLAN_CACHE if k[-1] is not None]:
+                _PLAN_CACHE.pop(_k, None)
+        elif len(_PLAN_CACHE) > 16:
             _PLAN_CACHE.clear()
         _PLAN_CACHE[key] = plan
     return plan
