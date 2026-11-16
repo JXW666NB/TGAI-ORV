@@ -1,3 +1,31 @@
+## [0.9.85] - 2026-11-16
+
+### 真 V3 架构对齐（6 项）+ 预训练管线
+
+**架构对齐**（3_train_cli.py，全部默认关，--faithful-v3 一次全开）：
+--tie-embeddings、--moe-post-norm、--qk-norm、--pad-id N、
+--moe-balance quantile、--attn-res。
+
+验证（lab/arch_check/check_default_path.py）：
+- 默认路径 **logits 逐位相等**（max_abs=0.000e+00），91 个参数指纹全等
+- 每个开关的参数量变化符合预期：tie 90 / qk_norm 99 / moe_post_norm 95 / pad_id 91 / attn_res 107
+- --faithful-v3 在 V100 上跑通，loss 8.3582（ln4096=8.317，正常）
+
+**预训练管线**（3_pretrain.py）：真实分片数据（memmap）+ LR warmup/cosine +
+梯度裁剪 + NaN/Inf 检测 + checkpoint 滚动 + --resume 续训 + 逐 step jsonl 日志。
+
+V100 实测（真语料 202M tokens / 99 shards / seq512 / d=256 4 层）：
+
+| 项 | 值 |
+| --- | ---: |
+| loss | **11.5737 → 9.7276**（ln(96000)=11.47）|
+| s/step（稳态）| 0.0975 |
+| tok/s | 5252 |
+| 峰值 | 1.63 GiB |
+| **续训一致性** | step25 **10.815651** vs 不中断 **10.815651**；step49 **9.727564** vs **9.727564**（逐位相同）|
+
+全套 812 passed。
+
 ## [0.9.84] - 2026-11-16
 
 ### CSA + 真 V3 混合注意力 + 训练脚本进包
