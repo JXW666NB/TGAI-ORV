@@ -614,6 +614,76 @@ def _load_into_buffer(buf, arr):
         T._cuda().copy_h2d_into(buf, arr)
 
 
+def _buffer_to_np_raw(buf):
+    """保留原 dtype 的 d2h。
+
+    ★ 绝不能用 `_buffer_to_np`：它强制 `astype(np.float32)`，
+    而 `Fp16MomAdamW(state="bf16")` 的 m16/v16 是 **uint16 存 bf16 位模式**，
+    按数值转 fp32 会把位模式当数字解释，读回来是垃圾 ⇒ 续训静默出错。
+    """
+    if isinstance(buf, np.ndarray):
+        return np.ascontiguousarray(buf)
+    return np.ascontiguousarray(T._cuda().d2h(buf))
+
+
+def _load_into_buffer_raw(buf, arr):
+    """按原 dtype 灌回；**dtype 不符必须立刻报错**，不许静默转换。"""
+    arr = np.ascontiguousarray(arr)
+    if tuple(buf.shape) != tuple(arr.shape):
+        raise SystemExit("优化器状态形状不一致：%s vs %s。修法：同一模型才能续训"
+                         % (tuple(buf.shape), tuple(arr.shape)))
+    if buf.dtype != arr.dtype:
+        raise SystemExit(
+            "优化器状态 dtype 不一致：checkpoint %s vs 当前 %s。"
+            "修法：用存盘时相同的 --opt-state（fp16/bf16）续训"
+            % (arr.dtype, buf.dtype))
+    if isinstance(buf, np.ndarray):
+        np.copyto(buf, arr)
+    else:
+        T._cuda().copy_h2d_into(buf, arr)
+
+
+def _save_optimizer_m16(dirpath, opt):
+    """`Fp16MomAdamW` 的 `(t, m16/v16 逐张量)` 落盘（保留 fp16 / uint16-bf16 原 dtype）。"""
+    os.makedirs(dirpath, exist_ok=True)
+    n = len(opt.params)
+    if len(opt.m16) != n or len(opt.v16) != n:
+        raise SystemExit("fp16mom 状态长度与参数数不符（%d/%d vs %d）。修法：优化器被换过？"
+                         % (len(opt.m16), len(opt.v16), n))
+    dt = None
+    for i in range(n):
+        m = _buffer_to_np_raw(opt.m16[i])
+        v = _buffer_to_np_raw(opt.v16[i])
+        if dt is None:
+            dt = str(m.dtype)
+        elif str(m.dtype) != dt:
+            raise SystemExit("m16 各张量 dtype 不一致（%s vs %s）" % (dt, m.dtype))
+        if str(v.dtype) != dt:
+            raise SystemExit("v16 dtype 与 m16 不一致（%s vs %s）" % (v.dtype, dt))
+        np.save(os.path.join(dirpath, "%06d_m" % i), m)
+        np.save(os.path.join(dirpath, "%06d_v" % i), v)
+    with open(os.path.join(dirpath, "t.txt"), "w", encoding="utf-8") as f:
+        f.write("%d\n" % int(getattr(opt, "t", 0)))
+    with open(os.path.join(dirpath, "dtype.txt"), "w", encoding="utf-8") as f:
+        f.write("%s\n" % dt)
+    return n
+
+
+def _load_optimizer_m16(dirpath, opt):
+    n = len(opt.params)
+    mfiles = sorted(glob.glob(os.path.join(dirpath, "*_m.npy")))
+    vfiles = sorted(glob.glob(os.path.join(dirpath, "*_v.npy")))
+    if len(mfiles) != n or len(vfiles) != n:
+        raise SystemExit("fp16mom 状态个数不一致：checkpoint %d/%d，当前参数 %d。"
+                         "修法：同一模型才能续训" % (len(mfiles), len(vfiles), n))
+    for i in range(n):
+        _load_into_buffer_raw(opt.m16[i], np.load(mfiles[i]))
+        _load_into_buffer_raw(opt.v16[i], np.load(vfiles[i]))
+    tp = os.path.join(dirpath, "t.txt")
+    opt.t = int(open(tp, encoding="utf-8").read().strip()) if os.path.exists(tp) else 0
+    return n
+
+
 def save_optimizer(dirpath, opt, half=True):
     """AdamW 的 `(t, m/v 逐张量)` 落盘（目录名与 `ckpt` 的 `opt/` 约定一致）。
 
@@ -623,6 +693,9 @@ def save_optimizer(dirpath, opt, half=True):
       Adam 的一阶/二阶矩降到 fp16 是业界常规做法（相对误差 ~5e-4，远小于 lr 本身），
       换来 checkpoint 从 18 GB 降到 **12 GB**。需要逐位复现时用 `half=False`。
     """
+    if hasattr(opt, "m16") and hasattr(opt, "v16"):
+        # Fp16MomAdamW：状态在 m16/v16（fp16 或 uint16-bf16），走保留 dtype 的实现
+        return _save_optimizer_m16(dirpath, opt)
     os.makedirs(dirpath, exist_ok=True)
     n = len(opt.params)
     if len(opt.m) != n or len(opt.v) != n:
@@ -644,6 +717,8 @@ def save_optimizer(dirpath, opt, half=True):
 
 
 def load_optimizer(dirpath, opt):
+    if hasattr(opt, "m16") and hasattr(opt, "v16"):
+        return _load_optimizer_m16(dirpath, opt)
     n = len(opt.params)
     mfiles = sorted(glob.glob(os.path.join(dirpath, "*_m.npy")))
     vfiles = sorted(glob.glob(os.path.join(dirpath, "*_v.npy")))
@@ -1068,7 +1143,10 @@ def main(argv=None):
                          % (a.opt,))
     # checkpoint 的优化器状态目前只实现了 AdamW 的 (t, m/v) 落盘。
     # 别的优化器不是"存不下"，而是存了也不能正确续训 —— 必须明确拒绝，不能静默错。
-    if a.opt != "adamw" and (a.ckpt_every > 0 or a.resume):
+    if a.opt not in ("adamw", "fp16mom") and (a.ckpt_every > 0 or a.resume):
+        # ★ 2026-11-17：`fp16mom` 已支持（按原 dtype 存 m16/v16，见 _save_optimizer_m16）。
+        #   其余优化器（muon/adafactor/int8）仍然拒绝 —— 存了也不能正确续训，
+        #   必须明确拒绝，不能静默错。
         raise SystemExit(
             "--opt=%s 目前不支持 checkpoint 续训：优化器状态落盘只实现了 AdamW 的 (t, m/v)。"
             "修法：要么用 --opt adamw 跑长训练；要么去掉 --ckpt-every/--resume "
