@@ -26,8 +26,10 @@ def main():
     else:
         os.environ.pop("TG_GRAD_CKPT", None)
 
+    data = (r"D:\TGAI-V3-1.5B\01_corpus\packed_1024" if a.seq >= 1024
+            else r"D:\TGAI-V3-1.5B\01_corpus\packed512\s512")
     sys.argv = ["v3_pretrain",
-                "--data", r"D:\TGAI-V3-1.5B\01_corpus\packed512\s512",
+                "--data", data,
                 "--vocab", "96000", "--seq", str(a.seq), "--d", "1024",
                 "--layers", str(a.layers), "--E", "4", "--n_q", "16",
                 "--d_ff", "2816", "--top_k", "2", "--csa", "4",

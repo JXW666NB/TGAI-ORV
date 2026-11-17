@@ -691,27 +691,36 @@ def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
 
     x = P["emb"][ids.reshape(-1)].reshape(B, Tlen, d)
     counts = {"csa": 0, "global": 0}
+    # ★ 2026-11-17：**预训练有自己的层循环**（不走 `CLI.forward_logits`）。
+    #   重算开关必须在**这里**生效，否则等于没开（实测内核数 6898 完全不变）。
+    use_ckpt = (os.environ.get("TG_GRAD_CKPT", "") not in ("", "0", "false", "False")
+                or bool((cfg or {}).get("grad_ckpt")))
     for Li, L in enumerate(P["layers"]):
-        xn = V.rmsnorm_orv(x, L["ln1"])
-        if kinds[Li] == "csa":
-            attn = C.csa_forward(xn, L["csa"], plan, cos, sin)
-            counts["csa"] += 1
-        else:
-            attn = V.attention_orv(xn, L["wq"], L["wk"], L["wv"], L["wo"], cos, sin,
-                                   d // n_q, n_q, n_kv_attn,
-                                   causal=(am is None), attn_mask=am)
-            counts["global"] += 1
-        h = x + attn
-        hn = V.rmsnorm_orv(h, L["ln2"]).reshape(B * Tlen, d)
-        if int(top_k) == 1:
-            eids, g, _s = MOE.route_top1(hn, L["router"])
-            mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
-        else:
-            eids, gates, _s = MOE.route_topk(hn, L["router"], int(top_k))
-            mo = MOE.moe_topk_orv(hn, eids, gates, L["W1"], L["W2"], L["W3"])
-        if shared:
-            mo = mo + V.situ_glu_orv(hn, L["S1"], L["S2"], L["S3"])
-        x = h + mo.reshape(B, Tlen, d)
+        kind = kinds[Li]
+        # 计数放在循环里做一次（重算会再跑一遍层体，不能在里面计数，否则翻倍）
+        counts["csa" if kind == "csa" else "global"] += 1
+
+        def _layer(x, Li=Li, L=L, kind=kind):
+            xn = V.rmsnorm_orv(x, L["ln1"])
+            if kind == "csa":
+                attn = C.csa_forward(xn, L["csa"], plan, cos, sin)
+            else:
+                attn = V.attention_orv(xn, L["wq"], L["wk"], L["wv"], L["wo"], cos, sin,
+                                       d // n_q, n_q, n_kv_attn,
+                                       causal=(am is None), attn_mask=am)
+            h = x + attn
+            hn = V.rmsnorm_orv(h, L["ln2"]).reshape(B * Tlen, d)
+            if int(top_k) == 1:
+                eids, g, _s = MOE.route_top1(hn, L["router"])
+                mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
+            else:
+                eids, gates, _s = MOE.route_topk(hn, L["router"], int(top_k))
+                mo = MOE.moe_topk_orv(hn, eids, gates, L["W1"], L["W2"], L["W3"])
+            if shared:
+                mo = mo + V.situ_glu_orv(hn, L["S1"], L["S2"], L["S3"])
+            return h + mo.reshape(B, Tlen, d)
+
+        x = CLI._checkpoint_layer(_layer, x) if use_ckpt else _layer(x)
 
     xh = V.rmsnorm_orv(x, P["ln_f"])[:, :Tlen - 1, :].reshape(B * (Tlen - 1), d)
     logits = xh @ P["head"].transpose(0, 1)
