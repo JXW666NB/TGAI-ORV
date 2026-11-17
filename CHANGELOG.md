@@ -1,3 +1,45 @@
+## [0.9.96] - 2026-11-17
+
+### 新增 `rt.pool_dump_live()`：显存归属的**权威口径**
+
+之前想量化"激活占多少"，用 `GpuBuf.__init__/__del__` 挂钩子统计，**结果是错的**：
+`__del__` 在引用环下不保证触发，会留下指向已被池复用内存的**僵尸条目**，
+于是出现"forward 一次没分配该形状、却报告 120 块活着"的自相矛盾。
+
+`pool_dump_live()` 直接读池自己的账本 `_pool_live`（借出时写入、归还时删除），
+与 Python 对象生命周期解耦。返回 `{"blocks", "bytes", "top": [(size, count, total)]}`。
+
+### 用它量出的可靠结论（1.5B / 24 层 / seq1024 / d_ff=3328）
+
+| 时点 | 借出块 | 字节 |
+| --- | ---: | ---: |
+| `build` 后 | 641 | **5.609 GiB**（参数量 5.590 GiB ⇒ 池干净、无泄漏）|
+| forward 后（backward 前）| 3692 | **14.395 GiB** ⇒ **激活 = 8.79 GiB** |
+| backward 后 | 1298 | 11.609 GiB（权重 + 梯度）|
+
+⇒ 之前"激活约 9 GiB、bf16 量化可省 4–5 GiB"的估算**成立**；
+而 4 层/seq512 的激活只有 0.9 GiB（激活随 层数 × seq 线性放大）。
+
+### 同时被证伪的几条（避免以后重复踩）
+
+* 构建器/池**没有**泄漏或重复分配（曾误判"建模型多占 3 倍"——
+  实际是脚本在 `AdamW(params)` 之后才 dump，m/v 构造时就占了 2×1.425 GiB）。
+* `1024×1024` 的 750 块**不是**冗余：它在 seq1024 下就是 `(seq, d)` 残差流的大小，
+  归因到 `mul`(144)/`matmul`(132)/`add`(126) 等真实算子输出。
+* 权重转置**基本不产生拷贝**：`_transpose_cuda` 只打 `_lazy_T`，
+  `_matmul_cuda` 的 2-D 路径走 `gemm_nt`；前向 114 次物化都是**通用路径**的小矩阵
+  （(1024,1024)、(256,1024)），合计约 294 MB。
+
+详见 `docs/ACTIVATION_MEMORY_INVESTIGATION.md`。
+
+### 工具
+
+新增 `lab/prof/pool_live.py`（权威驻留分布）、`build_alloc.py`/`who_alloc.py`/
+`who_1k.py`/`who_materialize.py`（分配事件归因，可靠）；
+`retention.py`/`act_shapes.py` 已标注**证伪、不要再用**。
+
+全套 814 passed。
+
 ## [0.9.95] - 2026-11-17
 
 ### 新增 `--opt int8gpu`：GPU 融合的量化 AdamW（m=int8 分块，v=bf16）
