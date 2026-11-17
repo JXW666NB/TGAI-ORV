@@ -332,6 +332,23 @@ _CUDA_INST = None
 _CUDA_TOKEN = -1
 
 
+def device_caps():
+    """探测本机 GPU 的精度能力（cc / fp16_arith / bf16_arith / bf16_store）。
+
+    V100：cc=(7,0)、fp16_arith=True、bf16_arith=False、**bf16_store=True**
+    （bf16 存储只是 fp32 高 16 位，任何卡都能做）。
+    """
+    return _cuda().device_caps()
+
+
+def precision_policy(storage=None, compute=None):
+    """给出 `(storage, compute)` 精度策略。默认「bf16 存储 + 设备能算的最快精度」。
+
+    存储优先 bf16（同 2 字节但指数范围同 fp32，不下溢）；永不默认 fp16 存储。
+    """
+    return _cuda().resolve_precision(storage, compute)
+
+
 def _cuda():
     """取当前后端实例（P0 抽象后统一走 backend 工厂，默认 CUDA）。
 

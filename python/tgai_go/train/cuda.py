@@ -3805,6 +3805,93 @@ class CudaRuntime:
             return
         self._pool_trim_to(_POOL_IDLE_KEEP, sync=False)
 
+    def device_caps(self):
+        """探测本机 GPU 的精度能力（进程内缓存一次）。
+
+        返回值：
+          `cc`          : (major, minor) 计算能力
+          `fp16_arith`  : 是否支持 fp16 算术/张量核（Volta+，cc >= 7.0）
+          `bf16_arith`  : 是否支持 bf16 算术/张量核（Ampere+，cc >= 8.0）
+          `bf16_store`  : 是否支持 bf16 **存储** —— **任何 GPU 都为真**：
+                          bf16 只是 fp32 的高 16 位（截断/RTP 舍入纯属整数运算，
+                          见本文件 `cast_f32_to_bf16`），不需要任何新硬件指令。
+          `fp16_store`  : 同上，fp16 存储也需要 `cvt` 指令，Volta+ 有；恒为真。
+
+        为什么把「存储」和「算力」分开探测：V100（cc=7.0）没有 bf16 张量核，
+        但把权重/激活/优化器状态**存成 bf16** 再在计算前升到 fp32/fp16，
+        可以拿到同样 2 字节的显存收益，而**指数范围与 fp32 相同、不会下溢**
+        （实测 fp16 存 Adam 的 v 会把 1e-8 压成 0，第 2 步 loss 从 11.7 炸到 135）。
+
+        环境变量用于在旧卡上验证新通路：`TG_FORCE_CC=8.0`、`TG_FORCE_NO_BF16=1`。
+        """
+        caps = getattr(self, "_device_caps", None)
+        if caps is not None:
+            return dict(caps)
+        major = minor = 0
+        try:
+            m, n = ctypes.c_int(), ctypes.c_int()
+            if self.cu.cuDeviceGetAttribute(
+                    ctypes.byref(m), CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    self.dev) == 0:
+                major = int(m.value)
+            if self.cu.cuDeviceGetAttribute(
+                    ctypes.byref(n), CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                    self.dev) == 0:
+                minor = int(n.value)
+        except Exception:
+            major = minor = 0
+        forced = os.environ.get("TG_FORCE_CC", "")
+        if forced:
+            try:
+                a, b = str(forced).split(".")
+                major, minor = int(a), int(b)
+            except Exception:
+                pass
+        cc = major + minor / 10.0
+        bf16_arith = cc >= 8.0
+        if os.environ.get("TG_FORCE_NO_BF16", "") not in ("", "0"):
+            bf16_arith = False
+        caps = {"cc": (major, minor),
+                "fp16_arith": bool(cc >= 7.0),
+                "bf16_arith": bool(bf16_arith),
+                "bf16_store": True,
+                "fp16_store": True}
+        self._device_caps = caps
+        return dict(caps)
+
+    def resolve_precision(self, storage=None, compute=None):
+        """按「用户指定 > 设备能力」给出 `(storage, compute)` 两个 dtype 名。
+
+        存储优先级（用户没说时）：**bf16 > fp32**。
+          bf16 与 fp32 同为 8 位指数 ⇒ 不会下溢；显存只有 fp32 的一半。
+          **永远不默认 fp16 存储** —— Adam 的 v ~1e-8 会在 fp16 里变 0（已实测炸过）。
+        计算优先级（用户没说时）：`bf16_arith ? bf16 : (fp16_arith ? fp16 : fp32)`。
+          V100 上因此是 **bf16 存储 + fp16 计算**；A100/H100 上是 **bf16 + bf16**。
+        """
+        caps = self.device_caps()
+        st = str(storage or "auto").lower()
+        cp = str(compute or "auto").lower()
+        if st in ("", "auto", "none"):
+            st = "bf16" if caps["bf16_store"] else "fp32"
+        if st not in ("bf16", "fp16", "fp32"):
+            raise ValueError("storage dtype 只能是 auto/bf16/fp16/fp32，收到 %r" % (storage,)
+                             + "。修法：传 storage='auto'（推荐，会挑 bf16）或 'bf16'/'fp32'；"
+                               "fp16 存储会让 Adam 的二阶动量 v（~1e-8）下溢成 0")
+        if st == "bf16" and not caps["bf16_store"]:
+            st = "fp32"
+        if cp in ("", "auto", "none"):
+            cp = "bf16" if caps["bf16_arith"] else ("fp16" if caps["fp16_arith"] else "fp32")
+        if cp not in ("bf16", "fp16", "fp32"):
+            raise ValueError("compute dtype 只能是 auto/bf16/fp16/fp32，收到 %r" % (compute,)
+                             + "。修法：传 compute='auto'（按显卡能力挑最快）或显式 "
+                               "'bf16'（需 cc>=8.0）/'fp16'/'fp32'")
+        if cp == "bf16" and not caps["bf16_arith"]:
+            # 没有 bf16 算力就退到 fp16（有张量核）或 fp32
+            cp = "fp16" if caps["fp16_arith"] else "fp32"
+        return {"storage": st, "compute": cp, "caps": caps,
+                "storage_bytes": 2 if st in ("bf16", "fp16") else 4,
+                "compute_supported": (cp != "bf16" or caps["bf16_arith"])}
+
     def _device_total_bytes(self):
         """设备总显存（**只查一次**并缓存）。
 
