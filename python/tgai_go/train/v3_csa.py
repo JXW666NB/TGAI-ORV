@@ -817,13 +817,18 @@ def _attn_chunked(q, k, v, mask, row_mask, scale, cq):
                 for a, b in spans]
         return T.cat(outs, dim=2)
 
-    kd, vd = k.detach(), v.detach()
+    # k/v 各只需一份**线性**副本（O(T*D)），不随 seq² 增长
+    kd_gpu = k.detach()._gpu
+    vd_gpu = v.detach()._gpu
     pieces = []
     for a, b in spans:
-        qs = s2(q, a, b).detach()
+        qg = s2(q, a, b)._gpu                       # 块级小拷贝 O(cq*D)
         ms, rs = s2(mask, a, b), s2(row_mask, a, b)
-        o = _attn(qs, kd, vd, ms, rs, scale)
-        pieces.append((a, b, qs, ms, rs, o._gpu))
+        # 前向用**不带梯度**的叶子 ⇒ 不建图 ⇒ 中间量随即释放
+        o = _attn(Tn._from_gpu(qg, requires_grad=False),
+                  Tn._from_gpu(kd_gpu, requires_grad=False),
+                  Tn._from_gpu(vd_gpu, requires_grad=False), ms, rs, scale)
+        pieces.append((a, b, qg, ms, rs, o._gpu))
 
     buf = _cat_dim2([p[5] for p in pieces])
     res = Tn._from_gpu(buf, requires_grad=True, _parents=(q, k, v))
@@ -832,19 +837,23 @@ def _attn_chunked(q, k, v, mask, row_mask, scale, cq):
         from . import _acc as _acc_fn
         gt = Tn._from_gpu(g, requires_grad=False)
         dq_bufs = []
-        for a, b, qs, ms, rs, _o in pieces:
-            gc = gt[:, :, a:b]
-            sub = _attn(qs, kd, vd, ms, rs, scale)
-            qs.grad = None
-            kd.grad = None
-            vd.grad = None
-            sub.backward(gc)
-            if qs.grad is not None:
-                dq_bufs.append(qs.grad._gpu)
-            if k.requires_grad and kd.grad is not None:
-                _acc_fn(grads, k, kd.grad._gpu)
-            if v.requires_grad and vd.grad is not None:
-                _acc_fn(grads, v, vd.grad._gpu)
+        for a, b, qg, ms, rs, _o in pieces:
+            # ★ 重算必须用**带梯度的叶子**：这样 sub.backward() 之后能直接读 .grad，
+            #   而不会顺着切片反传回 q._backward 把整张图重算一遍。
+            ql = Tn._from_gpu(qg, requires_grad=True)
+            kl = Tn._from_gpu(kd_gpu, requires_grad=True)
+            vl = Tn._from_gpu(vd_gpu, requires_grad=True)
+            ql.grad = None
+            kl.grad = None
+            vl.grad = None
+            sub = _attn(ql, kl, vl, ms, rs, scale)
+            sub.backward(gt[:, :, a:b])
+            if ql.grad is not None:
+                dq_bufs.append(ql.grad._gpu)
+            if k.requires_grad and kl.grad is not None:
+                _acc_fn(grads, k, kl.grad._gpu)
+            if v.requires_grad and vl.grad is not None:
+                _acc_fn(grads, v, vl.grad._gpu)
         if q.requires_grad and dq_bufs:
             _acc_fn(grads, q, _cat_dim2(dq_bufs))
 
