@@ -2066,6 +2066,63 @@ extern "C" __global__ void cast_f32_to_bf16(const float* __restrict__ src,
     }
 }
 
+/* 带广播的逐元素乘：按 stride 直接读两个操作数，**不物化广播缓冲**。
+
+ * 现在 `mul` 遇到广播要先 `broadcast_to` 出整尺寸副本（每步 196 次、16% 的内核），
+ * 那些副本纯粹是浪费：既多一次全尺寸写+读，又多一次分配。
+ * 索引算法与 `broadcast_to8` 完全一致（最后一维最快），所以结果**逐位等价**。
+ */
+extern "C" __global__ void mul_bcast8(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ out, int n,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int pa0, int pa1, int pa2, int pa3, int pa4, int pa5, int pa6, int pa7,
+    int pb0, int pb1, int pb2, int pb3, int pb4, int pb5, int pb6, int pb7) {
+  int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+  if (i >= n) return;
+  int shp[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+  int sa[8] = {pa0, pa1, pa2, pa3, pa4, pa5, pa6, pa7};
+  int sb[8] = {pb0, pb1, pb2, pb3, pb4, pb5, pb6, pb7};
+  int rem = i;
+  int ia = 0;
+  int ib = 0;
+  for (int d = 7; d >= 0; --d) {
+    int sz = shp[d];
+    if (sz <= 1) continue;
+    int idx = rem % sz;
+    rem /= sz;
+    ia += idx * sa[d];
+    ib += idx * sb[d];
+  }
+  out[i] = __fmul_rn(a[ia], b[ib]);
+}
+
+/* 带广播的逐元素加：与 `mul_bcast8` 同一套索引，只是把乘换成加。 */
+extern "C" __global__ void add_bcast8(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ out, int n,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int pa0, int pa1, int pa2, int pa3, int pa4, int pa5, int pa6, int pa7,
+    int pb0, int pb1, int pb2, int pb3, int pb4, int pb5, int pb6, int pb7) {
+  int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+  if (i >= n) return;
+  int shp[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+  int sa[8] = {pa0, pa1, pa2, pa3, pa4, pa5, pa6, pa7};
+  int sb[8] = {pb0, pb1, pb2, pb3, pb4, pb5, pb6, pb7};
+  int rem = i;
+  int ia = 0;
+  int ib = 0;
+  for (int d = 7; d >= 0; --d) {
+    int sz = shp[d];
+    if (sz <= 1) continue;
+    int idx = rem % sz;
+    rem /= sz;
+    ia += idx * sa[d];
+    ib += idx * sb[d];
+  }
+  out[i] = __fadd_rn(a[ia], b[ib]);
+}
+
 extern "C" __global__ void cast_bf16_to_f32(const unsigned short* __restrict__ src,
                                             float* __restrict__ dst, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4942,6 +4999,75 @@ class CudaRuntime:
             (d_inner, ctypes.c_int),
             (off, ctypes.c_int),
         ])
+        return out
+
+    def _bcast_strides(self, src, shape):
+        """某个操作数在目标形状下的字节步长（广播维填 0）。与 `broadcast_to` 的算法一致。
+
+        注意 `_row_strides` 收的是**形状**不是缓冲。
+        """
+        shape = tuple(int(s) for s in shape)
+        ndim = len(shape)
+        src = tuple(int(s) for s in src)
+        aligned = (1,) * (ndim - len(src)) + src
+        raw = self._row_strides(src)
+        base = ndim - len(src)
+        strides = []
+        for i, a in enumerate(aligned):
+            if i < base or a == 1:
+                strides.append(0)
+            else:
+                strides.append(int(raw[i - base]))
+        return strides
+
+    def mul_bcast(self, a, b, a_shape, b_shape, out_shape):
+        """带广播的逐元素乘：**一次内核**，不物化任何广播副本。
+
+        原来 `mul` 遇到广播先 `broadcast_to` 出整尺寸副本（每步 196 次 =
+        一步 16% 的内核，且每次都是一次全尺寸写 + 一次全尺寸读）。
+        这里把索引映射放进内核，结果与"先物化再乘"**逐位等价**
+        （同一个乘法、同一对元素，只是不再经过中间缓冲）。
+        """
+        out_shape = tuple(int(s) for s in out_shape)
+        out = self.empty(out_shape, dtype=np.float32)
+        n = int(out.n)
+        if n:
+            if n > 2147483647:
+                raise CudaError("mul_bcast 元素个数超过 int32"
+                                + "。修法：把张量分块相乘；或改用非广播路径")
+            grid, block = self._ewise_grid(n)
+            self._activate()
+            self.launch("mul_bcast8", grid, block, [
+                self._ptr(a), self._ptr(b), self._ptr(out), (n, ctypes.c_int),
+            ] + [(int(s), ctypes.c_int) for s in self._left_pad8(out_shape, 1)]
+              + [(int(s), ctypes.c_int)
+                 for s in self._left_pad8(
+                     self._bcast_strides(a_shape, out_shape), 0)]
+              + [(int(s), ctypes.c_int)
+                 for s in self._left_pad8(
+                     self._bcast_strides(b_shape, out_shape), 0)])
+        return out
+
+    def add_bcast(self, a, b, a_shape, b_shape, out_shape):
+        """带广播的逐元素加：一次内核，不物化广播副本（与 `mul_bcast` 同构）。"""
+        out_shape = tuple(int(s) for s in out_shape)
+        out = self.empty(out_shape, dtype=np.float32)
+        n = int(out.n)
+        if n:
+            if n > 2147483647:
+                raise CudaError("add_bcast 元素个数超过 int32"
+                                + "。修法：把张量分块相加；或改用非广播路径")
+            grid, block = self._ewise_grid(n)
+            self._activate()
+            self.launch("add_bcast8", grid, block, [
+                self._ptr(a), self._ptr(b), self._ptr(out), (n, ctypes.c_int),
+            ] + [(int(s), ctypes.c_int) for s in self._left_pad8(out_shape, 1)]
+              + [(int(s), ctypes.c_int)
+                 for s in self._left_pad8(
+                     self._bcast_strides(a_shape, out_shape), 0)]
+              + [(int(s), ctypes.c_int)
+                 for s in self._left_pad8(
+                     self._bcast_strides(b_shape, out_shape), 0)])
         return out
 
     def _broadcast_lead(self, sa, sb):

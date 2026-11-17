@@ -862,10 +862,15 @@ class Tensor:
         if self.device != "cuda" or other.device != "cuda":
             raise RuntimeError("add 不能混用 CPU 和 CUDA 张量" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         rt = _cuda()
-        buf = rt.add(self._gpu, other._gpu)
+        a_shape, b_shape = tuple(self.shape), tuple(other.shape)
+        if a_shape == b_shape:
+            buf = rt.add(self._gpu, other._gpu)
+        else:
+            # ★ 2026-11-17：带广播的加也走单内核，不再物化广播副本
+            out_shape = _broadcast_shape(a_shape, b_shape)
+            buf = rt.add_bcast(self._gpu, other._gpu, a_shape, b_shape, out_shape)
         rg = self.requires_grad or other.requires_grad
         out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
-        a_shape, b_shape = tuple(self.shape), tuple(other.shape)
         out_shape = tuple(buf.shape)
 
         def bw(g, grads):
@@ -905,9 +910,10 @@ class Tensor:
             out_shape = a_shape
         else:
             out_shape = _broadcast_shape(a_shape, b_shape)
-            aa = a if a_shape == out_shape else rt.broadcast_to(a, out_shape)
-            bb = b if b_shape == out_shape else rt.broadcast_to(b, out_shape)
-            buf = rt.mul(aa, bb)
+            # ★ 2026-11-17：不再物化广播副本，直接按 stride 一次乘完。
+            #   原来这里是 `broadcast_to(a)` + `broadcast_to(b)` + `mul`（最多 3 个内核），
+            #   而 `broadcast_to8` 在 4 层/seq512 的一步里占 **196 次 / 16%**。
+            buf = rt.mul_bcast(a, b, a_shape, b_shape, out_shape)
         rg = self.requires_grad or other.requires_grad
         out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
 
