@@ -32,9 +32,12 @@ def main():
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--opt", default="adamw")
+    ap.add_argument("--d_ff", type=int, default=2816)
+    ap.add_argument("--no-opt", action="store_true",
+                    help="不建优化器（只测权重+激活，避免 m/v 挤爆显存）")
     a = ap.parse_args()
 
-    cfg = dict(d=1024, d_ff=2816, E=4, layers=a.layers, n_q=16, n_kv=2,
+    cfg = dict(d=1024, d_ff=a.d_ff, E=4, layers=a.layers, n_q=16, n_kv=2,
                vocab=96000, seq=a.seq, attn_res=False, attn_res_block=2,
                top_k=2, csa=4, n_kv_attn=16, rope_theta=500000.0,
                csa_compress=4, csa_conv_kernel=3, csa_local_window=0)
@@ -42,7 +45,7 @@ def main():
     P = CLI.build(cfg, rng)
     kinds = CLI.layer_kinds(cfg)
     params = CLI.params_of(P)
-    opt = T.optim.AdamW(params, lr=3e-4)
+    opt = None if a.no_opt else T.optim.AdamW(params, lr=3e-4)
     csac = cfg["csa_cfg"]
     seq = int(cfg["seq"])
     plan = C.make_plan(csac, 1, seq)
@@ -69,7 +72,8 @@ def main():
         if step == 0:
             print("  ---- backward 之后 ----")
             show("after backward")
-        opt.step()
+        if opt is not None:
+            opt.step()
         rt.sync()
     ps = rt.pool_stats()
     print("\n  pool: peak_live=%.3f GiB  cached=%.3f GiB"
