@@ -1244,6 +1244,26 @@ def main(argv=None):
     th = threading.Thread(target=_vram_peak, args=(stop_ev, base_mib, prof), daemon=True)
     th.start()
 
+    # ── 数据并行（可选）：TGAI_DP_WORLD>1 时启用 ──
+    #   契约（见 dist.DataParallel 的 docstring）：
+    #     * 建好模型后先 broadcast 一次，保证各 rank 权重逐位相同；
+    #     * 每个 rank 吃**不同的**样本（这里用"跳过前 rank 个 batch"的简单做法，
+    #       多读 world-1 份数据换取实现简单、不碰语料迭代器的内部状态）；
+    #     * 反向之后、裁剪之前做 all_reduce（默认**取平均**）⇒ 与单卡语义一致；
+    #       要让等效 batch 变大，按 world 放大 lr。
+    _dp = None
+    try:
+        _dpworld = int(os.environ.get("TGAI_DP_WORLD", "1"))
+    except Exception:
+        _dpworld = 1
+    if _dpworld > 1:
+        from . import dist as _dist_mod
+        _dp = _dist_mod.DataParallel()
+        _dp.broadcast(params)
+        if _dp.rank == 0:
+            print("[dp] world=%d rank=%d job=%s dir=%s"
+                  % (_dp.world, _dp.rank, _dp.job, _dp.dir), flush=True)
+
     hist_tail = []
     losses, secs = [], []
     t_run0 = _now()
@@ -1253,7 +1273,15 @@ def main(argv=None):
         for step in range(start_step, stop_step):
             lr = sched.step()
             t0 = _now()
-            ids, labels, seg = corpus.take(int(a.batch))
+            if _dp is not None:
+                # 每个 rank 取不同的样本：先跳掉 rank 份，取自己那份，再跳掉后面剩下的。
+                for _ in range(_dp.rank):
+                    corpus.take(int(a.batch))
+                ids, labels, seg = corpus.take(int(a.batch))
+                for _ in range(_dp.world - 1 - _dp.rank):
+                    corpus.take(int(a.batch))
+            else:
+                ids, labels, seg = corpus.take(int(a.batch))
             opt.zero_grad()
             loss, fmeta = forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
                                        top_k=int(a.top_k), shared=(not a.no_shared),
@@ -1264,6 +1292,10 @@ def main(argv=None):
                 break
             loss.backward()
             del loss
+            # ★ 必须在裁剪**之前**归约：否则 gnorm 只是本 rank 的范数，
+            #   裁剪阈值在各 rank 上会不一致，梯度就不同步了。
+            if _dp is not None:
+                _dp.all_reduce_grads(params)
             gnorm = float(T.clip_grad_norm_(params, float(a.grad_clip))) \
                 if float(a.grad_clip) > 0 else 0.0
             if not _is_finite(gnorm):
