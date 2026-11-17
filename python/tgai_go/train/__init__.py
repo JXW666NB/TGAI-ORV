@@ -918,14 +918,16 @@ class Tensor:
         out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
 
         def bw(g, grads):
+            # ★ 2026-11-17：反向也不再物化广播副本。原来是
+            #   `broadcast_to(b) + mul + unbroadcast`（3 个内核），
+            #   现在 `mul_bcast(g, b) + unbroadcast`（2 个），且**归约顺序不变**
+            #   （仍由 `unbroadcast` 完成）⇒ 逐位等价。
             if self.requires_grad:
-                rhs = b if b_shape == out_shape else rt.broadcast_to(b, out_shape)
-                prod = rt.mul(g, rhs)
+                prod = rt.mul_bcast(g, b, out_shape, b_shape, out_shape)
                 src = prod if a_shape == out_shape else rt.unbroadcast(prod, a_shape)
                 _acc(grads, self, src)
             if other.requires_grad:
-                lhs = a if a_shape == out_shape else rt.broadcast_to(a, out_shape)
-                prod = rt.mul(g, lhs)
+                prod = rt.mul_bcast(g, a, out_shape, a_shape, out_shape)
                 src = prod if b_shape == out_shape else rt.unbroadcast(prod, b_shape)
                 _acc(grads, other, src)
         out._backward = bw
