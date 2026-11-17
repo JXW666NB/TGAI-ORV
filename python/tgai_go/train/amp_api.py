@@ -44,27 +44,71 @@ def _rt():
     return _cuda()
 
 
-def _set(on, dtype="fp16", weight_cache=True):
+def _auto_compute_dtype():
+    """按显卡能力挑**计算**精度：有 bf16 张量核 → bf16；只有 fp16 → fp16；都没有 → fp32。
+
+    存储精度不走这里 —— 见 `T.precision_policy()['storage']`（默认 bf16，任何卡都行）。
+    """
+    try:
+        import tgai_go.train as T
+        return T.precision_policy()["compute"]
+    except Exception:
+        return "fp16"
+
+
+def _set(on, dtype="auto", weight_cache=True):
     """底层开关：按 dtype 设置 fp16 或 bf16 的 GEMM 路径。"""
     rt = _rt()
+    if not on:
+        # 关 AMP 时两条路径都关。否则在 bf16 机器上 amp_off() 只关掉 fp16，
+        # bf16 仍在开（默认 dtype 从 'fp16' 改成 'auto' 后这会更常见）。
+        f16 = rt._fp16_state() if hasattr(rt, "_fp16_state") else {"on": False}
+        f16["on"] = False
+        if hasattr(rt, "_bf16_state"):
+            rt._bf16_state()["on"] = False
+        if hasattr(rt, "f16_cache_enable"):
+            rt.f16_cache_enable(False)
+        return f16
     kind = str(dtype).lower()
+    if kind in ("", "auto", "none", "bfloat16"):
+        # 'auto' 或 bf16 别名都按策略解析；bf16 在没有 bf16 算力的卡上会被降成 fp16
+        kind = _auto_compute_dtype() if kind in ("", "auto", "none") else "bf16"
+    if kind == "fp32":
+        # 策略说没有可用的低精度算力：不启用 AMP，保持全 fp32（不是错误）
+        f16 = rt._fp16_state() if hasattr(rt, "_fp16_state") else {"on": False}
+        f16["on"] = False
+        if hasattr(rt, "_bf16_state"):
+            rt._bf16_state()["on"] = False
+        if hasattr(rt, "f16_cache_enable"):
+            rt.f16_cache_enable(False)
+        return f16
     if kind in ("bf16", "bfloat16"):
         if not hasattr(rt, "_bf16_state"):
             raise RuntimeError("该后端没有 bf16 GEMM 支持" + "。修法：用 dtype='fp16'")
         st = rt._bf16_state()
         st["on"] = bool(on)
+        # 切换精度时必须把另一条路径关掉，否则 fp16/bf16 会同时开着
+        if hasattr(rt, "_fp16_state"):
+            rt._fp16_state()["on"] = False
         return st
     if hasattr(rt, "_fp16_state") is False:
         raise RuntimeError("该后端没有 fp16 GEMM 支持（只有 CUDA 后端有）" +
                            "。修法：T.set_default_device('cuda') 后再用 amp")
     st = rt._fp16_state()
     st["on"] = bool(on)
+    if hasattr(rt, "_bf16_state"):
+        rt._bf16_state()["on"] = False
     if hasattr(rt, "f16_cache_enable"):
         rt.f16_cache_enable(bool(on) and bool(weight_cache))
     return st
 
 
-def amp_on(dtype="fp16", weight_cache=True):
+def amp_on(dtype="auto", weight_cache=True):
+    """打开 AMP。`dtype='auto'`（默认）按显卡能力自动选计算精度。
+
+    V100（cc 7.0）→ fp16；A100/H100（cc≥8.0）→ bf16；都没有 → 自动保持 fp32。
+    **存储**精度另由 `T.precision_policy()['storage']` 决定（默认 bf16，任何卡都支持）。
+    """
     """打开 AMP（不用 with 时用这个）。"""
     _set(True, dtype, weight_cache)
     return amp_state()
