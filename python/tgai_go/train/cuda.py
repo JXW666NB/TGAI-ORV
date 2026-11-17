@@ -6474,7 +6474,7 @@ class CudaRuntime:
             self._bf16_shadow_bytes += count * 2
         return out
 
-    def _cast_bf16_to_f32_flat(self, src_buf, count):
+    def _cast_bf16_to_f32_flat(self, src_buf, count, shape=None):
         """把 bf16（uint16 位模式）缓冲升回 fp32。
 
         与 `cast_f32_to_bf16` 的 RTNE 收窄配对后，往返误差上界是 **2^-9 ≈ 1.95e-3**
@@ -6482,9 +6482,14 @@ class CudaRuntime:
         `dst[i] = __uint_as_float((unsigned int)src[i] << 16)`，纯左移，不丢位。
 
         **不做影子缓存**：这是"读时升回来"的路径，缓存住升精度结果就等于没省显存。
+
+        `shape` 给出时**直接按该形状分配**，不经过 `reshape` —— 之前先用一维分配
+        再 reshape 回原形状，实测在算子路径上引出 `ctypes.ArgumentError: RecursionError`，
+        直接按目标形状分配可以绕开那条链。
         """
         count = int(count)
-        out = self.empty((count,), dtype=np.float32)
+        out = self.empty(tuple(shape) if shape is not None else (count,),
+                         dtype=np.float32)
         if count:
             if count > 2147483647:
                 raise CudaError("bf16->f32 元素数超过 int32"

@@ -66,7 +66,7 @@ def main():
     a = np.asarray(rt.d2h(y1._gpu))
     b = np.asarray(rt.d2h(y2._gpu))
     rel = float(np.abs(a - b).max() / max(1e-30, np.abs(a).max()))
-    print("  经 matmul 的相对差 = %.3e（应 ≲2^-9）" % rel)
+    print("  matmul 相对差 = %.3e （应 <= 2^-9）" % rel)
 
 
 if __name__ == "__main__":
