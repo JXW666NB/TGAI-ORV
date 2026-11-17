@@ -3774,6 +3774,30 @@ class CudaRuntime:
             )[:8],
         }
 
+    def pool_dump_live(self, top=20):
+        """当前**借出未还**的显存按块大小分布 —— 直接读池自己的账本。
+
+        为什么不用 `GpuBuf.__init__/__del__` 挂钩子统计：`__del__` 在引用环下
+        不保证触发，会留下**僵尸条目**（指向已被池复用的内存），
+        我实测因此得到"forward 一次没分配该形状、却报告 120 块活着"的自相矛盾结果。
+
+        `self._pool_live` 是唯一权威来源：借出时写入、归还时删除（`_pool_checkout` /
+        `_pool_return`），与 Python 对象生命周期解耦。
+
+        返回 `{"blocks", "bytes", "top": [(size_bytes, count, total_bytes), ...]}`，
+        按 total_bytes 降序。元素个数 = size_bytes // 4（fp32）。
+        """
+        by = {}
+        tot = 0
+        for rec in self._pool_live.values():
+            sz = int(rec[0])
+            by[sz] = by.get(sz, 0) + 1
+            tot += sz
+        rows = sorted(((sz, n, sz * n) for sz, n in by.items()),
+                      key=lambda t: (-t[2], -t[0]))
+        return {"blocks": len(self._pool_live), "bytes": tot,
+                "top": rows[:int(top)]}
+
     def _pool_note(self):
         if self._pool_live_bytes > self._pool_peak_live:
             self._pool_peak_live = self._pool_live_bytes
