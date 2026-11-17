@@ -6141,6 +6141,28 @@ class CudaRuntime:
             self._bf16_shadow_bytes += count * 2
         return out
 
+    def _cast_bf16_to_f32_flat(self, src_buf, count):
+        """把 bf16（uint16 位模式）缓冲升回 fp32。
+
+        与 `cast_f32_to_bf16` 的 RTNE 收窄配对后，往返误差上界是 **2^-9 ≈ 1.95e-3**
+        （bf16 只有 8 位尾数）。升宽本身是精确的：内核做
+        `dst[i] = __uint_as_float((unsigned int)src[i] << 16)`，纯左移，不丢位。
+
+        **不做影子缓存**：这是"读时升回来"的路径，缓存住升精度结果就等于没省显存。
+        """
+        count = int(count)
+        out = self.empty((count,), dtype=np.float32)
+        if count:
+            if count > 2147483647:
+                raise CudaError("bf16->f32 元素数超过 int32"
+                                + "。修法：把张量分块升精度；或不要对该张量启用 bf16 存储")
+            grid, block = self._ewise_grid(count)
+            self._activate()
+            self.launch("cast_bf16_to_f32", grid, block, [
+                self._ptr(src_buf), self._ptr(out), (count, ctypes.c_int),
+            ])
+        return out
+
     def _sgemm_bf16(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
         """列主序调用和 _sgemm_f16 / _sgemm 完全一致。
 
