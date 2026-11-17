@@ -88,6 +88,7 @@ y = C.csa_forward(x, w, plan, cos, sin)         # (B,T,d_model)
    正确但非最优；单步开销实测见文末。
 """
 import math
+import os
 
 import numpy as np
 
@@ -755,6 +756,110 @@ def _conv_whole(x, w, causal=True):
 # ═════════════════════════════════════════════════════════════════════════
 # 注意力（4D 组合实现；数学 = SDPA(scale=1/sqrt(d_k), 加性 mask)）
 # ═════════════════════════════════════════════════════════════════════════
+#: 全局分支的 query 分块大小。0 = 关闭（走原来的整体物化路径）。
+#: 打开后峰值从 O(Lq*Lk) 降到 O(cq*Lk)；代价是反向要重算一次注意力。
+#: 用 `set_attn_chunk(n)` 或环境变量 `TG_CSA_ATTN_CQ` 设置。
+_ATTN_CQ = [0]
+
+
+def set_attn_chunk(n):
+    """设置 CSA 全局分支的 query 分块大小（0 = 关闭，走整体物化）。
+
+    为什么是 query 维：softmax 是**逐行**的，把 q 按行切块后每行参与的计算完全相同
+    ⇒ 数学等价；而中间量 `scores/p` 的形状 `(Lq,Lk)` 变成 `(cq,Lk)`。
+    """
+    _ATTN_CQ[0] = max(0, int(n))
+    return _ATTN_CQ[0]
+
+
+def _env_attn_chunk():
+    v = os.environ.get("TG_CSA_ATTN_CQ")
+    if v:
+        try:
+            set_attn_chunk(int(v))
+        except Exception:
+            pass
+
+
+def _cat_dim2(bufs):
+    """把若干 (B,H,cq,D) 的缓冲沿第 2 维拼成 (B,H,Lq,D)。"""
+    ts = [T.Tensor._from_gpu(b, requires_grad=False) for b in bufs]
+    return T.cat(ts, dim=2)._gpu
+
+
+def _attn_chunked(q, k, v, mask, row_mask, scale, cq):
+    """`_attn` 的**分块重算**版本：峰值 O(cq*Lk)，数学与整块计算等价。
+
+    做法与 `_checkpoint_layer` 同源（该模式梯度已验逐位等价）：
+    前向在"不建图"的前提下逐块算，只留输出；反向逐块**重跑**再反传，
+    所以每个 chunk 的 scores/p 都活不过一个 chunk。
+
+    ★ 关键点：每个 chunk 的 q 切片必须先 `detach()` 成**叶子**，
+      否则 `sub.backward()` 会顺着切片反传回 `q._backward`，把整张图重算一遍。
+      `detach()` 在 ORV 上是拷贝，但这些拷贝都是 O(cq*D) / O(T*D) 量级（线性）。
+    """
+    Tn = T.Tensor
+    Lq = int(q.shape[2])
+    if cq <= 0 or Lq <= cq:
+        return _attn(q, k, v, mask, row_mask, scale)
+
+    spans = [(i0, min(i0 + cq, Lq)) for i0 in range(0, Lq, cq)]
+
+    def s2(t, i0, i1):
+        return None if t is None else t[:, :, i0:i1]
+
+    need = bool(getattr(q, "requires_grad", False)
+                or getattr(k, "requires_grad", False)
+                or getattr(v, "requires_grad", False))
+
+    if not need:
+        outs = [_attn(s2(q, a, b), k, v, s2(mask, a, b), s2(row_mask, a, b), scale)
+                for a, b in spans]
+        return T.cat(outs, dim=2)
+
+    kd, vd = k.detach(), v.detach()
+    pieces = []
+    for a, b in spans:
+        qs = s2(q, a, b).detach()
+        ms, rs = s2(mask, a, b), s2(row_mask, a, b)
+        o = _attn(qs, kd, vd, ms, rs, scale)
+        pieces.append((a, b, qs, ms, rs, o._gpu))
+
+    buf = _cat_dim2([p[5] for p in pieces])
+    res = Tn._from_gpu(buf, requires_grad=True, _parents=(q, k, v))
+
+    def bw(g, grads):
+        from . import _acc as _acc_fn
+        gt = Tn._from_gpu(g, requires_grad=False)
+        dq_bufs = []
+        for a, b, qs, ms, rs, _o in pieces:
+            gc = gt[:, :, a:b]
+            sub = _attn(qs, kd, vd, ms, rs, scale)
+            qs.grad = None
+            kd.grad = None
+            vd.grad = None
+            sub.backward(gc)
+            if qs.grad is not None:
+                dq_bufs.append(qs.grad._gpu)
+            if k.requires_grad and kd.grad is not None:
+                _acc_fn(grads, k, kd.grad._gpu)
+            if v.requires_grad and vd.grad is not None:
+                _acc_fn(grads, v, vd.grad._gpu)
+        if q.requires_grad and dq_bufs:
+            _acc_fn(grads, q, _cat_dim2(dq_bufs))
+
+    res._backward = bw
+    return res
+
+
+def _attn_auto(q, k, v, mask, row_mask, scale):
+    """按开关决定走整体物化还是分块重算。"""
+    cq = _ATTN_CQ[0]
+    if cq > 0:
+        return _attn_chunked(q, k, v, mask, row_mask, scale, cq)
+    return _attn(q, k, v, mask, row_mask, scale)
+
+
 def _attn(q, k, v, mask, row_mask, scale):
     """`softmax(q·kᵀ·scale + mask) @ v`，q:(B,H,Lq,dk) k/v:(B,H,Lk,dk)。
 
@@ -832,7 +937,9 @@ def csa_forward(x, w, plan, cos, sin):
         v_g = v
 
     # ── 全局压缩分支 ──
-    out_g = _attn(q_g, k_g, v_g, t["mask_g"], t.get("row_g"), scale)
+    # ★ 长序列的唯一二次项就在这里：Lq=T、Lk=Tc=T/c ⇒ (T, Tc) 的 scores。
+    #   开关打开时走 `_attn_auto`（按 query 分块 + 反向重算），峰值 O(cq*Tc)。
+    out_g = _attn_auto(q_g, k_g, v_g, t["mask_g"], t.get("row_g"), scale)
 
     # ── 局部精确窗分支（key 是最后 lk 个 chunk，参考实现口径）──
     lk = plan.lk
@@ -923,3 +1030,7 @@ def weights_from_torch_state_dict(sd, cfg, device=None):
         w["qn"] = p(get("q_norm.weight"))
         w["kn"] = p(get("k_norm.weight"))
     return w
+
+
+# 环境变量开关只需读一次（TG_CSA_ATTN_CQ）；改运行期可用 set_attn_chunk()
+_env_attn_chunk()

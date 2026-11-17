@@ -32,6 +32,31 @@ PyPI 包名 `tgai-orv`，import 路径 `tgai_go.train`。
 5. **插件可以更快，不可以"更准"或"更省事地不同"。** dtype 提升、累加顺序、边界行为（nan/inf/空张量）
    属于核心语义，插件不得改变。
 6. **改代码前先看 `docs/INDEX.md`。** 仓库有 70+ 篇文档，不先读会写出与既有结论冲突的东西。
+### 2.2 先自省：`T.help()` —— 别再靠记忆猜库里有什么（0.9.97+）
+
+ORV 自带内省入口，**不需要 GPU**、不依赖 PyTorch 文档：
+
+```python
+import tgai_go.train as T
+T.help()                        # 总览：前 10 内核 + 10 API + 10 算子（中英双语提示）
+T.help(tag="内核")               # 125 个 CUDA 内核（每页 30；page=2 翻页）
+T.help(tag="API", s="gemm")     # 在运行时 API 里搜 gemm
+T.help(tag="算子", s="mul")      # 在张量算子里搜
+T.help(s="flash")               # 全类别搜索（位置参数也当关键字：T.help("flash")）
+```
+
+`tag` 中英文都认：`内核/kernel`、`API/接口/运行时`、`算子/op`、`优化器/opt`、`模块/mod`。
+
+**为什么把它写成铁律**：实测栽过三次"以为没有、其实早就写好了" ——
+`flash_attn`（分块注意力）、`_checkpoint_layer`（梯度重算）、`pool_dump_live`（显存账本），
+每次都白做一轮。**写新算子/新内核之前，先 `T.help()` 按名字搜一遍。**
+
+插件作者可以给自己的算子/内核登记说明，`T.help()` 立刻可见：
+
+```python
+T.describe("my_fused_kernel", cn="我的融合内核，做 X。", en="My fused kernel doing X.")
+```
+
 
 ### 2.1 硬件已知限制（外部实测，2026-11-12 · P100）
 
