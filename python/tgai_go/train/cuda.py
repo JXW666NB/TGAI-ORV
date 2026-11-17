@@ -7644,8 +7644,10 @@ class CudaRuntime:
                         % (i, entries[i][2].n, entries[i][4].n, n)
                         + "。修法：用 Int8AdamWGpu(state='m8v16') 重建状态")
                 if int(entries[i][3].n) != nb:
-                    raise CudaError("m8v16 AdamW 第 %d 项 scale 块数不对（期望 %d）"
-                                    % (i, nb))
+                    raise CudaError("m8v16 AdamW 第 %d 项 scale 块数不对（期望 %d，实际 %d）"
+                                    % (i, nb, entries[i][3].n)
+                                    + "。修法：用 Int8AdamWGpu(state='m8v16') 重建状态，"
+                                      "或检查 block 是否与分配时一致")
             szs = self.h2d(np.array(sizes, np.int32), dtype=np.int32)
             # 每个张量的**块偏移**（内核里二分用）；线性扫描会把 1.5B 拖慢 2.5 倍
             boff = [0]
