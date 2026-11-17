@@ -1131,28 +1131,19 @@ def main(argv=None):
         opt = T.optim.Muon(params, lr=float(a.muon_lr), momentum=float(a.muon_momentum),
                            weight_decay=float(a.wd), fp16_mom=bool(a.muon_fp16_mom))
     elif a.opt == "int8gpu":
-        # GPU 融合的 int8 分块 AdamW：量化/更新/反量化全在显存里
-        # （`--opt int8` 是主机侧 numpy 版本，1.5B 上要走约 12 GiB PCIe，不可用）
-        #
-        # ★ 2026-11-17 实测：**机制可用、数值不可用**。
-        #   4 层/20 步实测 step0 与基线一致（11.713757），但 step5 起发散：
-        #   loss 16.75 / gnorm 405，step19 gnorm 910。
-        #   原因：Adam 的二阶动量 v 在同一 block 内动态范围达 1e-8~1e-3，
-        #   **线性 int8 量化把小值压成 0** ⇒ m/sqrt(0) 爆掉。
-        #   bitsandbytes 能用 int8 是因为它用 256 项 **quantile 非线性量化表**。
-        #   因此默认**拒绝**，要试必须显式加 --allow-lossy-int8。
-        if not getattr(a, "allow_lossy_int8", False):
-            raise SystemExit(
-                "--opt int8gpu 目前是**有损且实测会发散**的实验路径"
-                "（4 层 20 步：step5 gnorm 405、step19 910）"
-                "。修法：改用 --opt fp16mom --opt-state bf16（已验证，2.125→4.0 字节/参数但数值安全）；"
-                "确实要试验加 --allow-lossy-int8")
+        # GPU 融合的量化 AdamW：量化/更新/反量化全在显存里，一次发射。
+        # 默认 state="m8v16"：m 用 int8、v 用 bf16（≈3.06 字节/参数，安全）。
+        # 纯 int8（≈2.125 字节/参数）**实测会发散**，必须显式 --allow-lossy-int8：
+        #   4 层/20 步：step5 gnorm 405、step19 910（v 在 block 内被线性量化压成 0）
+        #   bnb 能用全 int8 是因为用 256 项 quantile 非线性量化表。
         from tgai_go.train.int8_adamw_gpu import Int8AdamWGpu
+        st = "int8" if getattr(a, "allow_lossy_int8", False) else "m8v16"
         opt = Int8AdamWGpu(params, lr=float(a.lr),
                            betas=(float(a.beta1), float(a.beta2)),
-                           eps=float(a.eps), weight_decay=float(a.wd), block=64)
-        print("[int8gpu] 动量 int8 分块存储：%.3f 字节/参数（bf16 是 4.0，fp32 是 8.0）"
-              % opt.bytes_per_param(), flush=True)
+                           eps=float(a.eps), weight_decay=float(a.wd),
+                           block=64, state=st)
+        print("[int8gpu] state=%s，动量 %.3f 字节/参数（bf16 4.0，fp32 8.0）"
+              % (st, opt.bytes_per_param()), flush=True)
     elif a.opt == "fp16mom":
         from tgai_go.train.opt_fp16mv import Fp16MomAdamW
         opt = Fp16MomAdamW(params, lr=float(a.lr), betas=(float(a.beta1), float(a.beta2)),

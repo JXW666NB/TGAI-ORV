@@ -2214,6 +2214,88 @@ extern "C" __global__ void adamw_multi_int8(
   }
 }
 
+/* m=**int8 分块**、v=**bf16** 的融合 AdamW。
+
+ * 为什么不是两个都 int8：实测（4 层/20 步）全 int8 会发散 ——
+ * Adam 的二阶动量 v 在同一 block 内动态范围达 1e-8~1e-3，**线性 int8 把小值压成 0**
+ * ⇒ m/sqrt(0) 爆炸（step5 gnorm 405、step19 910）。
+ * bnb 能用全 int8 是因为它用 256 项 quantile **非线性**量化表。
+ *
+ * 折中：v 用 bf16（指数范围同 fp32，不下溢），m 用 int8（量级 ~1e-2，线性量化安全）。
+ * 显存 = 1(m) + 2(v) + 4/64(scale) ≈ **3.06 字节/参数**（bf16 是 4.0，fp32 是 8.0）。
+ */
+extern "C" __global__ void adamw_multi_m8v16(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* mqs, const unsigned long long* mss,
+    const unsigned long long* vbs,
+    const int* sizes, const int* boffs, int n_tensors, int block,
+    float b1, float omb1, float b2, float omb2,
+    float lr, float wd_lr, float eps, float bc1, float bc2) {
+  int gw = ((int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x) >> 5;
+  int lane = (int)threadIdx.x & 31;
+  int per = block / 32;
+  if (per < 1) per = 1;
+  if (per > 8) per = 8;
+  /* ★ 二分定位张量。原来是线性扫描 109 个（23M 个 warp × 平均 50 次迭代），
+     1.5B 上实测把一步拖慢到 1.17 s（bf16 版是 0.463 s）。 */
+  int lo = 0;
+  int hi = n_tensors - 1;
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    if (gw < boffs[mid + 1]) hi = mid; else lo = mid + 1;
+  }
+  int ti = lo;
+  long nb_in = (long)gw - (long)boffs[ti];
+  long n = (long)sizes[ti];
+  long i0 = nb_in * block;
+  if (i0 >= n) return;
+
+  float* p = (float*)ps[ti];
+  const float* g = (const float*)gs[ti];
+  signed char* mq = (signed char*)mqs[ti];
+  float* msk = (float*)mss[ti];
+  unsigned short* vb = (unsigned short*)vbs[ti];
+  float sm = msk[nb_in];
+
+  float mv[8];
+  float amx_m = 0.f;
+  for (int k = 0; k < per; ++k) {
+    long i = i0 + lane + k * 32;
+    float m = 0.f;
+    if (i < n) {
+      float gi = g[i];
+      m = (float)mq[i] * sm;
+      float v = __uint_as_float((unsigned int)vb[i] << 16);
+      m = b1 * m + omb1 * gi;
+      v = b2 * v + omb2 * gi * gi;
+      float mh = m / bc1;
+      float vh = v / bc2;
+      float upd = mh / (sqrtf(vh) + eps);
+      float pv = p[i];
+      pv -= lr * (upd + wd_lr * pv);
+      p[i] = pv;
+      amx_m = fmaxf(amx_m, fabsf(m));
+      unsigned int uv = __float_as_uint(v);
+      vb[i] = (unsigned short)((uv + 0x7FFFu + ((uv >> 16) & 1u)) >> 16);
+    }
+    mv[k] = m;
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    amx_m = fmaxf(amx_m, __shfl_xor_sync(0xffffffffu, amx_m, o));
+  }
+  float nsm = amx_m > 0.f ? amx_m / 127.f : 1.f;
+  if (lane == 0) {
+    msk[nb_in] = nsm;
+  }
+  for (int k = 0; k < per; ++k) {
+    long i = i0 + lane + k * 32;
+    if (i < n) {
+      float q1 = rintf(mv[k] / nsm);
+      mq[i] = (signed char)(q1 > 127.f ? 127.f : (q1 < -127.f ? -127.f : q1));
+    }
+  }
+}
+
 extern "C" __global__ void cast_bf16_to_f32(const unsigned short* __restrict__ src,
                                             float* __restrict__ dst, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -7520,6 +7602,68 @@ class CudaRuntime:
         self.launch("adamw_multi_int8", grid, tpb, [
             self._ptr(ps), self._ptr(gs), self._ptr(mqs), self._ptr(vqs),
             self._ptr(mss), self._ptr(vss), self._ptr(szs),
+            (int(n_par), ctypes.c_int), (int(block), ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (float(eps), ctypes.c_float),
+            (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+        ])
+
+    def adamw_multi_m8v16(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps,
+                          bc1, bc2, block=64):
+        """一次发射更新全部参数：`m` 是 int8 分块、`v` 是 bf16。
+
+        `entries` 每项 `(p, g, mq, ms, vb)`：`mq` int8、`ms` 每 block 一个 fp32、`vb` uint16(bf16)。
+        ≈3.06 字节/参数。为什么不全 int8 见内核注释（v 会下溢 ⇒ 实测发散）。
+        """
+        if not entries:
+            return
+        block = int(block)
+        for ent in entries:
+            for buf in ent:
+                self._split_forget_ptr(buf)
+        key = (tuple(id(x) for ent in entries for x in ent), block)
+        tb = getattr(self, "_adamw_m8v16_table", None)
+        if tb is None or tb[0] != key:
+            n_par = len(entries)
+
+            def _ptrs(idx):
+                return self.h2d(np.array([int(ent[idx].ptr) for ent in entries],
+                                         np.uint64), dtype=np.uint64)
+
+            ps, gs = _ptrs(0), _ptrs(1)
+            mqs, mss = _ptrs(2), _ptrs(3)
+            vbs = _ptrs(4)
+            sizes = [int(ent[0].n) for ent in entries]
+            for i, n in enumerate(sizes):
+                nb = (n + block - 1) // block
+                if int(entries[i][2].n) != n or int(entries[i][4].n) != n:
+                    raise CudaError(
+                        "m8v16 AdamW 第 %d 项 mq/vb 长度 ≠ 参数长度（%d/%d vs %d）"
+                        % (i, entries[i][2].n, entries[i][4].n, n)
+                        + "。修法：用 Int8AdamWGpu(state='m8v16') 重建状态")
+                if int(entries[i][3].n) != nb:
+                    raise CudaError("m8v16 AdamW 第 %d 项 scale 块数不对（期望 %d）"
+                                    % (i, nb))
+            szs = self.h2d(np.array(sizes, np.int32), dtype=np.int32)
+            # 每个张量的**块偏移**（内核里二分用）；线性扫描会把 1.5B 拖慢 2.5 倍
+            boff = [0]
+            for n in sizes:
+                boff.append(boff[-1] + (n + block - 1) // block)
+            bos = self.h2d(np.array(boff, np.int64).astype(np.int32),
+                           dtype=np.int32)
+            warps = boff[-1]
+            tb = (key, ps, gs, mqs, mss, vbs, szs, bos, n_par, warps)
+            self._adamw_m8v16_table = tb
+        _, ps, gs, mqs, mss, vbs, szs, bos, n_par, warps = tb
+        if warps <= 0:
+            return
+        grid, tpb = self._ewise_grid(int(warps) * 32)
+        self._activate()
+        self.launch("adamw_multi_m8v16", grid, tpb, [
+            self._ptr(ps), self._ptr(gs), self._ptr(mqs), self._ptr(mss),
+            self._ptr(vbs), self._ptr(szs), self._ptr(bos),
             (int(n_par), ctypes.c_int), (int(block), ctypes.c_int),
             (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
             (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),

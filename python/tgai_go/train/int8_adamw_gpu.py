@@ -34,7 +34,7 @@ class Int8AdamWGpu(object):
     """
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.95), eps=1e-8,
-                 weight_decay=0.1, block=64):
+                 weight_decay=0.1, block=64, state="m8v16"):
         self.params = list(params)
         self.lr = float(lr)
         self.b1 = float(betas[0])
@@ -42,6 +42,10 @@ class Int8AdamWGpu(object):
         self.eps = float(eps)
         self.wd = float(weight_decay)
         self.block = int(block)
+        self.state = str(state)
+        if self.state not in ("m8v16", "int8"):
+            raise ValueError("state 只能是 'm8v16'（推荐）或 'int8'（实测发散）"
+                             % () + "。修法：用 state='m8v16'")
         if self.block <= 0 or self.block % 32 != 0:
             raise ValueError("block 必须是 32 的正整数倍（当前 %d）" % self.block
                              + "。修法：用 block=32/64/128/256")
@@ -55,11 +59,18 @@ class Int8AdamWGpu(object):
             n = int(p._gpu.n)
             nb = (n + self.block - 1) // self.block
             self.mq.append(rt.zeros((n,), dtype=np.int8))
-            self.vq.append(rt.zeros((n,), dtype=np.int8))
             self.ms.append(rt.zeros((nb,), dtype=np.float32))
-            self.vs.append(rt.zeros((nb,), dtype=np.float32))
+            if self.state == "m8v16":
+                # v 用 bf16（uint16 位模式）：指数范围同 fp32，不下溢
+                self.vq.append(rt.zeros((n,), dtype=np.uint16))
+                self.vs.append(None)
+            else:
+                self.vq.append(rt.zeros((n,), dtype=np.int8))
+                self.vs.append(rt.zeros((nb,), dtype=np.float32))
 
     def bytes_per_param(self):
+        if self.state == "m8v16":
+            return 1.0 + 2.0 + 4.0 / float(self.block)      # m int8 + v bf16 + scale
         return 2.0 + 2.0 * 4.0 / float(self.block)
 
     def zero_grad(self):
@@ -78,13 +89,23 @@ class Int8AdamWGpu(object):
                 continue
             if self.mq[i] is None:
                 continue
-            ents.append((p._gpu, p.grad._gpu,
-                         self.mq[i], self.vq[i], self.ms[i], self.vs[i]))
+            if self.state == "m8v16":
+                ents.append((p._gpu, p.grad._gpu, self.mq[i], self.ms[i],
+                             self.vq[i]))
+            else:
+                ents.append((p._gpu, p.grad._gpu,
+                             self.mq[i], self.vq[i], self.ms[i], self.vs[i]))
         if not ents:
             return
-        rt.adamw_multi_int8(ents, self.b1, 1.0 - self.b1, self.b2, 1.0 - self.b2,
-                            self.lr, self.lr * self.wd, self.eps, bc1, bc2,
-                            self.block)
+        if self.state == "m8v16":
+            rt.adamw_multi_m8v16(ents, self.b1, 1.0 - self.b1,
+                                 self.b2, 1.0 - self.b2, self.lr,
+                                 self.lr * self.wd, self.eps, bc1, bc2,
+                                 self.block)
+        else:
+            rt.adamw_multi_int8(ents, self.b1, 1.0 - self.b1, self.b2,
+                                1.0 - self.b2, self.lr, self.lr * self.wd,
+                                self.eps, bc1, bc2, self.block)
         # 参数变了 ⇒ fp16 权重影子作废（同 Fp16MomAdamW 的处理）
         try:
             rt.f16_cache_clear()
