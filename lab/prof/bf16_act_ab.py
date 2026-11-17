@@ -76,6 +76,9 @@ def check_roundtrip():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quant", type=int, default=0)
+    ap.add_argument("--mode", default="rmsnorm", choices=["rmsnorm", "matmul"],
+                    help="量化点：rmsnorm=只量化 LN 输出（覆盖仅 1%%）；"
+                         "matmul=量化所有 @ 的输出（覆盖 GEMM 输出，也就是最大的那些激活）")
     ap.add_argument("--layers", type=int, default=4)
     ap.add_argument("--steps", type=int, default=20)
     a = ap.parse_args()
@@ -85,11 +88,20 @@ def main():
 
     if a.quant:
         import tgai_go.train.v3_ops as V
-        orig = V.rmsnorm_orv
-        V.rmsnorm_orv = lambda x, w: quant_tensor(orig(x, w))
         import tgai_go.train.v3_train_cli as CLI
-        CLI.V.rmsnorm_orv = V.rmsnorm_orv
-        print("[量化] 已把 rmsnorm_orv 的输出改为 bf16 往返（STE 梯度）")
+        if a.mode == "rmsnorm":
+            orig = V.rmsnorm_orv
+            V.rmsnorm_orv = lambda x, w: quant_tensor(orig(x, w))
+            CLI.V.rmsnorm_orv = V.rmsnorm_orv
+            print("[量化] rmsnorm_orv 输出（覆盖窄）")
+        else:
+            orig_mm = T.Tensor.__matmul__
+
+            def mm_bf16(self, other):
+                return quant_tensor(orig_mm(self, other))
+
+            T.Tensor.__matmul__ = mm_bf16
+            print("[量化] 所有 matmul 输出（覆盖宽）")
 
     sys.argv = ["v3_pretrain",
                 "--data", r"D:\TGAI-V3-1.5B\01_corpus\packed512\s512",
