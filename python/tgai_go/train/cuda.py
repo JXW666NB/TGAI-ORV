@@ -5107,15 +5107,25 @@ class CudaRuntime:
         if not a_lead and not b_lead:
             return self.sgemm(A, B)
         out_lead = self._broadcast_lead(a_lead, b_lead)
-        A2 = self.broadcast_to(A, out_lead + (M, K))
-        B2 = self.broadcast_to(B, out_lead + (K, N))
         batch = 1
         for s in out_lead:
             batch *= int(s)
-        C3 = self.bmm(
-            self.reshape(A2, (batch, M, K)),
-            self.reshape(B2, (batch, K, N)),
-        )
+        # ★ 2026-11-17：**不再物化广播副本**。
+        #   原写法 `broadcast_to(A) + broadcast_to(B)` 然后把两个整尺寸副本喂给 bmm，
+        #   一步要为此多 31 次 `broadcast_to8`（前向）+ 31 次（反向经 matmul_general）。
+        #   cuBLAS 的 strided-batched 允许把 stride 传 0 —— 语义就是"所有 batch 复用
+        #   同一块矩阵"，正好是广播。这里直接按元素步长调 `_bmm_op`
+        #   （与 `sgemm_nt/tn_strided_batched` 同一套步长约定）。
+        C3 = self.empty((batch, M, N), dtype=np.float32)
+        if batch == 0 or M == 0 or N == 0:
+            return self.reshape(C3, out_lead + (M, N))
+        if K == 0:
+            return self.reshape(self.zeros((batch, M, N), dtype=np.float32),
+                                out_lead + (M, N))
+        sa = int(M * K) if tuple(a_lead) == tuple(out_lead) else 0
+        sb = int(K * N) if tuple(b_lead) == tuple(out_lead) else 0
+        self._bmm_op(CUDA_OP_N, CUDA_OP_N, A.ptr, K, sa,
+                     B.ptr, N, sb, C3, batch, M, N, K)
         return self.reshape(C3, out_lead + (M, N))
 
     def reshape(self, buf, shape):

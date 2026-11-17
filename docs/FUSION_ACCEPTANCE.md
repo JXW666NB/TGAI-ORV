@@ -18,6 +18,7 @@
 | 广播逐元素 `mul_bcast8` / `add_bcast8` | **L1** | 训练 step0/1 loss 与 gnorm 与改前完全相同（11.713755 / 11.682596，gnorm 7.562/6.895）|
 | `mul` 反向改用 `mul_bcast` | **L1** | 同上；归约仍由 `unbroadcast` 完成，顺序未变 |
 | matmul 反向的批量转置 GEMM（`sgemm_nt/tn_strided_batched`）| **L2** | 端到端 loss 逐位相同；但 `lab/prof/bmm_branch_check.py` 显示 7 个形状里有 **2 个 `db` 不一致**：`(2,64,32)×(2,32,16)` 差 `1.490e-08`、`(2,512,1024)×(2,1024,256)` 差 `2.682e-07`。原因是 cuBLAS 换内核 ⇒ 归约顺序不同 |
+| `matmul_general` 用 stride=0 表达广播（不再物化副本）| **L2** | 端到端 loss `11.713755` → `11.713757`（差 2e-06，相对 1.7e-07），gnorm 三次完全相同；对拍仍是 `5.364e-07` PASS |
 
 **当前对拍结果（L3）**：`logits max_abs = 5.364e-07`，`max_rel = 5.570e-07` ⇒ **PASS**。
 
