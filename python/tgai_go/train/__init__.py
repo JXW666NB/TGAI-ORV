@@ -5812,6 +5812,21 @@ amp_invalidate = _amp_api.amp_invalidate
 GradScaler = _amp_api.GradScaler
 
 # ═══════════════════════════════════════════════════════════
+# 库内自省（0.9.97）：T.help() —— 这个库到底提供了什么
+# 起因：开发中反复"以为没有、其实早就写好了"（flash_attn / _checkpoint_layer /
+# pool_dump_live 都踩过），代价是重复劳动。这里给权威清单，不需要 GPU。
+#   T.help()            顶层索引
+#   T.help("rt")        运行时方法（按功能分组）
+#   T.help("kernels")   全部 CUDA 内核名 + 参数 + 注释
+#   T.help("ops")       Tensor 算子
+#   T.help("opt")       优化器
+#   T.help("mods")      子模块与公开名
+#   T.help("flash")     任意关键字全局搜索
+# ═══════════════════════════════════════════════════════════
+from .apilist import help as help                                     # noqa: E402,F401
+from .apilist import describe as describe                             # noqa: E402,F401
+
+# ═══════════════════════════════════════════════════════════
 # 开箱即用层（0.9.21）：T.preset.transformer / T.tokens / T.fit
 # ═══════════════════════════════════════════════════════════
 from . import preset as preset                                        # noqa: E402
