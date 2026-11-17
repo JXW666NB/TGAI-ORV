@@ -861,6 +861,12 @@ def build_arg_parser():
                    help="优化器。状态显存（每参数）：adamw 8B / muon(fp16 动量) 2B / fp16mom 4B "
                         "/ adafactor 因子化 O(n+m) / int8 约 1-2B。"
                         "★ 注意：非 adamw 时 checkpoint 的优化器状态暂不支持续训（会明确拒绝）")
+    g.add_argument("--opt-state", dest="opt_state", default="fp16",
+                   choices=["fp16", "bf16", "fp32"],
+                   help="--opt fp16mom 的动量存储精度。实测 fp16 会让 Adam 的二阶动量 v"
+                        "（常 1e-8 量级，fp16 最小正规数 6.1e-5）下溢成 0，"
+                        "第 2 步 loss 就从 11.7 炸到 135；bf16 指数范围与 fp32 相同不会下溢，"
+                        "V100 上可用（存储 bf16、计算 fp32）")
     g.add_argument("--amp", default="off", choices=["off", "gemm", "mlp", "both"],
                    help="混合精度。gemm=仅 GEMM 输入 fp16（参数/激活/梯度仍 fp32）；"
                         "mlp=MLP 内激活存 fp16（省带宽，带梯度缩放）；both=两者都开。"
@@ -1049,7 +1055,8 @@ def main(argv=None):
     elif a.opt == "fp16mom":
         from tgai_go.train.opt_fp16mv import Fp16MomAdamW
         opt = Fp16MomAdamW(params, lr=float(a.lr), betas=(float(a.beta1), float(a.beta2)),
-                           eps=float(a.eps), weight_decay=float(a.wd), state="fp16")
+                           eps=float(a.eps), weight_decay=float(a.wd),
+                           state=str(getattr(a, "opt_state", "fp16")))
     elif a.opt == "adafactor":
         opt = T.optim.Adafactor(params, lr=float(a.lr), weight_decay=float(a.wd))
     elif a.opt == "int8":
