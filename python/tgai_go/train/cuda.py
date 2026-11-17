@@ -6496,6 +6496,27 @@ class CudaRuntime:
             ])
         return out
 
+    def cast_f32_to_bf16_flat(self, src_buf):
+        """fp32 → bf16（uint16 位模式），**不做影子缓存**。
+
+        与 `_cast_flat_ptr_bf16` 的区别：那个是按指针缓存的"权重影子"
+        （同一块显存重复用、省转换），这里用于**激活存储压缩** ——
+        压缩完就要把 fp32 释放，缓存住反而等于没省。
+        收窄用 RTNE，往返误差上界 2^-9 ≈ 1.95e-3。
+        """
+        count = int(src_buf.n)
+        out = self.empty((count,), dtype=np.uint16)
+        if count:
+            if count > 2147483647:
+                raise CudaError("f32->bf16 元素数超过 int32"
+                                + "。修法：把张量分块压缩；或不要对该张量启用 bf16 存储")
+            grid, block = self._ewise_grid(count)
+            self._activate()
+            self.launch("cast_f32_to_bf16", grid, block, [
+                self._ptr(src_buf), self._ptr(out), (count, ctypes.c_int),
+            ])
+        return out
+
     def _sgemm_bf16(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
         """列主序调用和 _sgemm_f16 / _sgemm 完全一致。
 

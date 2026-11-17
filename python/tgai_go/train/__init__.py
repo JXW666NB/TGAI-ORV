@@ -647,7 +647,7 @@ class Tensor:
     """最小可用的张量：数据 + 梯度 + 反向闭包。"""
 
     __slots__ = ("data", "grad", "requires_grad", "_parents", "_bwd", "device", "_gpu_raw",
-                 "_lazy_T", "_lazy_shape")
+                 "_lazy_T", "_lazy_shape", "_bf16_store")
     __array_priority__ = 1000        # 让 ndarray <op> Tensor 走我们的 __r*__
 
     @property
@@ -680,6 +680,7 @@ class Tensor:
         self._backward = _backward
         self._lazy_T = None
         self._lazy_shape = None
+        self._bf16_store = None
         if dev == "cpu":
             # 整数/布尔只当显式 dtype 给出时才保留。默认路径与原来一样，强制 float32。
             if dtype is not None and not _is_float_dtype(dtype):
@@ -718,6 +719,7 @@ class Tensor:
         obj._backward = _backward
         obj._lazy_T = None
         obj._lazy_shape = None
+        obj._bf16_store = None
         return obj
 
     def _cpu_only(self, op):
@@ -1135,7 +1137,42 @@ class Tensor:
     def _gpu(self):
         if self._lazy_T is not None:
             self._materialize_inplace()
+        if self._bf16_store is not None:
+            # ★ bf16 存储：读的时候**临时**升回 fp32（不缓存 —— 缓存住就等于没省显存）。
+            #   代价是每次读都多一个升精度内核 + 一块临时 fp32 缓冲；
+            #   收益是"前向产出 → 反向读取"这一段只占一半显存。
+            #   数值：往返误差上界 2^-9 ≈ 1.95e-3（实测 1.954e-03，正好在上界）。
+            #   ★ 升精度返回的是 (count,) 一维缓冲，**必须 reshape 回本张量形状** ——
+            #     否则下游按 buffer.shape 判断会看到 1D（实测症状：
+            #     `_matmul_cuda` 报 "只支持 2D，收到 1D x 2D"）。
+            rt = _cuda()
+            up = rt._cast_bf16_to_f32_flat(self._bf16_store,
+                                           int(self._bf16_store.n))
+            return rt.reshape(up, tuple(int(s) for s in self.shape))
         return self._gpu_raw
+
+    def compact_bf16(self):
+        """把本张量的数据改成 **bf16 存储**（省一半显存），读时临时升回 fp32。
+
+        只对"存着等反向用"的激活有意义；对参数/梯度**不要**用
+        （参数用 `--opt-state bf16` 走优化器自己的路径）。
+
+        返回 self，便于链式调用。已经是 bf16 存储时为空操作。
+        """
+        if self._bf16_store is not None:
+            return self
+        if getattr(self, "device", "cpu") != "cuda":
+            return self
+        rt = _cuda()
+        raw = self._gpu                      # 触发 lazy 物化（如有）
+        if raw is None:
+            return self
+        self._bf16_store = rt.cast_f32_to_bf16_flat(raw)
+        self._gpu_raw = None                 # ★ 真正释放 fp32
+        return self
+
+    def is_bf16_stored(self):
+        return self._bf16_store is not None
 
     @_gpu.setter
     def _gpu(self, value):
