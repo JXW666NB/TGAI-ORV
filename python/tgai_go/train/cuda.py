@@ -3389,8 +3389,19 @@ class CudaRuntime:
             pass
 
     def _activate(self):
-        if self.ctx is not None:
-            self._chk(self.cu.cuCtxSetCurrent(self.ctx), "cuCtxSetCurrent")
+        # ★ 上下文一旦设为当前，在**单线程、单上下文**的前提下就一直保持当前。
+        #   之前每次 launch 都调一次 cuCtxSetCurrent：4 层一步 **1757 次驱动调用**
+        #   （cProfile: _activate tottime 0.002 s，而且驱动调用本身比 Python 栈更贵）。
+        #   这里记住状态，之后直接返回。任何会改变"当前上下文"的路径（我们只有
+        #   graph 捕获的 THREAD_LOCAL 模式）都要把该标志清掉。
+        if self.ctx is None or getattr(self, "_ctx_cur", False):
+            return
+        self._chk(self.cu.cuCtxSetCurrent(self.ctx), "cuCtxSetCurrent")
+        self._ctx_cur = True
+
+    def _deactivate_hint(self):
+        """告诉运行时"当前上下文可能被改掉了"，下次用到时重新设置。"""
+        self._ctx_cur = False
 
     def _chk(self, rc, what):
         if rc == 0:
