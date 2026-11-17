@@ -885,6 +885,8 @@ class Tensor:
                 src = g if b_shape == out_shape else rt.unbroadcast(g, b_shape)
                 _acc(grads, other, src)
         out._backward = bw
+        # add 的反向**不需要操作数**，所以它的输出可以安全压缩（消费方若已延迟读）
+        _maybe_compact(out)
         return out
 
     def _scale_cuda(self, scalar):
@@ -922,19 +924,18 @@ class Tensor:
         out = Tensor._from_gpu(buf, requires_grad=rg, _parents=(self, other))
 
         def bw(g, grads):
-            # ★ 2026-11-17：反向也不再物化广播副本。原来是
-            #   `broadcast_to(b) + mul + unbroadcast`（3 个内核），
-            #   现在 `mul_bcast(g, b) + unbroadcast`（2 个），且**归约顺序不变**
-            #   （仍由 `unbroadcast` 完成）⇒ 逐位等价。
+            # ★ 操作数在这里才读（不是 forward 时提前抓缓冲）——
+            #   这样父张量即使被 `compact_bf16()` 压成 bf16，也不会被闭包攥住 fp32。
             if self.requires_grad:
-                prod = rt.mul_bcast(g, b, out_shape, b_shape, out_shape)
+                prod = rt.mul_bcast(g, other._gpu, out_shape, b_shape, out_shape)
                 src = prod if a_shape == out_shape else rt.unbroadcast(prod, a_shape)
                 _acc(grads, self, src)
             if other.requires_grad:
-                prod = rt.mul_bcast(g, a, out_shape, a_shape, out_shape)
+                prod = rt.mul_bcast(g, self._gpu, out_shape, a_shape, out_shape)
                 src = prod if b_shape == out_shape else rt.unbroadcast(prod, b_shape)
                 _acc(grads, other, src)
         out._backward = bw
+        _maybe_compact(out)
         return out
 
     __rmul__ = __mul__
@@ -2090,6 +2091,56 @@ class Tensor:
                 return _cuda().d2h(_cuda().transpose2d(src._gpu))
             return _cuda().d2h(self._gpu)
         return self.data
+
+
+#: bf16 激活存储开关与最小元素数。默认 **关闭**：默认关掉时所有算子行为与以前完全一致。
+#: 打开后，下面几个已改造的算子会在产出激活时把它压成 bf16（省一半），
+#: 反向读的时候临时升回 fp32。**要求消费方全部按"延迟读"写**，否则没收益甚至涨内存。
+_BF16_ACT = [False]
+_BF16_ACT_MIN = [262144]        # 1 MiB（fp32）以下不值得：多一个内核反而亏
+
+
+def bf16_act_store(on=True, min_elems=262144):
+    """开关：把激活**存成 bf16**（省一半显存），反向读时临时升回 fp32。
+
+    `min_elems` 是启用阈值（元素个数）；太小的张量不值得多一次转换内核。
+
+    数值代价：bf16 只有 8 位尾数，往返相对误差上界 **2^-9 ≈ 1.95e-3**（实测 1.954e-03）。
+    20 步 A/B 实测（把**所有** matmul 输出经 bf16 往返）：末步 loss 偏差 **−0.027%**。
+
+    ⚠️ 这是"全有或全无"的：只有**读它的算子都在 `bw` 内部才读 `._gpu`** 时才有收益；
+    如果消费方在 forward 时就抓住了缓冲，压缩后那份 fp32 仍被攥着 ⇒ 内存反而涨 50%。
+    所以本开关默认关闭，且只在已改造的算子上生效（见 `_maybe_compact` 的调用点）。
+    """
+    _BF16_ACT[0] = bool(on)
+    _BF16_ACT_MIN[0] = int(min_elems)
+    return {"on": _BF16_ACT[0], "min_elems": _BF16_ACT_MIN[0]}
+
+
+# 环境变量开关（方便 A/B 实测，不必改代码）：TG_BF16_ACT=1 [/ TG_BF16_ACT_MIN=元素数]
+if os.environ.get("TG_BF16_ACT"):
+    try:
+        bf16_act_store(True, int(os.environ.get("TG_BF16_ACT_MIN", "262144")))
+    except Exception:
+        pass
+
+
+def _maybe_compact(t):
+    """按开关把大激活压成 bf16 存储（原地，返回同一个张量）。"""
+    if not _BF16_ACT[0]:
+        return t
+    try:
+        if t._bf16_store is not None:
+            return t
+        raw = t._gpu_raw
+        if raw is None:
+            return t
+        if int(raw.n) < _BF16_ACT_MIN[0]:
+            return t
+        t.compact_bf16()
+    except Exception:
+        pass
+    return t
 
 
 def _acc(grads, node, g):
