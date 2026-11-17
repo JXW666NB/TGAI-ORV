@@ -2123,6 +2123,97 @@ extern "C" __global__ void add_bcast8(
   out[i] = __fadd_rn(a[ia], b[ib]);
 }
 
+/* 多张量 int8 分块 AdamW：**量化/更新/反量化全在显存里**完成。
+
+ * 对照 bitsandbytes 的 `kOptimizerStatic8bit2StateBlockwise`（csrc/kernels.cu:915）：
+ * 那边用 256 项 quantile 表做动态量化；这里用**分块对称线性量化**
+ * （每 block 一个 fp32 scale = absmax/127），与 ORV 自己的 `int8_adamw.py` 口径一致。
+ *
+ * 一个 warp 处理一个 block（默认 BLOCK=64 ⇒ 每线程 2 个元素），
+ * 块内 absmax 用 warp shuffle 归约 —— 不需要 shared memory，也不需要额外一趟。
+ * 数学序列与 fp32 AdamW 逐条相同，只有 m/v 的存储是 int8。
+ */
+extern "C" __global__ void adamw_multi_int8(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* mqs, const unsigned long long* vqs,
+    const unsigned long long* mss, const unsigned long long* vss,
+    const int* sizes, int n_tensors, int block,
+    float b1, float omb1, float b2, float omb2,
+    float lr, float wd_lr, float eps, float bc1, float bc2) {
+  int gw = ((int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x) >> 5;
+  int lane = (int)threadIdx.x & 31;
+  int per = block / 32;                     /* 每线程负责几个元素 */
+  if (per < 1) per = 1;
+  if (per > 8) per = 8;                     /* mv/vv 定长 8，BLOCK<=256 */
+  int ti = 0;
+  long acc = 0;
+  for (; ti < n_tensors; ++ti) {
+    long nb = ((long)sizes[ti] + block - 1) / block;
+    if (gw < acc + nb) break;
+    acc += nb;
+  }
+  if (ti >= n_tensors) return;
+  long nb_in = (long)gw - acc;
+  long n = (long)sizes[ti];
+  long i0 = nb_in * block;
+  if (i0 >= n) return;
+
+  float* p = (float*)ps[ti];
+  const float* g = (const float*)gs[ti];
+  signed char* mq = (signed char*)mqs[ti];
+  signed char* vq = (signed char*)vqs[ti];
+  float* msk = (float*)mss[ti];
+  float* vsk = (float*)vss[ti];
+  float sm = msk[nb_in];
+  float sv = vsk[nb_in];
+
+  float mv[8];
+  float vv[8];
+  float amx_m = 0.f;
+  float amx_v = 0.f;
+  for (int k = 0; k < per; ++k) {
+    long i = i0 + lane + k * 32;
+    float m = 0.f;
+    float v = 0.f;
+    if (i < n) {
+      float gi = g[i];
+      m = (float)mq[i] * sm;
+      v = (float)vq[i] * sv;
+      m = b1 * m + omb1 * gi;
+      v = b2 * v + omb2 * gi * gi;
+      float mh = m / bc1;
+      float vh = v / bc2;
+      float upd = mh / (sqrtf(vh) + eps);
+      float pv = p[i];
+      pv -= lr * (upd + wd_lr * pv);
+      p[i] = pv;
+      amx_m = fmaxf(amx_m, fabsf(m));
+      amx_v = fmaxf(amx_v, fabsf(v));
+    }
+    mv[k] = m;
+    vv[k] = v;
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    amx_m = fmaxf(amx_m, __shfl_xor_sync(0xffffffffu, amx_m, o));
+    amx_v = fmaxf(amx_v, __shfl_xor_sync(0xffffffffu, amx_v, o));
+  }
+  float nsm = amx_m > 0.f ? amx_m / 127.f : 1.f;
+  float nsv = amx_v > 0.f ? amx_v / 127.f : 1.f;
+  if (lane == 0) {
+    msk[nb_in] = nsm;
+    vsk[nb_in] = nsv;
+  }
+  for (int k = 0; k < per; ++k) {
+    long i = i0 + lane + k * 32;
+    if (i < n) {
+      float q1 = rintf(mv[k] / nsm);
+      float q2 = rintf(vv[k] / nsv);
+      mq[i] = (signed char)(q1 > 127.f ? 127.f : (q1 < -127.f ? -127.f : q1));
+      vq[i] = (signed char)(q2 > 127.f ? 127.f : (q2 < -127.f ? -127.f : q2));
+    }
+  }
+}
+
 extern "C" __global__ void cast_bf16_to_f32(const unsigned short* __restrict__ src,
                                             float* __restrict__ dst, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -7368,6 +7459,73 @@ class CudaRuntime:
             (float(eps), ctypes.c_float),
             (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
             (1 if do_wd else 0, ctypes.c_int),
+        ])
+
+    def adamw_multi_int8(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps,
+                         bc1, bc2, block=64):
+        """一次发射更新全部参数，动量是 **int8 + 每 block 一个 fp32 scale**。
+
+        `entries` 里每项是 `(p, g, mq, vq, ms, vs)`；`mq/vq` 是 int8 缓冲，
+        `ms/vs` 是每 block 一个 fp32 的 scale（块数 = ceil(n/block)）。
+        显存占用 = 2 字节/参数 + 8/block 字节，BLOCK=64 时 **2.125 B/参数**
+        （fp32 是 8 B、bf16 是 4 B）。
+
+        为什么要有这个：`int8_adamw.py` 是**主机侧 numpy** 实现，
+        1.5B 上每步要把约 12 GiB 搬过 PCIe，实际不可用。
+        这个内核把量化/更新/反量化全留在显存，一次发射完成。
+        """
+        if not entries:
+            return
+        block = int(block)
+        for ent in entries:
+            for buf in ent:
+                self._split_forget_ptr(buf)
+        key = (tuple(id(x) for ent in entries for x in ent), block)
+        tb = getattr(self, "_adamw_i8_table", None)
+        if tb is None or tb[0] != key:
+            n_par = len(entries)
+
+            def _ptrs(idx):
+                return self.h2d(np.array([int(ent[idx].ptr) for ent in entries],
+                                         np.uint64), dtype=np.uint64)
+
+            ps, gs = _ptrs(0), _ptrs(1)
+            mqs, vqs = _ptrs(2), _ptrs(3)
+            mss, vss = _ptrs(4), _ptrs(5)
+            sizes = [int(ent[0].n) for ent in entries]
+
+            def _check(i):
+                n = sizes[i]
+                nb = (n + block - 1) // block
+                if int(entries[i][2].n) != n or int(entries[i][3].n) != n:
+                    raise CudaError(
+                        "int8 AdamW 第 %d 项 mq/vq 长度 ≠ 参数长度（%d/%d vs %d）"
+                        % (i, entries[i][2].n, entries[i][3].n, n)
+                        + "。修法：用 Int8AdamWGpu 重新分配状态，或改回 --opt adamw")
+                if int(entries[i][4].n) != nb or int(entries[i][5].n) != nb:
+                    raise CudaError(
+                        "int8 AdamW 第 %d 项 scale 块数不对（期望 %d）。修法：用 Int8AdamWGpu 重建状态"
+                        % (i, nb))
+            for i in range(n_par):
+                _check(i)
+            szs = self.h2d(np.array(sizes, np.int32), dtype=np.int32)
+            warps = sum((n + block - 1) // block for n in sizes)
+            tb = (key, ps, gs, mqs, vqs, mss, vss, szs, n_par, warps)
+            self._adamw_i8_table = tb
+        _, ps, gs, mqs, vqs, mss, vss, szs, n_par, warps = tb
+        if warps <= 0:
+            return
+        grid, tpb = self._ewise_grid(int(warps) * 32)
+        self._activate()
+        self.launch("adamw_multi_int8", grid, tpb, [
+            self._ptr(ps), self._ptr(gs), self._ptr(mqs), self._ptr(vqs),
+            self._ptr(mss), self._ptr(vss), self._ptr(szs),
+            (int(n_par), ctypes.c_int), (int(block), ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (float(eps), ctypes.c_float),
+            (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
         ])
 
     def adamw(self, p, g, m, v, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):

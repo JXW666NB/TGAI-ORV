@@ -1,0 +1,92 @@
+# -*- coding: utf-8 -*-
+"""GPU 融合的 int8 分块 AdamW（省显存的动量存储）。
+
+与 `int8_adamw.py` 的区别：**那个是主机侧 numpy 实现** —— 每步要把 m/v 从显存
+拷回主机、量化、再拷回去。1.5B 上光这一来一回就是约 12 GiB 的 PCIe 流量，
+所以它在 CLI 里虽然存在，实际上不能用于大模型。
+
+这个是**全显存**实现：量化/更新/反量化都在 `adamw_multi_int8` 一个内核里完成，
+一次发射覆盖全部参数（与 `adamw_multi_bf16` 同一套指针数组管线）。
+
+显存占用（每参数）：int8 的 m + int8 的 v + 每 block 一个 fp32 scale
+  BLOCK=64  ⇒ 2 + 8/64 = **2.125 字节/参数**
+  对照：fp32 8 字节、bf16 4 字节、fp16 4 字节。
+
+**这是有损量化**：m/v 从 fp32 压到 int8（每 block 独立 scale）必然丢精度。
+等价性靠实测判断（同种子跑 20 步比 loss），不达标就不要用。
+"""
+
+import numpy as np
+
+__all__ = ["Int8AdamWGpu"]
+
+
+def _rt():
+    import tgai_go.train as T
+    return T._cuda()
+
+
+class Int8AdamWGpu(object):
+    """int8 分块 AdamW（全显存）。
+
+    参数语义与 `torch.optim.AdamW` 一致：`lr` / `betas` / `eps` / `weight_decay`，
+    解耦权重衰减（`p -= lr*(upd + wd*p)`），偏差校正 `1-b1^t` / `1-b2^t`。
+    """
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.95), eps=1e-8,
+                 weight_decay=0.1, block=64):
+        self.params = list(params)
+        self.lr = float(lr)
+        self.b1 = float(betas[0])
+        self.b2 = float(betas[1])
+        self.eps = float(eps)
+        self.wd = float(weight_decay)
+        self.block = int(block)
+        if self.block <= 0 or self.block % 32 != 0:
+            raise ValueError("block 必须是 32 的正整数倍（当前 %d）" % self.block
+                             + "。修法：用 block=32/64/128/256")
+        self.t = 0
+        self.mq, self.vq, self.ms, self.vs = [], [], [], []
+        rt = _rt()
+        for p in self.params:
+            if getattr(p, "device", "cpu") != "cuda":
+                raise ValueError("Int8AdamWGpu 只支持 CUDA 张量"
+                                 + "。修法：先 T.set_default_device('cuda')")
+            n = int(p._gpu.n)
+            nb = (n + self.block - 1) // self.block
+            self.mq.append(rt.zeros((n,), dtype=np.int8))
+            self.vq.append(rt.zeros((n,), dtype=np.int8))
+            self.ms.append(rt.zeros((nb,), dtype=np.float32))
+            self.vs.append(rt.zeros((nb,), dtype=np.float32))
+
+    def bytes_per_param(self):
+        return 2.0 + 2.0 * 4.0 / float(self.block)
+
+    def zero_grad(self):
+        for p in self.params:
+            p.grad = None
+
+    def step(self):
+        """一步更新：一次内核发射覆盖所有带梯度的参数。"""
+        self.t += 1
+        rt = _rt()
+        bc1 = 1.0 - self.b1 ** self.t
+        bc2 = 1.0 - self.b2 ** self.t
+        ents = []
+        for i, p in enumerate(self.params):
+            if p.grad is None or not getattr(p, "requires_grad", True):
+                continue
+            if self.mq[i] is None:
+                continue
+            ents.append((p._gpu, p.grad._gpu,
+                         self.mq[i], self.vq[i], self.ms[i], self.vs[i]))
+        if not ents:
+            return
+        rt.adamw_multi_int8(ents, self.b1, 1.0 - self.b1, self.b2, 1.0 - self.b2,
+                            self.lr, self.lr * self.wd, self.eps, bc1, bc2,
+                            self.block)
+        # 参数变了 ⇒ fp16 权重影子作废（同 Fp16MomAdamW 的处理）
+        try:
+            rt.f16_cache_clear()
+        except Exception:
+            pass

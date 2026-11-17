@@ -932,7 +932,7 @@ def build_arg_parser():
     g.add_argument("--warmup-ratio", type=float, default=0.01)
     g.add_argument("--wd", type=float, default=0.1, help="AdamW weight decay（参考实现 0.1）")
     g.add_argument("--opt", default="adamw",
-                   choices=["adamw", "muon", "fp16mom", "adafactor", "int8"],
+                   choices=["adamw", "muon", "fp16mom", "adafactor", "int8", "int8gpu"],
                    help="优化器。状态显存（每参数）：adamw 8B / muon(fp16 动量) 2B / fp16mom 4B "
                         "/ adafactor 因子化 O(n+m) / int8 约 1-2B。"
                         "★ 注意：非 adamw 时 checkpoint 的优化器状态暂不支持续训（会明确拒绝）")
@@ -977,6 +977,9 @@ def build_arg_parser():
     g.add_argument("--keep", type=int, default=2, help="只保留最近 K 个 checkpoint")
     g.add_argument("--resume", default=None,
                    help="checkpoint 目录（或 --out 根目录，取最新的）")
+    g.add_argument("--allow-lossy-int8", dest="allow_lossy_int8",
+                   action="store_true",
+                   help="允许 --opt int8gpu 这条**实测会发散**的有损路径（仅供实验）")
     g.add_argument("--no-final-save", action="store_true", help="结束时不再存（大模型省盘）")
     g.add_argument("--grad-ckpt", dest="grad_ckpt", action="store_true",
                    help="梯度重算：每层前向不建图、反向重跑（省激活显存，多花约一层的前向时间）")
@@ -1127,6 +1130,29 @@ def main(argv=None):
         # 所以走 --muon-lr；--lr 对它不生效（避免误用 AdamW 的量级把权重打飞）。
         opt = T.optim.Muon(params, lr=float(a.muon_lr), momentum=float(a.muon_momentum),
                            weight_decay=float(a.wd), fp16_mom=bool(a.muon_fp16_mom))
+    elif a.opt == "int8gpu":
+        # GPU 融合的 int8 分块 AdamW：量化/更新/反量化全在显存里
+        # （`--opt int8` 是主机侧 numpy 版本，1.5B 上要走约 12 GiB PCIe，不可用）
+        #
+        # ★ 2026-11-17 实测：**机制可用、数值不可用**。
+        #   4 层/20 步实测 step0 与基线一致（11.713757），但 step5 起发散：
+        #   loss 16.75 / gnorm 405，step19 gnorm 910。
+        #   原因：Adam 的二阶动量 v 在同一 block 内动态范围达 1e-8~1e-3，
+        #   **线性 int8 量化把小值压成 0** ⇒ m/sqrt(0) 爆掉。
+        #   bitsandbytes 能用 int8 是因为它用 256 项 **quantile 非线性量化表**。
+        #   因此默认**拒绝**，要试必须显式加 --allow-lossy-int8。
+        if not getattr(a, "allow_lossy_int8", False):
+            raise SystemExit(
+                "--opt int8gpu 目前是**有损且实测会发散**的实验路径"
+                "（4 层 20 步：step5 gnorm 405、step19 910）"
+                "。修法：改用 --opt fp16mom --opt-state bf16（已验证，2.125→4.0 字节/参数但数值安全）；"
+                "确实要试验加 --allow-lossy-int8")
+        from tgai_go.train.int8_adamw_gpu import Int8AdamWGpu
+        opt = Int8AdamWGpu(params, lr=float(a.lr),
+                           betas=(float(a.beta1), float(a.beta2)),
+                           eps=float(a.eps), weight_decay=float(a.wd), block=64)
+        print("[int8gpu] 动量 int8 分块存储：%.3f 字节/参数（bf16 是 4.0，fp32 是 8.0）"
+              % opt.bytes_per_param(), flush=True)
     elif a.opt == "fp16mom":
         from tgai_go.train.opt_fp16mv import Fp16MomAdamW
         opt = Fp16MomAdamW(params, lr=float(a.lr), betas=(float(a.beta1), float(a.beta2)),
