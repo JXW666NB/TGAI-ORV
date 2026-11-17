@@ -1168,13 +1168,53 @@ class Tensor:
         b_shape = tuple(int(s) for s in other.shape)
 
         def bw(g, grads):
+            # ★ 2026-11-17：3-D/4-D 的 matmul 反向不再物化转置。
+            #   原写法 `matmul_general(g, swap_last2(b))` 每次要多一个全尺寸转置内核
+            #   （实测一步 74 次、`swap_last2` 占 7.8%）。这里把前导维压成 batch，
+            #   用带转置标志的批量 GEMM：
+            #     da(...,M,k) = g(...,M,n) @ b(...,k,n)^T   ⇒ sgemm_nt(g, b, batch, M, k, n)
+            #     db(...,k,N) = a(...,M,k)^T @ g(...,M,N)   ⇒ sgemm_tn(a, g, batch, k, N, M)
+            gshape = tuple(int(s) for s in g.shape)
+
+            def _bat(shape):
+                n = 1
+                for s in shape[:-2]:
+                    n *= int(s)
+                return n
+
+            def _nt():
+                bs = tuple(int(s) for s in b.shape)
+                if len(gshape) < 3 or len(bs) < 3:
+                    return None
+                gb, bb = _bat(gshape), _bat(bs)
+                if gb != bb or bs[-1] != gshape[-1]:
+                    return None
+                M_, n_, k_ = gshape[-2], gshape[-1], bs[-2]
+                out = rt.sgemm_nt_strided_batched(g, b, gb, M_, k_, n_)
+                return out if tuple(out.shape) == a_shape else rt.reshape(out, a_shape)
+
+            def _tn():
+                as_ = tuple(int(s) for s in a.shape)
+                if len(as_) < 3 or len(gshape) < 3:
+                    return None
+                ab, gb = _bat(as_), _bat(gshape)
+                if ab != gb or as_[-2] != gshape[-2]:
+                    return None
+                M_, k_, N_ = as_[-2], as_[-1], gshape[-1]
+                out = rt.sgemm_tn_strided_batched(a, g, ab, k_, N_, M_)
+                return out if tuple(out.shape) == b_shape else rt.reshape(out, b_shape)
+
             if self.requires_grad:
-                da = rt.matmul_general(g, rt.swap_last2(b))
+                da = _nt()
+                if da is None:
+                    da = rt.matmul_general(g, rt.swap_last2(b))
                 if tuple(int(s) for s in da.shape) != a_shape:
                     da = rt.unbroadcast(da, a_shape)
                 _acc(grads, self, da)
             if other.requires_grad:
-                db = rt.matmul_general(rt.swap_last2(a), g)
+                db = _tn()
+                if db is None:
+                    db = rt.matmul_general(rt.swap_last2(a), g)
                 if tuple(int(s) for s in db.shape) != b_shape:
                     db = rt.unbroadcast(db, b_shape)
                 _acc(grads, other, db)
