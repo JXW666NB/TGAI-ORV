@@ -302,6 +302,32 @@ class DataParallel:
                 off += a.nbytes
         self._barrier("bcast2")
 
+    def _all_reduce_host(self, entries, total, scale):
+        """纯主机路径：CPU 后端（无 CUDA）时使用，语义与 GPU 路径完全一致。"""
+        off = 0
+        base = self.rank * total * 4
+        own = np.ndarray((total,), dtype=np.float32, buffer=self._slot.buf, offset=base)
+        for p, g, n in entries:
+            dst = own[off:off + n]
+            if g is None:
+                dst.fill(0.0)
+            else:
+                arr = _grad_to_numpy(g)
+                np.copyto(dst, np.ascontiguousarray(arr, dtype=np.float32).reshape(-1))
+            off += n
+        self._gen = int(getattr(self, "_gen", 0)) + 1
+        self._barrier("grads")
+        allv = np.ndarray((self.world, total), dtype=np.float32, buffer=self._slot.buf)
+        acc = np.empty(total, dtype=np.float32)
+        np.sum(allv, axis=0, out=acc)
+        acc *= (float(scale) if scale is not None else 1.0 / float(self.world))
+        off = 0
+        for p, g, n in entries:
+            val = acc[off:off + n]
+            val = val.reshape(tuple(getattr(p, "shape", (n,))))
+            _set_grad(p, val, g)
+            off += n
+
     def _buffers(self, total):
         """返回 (打包用设备缓冲, pinned 主机缓冲)，按需扩容并**跨步复用**。
 
@@ -345,7 +371,9 @@ class DataParallel:
         for p in params:
             g = getattr(p, "grad", None)
             if g is not None:
-                n = int(g._gpu.n)
+                # ★ 不能假设 `g._gpu` 存在：CPU 后端下梯度是主机张量（tests/test_dist_cpu.py 守着）
+                gshape = tuple(int(s) for s in getattr(g, "shape", ()) or ())
+                n = int(np.prod(gshape)) if gshape else int(getattr(g, "numel", 0) or 0)
                 pshape = tuple(getattr(p, "shape", (n,)))
                 if int(np.prod(pshape)) != n:
                     # 形状对不上时不能静默：后面按偏移切片会整段错位
@@ -365,7 +393,14 @@ class DataParallel:
         #   实测：可分页 2.18/1.48 GiB/s → pinned 12.05/10.54 GiB/s（3.16 GiB 往返
         #   3.55 s → 0.56 s）。原来的瓶颈是每次 `cuMemcpyDtoH` 都要驱动逐页锁定，
         #   加上 321 次调用的固定开销（每次约 15 ms）。
-        rt = _runtime()
+        # ★ CPU 后端（没有 CUDA）时必须走纯主机路径：GPU 原语不可用。
+        #   这一条由 tests/test_dist_cpu.py 守着，不能被性能优化破坏。
+        try:
+            rt = _runtime()
+        except Exception:
+            rt = None
+        if rt is None:
+            return self._all_reduce_host(entries, total, scale)
         pack, host = self._buffers(total)
         # ★ 把共享内存注册成页锁定 ⇒ d2h 可以直接写进去，省掉
         #   「pinned → shm」那一次 3.16 GiB 主机拷贝（实测约 0.3 s）。
@@ -421,78 +456,39 @@ class DataParallel:
         self._barrier("grads")
         _mark("4_barrier")
 
-        # ⑤+⑥ **流水**：主线程逐块求和（CPU），后台线程逐块回传（PCIe）——
-        #   两者用不同资源，可以真重叠。不开流水时是「先全部求和、再全部回传」，
-        #   实测 0.46 + 0.33 s 串行；流水后取较长的那一段。
-        #   `numpy` 与 `ctypes` 调用都会释放 GIL，所以线程能真的并行。
-        import queue as _queue
-        import threading as _threading
-
-        try:
-            _k = int(os.environ.get("TG_DP_CHUNKS", "1"))   # 1 = 不流水（默认；流水版有竞态，待查）
-        except Exception:
-            _k = 8
-        _k = max(1, min(_k, max(1, total)))
-        bounds = [(int(total) * i) // _k for i in range(_k + 1)]
-        _sc = float(scale) if scale is not None else 1.0 / float(self.world)
-        acc = own_view
-        peers = []
+        # ⑤ **GPU 侧求和**：把对端那段 h2d 上来，直接在各自的梯度缓冲上就地加、再乘均值。
+        #   ★ 为什么不在主机上求和：3.16 GiB 的 numpy 加法实测 0.46 s，而 GPU 就地加
+        #     约 0.02 s。主机只负责搬运（d2h 0.28 + h2d 0.32）——无 P2P 时这是物理成本。
+        #   ★ 这样也不再需要"打包→求和→拆回"的整块搬运：梯度原地更新。
+        #   ★ 复用 `pack` 作为对端数据的落点：d2h 之后 pack 里的内容已经在共享内存里，
+        #     不再需要，可以覆盖。16 层时两块暂存各 4.2 GiB，不复用会直接顶到显存上限
+        #     （实测 16 层因此失败过一次）。
+        peer_gpu = pack
+        sc = float(scale) if scale is not None else 1.0 / float(self.world)
         for r in range(self.world):
             if r == self.rank:
                 continue
-            peers.append(np.ndarray((total,), dtype=np.float32, buffer=self._slot.buf,
-                                    offset=r * total * 4))
+            if shm_stage is not None:
+                src = ctypes.c_void_p(shm_stage.ptr.value + r * total * 4)
+            else:                       # 未注册成功：从 shm 的正常映射拷
+                seg = np.ndarray((total,), dtype=np.float32, buffer=self._slot.buf,
+                                 offset=r * total * 4)
+                src = ctypes.c_void_p(seg.ctypes.data)
+            rt.h2d_into(peer_gpu, src)
+            off = 0
+            for p, g, n in entries:
+                if g is not None:
+                    rt.add_(g._gpu, rt.sub_view(peer_gpu, (n,), off))
+                off += n
+        _mark("5_gpu_add")
 
-        q = _queue.Queue()
-        errors = []
-
-        def _uploader():
-            # ★ CUDA 上下文是**线程局部**的：后台线程必须自己设一次，
-            #   否则 cuMemcpyHtoD 会报 rc=201 invalid device context（实测踩过）。
-            try:
-                rt._ctx_cur = False
-                rt._activate()
-            except Exception:
-                pass
-            while True:
-                idx = q.get()
-                if idx is None:
-                    return
-                a, b = bounds[idx], bounds[idx + 1]
-                try:
-                    # 只回传这一段（其余段不受影响，pack 里已有原值）
-                    rt.h2d_into(pack, acc_ptr, nbytes=(b - a) * 4,
-                                dst_off=a * 4, src_off=a * 4)
-                except BaseException as exc:      # noqa: BLE001
-                    errors.append(exc)
-                    return
-
-        th = _threading.Thread(target=_uploader, daemon=True)
-        th.start()
-        for idx in range(_k):
-            a, b = bounds[idx], bounds[idx + 1]
-            seg_out = acc[a:b]
-            for pv in peers:
-                np.add(seg_out, pv[a:b], out=seg_out)
-            seg_out *= _sc
-            q.put(idx)
-        q.put(None)
-        th.join()
-        if errors:
-            raise errors[0]
-        _mark("5_sum")
-
-        # ⑦ D2D 拆回各梯度（整块 D2D，实测 0.008 s，不构成瓶颈）
-        off = 0
+        # ⑥ 就地乘均值；没有梯度的参数补 0（与原语义一致）
         for p, g, n in entries:
             if g is not None:
-                rt.copy_d2d(g._gpu, pack, n * 4, src_off=off * 4)
+                rt.scale_inplace(g._gpu, sc)
             else:
-                # 没有梯度的参数：从主机侧补一份（与原语义一致：补 0 后再平均）
-                val = acc[off:off + n].reshape(tuple(getattr(p, "shape", (n,))))
-                _set_grad(p, val, None)
-            off += n
-        _mark("6_h2d_unpack")
+                _set_grad(p, np.zeros(tuple(getattr(p, "shape", (n,))), np.float32), None)
+        _mark("6_scale")
         if _ph is not None:
             print("[dp-phases] " + "  ".join("%s=%.3fs" % (k, v) for k, v in
                                              sorted(_ph.items())), flush=True)
