@@ -50,6 +50,8 @@ def main():
                     help="每专家中间维度。真实 V3 是 2816（model_v3.py:97）；0 = 4*d")
     ap.add_argument("--amp", action="store_true",
                     help="PyTorch autocast fp16 + GradScaler（与 ORV 的 --amp gemm 同口径对照用）")
+    ap.add_argument("--ckpt", type=int, default=1,
+                    help="1=开梯度检查点（省显存、多付重算）；0=关（公平对比用）")
     ap.add_argument("--vocab", type=int, default=4096,
                     help="词表大小。真实 V3 是 96000（model_v3.py:93）")
     a = ap.parse_args()
@@ -64,7 +66,7 @@ def main():
     # ★ 与 ORV 侧同口径：PyTorch 也开梯度检查点
     #   参考实现里检查点只在 `gradient_checkpointing and training and targets is not None`
     #   时才生效 ⇒ 必须把 targets 传进 forward，否则等于没开（我上一版就是漏了这点）
-    model.enable_gradient_checkpointing(True)
+    model.enable_gradient_checkpointing(bool(a.ckpt))
     model.train()
     n_par = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr)
