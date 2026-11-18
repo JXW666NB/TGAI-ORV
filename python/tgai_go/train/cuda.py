@@ -3188,6 +3188,26 @@ _POOL_IDLE_TRIGGER = 2 * 1024 * 1024 * 1024
 _POOL_OCC_LIMIT = (16 * 1024 + 256) * 1024 * 1024
 
 
+class _PinnedHost(object):
+    """页锁定主机缓冲的托管对象（内部用，别直接构造）。
+
+    `ptr` 是 c_void_p，`nbytes` 是容量；`array(dtype, n)` 给出 numpy 视图，
+    这样调用方可以按偏移读写，不需要再拷一份。
+    """
+
+    __slots__ = ("ptr", "nbytes", "_owner")
+
+    def __init__(self, ptr, nbytes, owner=None):
+        self.ptr = ptr
+        self.nbytes = int(nbytes)
+        self._owner = owner          # 退回可分页内存时，必须持有它防止被回收
+
+    def array(self, dtype=np.float32, n=None):
+        dt = np.dtype(dtype)
+        n = int(n) if n is not None else self.nbytes // dt.itemsize
+        raw = (ctypes.c_char * (n * dt.itemsize)).from_address(self.ptr.value)
+        return np.frombuffer(raw, dtype=dt, count=n)
+
 class CudaRuntime:
     def __init__(self):
         self.ready = False
@@ -5353,6 +5373,119 @@ class CudaRuntime:
             raise CudaError("reshape %s -> %s 元素个数 %d != %d" % (buf.shape, shape, buf.n, n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         return GpuBuf(self, buf.ptr, buf.nbytes, shape, n, buf.dtype, view_of=buf)
 
+    # ── 大块主机↔设备传输（2026-11-18：数据并行整改）───────────────────
+    # 起因：DP 的梯度归约要把几 GiB 搬过 PCIe。原来每个张量单独 `d2h/h2d`，
+    # 且目标主机内存是**可分页**的（numpy 默认），实测只有 1.5~2.1 GiB/s ——
+    # 而同一张卡在 gen4 x16 上的线速远高于此。可分页内存在传输时还要驱动逐页锁定，
+    # 这是主因。这里提供**页锁定（pinned）**缓冲 + 按偏移的整块拷贝，
+    # 让调用方能把 N 个小张量打包成 1 次传输。
+
+    def host_register(self, obj, nbytes=None, slot=None):
+        """把**已有的主机内存**（比如 multiprocessing 的共享内存）注册成页锁定。
+
+        为什么需要：DP 的梯度要写进共享内存给对端读。若先把数据 d2h 到 pinned 再
+        拷进 shm，就要多一次 3.16 GiB 的主机拷贝（实测约 0.3 s）。直接让 d2h 写进
+        **已注册的** shm，就等于省掉这一整趟。
+
+        返回 `_PinnedHost`（`.ptr` 指向这块内存，不拥有它）。
+        注册失败时返回 None，调用方退回"pinned + 拷贝"的老路。
+        """
+        try:
+            addr = obj if isinstance(obj, int) else ctypes.addressof(
+                ctypes.c_char.from_buffer(obj))
+        except Exception:
+            return None
+        nb = int(nbytes if nbytes is not None else len(obj))
+        reg = getattr(self, "_hostreg", None)
+        if reg is None:
+            reg = self._hostreg = {}
+        key = (addr, nb)
+        if key in reg:
+            return reg[key]
+        fn = getattr(self.cu, "cuMemHostRegister_v2", None) or \
+            getattr(self.cu, "cuMemHostRegister", None)
+        if fn is None:
+            return None
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        rc = fn(ctypes.c_void_p(addr), ctypes.c_size_t(nb), ctypes.c_uint(0))
+        if rc != 0:
+            return None
+        ph = _PinnedHost(ctypes.c_void_p(addr), nb, None)
+        reg[key] = ph
+        return ph
+    def host_pinned(self, nbytes, slot=0):
+        """分配（或复用）一块**页锁定**主机内存，返回托管对象。
+
+        `slot` 用于区分用途（比如打包缓冲 / 收包缓冲），复用可避免反复分配。
+        托管对象有 `.ptr`（c_void_p）与 `.nbytes`；numpy 视图用 `.array(dtype, n)` 取。
+        """
+        nbytes = int(nbytes)
+        cache = getattr(self, "_pinned", None)
+        if cache is None:
+            cache = self._pinned = {}
+        ent = cache.get(slot)
+        if ent is not None and ent["nbytes"] >= nbytes:
+            return _PinnedHost(ent["ptr"], ent["nbytes"], ent.get("owner"))
+        if ent is not None:
+            self._free_pinned(ent)
+        ptr = ctypes.c_void_p()
+        fn = None
+        for nm in ("cuMemAllocHost_v2", "cuMemAllocHost"):
+            if hasattr(self.cu, nm):
+                fn = getattr(self.cu, nm)
+                break
+        if fn is not None:
+            # 驱动库是裸 CDLL，不显式设 argtypes 会按 C int 默认规则乱传
+            fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+            fn.restype = ctypes.c_int
+            rc = fn(ctypes.byref(ptr), ctypes.c_size_t(nbytes))
+        else:
+            rc = -1
+        if rc != 0:
+            # 退回普通可分页内存：慢，但不至于跑不了
+            arr = np.zeros(max(1, nbytes // 4), dtype=np.float32)
+            ent = {"ptr": ctypes.c_void_p(arr.ctypes.data), "nbytes": arr.nbytes,
+                   "owner": arr}
+            cache[slot] = ent
+            return _PinnedHost(ent["ptr"], ent["nbytes"], arr)
+        ent = {"ptr": ptr, "nbytes": nbytes, "owner": None}
+        cache[slot] = ent
+        return _PinnedHost(ptr, nbytes, None)
+
+    def _free_pinned(self, ent):
+        if ent.get("owner") is None and ent.get("ptr"):
+            try:
+                self.cu.cuMemFreeHost(ent["ptr"])
+            except Exception:
+                pass
+
+    def d2h_into(self, buf, dst, nbytes=None, dst_off=0, src_off=0):
+        """把设备缓冲拷进给定的主机缓冲（可 pinned），支持字节偏移。"""
+        nb = int(nbytes if nbytes is not None else buf.n * 4)
+        rc = self.cu.cuMemcpyDtoH(ctypes.c_void_p(dst.value + int(dst_off)),
+                                  ctypes.c_uint64(buf.ptr + int(src_off)),
+                                  ctypes.c_size_t(nb))
+        self._chk(rc, "cuMemcpyDtoH(大块)")
+        return nb
+
+    def h2d_into(self, buf, src, nbytes=None, dst_off=0, src_off=0):
+        """把主机缓冲（可 pinned）拷回设备缓冲，支持字节偏移。"""
+        nb = int(nbytes if nbytes is not None else buf.n * 4)
+        rc = self.cu.cuMemcpyHtoD(ctypes.c_uint64(buf.ptr + int(dst_off)),
+                                  ctypes.c_void_p(src.value + int(src_off)),
+                                  ctypes.c_size_t(nb))
+        self._chk(rc, "cuMemcpyHtoD(大块)")
+        return nb
+
+    def copy_d2d(self, dst, src, nbytes=None, dst_off=0, src_off=0):
+        """设备内整块拷贝（用来把多个小梯度拼进一个打包缓冲）。"""
+        nb = int(nbytes if nbytes is not None else src.n * 4)
+        rc = self.cu.cuMemcpyDtoD(ctypes.c_uint64(dst.ptr + int(dst_off)),
+                                  ctypes.c_uint64(src.ptr + int(src_off)),
+                                  ctypes.c_size_t(nb))
+        self._chk(rc, "cuMemcpyDtoD(整块)")
+        return nb
     def sub_view(self, buf, shape, elem_offset=0):
         """在 `buf` 的字节区间内做一个**偏移视图**（与 `reshape` 的区别：起点可偏移）。
 

@@ -33,6 +33,7 @@ world=1 时所有操作都是**快速空操作**，所以单卡跑不会有任�
 或 lr 按 √W 放宽）。本模块**不会**替你改 lr。
 """
 import os
+import ctypes
 import tempfile
 import time
 
@@ -43,6 +44,12 @@ try:
     _HAS_SHM = True
 except Exception:                                    # noqa: BLE001
     _HAS_SHM = False
+
+
+def _runtime():
+    """拿运行时单例（本模块不 import tgai_go.train，避免循环导入）。"""
+    import tgai_go.train as T
+    return T._cuda()
 
 
 def _grad_to_numpy(g):
@@ -295,6 +302,24 @@ class DataParallel:
                 off += a.nbytes
         self._barrier("bcast2")
 
+    def _buffers(self, total):
+        """返回 (打包用设备缓冲, pinned 主机缓冲)，按需扩容并**跨步复用**。
+
+        反复 new 会每步重付一次分配/锁定开销（3.16 GiB 的 pinned 分配很贵），
+        所以缓存在实例上，只在变大时重建。
+        """
+        rt = _runtime()
+        need = int(total) * 4
+        b = getattr(self, "_pack", None)
+        if b is None or int(b.n) < int(total):
+            b = rt.empty((int(total),), dtype=np.float32)
+            self._pack = b
+        h = getattr(self, "_host", None)
+        if h is None or int(h.nbytes) < need:
+            h = rt.host_pinned(need, slot="allreduce")
+            self._host = h
+        return b, h
+
     def all_reduce_grads(self, params, scale=None):
         """梯度全归约，默认取**平均**（`scale=None`）。
 
@@ -319,49 +344,112 @@ class DataParallel:
         entries = []
         for p in params:
             g = getattr(p, "grad", None)
-            arr = _grad_to_numpy(g) if g is not None else None
-            if arr is not None and arr.shape != tuple(getattr(p, "shape", arr.shape)):
-                # 形状对不上时不能静默：后面的按位置切片会整段错位
-                raise RuntimeError(
-                    "梯度形状 %s 与参数形状 %s 不一致。修法：确认没有手动改过 p.grad"
-                    % (arr.shape, tuple(getattr(p, "shape", ()))))
-            n = int(arr.size) if arr is not None else int(p.numel())
-            entries.append((p, arr, g, n))
-        total = sum(e[3] for e in entries)
+            if g is not None:
+                n = int(g._gpu.n)
+                pshape = tuple(getattr(p, "shape", (n,)))
+                if int(np.prod(pshape)) != n:
+                    # 形状对不上时不能静默：后面按偏移切片会整段错位
+                    raise RuntimeError(
+                        "梯度长度 %d 与参数形状 %s 不一致。修法：确认没有手动改过 p.grad"
+                        % (n, pshape))
+            else:
+                n = int(p.numel())
+            entries.append((p, g, n))
+        total = sum(e[2] for e in entries)
         if total <= 0:
             raise RuntimeError("梯度总长度为 0" + "。修法：确认反向已经跑过、params 非空")
         self._ensure_slot(max(total * 4, 8))
 
-        # ★ 2026-11-18 性能整改：原来每个参数都走 `ascontiguousarray(...).tobytes()`
-        #   （多一次整份主机拷贝）再切片赋值（又一次），求和后又 `astype(copy=True)`
-        #   （第三次）。3.16 GiB 的梯度会在主机侧来回拷 ~12 GiB，实测 8~9 s。
-        #   这里直接用**共享内存的 numpy 视图**写入 / 读出，消掉三次冗余拷贝。
+        # ★ 2026-11-18 性能整改（第二版）：把 321 次逐张量同步拷贝换成
+        #   「GPU 内打包 → 一次 d2h(pinned) → 一次 h2d」，并把主机侧缓冲改成**页锁定**。
+        #   实测：可分页 2.18/1.48 GiB/s → pinned 12.05/10.54 GiB/s（3.16 GiB 往返
+        #   3.55 s → 0.56 s）。原来的瓶颈是每次 `cuMemcpyDtoH` 都要驱动逐页锁定，
+        #   加上 321 次调用的固定开销（每次约 15 ms）。
+        rt = _runtime()
+        pack, host = self._buffers(total)
+        # ★ 把共享内存注册成页锁定 ⇒ d2h 可以直接写进去，省掉
+        #   「pinned → shm」那一次 3.16 GiB 主机拷贝（实测约 0.3 s）。
+        #   注册失败就退回老路（pinned + copyto），不影响正确性。
+        shm_stage = rt.host_register(self._slot.buf)
+        own_off = self.rank * total * 4
+        _ph = {} if os.environ.get("TG_DP_TIMING") else None
+        _t = [time.perf_counter()]
+
+        def _mark(name):
+            if _ph is not None:
+                now = time.perf_counter()
+                _ph[name] = now - _t[0]
+                _t[0] = now
+
+        # ① GPU 内打包（321 次 D2D，300+ GB/s，合计约 20 ms）
         off = 0
-        base = self.rank * total * 4
-        own = np.ndarray((total,), dtype=np.float32, buffer=self._slot.buf, offset=base)
-        for p, arr, _orig, n in entries:       # 各 rank 写自己那一段；缺梯度写 0
-            dst = own[off:off + n]
-            if arr is None:
-                dst.fill(0.0)
-            else:
-                np.copyto(dst, np.ascontiguousarray(arr, dtype=np.float32).reshape(-1))
+        for p, g, n in entries:
+            if g is not None:
+                rt.copy_d2d(pack, g._gpu, n * 4, dst_off=off * 4)
             off += n
+
+        _mark("1_pack_d2d")
+        # ② 一次 d2h：优先**直接写进已注册的共享内存**
+        #   ★ 注意：d2h 和后面的 h2d 必须用**同一个地址**（acc_ptr），
+        #     否则回传的是另一块缓冲里的旧数据（我曾因此让梯度变成全 0，
+        #     是「各 rank gnorm 必须逐位相同」这条判据当场抓到的）。
+        if shm_stage is not None:
+            acc_ptr = ctypes.c_void_p(shm_stage.ptr.value + own_off)
+            rt.d2h_into(pack, acc_ptr)
+            own_view = np.ndarray((total,), dtype=np.float32, buffer=self._slot.buf,
+                                  offset=own_off)
+        else:
+            acc_ptr = host.ptr
+            rt.d2h_into(pack, acc_ptr)
+            own_view = host.array(np.float32, total)
+        _mark("2_d2h")
+
+        # ③ 缺梯度的位置在**主机侧**清零（不占额外显存；这类位置很少）
+        off = 0
+        for p, g, n in entries:
+            if g is None:
+                own_view[off:off + n] = 0.0
+            off += n
+
+        # ④ 写进共享内存自己那一段（若已直接 d2h 进去则跳过）
+        if shm_stage is None:
+            base = self.rank * total
+            shm_own = np.ndarray((total,), dtype=np.float32, buffer=self._slot.buf,
+                                 offset=base * 4)
+            np.copyto(shm_own, own_view)
+        _mark("3_shm_copy")
         self._barrier("grads")
+        _mark("4_barrier")
 
-        allv = np.ndarray((self.world, total), dtype=np.float32, buffer=self._slot.buf)
-        acc = np.empty(total, dtype=np.float32)
-        np.sum(allv, axis=0, out=acc)          # 预分配，避免再开一份
+        # ⑤ 求和到 pinned（复用同一块：自己那段已写进 shm，可以覆盖）
+        #   ★ 实测：`np.sum(allv, axis=0, out=acc)` 要 1.263 s，而逐段 `np.add`
+        #   只要 0.464 s（同样的 3.16 GiB）—— numpy 对 (world,N) 的跨行求和
+        #   向量化得不好。改成对每个对端段做一次 add，快 2.7×。
+        acc = own_view
+        for r in range(self.world):
+            if r == self.rank:
+                continue
+            seg = np.ndarray((total,), dtype=np.float32, buffer=self._slot.buf,
+                             offset=r * total * 4)
+            np.add(acc, seg, out=acc)
         acc *= (float(scale) if scale is not None else 1.0 / float(self.world))
+        _mark("5_sum")
 
+        # ⑥ 一次 h2d 回打包缓冲，再 D2D 拆回各梯度
+        rt.h2d_into(pack, acc_ptr)
         off = 0
-        for p, arr, orig, n in entries:
-            val = acc[off:off + n]             # ★ 视图，不再 copy
-            if arr is not None:
-                val = val.reshape(arr.shape)
+        for p, g, n in entries:
+            if g is not None:
+                rt.copy_d2d(g._gpu, pack, n * 4, src_off=off * 4)
             else:
-                val = val.reshape(tuple(getattr(p, "shape", (n,))))
-            _set_grad(p, val, orig)
+                # 没有梯度的参数：从主机侧补一份（与原语义一致：补 0 后再平均）
+                val = acc[off:off + n].reshape(tuple(getattr(p, "shape", (n,))))
+                _set_grad(p, val, None)
             off += n
+        _mark("6_h2d_unpack")
+        if _ph is not None:
+            print("[dp-phases] " + "  ".join("%s=%.3fs" % (k, v) for k, v in
+                                             sorted(_ph.items())), flush=True)
 
     def close(self):
         """释放共享内存。
