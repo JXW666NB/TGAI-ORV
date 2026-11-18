@@ -58,9 +58,38 @@ baseline 各重复 3 次：ORV seq512 `0.246/0.247/0.245`（极差 0.5%）、
 PyT seq512 `0.450/0.446/0.448`（0.8%）、seq2048 ORV 0.8%、PyT 0.6%。
 **机器稳定，测量噪声 <1%，此前担心的 ±5% 抖动不存在。**
 
-## 六、还没做的
+## 六、batch>1 的 bug：定位、修复、验证
 
-* `batch > 1`：CSA 路径仍报错（`reshape (2,1024,1024) -> (1024,1024)`），未修
-* PyTorch 的 `--amp` 用的是 GradScaler + autocast；ORV 的 amp 无 loss scaling —— 这很可能是
+**现象**：CSA 路径下 `--batch 2` 直接抛
+`CudaError: reshape (2,128,128) -> (128,128) 元素个数 32768 != 16384`。
+
+**最小复现**：2 层 / d=128 / seq=64 / batch=2（`lab/rent/repro_batch2.py`）。
+
+**根因**：`matmul` 反向的"跨步批量 GEMM"快路径（`tgai_go/train/__init__.py`）
+在形状不一致时直接 `reshape`，**漏了广播归约**。同一个函数里慢路径后面是有
+`rt.unbroadcast(...)` 的，快路径没跟上 —— 权重对 batch 共享时，梯度必须**沿 batch 求和**。
+
+**修法**：元素数一致才 `reshape`，否则走 `rt.unbroadcast`（按广播规则求和回原形状）。
+
+**验证**（缺一不可）：
+1. 复现脚本：batch=1 / batch=2 均成功
+2. **数值对拍**：`lr=0` 时 `loss(batch=2,1步)` 必须等于两个样本 loss 的均值
+   → 期望 11.50970030，实测 11.50970078，**相对差 4.2e-08 PASS**
+3. 全套 pytest：**824 passed, 59 skipped**
+
+**收益**（MoE 12L / seq512 / 20 步 / AMP）：
+
+| batch | 步时 | 吞吐 | 显存 |
+| --- | --- | --- | --- |
+| 1 | 0.238 s | 2,148 tok/s | 12.6 GiB |
+| **2** | 0.271 s | **3,783 tok/s（1.76×）** | 15.0 GiB |
+| 4 | 0.546 s | 3,750 tok/s（1.75×） | 19.8 GiB |
+
+batch=2 是最佳点（+76% 吞吐，多 2.4 GiB）；batch=4 无额外收益。
+
+## 七、还没做的
+
+* **PyTorch 侧的 batch>1 未接入**我用的驱动，所以 batch 对两边的**公平**影响还没比
+* PyTorch 的 `--amp` 用 GradScaler + autocast；ORV 的 amp 无 loss scaling —— 很可能是
   `fp16mom` 发散的根源，但**未验证**
-* 多机（>2 卡）未测
+* 多机（>2 卡）未测；`fp16mom` 未修（建议先改为默认禁用或加断言）

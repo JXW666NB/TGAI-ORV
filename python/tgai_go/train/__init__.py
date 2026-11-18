@@ -1232,7 +1232,16 @@ class Tensor:
                     return None
                 M_, n_, k_ = gshape[-2], gshape[-1], bs[-2]
                 out = rt.sgemm_nt_strided_batched(g, b, gb, M_, k_, n_)
-                return out if tuple(out.shape) == a_shape else rt.reshape(out, a_shape)
+                if tuple(out.shape) == a_shape:
+                    return out
+                # ★ 2026-11-19 修 batch>1：a 有可能被广播到 batch 维（比如权重对 batch
+                #   共享），此时梯度必须**沿 batch 求和**回原形状。原来直接 reshape，
+                #   元素数对不上就抛 CudaError（batch=2 实测：(2,128,128) -> (128,128)）。
+                _need = 1
+                for _v in a_shape:
+                    _need *= int(_v)
+                return (rt.reshape(out, a_shape) if int(out.n) == _need
+                        else rt.unbroadcast(out, a_shape))
 
             def _tn():
                 as_ = tuple(int(s) for s in a.shape)
@@ -1243,7 +1252,14 @@ class Tensor:
                     return None
                 M_, k_, N_ = as_[-2], as_[-1], gshape[-1]
                 out = rt.sgemm_tn_strided_batched(a, g, ab, k_, N_, M_)
-                return out if tuple(out.shape) == b_shape else rt.reshape(out, b_shape)
+                if tuple(out.shape) == b_shape:
+                    return out
+                # ★ 同上：b 被广播到 batch 维时，梯度要沿 batch 求和（不是 reshape）
+                _need = 1
+                for _v in b_shape:
+                    _need *= int(_v)
+                return (rt.reshape(out, b_shape) if int(out.n) == _need
+                        else rt.unbroadcast(out, b_shape))
 
             if self.requires_grad:
                 da = _nt()
