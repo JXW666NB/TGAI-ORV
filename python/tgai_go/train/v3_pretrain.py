@@ -1295,7 +1295,17 @@ def main(argv=None):
             # ★ 必须在裁剪**之前**归约：否则 gnorm 只是本 rank 的范数，
             #   裁剪阈值在各 rank 上会不一致，梯度就不同步了。
             if _dp is not None:
+                _t_r = _now()
+                _nred = sum(1 for q in params if getattr(q, "grad", None) is not None)
+                _bytes = sum(int(q.grad._gpu.n) * 4 for q in params
+                             if getattr(q, "grad", None) is not None)
                 _dp.all_reduce_grads(params)
+                if os.environ.get("TG_DP_TIMING"):
+                    _dt_r = _now() - _t_r
+                    print("[dp] reduce %.3f s  grads=%d  bytes=%.2f GiB  => %.1f GiB/s"
+                          % (_dt_r, _nred, _bytes / float(1 << 30),
+                             (_bytes / float(1 << 30)) / _dt_r if _dt_r > 0 else 0.0),
+                          flush=True)
             gnorm = float(T.clip_grad_norm_(params, float(a.grad_clip))) \
                 if float(a.grad_clip) > 0 else 0.0
             if not _is_finite(gnorm):

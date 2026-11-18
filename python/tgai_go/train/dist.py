@@ -332,29 +332,32 @@ class DataParallel:
             raise RuntimeError("梯度总长度为 0" + "。修法：确认反向已经跑过、params 非空")
         self._ensure_slot(max(total * 4, 8))
 
+        # ★ 2026-11-18 性能整改：原来每个参数都走 `ascontiguousarray(...).tobytes()`
+        #   （多一次整份主机拷贝）再切片赋值（又一次），求和后又 `astype(copy=True)`
+        #   （第三次）。3.16 GiB 的梯度会在主机侧来回拷 ~12 GiB，实测 8~9 s。
+        #   这里直接用**共享内存的 numpy 视图**写入 / 读出，消掉三次冗余拷贝。
         off = 0
         base = self.rank * total * 4
+        own = np.ndarray((total,), dtype=np.float32, buffer=self._slot.buf, offset=base)
         for p, arr, _orig, n in entries:       # 各 rank 写自己那一段；缺梯度写 0
+            dst = own[off:off + n]
             if arr is None:
-                blob = np.zeros(n, dtype=np.float32).tobytes()
+                dst.fill(0.0)
             else:
-                blob = np.ascontiguousarray(arr, dtype=np.float32).tobytes()
-            self._slot.buf[base + off:base + off + len(blob)] = blob
-            off += len(blob)
+                np.copyto(dst, np.ascontiguousarray(arr, dtype=np.float32).reshape(-1))
+            off += n
         self._barrier("grads")
 
-        buf = np.ndarray((self.world, total), dtype=np.float32,
-                         buffer=self._slot.buf, offset=0)
-        acc = buf.sum(axis=0)
-        if scale is None:
-            acc /= float(self.world)
-        else:
-            acc *= float(scale)
+        allv = np.ndarray((self.world, total), dtype=np.float32, buffer=self._slot.buf)
+        acc = np.empty(total, dtype=np.float32)
+        np.sum(allv, axis=0, out=acc)          # 预分配，避免再开一份
+        acc *= (float(scale) if scale is not None else 1.0 / float(self.world))
+
         off = 0
         for p, arr, orig, n in entries:
-            val = acc[off:off + n].astype(np.float32, copy=True)
+            val = acc[off:off + n]             # ★ 视图，不再 copy
             if arr is not None:
-                val = val.astype(arr.dtype, copy=False).reshape(arr.shape)
+                val = val.reshape(arr.shape)
             else:
                 val = val.reshape(tuple(getattr(p, "shape", (n,))))
             _set_grad(p, val, orig)
