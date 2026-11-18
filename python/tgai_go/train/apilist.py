@@ -188,16 +188,32 @@ def _kernels():
                     break
             j += 1
         params = " ".join(txt[i + 1:j].split())
-        head = txt[max(0, m.start() - 800):m.start()]
+        head = txt[max(0, m.start() - 3000):m.start()]
         desc = ""
-        cm = re.findall(r"/\*(.*?)\*/", head, re.S)
-        if cm:
-            desc = _first_line(cm[-1].replace("*", " "))
+        # ★ 2026-11-19 修：原来取"内核前 800 字符内最后一条 /* */"，
+        #   于是**没有自己注释**的内核会借用上一个内核的说明
+        #   （实测 `ewise_div` 显示了 `ewise_clamp` 的 "lo/hi ..."）。
+        #   现在只认**紧邻上方**的注释：注释结束到内核开头之间除空行外不允许有别的东西。
+        last_cm = None
+        for cm in re.finditer(r"/\*(.*?)\*/", head, re.S):
+            last_cm = cm
+        if last_cm is not None and head[last_cm.end():].strip() == "":
+            desc = _first_line(last_cm.group(1).replace("*", " "))
         if not desc:
-            lines = [ln.lstrip("/ ").strip() for ln in head.splitlines()
-                     if ln.strip().startswith("//")]
-            if lines:
-                desc = _first_line(" ".join(lines[-3:]))
+            # 同理处理 `//` 注释：只取紧邻上方的**连续**几行，遇到代码就停
+            got = []
+            for ln in reversed(head.splitlines()):
+                s = ln.strip()
+                if not s:
+                    if got:
+                        break
+                    continue
+                if s.startswith("//"):
+                    got.append(s.lstrip("/ ").strip())
+                    continue
+                break
+            if got:
+                desc = _first_line(" ".join(reversed(got)))
         # ★ 只接受"像一句话"的注释：过短、以符号开头、或明显是句中片段（★/→/…开头）
         #   的一律丢掉，否则列出来会像 "ce_fwd_rows: ★ 改成 跨步 访问：原来…" 这种碎片。
         if desc:

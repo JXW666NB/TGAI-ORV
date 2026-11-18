@@ -83,3 +83,27 @@ def test_print_true_writes_to_stdout():
     finally:
         sys.stdout = old
     assert "张量算子" in buf.getvalue()
+
+
+def test_kernel_desc_not_borrowed():
+    """没有自己注释的内核，不能借用上一个内核的说明。
+
+    回归用例：`ewise_div` 曾经显示 `ewise_clamp` 的 "lo/hi ... CUDART_INF"。
+    原因是提取时取"内核前 800 字符内最后一条 /* */"，会跨过上一个内核。
+    """
+    import contextlib
+    import io
+
+    import tgai_go.train as T
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        T.help(s="ewise_div")
+    txt = buf.getvalue()
+    assert "ewise_div" in txt, "搜索结果里没有 ewise_div，用例本身失效"
+    assert "CUDART_INF" not in txt, "ewise_div 又借用了 clamp 的说明"
+
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        T.help(s="ewise_clamp")
+    txt2 = buf2.getvalue()
+    assert "CUDART_INF" in txt2, "ewise_clamp 自己的说明丢了"
