@@ -121,6 +121,79 @@ print(T.policy("attn_tile"))            # 读某一项（带默认值：T.policy
 
 ---
 
+### 长上下文：现在能跑到 64K（0.9.97+）
+
+CSA 的全局分支改成「query 分块 + 反向重算」后，显存从 O(seq²) 降到近似线性：
+
+| seq（d=128 / 2 层小模型） | 改前 | 改后 |
+| --- | --- | --- |
+| 16384 | 11.97 GiB | **2.99 GiB** |
+| 32768 | 跑不了（OOM） | **7.64 GiB** |
+| 65536 | 跑不了（OOM） | **20.59 GiB**（真实训练步，loss 9.00 → 8.97）|
+
+默认 `cq=2048`：**seq ≤ 2048 自动走原路径、逐位不变**；要完全回退设 `TG_CSA_ATTN_CQ=0`。
+数学：前向与物化路径 **max_abs = 0.000e+00（逐位一致）**；4 层/seq512 的 loss 与基线精确相同。
+
+## 分布式训练（数据并行）
+
+模型**单卡装不下**、或想要更高聚合吞吐时用它。
+ORV 的 DP 是「每卡一份完整模型 + 梯度平均」，进程间走**共享内存 + 文件屏障**，
+**不依赖 NCCL/MPI** —— 所以 Linux 和 Windows 都能直接用，装完即跑。
+
+```bash
+# 两张卡、两个进程；CUDA_VISIBLE_DEVICES 指定各自的卡（ORV 没有选卡参数）
+CUDA_VISIBLE_DEVICES=0 TGAI_DP_WORLD=2 TGAI_DP_RANK=0 TGAI_DP_JOB=run1 \
+  python -m tgai_go.train.v3_pretrain --data <语料> ...
+CUDA_VISIBLE_DEVICES=1 TGAI_DP_WORLD=2 TGAI_DP_RANK=1 TGAI_DP_JOB=run1 \
+  python -m tgai_go.train.v3_pretrain --data <语料> ...
+```
+
+* `TGAI_DP_WORLD`：总进程数（≥2 才启用）
+* `TGAI_DP_RANK`：本进程编号（0..world-1）
+* `TGAI_DP_JOB`：**必须一致**，同一个 rendezvous 目录名
+
+**实测（RTX 3090 24GB ×2 / V3-1.5B / seq512 / m8v16）**
+
+| 配置 | 步时 | 聚合吞吐 |
+| --- | --- | --- |
+| 单卡 | 0.505 s | 1,013 tok/s |
+| **双卡 DP** | 0.507 / 0.497 s | **≈ 2,039 tok/s（1.99×）** |
+
+**双卡对双卡：与 PyTorch DDP 同条件对比**（同形状、同 seq、各 rank 不同数据、真实训练步）
+
+| 层数 | PyTorch DDP | ORV DP | ORV 优势 | 显存（PyT / ORV）|
+| --- | --- | --- | --- | --- |
+| 12 | 0.905 s → 1,132 tok/s（聚合）| **0.264 s → 3,881 tok/s** | **3.43×** | 17.7 / **11.2 GiB** |
+| 16 | 1.201 s → 853 tok/s（聚合）| **0.344 s → 2,976 tok/s** | **3.49×** | 22.8 / **14.2 GiB** |
+
+单卡时 ORV 只快 2.3–2.5×，**一上双卡差距反而拉大到 3.4–3.5×** —— 原因是两边的扩展开销不同：
+
+| | 单卡 → 双卡 每步耗时变化 |
+| --- | --- |
+| ORV DP | 0.252 → 0.264 s（**+5%**）|
+| PyTorch DDP | 0.577 → 0.905 s（**+57%**）|
+
+PyTorch 这边贵在两处：MoE 的路由是数据相关的，DDP 必须开 `find_unused_parameters=True`
+（每步多一次图遍历），以及 NCCL all-reduce。ORV 不需要前者，后者的实测开销接近零
+（`pytorch-ddp 对照` 数据见 `lab/rent/`）。
+归约开销几乎为零（0.507 vs 0.505 s）。梯度归约**默认取平均**，与 PyTorch DDP 语义一致；
+要让等效 batch 变大，按 world 放大 lr。正确性判据：**各 rank 的 gnorm 必须逐位相同**
+（实测 3.645 / 3.526 / 5.076 两次运行完全一致）。
+
+### V3-1.5B 规模下与 PyTorch 的对比（RTX 3090 24GB，单卡）
+
+同形状（d=1024 / d_ff=3328 / E=4 / vocab 96000 / seq512），真实训练步：
+
+| 层数 | PyTorch 步时 | PyTorch 峰值 | ORV 步时 | ORV 峰值 |
+| --- | --- | --- | --- | --- |
+| 12 | 0.577 s | 16.5 GiB | **0.252 s** | **10.5 GiB** |
+| 16 | 0.818 s | 20.9 GiB | **0.328 s** | **13.2 GiB** |
+
+**每层边际成本：PyTorch 60.3 ms vs ORV 19.0 ms ⇒ 便宜 3.2×**，显存也低约 37%。
+这个形状 PyTorch 到 24 层会 OOM（fp32 AdamW 光状态就要 24 GiB 以上），ORV 用 m8v16 能跑完。
+
+---
+
 ## 插件系统
 
 算子、后端、损失函数、优化器、分词器、调度器 —— **六条扩展轴共用一个命名空间**，

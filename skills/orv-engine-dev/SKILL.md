@@ -315,6 +315,44 @@ hist = T.fit(model, loader, steps=2000, lr=3e-4, amp=True)
 
 ---
 
+## 6.5 多卡 / 数据并行（1.0.0+）
+
+**什么时候用**：模型单卡装不下，或想要更高聚合吞吐。ORV 的 DP 是「每卡一份完整模型 +
+梯度平均」，进程间走**共享内存 + 文件屏障**，**不需要 NCCL/MPI**（Linux/Windows 都能跑）。
+
+```bash
+# 两个进程 = 两张卡。TGAI_DP_JOB 必须一致，它是 rendezvous 目录名。
+CUDA_VISIBLE_DEVICES=0 TGAI_DP_WORLD=2 TGAI_DP_RANK=0 TGAI_DP_JOB=run1 \
+  python -m tgai_go.train.v3_pretrain --data <语料> ...
+CUDA_VISIBLE_DEVICES=1 TGAI_DP_WORLD=2 TGAI_DP_RANK=1 TGAI_DP_JOB=run1 \
+  python -m tgai_go.train.v3_pretrain --data <语料> ...
+```
+
+### 四条必须知道的
+
+1. **`CUDA_VISIBLE_DEVICES` 一定要给**。ORV 没有选卡参数（`set_device("cuda")` 恒用 0 号卡），
+   两个进程都不设就会**挤在同一张卡上** OOM。实测踩过。
+2. **正确性判据是「各 rank 的 gnorm 逐位相同」**。各 rank 吃不同数据、loss 不同，
+   但归约后的梯度必须一致 ⇒ gnorm 一定相同。不同就是归约/裁剪顺序错了。
+3. **归约必须在梯度裁剪之前**（`v3_pretrain` 已按此实现）。否则 gnorm 只是本 rank 的范数，
+   各 rank 裁剪阈值不一致，梯度就不同步。
+4. **归约默认取平均**（与 PyTorch DDP 一致）。要让等效 batch 变大，按 world 放大 lr。
+
+### 实测（RTX 3090 24GB ×2 / V3-1.5B / seq512 / m8v16）
+
+| 配置 | 步时 | 聚合吞吐 |
+| --- | --- | --- |
+| 单卡 | 0.505 s | 1,013 tok/s |
+| 双卡 DP | 0.507 / 0.497 s | **≈ 2,039 tok/s（1.99×）** |
+
+归约开销几乎为零。
+
+### 别指望 DP 省显存
+
+DP 每卡一份**完整**模型（参数+梯度+优化器）。3B 光这三项就要 33 GiB
+（`4+4+3.0625` B/参数），2×24GB 合计 48 GB 也装不下 —— **那需要专家并行（EP）**，
+因为专家占了 V3 参数量的 65.7%。EP 尚未实现。
+
 ## 7. 开发插件
 
 先读 **`docs/PLUGIN_CHARTER.md`** —— 那是规范性文档（不变量），与它冲突的代码视为 bug。
