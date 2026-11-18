@@ -421,22 +421,68 @@ class DataParallel:
         self._barrier("grads")
         _mark("4_barrier")
 
-        # ⑤ 求和到 pinned（复用同一块：自己那段已写进 shm，可以覆盖）
-        #   ★ 实测：`np.sum(allv, axis=0, out=acc)` 要 1.263 s，而逐段 `np.add`
-        #   只要 0.464 s（同样的 3.16 GiB）—— numpy 对 (world,N) 的跨行求和
-        #   向量化得不好。改成对每个对端段做一次 add，快 2.7×。
+        # ⑤+⑥ **流水**：主线程逐块求和（CPU），后台线程逐块回传（PCIe）——
+        #   两者用不同资源，可以真重叠。不开流水时是「先全部求和、再全部回传」，
+        #   实测 0.46 + 0.33 s 串行；流水后取较长的那一段。
+        #   `numpy` 与 `ctypes` 调用都会释放 GIL，所以线程能真的并行。
+        import queue as _queue
+        import threading as _threading
+
+        try:
+            _k = int(os.environ.get("TG_DP_CHUNKS", "1"))   # 1 = 不流水（默认；流水版有竞态，待查）
+        except Exception:
+            _k = 8
+        _k = max(1, min(_k, max(1, total)))
+        bounds = [(int(total) * i) // _k for i in range(_k + 1)]
+        _sc = float(scale) if scale is not None else 1.0 / float(self.world)
         acc = own_view
+        peers = []
         for r in range(self.world):
             if r == self.rank:
                 continue
-            seg = np.ndarray((total,), dtype=np.float32, buffer=self._slot.buf,
-                             offset=r * total * 4)
-            np.add(acc, seg, out=acc)
-        acc *= (float(scale) if scale is not None else 1.0 / float(self.world))
+            peers.append(np.ndarray((total,), dtype=np.float32, buffer=self._slot.buf,
+                                    offset=r * total * 4))
+
+        q = _queue.Queue()
+        errors = []
+
+        def _uploader():
+            # ★ CUDA 上下文是**线程局部**的：后台线程必须自己设一次，
+            #   否则 cuMemcpyHtoD 会报 rc=201 invalid device context（实测踩过）。
+            try:
+                rt._ctx_cur = False
+                rt._activate()
+            except Exception:
+                pass
+            while True:
+                idx = q.get()
+                if idx is None:
+                    return
+                a, b = bounds[idx], bounds[idx + 1]
+                try:
+                    # 只回传这一段（其余段不受影响，pack 里已有原值）
+                    rt.h2d_into(pack, acc_ptr, nbytes=(b - a) * 4,
+                                dst_off=a * 4, src_off=a * 4)
+                except BaseException as exc:      # noqa: BLE001
+                    errors.append(exc)
+                    return
+
+        th = _threading.Thread(target=_uploader, daemon=True)
+        th.start()
+        for idx in range(_k):
+            a, b = bounds[idx], bounds[idx + 1]
+            seg_out = acc[a:b]
+            for pv in peers:
+                np.add(seg_out, pv[a:b], out=seg_out)
+            seg_out *= _sc
+            q.put(idx)
+        q.put(None)
+        th.join()
+        if errors:
+            raise errors[0]
         _mark("5_sum")
 
-        # ⑥ 一次 h2d 回打包缓冲，再 D2D 拆回各梯度
-        rt.h2d_into(pack, acc_ptr)
+        # ⑦ D2D 拆回各梯度（整块 D2D，实测 0.008 s，不构成瓶颈）
         off = 0
         for p, g, n in entries:
             if g is not None:
