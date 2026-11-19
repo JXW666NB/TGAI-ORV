@@ -20,6 +20,7 @@ import ctypes
 import os
 import re
 import sys
+import time
 
 import numpy as np
 
@@ -3204,7 +3205,31 @@ def _pool_bucket(nbytes):
 
 
 # 空闲块超过这个数就真正 cuMemFree，避免池无限囤积。活着的张量不占这份额度。
-_POOL_CAP_BYTES = 12 * (1024 ** 3)
+def _pool_cap_from_env(default_bytes=12 * (1024 ** 3)):
+    """显存池上限。**TG_POOL_GB 之前只在错误信息里被承诺、实际没实现**（2026-11-19 补）。
+
+    为什么重要：池缓存顶到 cap 后，每次 `_pool_release` 都会触发 trim 把块还给驱动，
+    下一步再重新 `cuMemAlloc`。V100 / seq2048 / 12 层 MoE 实测：
+      * 命中率 60%，**每步 2015 次 cuMemAlloc + 2016 次 cuMemFree，CPU 368.7 ms**
+        （占步时 47.2%）；seq512 命中率 99.8%，只有 1.6 ms。
+      * 因果 A/B（只改这个上限）：4 GiB → 0.880 s，12 GiB → 0.78 s，16 GiB → **0.699 s（−10%）**。
+    所以卡上显存够时，把它调大是纯收益。默认仍保守取 12 GiB（24 GB 卡上留足余量），
+    32 GB 级别的卡建议 `TG_POOL_GB=16`。
+    """
+    v = os.environ.get("TG_POOL_GB")
+    if not v:
+        return int(default_bytes)
+    try:
+        gb = float(v)
+        if gb <= 0:
+            raise ValueError
+    except Exception:
+        raise CudaError("TG_POOL_GB 必须是正数（单位 GiB），收到 %r" % (v,)
+                        + "。修法：设成如 16，或留空用默认 12")
+    return int(gb * (1024 ** 3))
+
+
+_POOL_CAP_BYTES = _pool_cap_from_env()
 # d2h 已经同步过默认流。这时如果池里堆了超过 2 GiB 的空闲块，
 # 就从最小的开始释放到只留 256 MiB，避免下一步把上一步的尺寸全堆在活张量上。
 # 一步中间的小块不在这里放：那时候核还在飞，同步会把一步切碎。
@@ -3293,6 +3318,7 @@ class CudaRuntime:
         self._attn_nop_path = None
         # 缓存分配器。热路径只在 CPU 侧交接指针，不调用 cuMemAlloc/cuMemFree。
         self._pool_cap = _POOL_CAP_BYTES
+        self._adapt_pool_cap()
         self._pool_free = {}
         self._pool_live = {}
         self._pool_seq = 0
@@ -3415,6 +3441,14 @@ class CudaRuntime:
         cu.cuEventElapsedTime.restype = ctypes.c_int
         cu.cuEventQuery.argtypes = [ctypes.c_void_p]
         cu.cuEventQuery.restype = ctypes.c_int
+        try:
+            # 单 event 等待（event 计时用；比 cuCtxSynchronize 精确）。
+            # 驱动一定有这个符号，但按 cuGetErrorString 的先例仍容错处理，
+            # 免得因为一个非必需符号把整个后端初始化拖死。
+            cu.cuEventSynchronize.argtypes = [ctypes.c_void_p]
+            cu.cuEventSynchronize.restype = ctypes.c_int
+        except AttributeError:
+            pass
         cu.cuEventDestroy.argtypes = [ctypes.c_void_p]
         cu.cuEventDestroy.restype = ctypes.c_int
         cu.cuModuleLoadData.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
@@ -3752,6 +3786,157 @@ class CudaRuntime:
         self._activate()
         self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize")
 
+    # ─────────────────── CUDA event 计时（性能归因用）───────────────────
+    # 为什么必须有这一组：用「调用前后各 rt.sync()」去量单个 kernel，会把**探测
+    # 自身的开销**算进 kernel —— 实测 `transpose2d` 被量成 76 ms/步，但端到端把
+    # 它整条替换掉步时一点没变。sync 会强制排空整条流，于是每个 kernel 都要付一次
+    # 全设备同步的代价。
+    #
+    # event 是**流内**打点：`cuEventRecord` 只是往默认流里塞一个"写时间戳"的命令，
+    # 不阻塞主机、不打断发射流水；一步结束后（或任何一次 sync 之后）再批量读
+    # `cuEventElapsedTime`。相邻两个 event 之间的 elapsed 就是这段 GPU 工作的真实
+    # 耗时，不含主机侧开销。
+    #
+    # 约定：
+    #   * event 对象就是 `ctypes.c_void_p`（与 `_pool_ev_acquire` 同一种表示），
+    #     生命周期由调用方负责，用完 `event_destroy`；
+    #   * 全部记录在**当前流**（`self._stream`，默认就是 legacy NULL 流）上，与
+    #     本运行时的其它操作同流 ⇒ 顺序即时间顺序；
+    #   * 只读 CPU 后端/未初始化时不会有这些调用：cuda.py 本来就只在 cuda 路径加载，
+    #     这组方法也不改变任何已有的发射/同步行为。
+
+    def event_create(self):
+        """建一个 CUDA event（flags=0，仅计时用）。返回 ctypes.c_void_p。"""
+        self.ensure()
+        ev = ctypes.c_void_p()
+        self._chk(self.cu.cuEventCreate(ctypes.byref(ev), ctypes.c_uint(0)),
+                  "cuEventCreate")
+        return ev
+
+    def event_record(self, ev):
+        """把 event 记在当前流上（异步；只入队，不阻塞主机）。"""
+        if self.cu is None:
+            raise CudaError("event_record 需要 CUDA 后端已初始化（当前 self.cu 为空）"
+                            + "。修法：先 set_device('cuda')；CPU 后端不提供 event 计时")
+        self._activate()
+        self._chk(self.cu.cuEventRecord(ev, self._stream), "cuEventRecord")
+        return ev
+
+    def event_query(self, ev):
+        """event 是否已经在设备上跑完（True = 完成）。"""
+        if self.cu is None:
+            return False
+        return int(self.cu.cuEventQuery(ev)) == 0
+
+    def event_elapsed_ms(self, start, end):
+        """两个 event 之间的 GPU 毫秒数（float）。
+
+        `end` 必须已经完成；没完成时驱动返回 CUDA_ERROR_NOT_READY(600)，这里给出
+        明确报错而不是吞掉 —— 静默返回 0 会让归因表整体失真。
+        """
+        if self.cu is None:
+            raise CudaError("event_elapsed_ms 需要 CUDA 后端已初始化"
+                            + "。修法：先 set_device('cuda')")
+        ms = ctypes.c_float()
+        rc = int(self.cu.cuEventElapsedTime(ctypes.byref(ms), start, end))
+        if rc == 600:                       # CUDA_ERROR_NOT_READY
+            raise CudaError(
+                "event_elapsed_ms: 第二个 event 还没跑完（rc=600 CUDA_ERROR_NOT_READY）"
+                + "。修法：读 elapsed 之前先 sync()，或只读已经过去的步")
+        self._chk(rc, "cuEventElapsedTime")
+        return float(ms.value)
+
+    def event_sync(self, ev):
+        """等单个 event 完成（比整设备 sync 精确；不改变已入队的工作）。"""
+        if self.cu is None:
+            raise CudaError("event_sync 需要 CUDA 后端已初始化"
+                            + "。修法：先 set_device('cuda')")
+        self._activate()
+        self._chk(self.cu.cuEventSynchronize(ev), "cuEventSynchronize")
+
+    def event_destroy(self, ev):
+        """销毁 event。重复销毁/传 None 都安全跳过（析构路径不该抛）。"""
+        if self.cu is None or ev is None:
+            return
+        try:
+            self.cu.cuEventDestroy(ev)
+        except Exception:                   # noqa: BLE001 - 析构路径不抛
+            pass
+
+    def event_selftest(self, iters=100, elems=(1 << 20)):
+        """event 计时自检：量一批 `add`，核对量级，并与墙钟交叉校验。
+
+        判据：
+          1. 数值正确（`add(1,2)` == 3，读回逐元素比较）；
+          2. 单次耗时落在 [3 µs, 5 ms]（1 M float 的 add 要读写 12 MB；V100 上约
+             13–18 µs，放宽两个数量级只为抓"量错量级"，不锁死具体卡）；
+          3. **event 总和 ≈ 墙钟**（比值在 [0.5, 1.5] 内）：这条是关键 ——
+             「sync 包裹法」正是在这一步失真的；
+          4. 不崩、elapsed 非负且有限。
+
+        返回 dict（含实测数字），失败抛 CudaError。
+        """
+        elems = int(elems)
+        iters = int(iters)
+        if elems <= 0 or iters <= 0:
+            raise CudaError("event_selftest 参数必须为正"
+                            + "。修法：传 iters>=1、elems>=1")
+        a = self.full((elems,), 1.0)
+        b = self.full((elems,), 2.0)
+        # 预热：把内核模块、参数模板、池块都走到稳态，否则第一批含首次开销。
+        for _ in range(5):
+            self.add(a, b)
+        self.sync()
+
+        evs = [self.event_create() for _ in range(2 * iters)]
+        try:
+            t0 = time.perf_counter()
+            for i in range(iters):
+                self.event_record(evs[2 * i])
+                out = self.add(a, b)
+                self.event_record(evs[2 * i + 1])
+            self.sync()
+            wall_ms = (time.perf_counter() - t0) * 1000.0
+            vals = [self.event_elapsed_ms(evs[2 * i], evs[2 * i + 1])
+                    for i in range(iters)]
+        finally:
+            for ev in evs:
+                self.event_destroy(ev)
+
+        # 数值自检：只读首尾两个元素，避免一次 4 MB 的 D2H 干扰计时结论
+        head = np.asarray(out.to_numpy(), dtype=np.float64).reshape(-1)
+        if not (abs(head[0] - 3.0) <= 1e-6 and abs(head[-1] - 3.0) <= 1e-6):
+            raise CudaError("event_selftest 数值错误：add(1,2) 得到 %r"
+                            % (head[:2],) + "。修法：先跑 docs 里的最小闭环确认后端正常")
+
+        total_ms = float(sum(vals))
+        avg_ms = total_ms / float(iters)
+        lo, hi = 0.003, 5.0
+        ok = True
+        why = []
+        if not all(v == v and 0.0 <= v < 1e6 for v in vals):
+            ok = False
+            why.append("elapsed 非法（nan/负数/离谱值）")
+        if not (lo <= avg_ms <= hi):
+            ok = False
+            why.append("单次 %.6f ms 不在 [%.3f, %.1f] 区间" % (avg_ms, lo, hi))
+        if wall_ms > 0:
+            ratio = total_ms / wall_ms
+            if not (0.5 <= ratio <= 1.5):
+                ok = False
+                why.append("event 总和/墙钟 = %.2f（应≈1）" % ratio)
+        else:
+            ratio = float("nan")
+        res = {"ok": bool(ok), "iters": iters, "elems": elems,
+               "avg_ms": avg_ms, "min_ms": float(min(vals)),
+               "max_ms": float(max(vals)), "sum_ms": total_ms,
+               "wall_ms": float(wall_ms), "event_over_wall": float(ratio),
+               "out_head": float(head[0])}
+        if not ok:
+            raise CudaError("event_selftest 失败：%s；实测 %r" % ("；".join(why), res)
+                            + "。修法：把这段数字与 GPU/驱动版本一起反馈")
+        return res
+
     def free(self, ptr, token=None):
         """把块还回池，不调用 cuMemFree。
 
@@ -3907,6 +4092,37 @@ class CudaRuntime:
         ev = ctypes.c_void_p()
         self._chk(self.cu.cuEventCreate(ctypes.byref(ev), ctypes.c_uint(0)), "cuEventCreate")
         return ev
+
+    def _adapt_pool_cap(self):
+        """按**设备总显存**自适应决定池上限（0.6×总量，夹在 8–20 GiB）。
+
+        2026-11-19 实测（V100 32 GiB / seq2048 / 12 层 MoE / 20 步稳态）：
+            TG_POOL_GB=12 → 0.775 s      （原默认，池长期顶在 cap 上）
+            TG_POOL_GB=16 → 0.694 s
+            TG_POOL_GB=20 → **0.501 s（−35%）**
+        机制：池缓存顶到 cap 后，每次 `_pool_release` 都会触发 trim 把块还给驱动，
+        下一步再 `cuMemAlloc` —— 实测每步 2015 次 alloc + 2016 次 free、CPU 368.7 ms，
+        占步时 47%。cap 放宽后缓存不再溢出，命中率从 60% 回到接近 100%。
+
+        显式设了 `TG_POOL_GB` 时**不覆盖用户的选择**。
+        拿不到设备总量时保持默认值（行为与之前一致，不会更差）。
+        """
+        if os.environ.get("TG_POOL_GB"):
+            return
+        total = None
+        for nm in ("_device_total_bytes", "device_total_bytes", "total_device_bytes",
+                   "mem_total_bytes", "total_mem_bytes"):
+            fn = getattr(self, nm, None)
+            if callable(fn):
+                try:
+                    total = int(fn())
+                    break
+                except Exception:                # noqa: BLE001 - 拿不到就算了
+                    total = None
+        if not total or total <= 0:
+            return
+        cap = int(total * 0.6)
+        self._pool_cap = max(8 << 30, min(cap, 20 << 30))
 
     def _pool_release(self, ptr, token):
         if ptr <= 0:
