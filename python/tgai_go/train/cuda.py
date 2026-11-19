@@ -2335,6 +2335,308 @@ extern "C" __global__ void sgd_multi_flat(
 }
 
 
+/* ---- Adafactor 设备端更新（2026-11-20）--------------------------------------
+   背景：`opt_extra.Adafactor` 原来是纯 numpy 实现 —— 每个参数
+   `g.to_numpy()`(D2H) + `p.to_numpy()`(D2H) + numpy 更新 + 写回(H2D)，因子化二阶矩
+   （row/col/sq）和 β1 动量也全在主机 numpy 里。实测 9.4M 参数 **143 ms/步**（同一台
+   V100 上融合版 AdamW 只要 0.34 ms；任务书里修前记的是 160.8 ms，配置略有差异）。
+   这里把整条链路留在显存：**6 次发射**覆盖全部参数，每步 **0 次标量 D2H**。
+
+   为什么必须 0 次 D2H：`clip` 要 rms(update)、`scale_parameter` 要 rms(p)、`mc`
+   要 mean(c) —— 三个都是"每张量一个标量"。朴素写法是每个标量 D2H 一次，而队列
+   深时单次标量 D2H 实测可达 **9.8 ms**，40 个张量就是 0.4 s。所以这里把这三个标量
+   全部留在设备上（`ada_mc` / `ada_finalize` 各写一张小表，`ada_update` / `ada_apply`
+   按张量下标取用），主机一步只上传 n_tensors 个 `b2t`（几十个 float）。
+
+   数学与 numpy 版逐行对齐（因子化二阶矩 + 相对 β2 + 可选 β1 + clip + scale_parameter）：
+       b2t = 1 - t**decay_rate                       （t 从 1 开始，每张量独立）
+       2D：r = b2t*r + omb2t*mean(g², axis=-1)        # (R,)
+           c = b2t*c + omb2t*mean(g², axis=0)         # (C,)
+           denom = sqrt((r/mean(c))[:,None] * c[None,:] + eps1)
+       1D：s = b2t*s + omb2t*g²;  denom = sqrt(s + eps1)
+       update = g/denom
+       β1：m = β1*m + (1-β1)*update;  update = m
+       clip：rms = sqrt(mean(update²)); 若 rms > clip 则 update *= clip/rms
+       lr_t = lr; scale_parameter 时 lr_t *= max(eps2, sqrt(mean(p²)))
+       wd：p -= (lr_t*wd)*p;  p -= lr_t*update
+
+   确定性（`TG_DETERMINISTIC` 的约定）：**全程没有 atomicAdd**。跨 block 的求和一律
+   "每 block 写自己的槽位 slots[blockIdx]（或自己的那个 c[j]）+ 下一条内核按**固定
+   下标顺序**树归约"，所以同一次训练重跑逐位相同。块与张量的归属也固定（按 `boffs`
+   二分后取块内偏移），不随调度变化。
+
+   1D 张量在设备端按 (R=1, C=n) 的矩阵处理：`mean(g², axis=0)` 就是 g²（除 1 精确），
+   `1 * c[j]` 精确等于 `c[j]`，所以与 numpy 的 1D 分支**逐位等价**。
+   -------------------------------------------------------------------------- */
+
+/* Adafactor 每条扁平内核里"每线程处理几个元素"。
+   ★ 必须与 Python 侧的 `_ADA_PER` 一致（`_ada_table_build` 会校验）：
+     两处任何一个改了都会让块数/槽位区间错位。 */
+#define ADA_PER 4
+
+/* Adafactor 行均值（更新 r）。 */
+extern "C" __global__ void ada_rowstats(
+    const unsigned long long* gs, const unsigned long long* rs,
+    const int* cols, const long long* roffs, const float* b2t, int n_tensors) {
+    long long row = (long long)blockIdx.x;
+    /* 按"累积行偏移"二分：1D 张量贡献 0 行，所以 roffs 里会有重复值 ——
+       找的是第一个满足 row < roffs[t+1] 的 t，1D 张量不会被选中。 */
+    int lo = 0, hi = n_tensors - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (row < roffs[mid + 1]) hi = mid; else lo = mid + 1;
+    }
+    if (row >= roffs[lo + 1]) return;
+    long long i = row - roffs[lo];
+    int C = cols[lo];
+    const float* g = (const float*)gs[lo] + i * (long long)C;
+    float s = 0.f;
+    for (int j = (int)threadIdx.x; j < C; j += (int)blockDim.x) {
+        float v = g[j];
+        s = __fadd_rn(s, __fmul_rn(v, v));
+    }
+    __shared__ float sm[256];
+    sm[threadIdx.x] = s;
+    __syncthreads();
+    for (int off = ((int)blockDim.x) >> 1; off > 0; off >>= 1) {
+        if ((int)threadIdx.x < off)
+            sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + off]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float b = b2t[lo];
+        float* r = (float*)rs[lo];
+        r[i] = __fadd_rn(__fmul_rn(b, r[i]),
+                         __fmul_rn(1.f - b, __fdiv_rn(sm[0], (float)C)));
+    }
+}
+
+/* Adafactor 列均值（更新 c）。 */
+extern "C" __global__ void ada_colstats(
+    const unsigned long long* gs, const unsigned long long* cs,
+    const unsigned long long* ps, const int* rows, const int* cols,
+    const long long* coffs, const float* b2t, int n_tensors,
+    int do_psum, float* pslots) {
+    int blk = (int)blockIdx.x;
+    int lo = 0, hi = n_tensors - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if ((long long)blk < coffs[mid + 1]) hi = mid; else lo = mid + 1;
+    }
+    if ((long long)blk >= coffs[lo + 1]) return;
+    /* 一个 block 负责 256 列 × 全部行：列由线程独占 ⇒ 不需要跨线程归约，
+       按行循环时同一 warp 的 32 个线程读的是连续的 32 个 float（合并访问）。 */
+    int j = (int)((long long)blk - coffs[lo]) * (int)blockDim.x + (int)threadIdx.x;
+    int C = cols[lo];
+    int R = rows[lo];
+    __shared__ float sm[256];
+    float s = 0.f;
+    float pa = 0.f;
+    if (j < C) {
+        const float* g = (const float*)gs[lo];
+        const float* p = (const float*)ps[lo];
+        for (int i = 0; i < R; ++i) {
+            long long o = (long long)i * (long long)C + (long long)j;
+            float v = g[o];
+            s = __fadd_rn(s, __fmul_rn(v, v));
+            if (do_psum) {
+                float q = p[o];
+                pa = __fadd_rn(pa, __fmul_rn(q, q));
+            }
+        }
+        float b = b2t[lo];
+        float* c = (float*)cs[lo];
+        c[j] = __fadd_rn(__fmul_rn(b, c[j]),
+                         __fmul_rn(1.f - b, __fdiv_rn(s, (float)R)));
+    }
+    if (do_psum) {
+        /* scale_parameter 的 Σp²：每 block 一个 partial，等 `ada_finalize` 按固定顺序求和。 */
+        sm[threadIdx.x] = pa;
+        __syncthreads();
+        for (int off = ((int)blockDim.x) >> 1; off > 0; off >>= 1) {
+            if ((int)threadIdx.x < off)
+                sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + off]);
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) pslots[blk] = sm[0];
+    }
+}
+
+/* Adafactor：算 mean(c)。 */
+extern "C" __global__ void ada_mc(
+    const unsigned long long* cs, const int* kinds, const int* cols,
+    float* mc, int n_tensors) {
+    int t = (int)blockIdx.x;
+    if (t >= n_tensors) return;
+    __shared__ float sm[256];
+    float s = 0.f;
+    if (kinds[t]) {
+        const float* c = (const float*)cs[t];
+        int C = cols[t];
+        for (int j = (int)threadIdx.x; j < C; j += (int)blockDim.x) s = __fadd_rn(s, c[j]);
+    }
+    sm[threadIdx.x] = s;
+    __syncthreads();
+    for (int off = ((int)blockDim.x) >> 1; off > 0; off >>= 1) {
+        if ((int)threadIdx.x < off)
+            sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + off]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        mc[t] = kinds[t] ? __fdiv_rn(sm[0], (float)cols[t]) : 1.f;
+}
+
+/* Adafactor 算 update。 */
+extern "C" __global__ void ada_update(
+    const unsigned long long* gs, const unsigned long long* rs,
+    const unsigned long long* cs, const unsigned long long* ms,
+    const int* sizes, const int* kinds, const int* cols,
+    const long long* boffs, const float* mc, int n_tensors,
+    int has_m, float b1, float eps1, float* slots) {
+    int blk = (int)blockIdx.x;
+    int lo = 0, hi = n_tensors - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if ((long long)blk < boffs[mid + 1]) hi = mid; else lo = mid + 1;
+    }
+    /* 块按张量对齐（boffs 是"每个张量 ceil(n/block/ADA_PER) 的累积"），所以
+       slots[boffs[t] .. boffs[t+1]) 恰好是这个张量的全部块 —— `ada_finalize` 直接
+       按这个区间求和就行，不需要 eoffs 那种跨张量的扁平偏移。
+
+       ★ 每线程 ADA_PER 个元素（同 block 内按 blockDim 跨步，仍然是合并访问）：
+         实测 1 元素/线程时这条内核只有 176 GB/s（纯流式 mul 能到 807 GB/s）——
+         每线程只有 1 个在飞的 load，显存延迟盖不住。4 元素/线程把在飞 load 提到 4 个。 */
+    long long base = ((long long)blk - boffs[lo]) * (long long)blockDim.x * ADA_PER
+                     + (long long)threadIdx.x;
+    int n = sizes[lo];
+    int C = cols[lo];
+    float s = 0.f;
+    for (int k = 0; k < ADA_PER; ++k) {
+        long long i = base + (long long)k * (long long)blockDim.x;
+        if (i < (long long)n) {
+            float gv = ((const float*)gs[lo])[i];
+            /* 用 int32 除余：一个张量的元素数受 sizes 的 int32 限制，i 必然 < 2^31；
+               64 位整数除法在 PTX 里是子程序调用（几十条指令），逐元素做会拖慢这条内核。 */
+            int row = (int)i / C;
+            int col = (int)i - row * C;
+            float rv = 1.f;
+            if (kinds[lo]) rv = __fdiv_rn(((const float*)rs[lo])[row], mc[lo]);
+            float d = sqrtf(__fadd_rn(__fmul_rn(rv, ((const float*)cs[lo])[col]), eps1));
+            float u = __fdiv_rn(gv, d);
+            if (has_m) {
+                float* m = (float*)ms[lo];
+                u = __fadd_rn(__fmul_rn(b1, m[i]), __fmul_rn(1.f - b1, u));
+                m[i] = u;
+            }
+            s = __fadd_rn(s, __fmul_rn(u, u));
+        }
+    }
+    /* 越界线程必须继续参与归约（不能提前 return，否则 __syncthreads 死锁）。 */
+    __shared__ float sm[256];
+    sm[threadIdx.x] = s;
+    __syncthreads();
+    for (int off = ((int)blockDim.x) >> 1; off > 0; off >>= 1) {
+        if ((int)threadIdx.x < off)
+            sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + off]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) slots[blk] = sm[0];
+}
+
+/* Adafactor 设备端定标。 */
+extern "C" __global__ void ada_finalize(
+    const int* sizes, const long long* boffs, const long long* coffs,
+    const float* slots, const float* pslots, float* factor, float* lrt,
+    int n_tensors, float clip, float lr, int do_psum, float eps2) {
+    int t = (int)blockIdx.x;
+    if (t >= n_tensors) return;
+    __shared__ float sm[256];
+    float s = 0.f;
+    for (long long k = boffs[t] + (long long)threadIdx.x; k < boffs[t + 1];
+         k += (long long)blockDim.x)
+        s = __fadd_rn(s, slots[k]);
+    sm[threadIdx.x] = s;
+    __syncthreads();
+    for (int off = ((int)blockDim.x) >> 1; off > 0; off >>= 1) {
+        if ((int)threadIdx.x < off)
+            sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + off]);
+        __syncthreads();
+    }
+    float ss = sm[0];
+    __syncthreads();              /* 所有线程读完 sm[0] 之后才能复用 sm */
+    float sp = 0.f;
+    if (do_psum) {
+        for (long long k = coffs[t] + (long long)threadIdx.x; k < coffs[t + 1];
+             k += (long long)blockDim.x)
+            sp = __fadd_rn(sp, pslots[k]);
+        sm[threadIdx.x] = sp;
+        __syncthreads();
+        for (int off = ((int)blockDim.x) >> 1; off > 0; off >>= 1) {
+            if ((int)threadIdx.x < off)
+                sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + off]);
+            __syncthreads();
+        }
+        sp = sm[0];
+    }
+    if (threadIdx.x == 0) {
+        float n = (float)sizes[t];
+        float rms = sqrtf(__fdiv_rn(ss, n));
+        float f = 1.f;
+        if (clip > 0.f && rms > clip) f = __fdiv_rn(clip, rms);
+        float lt = lr;
+        if (do_psum) lt = __fmul_rn(lr, fmaxf(eps2, sqrtf(__fdiv_rn(sp, n))));
+        factor[t] = f;
+        lrt[t] = lt;
+    }
+}
+
+/* Adafactor 写回参数。 */
+extern "C" __global__ void ada_apply(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* rs, const unsigned long long* cs,
+    const unsigned long long* ms, const int* sizes, const int* kinds,
+    const int* cols, const long long* boffs, const float* mc,
+    const float* factor, const float* lrt, int n_tensors,
+    int has_m, float b1, float eps1, float wd) {
+    int blk = (int)blockIdx.x;
+    int lo = 0, hi = n_tensors - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if ((long long)blk < boffs[mid + 1]) hi = mid; else lo = mid + 1;
+    }
+    /* 与 `ada_update` 同一套"每线程 ADA_PER 个元素"的分块/跨步，块数与槽位才对得上。 */
+    long long base = ((long long)blk - boffs[lo]) * (long long)blockDim.x * ADA_PER
+                     + (long long)threadIdx.x;
+    int n = sizes[lo];
+    int C = cols[lo];
+    float lt = lrt[lo];
+    float fac = factor[lo];
+    float* p = (float*)ps[lo];
+    for (int k = 0; k < ADA_PER; ++k) {
+        long long i = base + (long long)k * (long long)blockDim.x;
+        if (i >= (long long)n) continue;
+        float u;
+        if (has_m) {
+            /* β1 开着时 `ada_update` 写进 m 的就是最终的 update，**逐位相同**，不必重算。 */
+            u = ((const float*)ms[lo])[i];
+        } else {
+            /* β1 关时重算：读 g/r/c + mc 比"写一份 ubuf 再读回来"少一趟显存，
+               而且不用为整个模型多留一份满尺寸缓冲（Adafactor 的卖点就是省状态）。 */
+            float gv = ((const float*)gs[lo])[i];
+            int row = (int)i / C;
+            int col = (int)i - row * C;
+            float rv = 1.f;
+            if (kinds[lo]) rv = __fdiv_rn(((const float*)rs[lo])[row], mc[lo]);
+            float d = sqrtf(__fadd_rn(__fmul_rn(rv, ((const float*)cs[lo])[col]), eps1));
+            u = __fdiv_rn(gv, d);
+        }
+        float pv = p[i];
+        if (wd != 0.f) pv = __fsub_rn(pv, __fmul_rn(__fmul_rn(lt, wd), pv));
+        p[i] = __fsub_rn(pv, __fmul_rn(lt, __fmul_rn(fac, u)));
+    }
+}
+
+
 extern "C" __global__ void adamw_multi_int8(
     const unsigned long long* ps, const unsigned long long* gs,
     const unsigned long long* mqs, const unsigned long long* vqs,
@@ -2997,6 +3299,12 @@ def _device_source():
     return (_CE_AND_HELPERS + "\n" + _M2_KERNELS + "\n" + _M3_KERNELS + "\n"
             + _M5_KERNELS + "\n" + _MOE_KERNELS + "\n" + _CAT_KERNELS + "\n"
             + _FP16_KERNELS + "\n" + _FUSED_KERNELS + "\n" + _VEC4_KERNELS)
+
+
+# Adafactor 扁平内核里每个线程处理几个元素。**必须等于 CUDA 源码里的 `ADA_PER`**
+# （`adafactor_multi` 会校验）。1 元素/线程实测只有 176 GB/s（纯流式 mul 能到 807 GB/s），
+# 4 元素/线程把每线程在飞的 load 从 1 个提到 4 个。
+_ADA_PER = 4
 
 
 # 逐元素 float4 路径的总开关。TG_NO_VEC4=1 时全部退回标量内核（A/B 对拍和线上排障用）。
@@ -8411,6 +8719,219 @@ class CudaRuntime:
             (float(lr), ctypes.c_float), (float(wd), ctypes.c_float),
             (float(grad_scale), ctypes.c_float),
         ])
+
+    def adafactor_multi(self, entries, steps, lr, eps1, eps2, clip, decay_rate,
+                        beta1=None, wd=0.0, scale_parameter=False):
+        """Adafactor：**一次调用**跑完全部参数的更新，状态与标量都留在显存。
+
+        `entries` 每项 `(p, g, r, c, m, shape)`：
+          * 2D 参数：`r` 长度 = shape[0]、`c` 长度 = shape[-1]（因子化二阶矩）；
+          * 1D（含 0 维）：`r` 传 `None`，`c` 就是普通二阶矩（长度 = 元素数）；
+          * `m` 是 β1 动量，`beta1=None` 时传 `None`；
+          * 三者都是**设备缓冲**（`rt.zeros(shape)`），长度必须与参数一致（下面的
+            `_ada_table_build` 会逐项校验，形状不对就明确报错而不是算错）。
+        `steps` 与 entries 等长，是每个参数**已经自增过**的 1-based 步数。
+
+        每步 6 次发射（全部 block=256，只依赖固定大小的 `__shared__`）：
+          1. `ada_rowstats`  一个 block 一行：更新 r；
+          2. `ada_colstats`  一个 block 256 列 × 全部行：更新 c（1D 即普通二阶矩），
+                             并按需累加 scale_parameter 的 Σp² 到 `pslots`；
+          3. `ada_mc`        一个 block 一张量：mc = mean(c)（1D 直接写 1.0）；
+          4. `ada_update`    每张量 `ceil(n/256)` 个 block：算 update、走 β1 动量、
+                             并把每块的 Σupdate² 写进 `slots[blockIdx]`；
+          5. `ada_finalize`  一个 block 一张量：按固定下标顺序把该张量的 slots 求和
+                             → rms / factor / lr_t（`scale_parameter` 时再归约 pslots）；
+          6. `ada_apply`     每张量同样的分块：`p -= (lr_t*wd)*p` 然后 `p -= lr_t*(factor*u)`。
+
+        为什么不是 4 条内核（任务书建议的 K1~K4）：K1 读的是**已经更新过**的 `c`
+        （numpy 版 `row_mean = r/mean(c)` 用的是本步新的 c），而 c 的更新本身要跨行
+        归约，所以"更新 c"必须先有一条内核；`mc` 又只能在 c 写完之后算。因此实际是
+        "更新 r / 更新 c / 取 mean(c) / 算 update / 定标 / 写回"六步。**每步 0 次
+        D2H** 这个硬指标不变（`b2t` 是主机算好上传的小数组，方向是 H2D）。
+
+        确定性：没有 atomicAdd；所有跨 block 求和都走"每块独占槽位 + 固定顺序树归约"。
+        """
+        if not entries:
+            return
+        block = 256
+        if int(_ADA_PER) != 4:
+            raise CudaError(
+                "Adafactor 的 _ADA_PER=%d 与 CUDA 源码里的 ADA_PER=4 不一致。"
+                "修法：两处一起改（块数与槽位区间必须对得上）" % int(_ADA_PER))
+        if len(steps) != len(entries):
+            raise CudaError(
+                "Adafactor 的 steps 与 entries 长度不一致（%d vs %d）。"
+                "修法：每个参数一份步数（本实现按张量独立计数 β2）"
+                % (len(steps), len(entries)))
+        ents, sts = [], []
+        for ent, st in zip(entries, steps):
+            if int(ent[0].n) <= 0:      # 空张量：numpy 路径会算出 nan，这里直接跳过
+                continue
+            ents.append(ent)
+            sts.append(int(st))
+        if not ents:
+            return
+        has_m = beta1 is not None
+        do_ps = bool(scale_parameter)
+        for ent in ents:
+            for buf in ent[:5]:
+                if buf is not None:
+                    self._split_forget_ptr(buf)
+        key = (tuple(id(x) for ent in ents for x in ent[:5]), block, has_m, do_ps,
+               tuple(tuple(int(s) for s in ent[5]) for ent in ents))
+        tb = getattr(self, "_ada_table", None)
+        if tb is None or tb["key"] != key:
+            tb = self._ada_table_build(ents, block, has_m, do_ps)
+            self._ada_table = tb
+        # β2 的相对衰减只跟 step 有关；按 numpy 路径**同一口径**算（float64 pow → float32），
+        # 再一次性上传（几十个 float，方向 H2D，不是 D2H）。
+        memo = {}
+        b2t = np.empty((tb["n_par"],), np.float32)
+        dr = float(decay_rate)
+        for i, st in enumerate(sts):
+            v = memo.get(st)
+            if v is None:
+                v = 1.0 - float(st) ** dr
+                memo[st] = v
+            b2t[i] = v
+        self.copy_h2d_into(tb["b2t"], b2t)
+
+        if tb["total_rows"]:
+            self.launch("ada_rowstats", (tb["total_rows"], 1, 1), (block, 1, 1), [
+                self._ptr(tb["gs"]), self._ptr(tb["rs"]),
+                self._ptr(tb["cols"]), self._ptr(tb["roffs"]),
+                self._ptr(tb["b2t"]), (tb["n_par"], ctypes.c_int),
+            ])
+        self.launch("ada_colstats", (tb["total_col_blocks"], 1, 1), (block, 1, 1), [
+            self._ptr(tb["gs"]), self._ptr(tb["cs"]), self._ptr(tb["ps"]),
+            self._ptr(tb["rows"]), self._ptr(tb["cols"]), self._ptr(tb["coffs"]),
+            self._ptr(tb["b2t"]), (tb["n_par"], ctypes.c_int),
+            (1 if do_ps else 0, ctypes.c_int),
+            self._ptr(tb["pslots"] if do_ps else tb["slots"]),
+        ])
+        self.launch("ada_mc", (tb["n_par"], 1, 1), (block, 1, 1), [
+            self._ptr(tb["cs"]), self._ptr(tb["kinds"]), self._ptr(tb["cols"]),
+            self._ptr(tb["mc"]), (tb["n_par"], ctypes.c_int),
+        ])
+        self.launch("ada_update", (tb["total_blocks"], 1, 1), (block, 1, 1), [
+            self._ptr(tb["gs"]), self._ptr(tb["rs"]), self._ptr(tb["cs"]),
+            self._ptr(tb["ms"]), self._ptr(tb["sizes"]), self._ptr(tb["kinds"]),
+            self._ptr(tb["cols"]), self._ptr(tb["boffs"]), self._ptr(tb["mc"]),
+            (tb["n_par"], ctypes.c_int), (1 if has_m else 0, ctypes.c_int),
+            (float(beta1) if has_m else 0.0, ctypes.c_float),
+            (float(eps1), ctypes.c_float), self._ptr(tb["slots"]),
+        ])
+        self.launch("ada_finalize", (tb["n_par"], 1, 1), (block, 1, 1), [
+            self._ptr(tb["sizes"]), self._ptr(tb["boffs"]), self._ptr(tb["coffs"]),
+            self._ptr(tb["slots"]), self._ptr(tb["pslots"] if do_ps else tb["slots"]),
+            self._ptr(tb["factor"]), self._ptr(tb["lrt"]),
+            (tb["n_par"], ctypes.c_int), (float(clip), ctypes.c_float),
+            (float(lr), ctypes.c_float), (1 if do_ps else 0, ctypes.c_int),
+            (float(eps2), ctypes.c_float),
+        ])
+        self.launch("ada_apply", (tb["total_blocks"], 1, 1), (block, 1, 1), [
+            self._ptr(tb["ps"]), self._ptr(tb["gs"]), self._ptr(tb["rs"]),
+            self._ptr(tb["cs"]), self._ptr(tb["ms"]), self._ptr(tb["sizes"]),
+            self._ptr(tb["kinds"]), self._ptr(tb["cols"]), self._ptr(tb["boffs"]),
+            self._ptr(tb["mc"]), self._ptr(tb["factor"]), self._ptr(tb["lrt"]),
+            (tb["n_par"], ctypes.c_int), (1 if has_m else 0, ctypes.c_int),
+            (float(beta1) if has_m else 0.0, ctypes.c_float),
+            (float(eps1), ctypes.c_float), (float(wd), ctypes.c_float),
+        ])
+
+    def _ada_table_build(self, ents, block, has_m, do_ps):
+        """建 Adafactor 的指针表与设备缓冲（按 key 缓存，step 里不会重建）。
+
+        校验形状：查不出来就会算错，所以这里**宁可报错**。`r/c/sq/m` 的长度
+        必须与 `p` 的形状严格对应（2D: r=shape[0]、c=shape[-1]；1D: c=n）。
+        """
+        n_par = len(ents)
+        sizes, rows, cols, kinds = [], [], [], []
+        for (p, g, r, c, m, shp) in ents:
+            shp = tuple(int(s) for s in shp)
+            n = int(p.n)
+            if len(shp) > 2:
+                raise CudaError(
+                    "Adafactor 设备路径只支持 0/1/2 维参数，收到 shape=%s。"
+                    "修法：把参数 reshape 成 2D，或改用 AdamW（CUDA 上任意维都支持）"
+                    % (shp,))
+            if int(g.n) != n:
+                raise CudaError(
+                    "Adafactor 梯度长度 ≠ 参数长度（%d vs %d）。"
+                    "修法：检查该参数的梯度是否被裁剪/重置成了别的形状"
+                    % (int(g.n), n))
+            if len(shp) == 2:
+                R, C = shp
+                if int(r.n if r is not None else -1) != R or int(c.n) != C:
+                    raise CudaError(
+                        "Adafactor 因子化状态形状不对：参数 %s 需要 row=%d / col=%d，"
+                        "实际 row=%s / col=%d。修法：重建优化器状态"
+                        % (shp, R, C,
+                           "None" if r is None else int(r.n), int(c.n)))
+                kinds.append(1)
+            else:
+                R, C = 1, n
+                if r is not None:
+                    raise CudaError(
+                        "Adafactor 1D 参数 %s 不该有 row 状态（收到 %d 个元素）。"
+                        "修法：重建优化器状态" % (shp, int(r.n)))
+                if int(c.n) != n:
+                    raise CudaError(
+                        "Adafactor 1D 参数 %s 的二阶矩长度不对（%d vs %d）。"
+                        "修法：重建优化器状态" % (shp, int(c.n), n))
+                kinds.append(0)
+            if R * C != n:
+                raise CudaError(
+                    "Adafactor 参数形状与元素数不符：shape=%s 但 n=%d。"
+                    "修法：重建该参数" % (shp, n))
+            if has_m and (m is None or int(m.n) != n):
+                raise CudaError(
+                    "Adafactor 动量长度 ≠ 参数长度（%s vs %d）。修法：重建优化器状态"
+                    % ("None" if m is None else int(m.n), n))
+            sizes.append(n)
+            rows.append(int(R))
+            cols.append(int(C))
+
+        def _ptrs(idx, allow_none=True):
+            vals = []
+            for ent in ents:
+                buf = ent[idx]
+                vals.append(0 if (buf is None and allow_none) else int(buf.ptr))
+            return self.h2d(np.array(vals, np.uint64), dtype=np.uint64)
+
+        ps, gs, cs = _ptrs(0), _ptrs(1), _ptrs(3)
+        rs = _ptrs(2)
+        ms = _ptrs(4)
+        szs = self.h2d(np.array(sizes, np.int32), dtype=np.int32)
+        kds = self.h2d(np.array(kinds, np.int32), dtype=np.int32)
+        cls = self.h2d(np.array(cols, np.int32), dtype=np.int32)
+        rws = self.h2d(np.array(rows, np.int32), dtype=np.int32)
+        roff, coff, boff = [0], [0], [0]
+        per_block = block * _ADA_PER
+        for i, n in enumerate(sizes):
+            roff.append(roff[-1] + (rows[i] if kinds[i] else 0))
+            coff.append(coff[-1] + (cols[i] + block - 1) // block)
+            boff.append(boff[-1] + (n + per_block - 1) // per_block)
+        rofs = self.h2d(np.array(roff, np.int64), dtype=np.int64)
+        cofs = self.h2d(np.array(coff, np.int64), dtype=np.int64)
+        bofs = self.h2d(np.array(boff, np.int64), dtype=np.int64)
+        return {
+            "key": (tuple(id(x) for ent in ents for x in ent[:5]), block, has_m, do_ps,
+                    tuple(tuple(int(s) for s in ent[5]) for ent in ents)),
+            "n_par": n_par,
+            "ps": ps, "gs": gs, "rs": rs, "cs": cs, "ms": ms,
+            "sizes": szs, "kinds": kds, "cols": cls, "rows": rws,
+            "roffs": rofs, "coffs": cofs, "boffs": bofs,
+            "total_rows": int(roff[-1]),
+            "total_col_blocks": int(coff[-1]),
+            "total_blocks": int(boff[-1]),
+            "mc": self.empty((n_par,), dtype=np.float32),
+            "pslots": (self.empty((int(coff[-1]),), dtype=np.float32) if do_ps else None),
+            "slots": self.empty((int(boff[-1]),), dtype=np.float32),
+            "factor": self.empty((n_par,), dtype=np.float32),
+            "lrt": self.empty((n_par,), dtype=np.float32),
+            "b2t": self.empty((n_par,), dtype=np.float32),
+        }
 
     def adamw_multi_int8(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps,
                          bc1, bc2, block=64, grad_scale=1.0):
