@@ -22,15 +22,25 @@ jobs:
         run: |
           python -m pip install -U pip
           python -m pip install -e ".[dev]"
-      # Windows 的 `cc` 是 clang -> MSVC 目标：既不吃 -fPIC，产物也**没有导出表**，
-      # 于是 CPU 插件用例必挂（Linux 腿不受影响，所以只有 Windows 一直红）。
-      # 这里显式钉到一个"默认导出符号"的工具链（ziglang，dev extra 已按平台安装）。
-      - name: pin a symbol-exporting C toolchain (Windows)
+      # Windows 的 `cc` 是 clang -> MSVC 目标，两个坑（Linux 腿都没有，所以只有 Windows 红）：
+      #   1) 不认 -fPIC（已在 ops_cpu._compile 里按平台分派 + 回退）
+      #   2) 产物**没有导出表**，ctypes 找不到插件函数
+      #      （已在 ops_cpu.find_compiler 里改为：Windows 上若有 ziglang 就避开 clang）
+      # 这一步只是双保险，且**不能因为它让整个 job 失败**：拿不到 zig 就什么都不做。
+      - name: report the Windows C toolchain (best effort)
         if: runner.os == 'Windows'
         shell: pwsh
+        continue-on-error: true
         run: |
-          $z = python -c "import os,ziglang; print(os.path.join(os.path.dirname(ziglang.__file__), 'zig.exe'))"
-          Write-Host "TGAI_CC=$z"
-          "TGAI_CC=$z" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $z = $null
+          try {
+            $z = python -c "import os,ziglang; print(os.path.join(os.path.dirname(ziglang.__file__), 'zig.exe'))"
+          } catch {
+            Write-Host "ziglang 不可用，按 PATH 选择编译器"
+          }
+          if ($z -and (Test-Path $z)) {
+            Write-Host "pinning TGAI_CC=$z"
+            [System.IO.File]::AppendAllText($env:GITHUB_ENV, "TGAI_CC=$z`n")
+          }
       - name: "test (no GPU; CUDA 用例会被 skipif 跳过)"
         run: python -m pytest tests -q
