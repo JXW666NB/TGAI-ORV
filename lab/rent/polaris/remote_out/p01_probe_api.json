@@ -1,0 +1,285 @@
+{
+ "help_ok": true,
+ "help_sig": "(topic=None, tag=None, s=None, page=1, n=30, full=False, **kw)",
+ "optim_sig": {
+  "AdamW": "(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-08, weight_decay=0.01)",
+  "Adafactor": "(self, params, lr=0.01, eps1=1e-30, eps2=0.001, clip_threshold=1.0, decay_rate=-0.8, beta1=None, weight_decay=0.0, scale_parameter=False)",
+  "Muon": "(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0, fp16_mom=False, ns_fast=False, ns_steps=5)",
+  "LAMB": "(self, params, lr=0.001, betas=(0.9, 0.999), eps=1e-06, weight_decay=0.0)",
+  "Lion": "(self, params, lr=0.001, betas=(0.9, 0.99), weight_decay=0.0)",
+  "SGD": "(self, params, lr=0.001, momentum=0.0, dampening=0.0, weight_decay=0.0, nesterov=False)"
+ },
+ "build_candidates": [
+  [
+   "tgai_go.train",
+   "build",
+   "(name, **kwargs)"
+  ],
+  [
+   "tgai_go.train.v3_pretrain",
+   "build_arg_parser",
+   "()"
+  ]
+ ],
+ "preset_names": [
+  "Embedding",
+  "LayerNorm",
+  "Linear",
+  "Module",
+  "ModuleList",
+  "Parameter",
+  "RMSNorm",
+  "Tokenizer",
+  "Transformer",
+  "fit",
+  "load_corpus",
+  "np",
+  "tokens",
+  "train_tokenizer",
+  "transformer"
+ ],
+ "data": {
+  "D:\\orv_bench": [
+   [
+    "__pycache__",
+    "DIR"
+   ],
+   [
+    "_check_import.py",
+    643
+   ],
+   [
+    "_moe_env.py",
+    1161
+   ],
+   [
+    "_rsx_run.bat",
+    128
+   ],
+   [
+    "ab_amp_bmm.py",
+    2624
+   ],
+   [
+    "ab_pool_gb.ps1",
+    889
+   ],
+   [
+    "ab_pool_high.py",
+    2655
+   ],
+   [
+    "ab_route_2d.py",
+    4257
+   ],
+   [
+    "ab_vocab_data.py",
+    4441
+   ],
+   [
+    "ab_vocab_seq512.py",
+    2399
+   ],
+   [
+    "attr_cast4096.json",
+    2172
+   ],
+   [
+    "attr_cast96000.json",
+    2159
+   ],
+   [
+    "attr_s2048_v4096.json",
+    1983
+   ],
+   [
+    "attr_s2048_v96000.json",
+    1975
+   ],
+   [
+    "attr_v4096.json",
+    1996
+   ],
+   [
+    "attr_v96000_tie.json",
+    2000
+   ],
+   [
+    "attr_v96000_untie.json",
+    2002
+   ],
+   [
+    "attr_v96000model.json",
+    1996
+   ],
+   [
+    "attr_vocab_event.py",
+    9909
+   ],
+   [
+    "b2048.json",
+    904
+   ],
+   [
+    "bench_bmm_fp16.json",
+    23787
+   ],
+   [
+    "bench_bmm_fp16.py",
+    17726
+   ],
+   [
+    "bench_ds_fp16.json",
+    8264
+   ],
+   [
+    "bench_ds_fp16.py",
+    13927
+   ],
+   [
+    "bench_moe_dispatch.json",
+    3656
+   ],
+   [
+    "bench_moe_dispatch.py",
+    13985
+   ],
+   [
+    "bench_seq.py",
+    3427
+   ],
+   [
+    "bench_seq_v100.ps1",
+    2922
+   ],
+   [
+    "bench_stable.py",
+    2784
+   ],
+   [
+    "bench_stable_pyt.py",
+    1545
+   ],
+   [
+    "bmm_sites.json",
+    27154
+   ],
+   [
+    "check_pool.py",
+    1485
+   ],
+   [
+    "check_seg_semantics.py",
+    1759
+   ],
+   [
+    "cot_clean.jsonl",
+    25110225
+   ],
+   [
+    "cot_v27.jsonl",
+    25035225
+   ],
+   [
+    "count_kernels.py",
+    1476
+   ],
+   [
+    "count_sync.py",
+    1731
+   ],
+   [
+    "data2048",
+    "DIR"
+   ],
+   [
+    "data2048_v4096",
+    "DIR"
+   ],
+   [
+    "data2048_v96000",
+    "DIR"
+   ]
+  ],
+  "D:\\orv_bench\\data2048_v4096": [
+   [
+    "shard_000.npz",
+    137972
+   ],
+   [
+    "shard_001.npz",
+    138005
+   ],
+   [
+    "shard_002.npz",
+    137866
+   ],
+   [
+    "shard_003.npz",
+    137922
+   ],
+   [
+    "shard_004.npz",
+    137861
+   ],
+   [
+    "shard_005.npz",
+    137841
+   ],
+   [
+    "shard_006.npz",
+    137759
+   ],
+   [
+    "shard_007.npz",
+    137832
+   ]
+  ],
+  "D:\\orv_bench\\data2048_v96000": [
+   [
+    "shard_000.npz",
+    181778
+   ],
+   [
+    "shard_001.npz",
+    181861
+   ],
+   [
+    "shard_002.npz",
+    181708
+   ],
+   [
+    "shard_003.npz",
+    181710
+   ],
+   [
+    "shard_004.npz",
+    181716
+   ],
+   [
+    "shard_005.npz",
+    181690
+   ],
+   [
+    "shard_006.npz",
+    181688
+   ],
+   [
+    "shard_007.npz",
+    181735
+   ]
+  ]
+ },
+ "loop_api": {
+  "fit": true,
+  "train_step": false,
+  "backward": false,
+  "no_grad": true,
+  "clip_grad_norm": false,
+  "clip_grads": false,
+  "lr_scheduler": false,
+  "set_device": true,
+  "set_default_device": true
+ },
+ "torch": "2.6.0+cu124 True Tesla V100-PCIE-32GB"
+}

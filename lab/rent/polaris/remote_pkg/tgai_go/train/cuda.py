@@ -1,0 +1,9253 @@
+# -*- coding: utf-8 -*-
+"""tgai_go.train 的 CUDA 运行时（M1 + Linux + M2 + M3 + M5 算子）。
+
+不 import torch。只通过 ctypes 调用驱动、cuBLAS、NVRTC：
+
+    Windows: nvcuda.dll / cublas64_*.dll / nvrtc64_*.dll
+    Linux:   libcuda.so.1 / libcublas.so.12 / libnvrtc.so.12
+             （cuBLAS、NVRTC 用完整路径 CDLL，不改 LD_LIBRARY_PATH）
+
+内嵌 device 源码来自 training/kernels/tgai_ce.cu、tgai_fwd.cu、tgai_bwd.cu，
+编译进本包，训练包不 import training 目录。算子公式不在这里重写。
+
+cuBLAS 句柄设为 CUBLAS_PEDANTIC_MATH，让 cublasSgemm 走
+CUBLAS_COMPUTE_32F_PEDANTIC，避免 Ampere+ 默认 TF32 把 fp32 GEMM 拉到 ~1e-3。
+"""
+from __future__ import annotations
+
+import glob
+import ctypes
+import os
+import re
+import sys
+import time
+
+import numpy as np
+
+CUDA_OP_N = 0
+CUDA_OP_T = 1
+# cublas_api.h: CUBLAS_PEDANTIC_MATH = 2
+# 注释写明：cublas<T> 例程因此改用对应的 _PEDANTIC compute type。
+CUBLAS_PEDANTIC_MATH = 2
+CUBLAS_DEFAULT_MATH = 0
+CUBLAS_POINTER_MODE_HOST = 0
+# cuStreamBeginCapture 的 mode。先 RELAXED，不行再 THREAD_LOCAL。
+CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1
+CU_STREAM_CAPTURE_MODE_RELAXED = 2
+# CUgraphNodeType：kernel 节点。
+CU_GRAPH_NODE_TYPE_KERNEL = 0
+
+
+class _CudaKernelNodeParams(ctypes.Structure):
+    """CUDA 12 仍用这份 v1 布局给 cuGraphKernelNodeGetParams / ExecKernelNodeSetParams。
+
+    64 位上是 8 字节对齐：7 个 uint 后面补 4 字节，总大小 56。
+    """
+    _fields_ = [
+        ("func", ctypes.c_void_p),
+        ("gridDimX", ctypes.c_uint),
+        ("gridDimY", ctypes.c_uint),
+        ("gridDimZ", ctypes.c_uint),
+        ("blockDimX", ctypes.c_uint),
+        ("blockDimY", ctypes.c_uint),
+        ("blockDimZ", ctypes.c_uint),
+        ("sharedMemBytes", ctypes.c_uint),
+        ("kernelParams", ctypes.c_void_p),
+        ("extra", ctypes.c_void_p),
+    ]
+
+# ---- Phase 1 fp16（只给 GEMM 用，由环境变量 TG_FP16=1 打开，默认关） ----
+# cudaDataType_t
+CUDA_R_32F = 0
+CUDA_R_16F = 2
+CUDA_R_16BF = 14          # cudaDataType_t：bfloat16
+# cublasComputeType_t：CUBLAS_COMPUTE_16F=64, CUBLAS_COMPUTE_32F=68, 64F=70, 32I=72
+CUBLAS_COMPUTE_32F = 68
+# cublasGemmAlgo_t：CUBLAS_GEMM_DEFAULT=-1。实测（V100 + cublas64_12）
+# algo=-1 在所有形状上都不慢于 99(DEFAULT_TENSOR_OP)，且不用碰已废弃枚举。
+CUBLAS_GEMM_DEFAULT = -1
+
+# 环境变量开关。只认 "1"/"true"/"yes"/"on"（大小写不敏感）。
+_FP16_ENV = "TG_FP16"
+# 输出元素数小于这个数就别转 fp16 了（cast 比省下的 GEMM 时间还贵）。
+_FP16_MIN_OUTPUT = 262144
+# K 的默认上限。**0.9.19 起从 1280 放开到大数**：原来担心"长累加 + 对消"掉精度，
+# 但 compute type 固定 `CUBLAS_COMPUTE_32F`，累加本身是 fp32，误差只来自**输入**被舍成 fp16
+# （标准 AMP 做法）。旧阈值把 tensor core 最有用的大形状全挡回 fp32，实测（V100）：
+#   2048x2048x6144: 3.86 → 0.60 ms；2048x4096x11008: 13.89 → 1.93 ms（约 6-7×）。
+_FP16_MAX_K = int(os.environ.get("TG_FP16_MAX_K", 1 << 30))
+# 门槛可用环境变量覆盖（V100 实测：全部 GEMM 走 fp16 也是 45.2 ms / loss 0.0891，
+# （K 上限已放开到 1<<30；如需更保守可用 TG_FP16_MAX_K=1280 还原旧行为）。
+try:
+    _FP16_MAX_K = int(os.environ.get("TG_FP16_MAX_K", _FP16_MAX_K))
+    _FP16_MIN_OUTPUT = int(os.environ.get("TG_FP16_MIN_OUTPUT", _FP16_MIN_OUTPUT))
+except (TypeError, ValueError):
+    pass
+
+
+def fp16_env_requested():
+    v = os.environ.get(_FP16_ENV, "")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+# ---- bf16 GEMM（TG_BF16=1 打开，默认关；在 _sgemm 里先于 fp16 分发）----
+# 门槛和 fp16 同一套：输出太小 cast 不划算，K 太长累加误差和耗时都变差。
+_BF16_ENV = "TG_BF16"
+_BF16_MIN_OUTPUT = 262144
+_BF16_MAX_K = 1280
+try:
+    _BF16_MAX_K = int(os.environ.get("TG_BF16_MAX_K", _BF16_MAX_K))
+    _BF16_MIN_OUTPUT = int(os.environ.get("TG_BF16_MIN_OUTPUT", _BF16_MIN_OUTPUT))
+except (TypeError, ValueError):
+    pass
+
+
+def bf16_env_requested():
+    v = os.environ.get(_BF16_ENV, "")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+# 2×fp16 拆分 GEMM：三次 fp16 乘、fp32 累加，逼近 fp32 精度。默认关。
+# 只认 TG_FP16_SPLIT=1/true/yes/on。门槛在 _sgemm 的列主序 m,n,k 上判断。
+_FP16_SPLIT_ENV = "TG_FP16_SPLIT"
+_FP16_SPLIT_MIN_K = 1024
+_FP16_SPLIT_MIN_MN = 262144
+
+
+def fp16_split_env_requested():
+    v = os.environ.get(_FP16_SPLIT_ENV, "")
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+# cuda.h
+CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR = 75
+CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR = 76
+
+HINT_MATMUL = "（怎么办：矩阵乘要求 A.shape[-1] == B.shape[0]；若在算 attention 的 q@k^T，用 bmm_nt 而不是先转置）"
+HINT_BCAST = "（怎么办：用 .reshape 显式对齐维度，或检查是不是漏了 keepdim=True / 多套了一层 batch 维）"
+
+_CE_AND_HELPERS = r"""
+/* transplanted from training/kernels/tgai_ce.cu — keep the math identical. */
+
+__device__ float exp32_bits(float x);
+__device__ float log32_bits(float x);
+
+/* 一行一个 block、块内 256 线程。发射端必须用这个块大小。
+ * 每线程扫一段连续列，块内再按线程号左折叠。V<=256 时每段至多一个元素，
+ * 和原来的单线程左折叠逐位相同。exp32 / log32 / __fadd_rn 不换。
+ * sm 由 kernel 的 __shared__ 传入；归约函数末尾再栅栏一次，避免下一次复用 sm 时读穿。
+ */
+__device__ float ce_red_max(float v, float* sm) {
+    sm[threadIdx.x] = v;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = sm[0];
+        for (int i = 1; i < 256; ++i) m = fmaxf(m, sm[i]);
+        sm[0] = m;
+    }
+    __syncthreads();
+    float out = sm[0];
+    __syncthreads();
+    return out;
+}
+
+__device__ float ce_red_sum(float v, float* sm) {
+    sm[threadIdx.x] = v;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int i = 0; i < 256; ++i) s = __fadd_rn(s, sm[i]);
+        sm[0] = s;
+    }
+    __syncthreads();
+    float out = sm[0];
+    __syncthreads();
+    return out;
+}
+
+__device__ void ce_chunk_range(int V, int* begin_out, int* end_out) {
+    const int tid = (int)threadIdx.x;
+    const int chunk = (V + 255) >> 8;
+    int begin = tid * chunk;
+    int end = begin + chunk;
+    if (begin > V) begin = V;
+    if (end > V) end = V;
+    *begin_out = begin;
+    *end_out = end;
+}
+
+__device__ void ce_row_stats(const float* row, int V, float* sm, float* m_out, float* sum_out) {
+    /* ★ 改成**跨步**访问：原来 ce_chunk_range 给每个线程分连续一段（步长 V/256 ≈ 594），
+       相邻线程地址相隔 594 个 float —— 完全非合并，实测只有 37 GB/s
+       （[2048,151936] 的 CE 前向要 67.5 ms，torch 只要 6.8 ms）。
+       跨步后相邻线程读相邻地址，合并访问。数学不变（max 精确；sum 只是求和顺序变了）。 */
+    const int tid = (int)threadIdx.x;
+    const int step = (int)blockDim.x;
+    float m = __int_as_float(0xff800000u);
+    for (int j = tid; j < V; j += step) m = fmaxf(m, row[j]);
+    m = ce_red_max(m, sm);
+    float s = 0.0f;
+    for (int j = tid; j < V; j += step) {
+        float e = exp32_bits(__fsub_rn(row[j], m));
+        s = __fadd_rn(s, e);
+    }
+    s = ce_red_sum(s, sm);
+    *m_out = m;
+    *sum_out = s;
+}
+
+extern "C" __global__ void ce_fwd_rows(const float* logits, const int* targets, float* terms,
+                                  int N, int V) {
+    __shared__ float sm[256];
+    const int i = (int)blockIdx.x;
+    const float* row = logits + static_cast<long long>(i) * (long long)V;
+    float m, sum;
+    ce_row_stats(row, V, sm, &m, &sum);
+    if (threadIdx.x == 0) {
+        const int t = targets[i];
+        terms[i] = __fsub_rn(__fadd_rn(m, log32_bits(sum)), row[t]);
+    }
+}
+
+extern "C" __global__ void ce_fwd_mean(const float* terms, float* loss, int N) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    float acc = 0.0f;
+    for (int i = 0; i < N; ++i) acc = __fadd_rn(acc, terms[i]);
+    loss[0] = __fdiv_rn(acc, static_cast<float>(N));
+}
+
+/* V<=256 仍走上面的按线程连续段，和单线程左折叠逐位相同。
+ * V>256（训练词表 32779）改成对齐后的 float4 合并访问：旧的按 tid*chunk
+ * 扫列，相邻线程隔 129 个 float，带宽只有 ~140GB/s。这里一趟归约 max、
+ * 一趟归约 sum(exp)，再一趟写出 (exp-onehot)/N。exp32 / __fadd_rn 不换。
+ */
+__device__ int ce_align_prefix(const float* row, int V) {
+    unsigned long long a = (unsigned long long)row;
+    int mis = (int)((a >> 2) & 3ull);
+    if (mis == 0) return 0;
+    int pre = 4 - mis;
+    return pre > V ? V : pre;
+}
+
+__device__ float ce_row_max_vec(const float* row, int V, float* sm) {
+    const int tid = (int)threadIdx.x;
+    const int pre = ce_align_prefix(row, V);
+    float m = __int_as_float(0xff800000u);
+    for (int j = tid; j < pre; j += 256) m = fmaxf(m, row[j]);
+    const int vend = pre + ((V - pre) & ~3);
+    const int n4 = (vend - pre) >> 2;
+    const float4* p = (const float4*)(row + pre);
+    for (int j4 = tid; j4 < n4; j4 += 256) {
+        float4 v = p[j4];
+        m = fmaxf(m, fmaxf(fmaxf(v.x, v.y), fmaxf(v.z, v.w)));
+    }
+    for (int j = vend + tid; j < V; j += 256) m = fmaxf(m, row[j]);
+    return ce_red_max(m, sm);
+}
+
+__device__ float ce_row_sumexp_vec(const float* row, int V, float m, float* sm) {
+    const int tid = (int)threadIdx.x;
+    const int pre = ce_align_prefix(row, V);
+    float s = 0.0f;
+    for (int j = tid; j < pre; j += 256)
+        s = __fadd_rn(s, exp32_bits(__fsub_rn(row[j], m)));
+    const int vend = pre + ((V - pre) & ~3);
+    const int n4 = (vend - pre) >> 2;
+    const float4* p = (const float4*)(row + pre);
+    for (int j4 = tid; j4 < n4; j4 += 256) {
+        float4 v = p[j4];
+        s = __fadd_rn(s, exp32_bits(__fsub_rn(v.x, m)));
+        s = __fadd_rn(s, exp32_bits(__fsub_rn(v.y, m)));
+        s = __fadd_rn(s, exp32_bits(__fsub_rn(v.z, m)));
+        s = __fadd_rn(s, exp32_bits(__fsub_rn(v.w, m)));
+    }
+    for (int j = vend + tid; j < V; j += 256)
+        s = __fadd_rn(s, exp32_bits(__fsub_rn(row[j], m)));
+    return ce_red_sum(s, sm);
+}
+
+__device__ void ce_row_write_vec(const float* row, float* grow, int V, float m,
+                                 float inv_sum, float inv_n, int target) {
+    const int tid = (int)threadIdx.x;
+    const int pre = ce_align_prefix(row, V);
+    for (int j = tid; j < pre; j += 256) {
+        float p = __fmul_rn(exp32_bits(__fsub_rn(row[j], m)), inv_sum);
+        if (j == target) p = __fsub_rn(p, 1.0f);
+        grow[j] = __fmul_rn(p, inv_n);
+    }
+    const int vend = pre + ((V - pre) & ~3);
+    const int n4 = (vend - pre) >> 2;
+    const float4* p = (const float4*)(row + pre);
+    float4* g4 = (float4*)(grow + pre);
+    for (int j4 = tid; j4 < n4; j4 += 256) {
+        float4 v = p[j4];
+        int j = pre + (j4 << 2);
+        float4 o;
+        o.x = __fmul_rn(exp32_bits(__fsub_rn(v.x, m)), inv_sum);
+        o.y = __fmul_rn(exp32_bits(__fsub_rn(v.y, m)), inv_sum);
+        o.z = __fmul_rn(exp32_bits(__fsub_rn(v.z, m)), inv_sum);
+        o.w = __fmul_rn(exp32_bits(__fsub_rn(v.w, m)), inv_sum);
+        if (j == target) o.x = __fsub_rn(o.x, 1.0f);
+        if (j + 1 == target) o.y = __fsub_rn(o.y, 1.0f);
+        if (j + 2 == target) o.z = __fsub_rn(o.z, 1.0f);
+        if (j + 3 == target) o.w = __fsub_rn(o.w, 1.0f);
+        o.x = __fmul_rn(o.x, inv_n);
+        o.y = __fmul_rn(o.y, inv_n);
+        o.z = __fmul_rn(o.z, inv_n);
+        o.w = __fmul_rn(o.w, inv_n);
+        g4[j4] = o;
+    }
+    for (int j = vend + tid; j < V; j += 256) {
+        float pv = __fmul_rn(exp32_bits(__fsub_rn(row[j], m)), inv_sum);
+        if (j == target) pv = __fsub_rn(pv, 1.0f);
+        grow[j] = __fmul_rn(pv, inv_n);
+    }
+}
+
+extern "C" __global__ void ce_bwd(const float* logits, const int* targets, float* dlogits,
+                                  int N, int V) {
+    __shared__ float sm[256];
+    const int i = (int)blockIdx.x;
+    const float* row = logits + static_cast<long long>(i) * (long long)V;
+    float* grow = dlogits + static_cast<long long>(i) * (long long)V;
+    if (V <= 256) {
+        float m, sum;
+        ce_row_stats(row, V, sm, &m, &sum);
+        const float inv_sum = __fdiv_rn(1.0f, sum);
+        const float inv_n = __fdiv_rn(1.0f, static_cast<float>(N));
+        const int t = targets[i];
+        int begin, end;
+        ce_chunk_range(V, &begin, &end);
+        for (int j = begin; j < end; ++j) {
+            float e = exp32_bits(__fsub_rn(row[j], m));
+            float p = __fmul_rn(e, inv_sum);
+            if (j == t) p = __fsub_rn(p, 1.0f);
+            grow[j] = __fmul_rn(p, inv_n);
+        }
+        return;
+    }
+    const float m = ce_row_max_vec(row, V, sm);
+    const float sum = ce_row_sumexp_vec(row, V, m, sm);
+    const float inv_sum = __fdiv_rn(1.0f, sum);
+    const float inv_n = __fdiv_rn(1.0f, static_cast<float>(N));
+    const int t = targets[i];
+    ce_row_write_vec(row, grow, V, m, inv_sum, inv_n, t);
+}
+
+/* 分块转置（2026-11-19）：原来的朴素版把 b[c*rows+r] 写成跨步访问 —— 每个 warp 的
+   32 个线程写到 32 条不同 cache line，实测只有理论带宽的约 1/30（seq2048 下
+   transpose2d 占 76 ms/步）。这里用 32×32 共享内存分块：读合并、写也合并。
+   pad 成 [32][33] 是为了避开 bank conflict。block 固定 256 线程，每线程搬 4 个元素。 */
+extern "C" __global__ void transpose2d_tiled(const float* a, float* b, int rows,
+                                            int cols, int tiles_x) {
+    __shared__ float tile[32][33];
+    int bx = blockIdx.x % tiles_x;
+    int by = blockIdx.x / tiles_x;
+    int c0 = bx * 32, r0 = by * 32;
+    int tid = threadIdx.x;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        int idx = tid + k * 256;          /* 0..1023 */
+        int ry = idx >> 5, cx = idx & 31;
+        int r = r0 + ry, c = c0 + cx;
+        if (r < rows && c < cols) tile[ry][cx] = a[r * cols + c];
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        int idx = tid + k * 256;
+        int ci = idx >> 5, ri = idx & 31; /* 让连续线程写连续行 ⇒ 合并写 */
+        int r = r0 + ri, c = c0 + ci;
+        if (r < rows && c < cols) b[c * rows + r] = tile[ri][ci];
+    }
+}
+extern "C" __global__ void transpose2d(const float* a, float* b, int rows, int cols) {
+    int n = rows * cols;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        int r = i / cols;
+        int c = i - r * cols;
+        b[c * rows + r] = a[i];
+    }
+}
+
+extern "C" __global__ void ewise_add(const float* a, const float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = a[i] + b[i];
+}
+
+extern "C" __global__ void ewise_scale(const float* a, float s, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = a[i] * s;
+}
+
+extern "C" __global__ void ewise_mul(const float* a, const float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = a[i] * b[i];
+}
+
+/* 与 Python _exp32 / _log32 同一套 float32 运算。不用 expf/logf，也不用 SVML。 */
+__device__ float exp32_taylor(float x) {
+    float cs[13];
+    cs[0] = __int_as_float(0x310f76c8);
+    cs[1] = __int_as_float(0x32d7322c);
+    cs[2] = __int_as_float(0x3493f27e);
+    cs[3] = __int_as_float(0x3638ef1d);
+    cs[4] = __int_as_float(0x37d00d01);
+    cs[5] = __int_as_float(0x39500d01);
+    cs[6] = __int_as_float(0x3ab60b61);
+    cs[7] = __int_as_float(0x3c088889);
+    cs[8] = __int_as_float(0x3d2aaaab);
+    cs[9] = __int_as_float(0x3e2aaaab);
+    cs[10] = 0.5f;
+    cs[11] = 1.0f;
+    cs[12] = 1.0f;
+    float p = cs[0];
+    for (int i = 1; i < 13; ++i) p = __fadd_rn(__fmul_rn(p, x), cs[i]);
+    return p;
+}
+
+__device__ void exp32_pair(float x, float* y_out, float* dy_out) {
+    if (!(x == x)) {
+        *y_out = x;
+        *dy_out = x;
+        return;
+    }
+    if (fabsf(x) <= __int_as_float(0x40200000)) {
+        *y_out = exp32_taylor(x);
+        *dy_out = *y_out;
+        return;
+    }
+    if (x > 80.0f) x = 80.0f;
+    if (x < -80.0f) x = -80.0f;
+    float log2e = __int_as_float(0x3fb8aa3b);
+    float ln2 = __int_as_float(0x3f317218);
+    float nf = rintf(__fmul_rn(x, log2e));
+    float t = __fsub_rn(x, __fmul_rn(nf, ln2));
+    float cs[8];
+    cs[0] = __int_as_float(0x39500d01);
+    cs[1] = __int_as_float(0x3ab60b61);
+    cs[2] = __int_as_float(0x3c088889);
+    cs[3] = __int_as_float(0x3d2aaaab);
+    cs[4] = __int_as_float(0x3e2aaaab);
+    cs[5] = 0.5f;
+    cs[6] = 1.0f;
+    cs[7] = 1.0f;
+    float p = cs[0];
+    float dp = 0.0f;
+    for (int i = 1; i < 8; ++i) {
+        dp = __fadd_rn(__fmul_rn(dp, t), p);
+        p = __fadd_rn(__fmul_rn(p, t), cs[i]);
+    }
+    int n = (int)nf;
+    int one_bits = __float_as_int(1.0f);
+    float scale = __int_as_float(one_bits + n * 8388608);
+    *y_out = __int_as_float(__float_as_int(p) + n * 8388608);
+    *dy_out = __fmul_rn(dp, scale);
+}
+
+__device__ float exp32_bits(float x) {
+    float y, dy;
+    exp32_pair(x, &y, &dy);
+    return y;
+}
+
+__device__ float log32_bits(float x) {
+    unsigned ub = __float_as_uint(x);
+    int e = (int)((ub >> 23) & 255u) - 127;
+    float m = __uint_as_float((ub & 0x7fffffu) | 0x3f800000u);
+    float num = __fsub_rn(m, 1.0f);
+    float den = __fadd_rn(m, 1.0f);
+    float z = __fdiv_rn(num, den);
+    float z2 = __fmul_rn(z, z);
+    float z3 = __fmul_rn(z2, z);
+    float z5 = __fmul_rn(z3, z2);
+    float z7 = __fmul_rn(z5, z2);
+    float z9 = __fmul_rn(z7, z2);
+    float s = z;
+    s = __fadd_rn(s, __fmul_rn(z3, __int_as_float(0x3eaaaaab)));
+    s = __fadd_rn(s, __fmul_rn(z5, __int_as_float(0x3e4ccccd)));
+    s = __fadd_rn(s, __fmul_rn(z7, __int_as_float(0x3e124925)));
+    s = __fadd_rn(s, __fmul_rn(z9, __int_as_float(0x3de38e39)));
+    float ln_m = __fmul_rn(2.0f, s);
+    return __fadd_rn(ln_m, __fmul_rn((float)e, __int_as_float(0x3f317218)));
+}
+
+extern "C" __global__ void ewise_exp32(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = exp32_bits(a[i]);
+}
+
+extern "C" __global__ void ewise_log32(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = log32_bits(a[i]);
+}
+
+extern "C" __global__ void ewise_exp(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = expf(a[i]);
+}
+
+extern "C" __global__ void ewise_log(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = logf(a[i]);
+}
+
+// tanh：单次分配，无 workspace。原先没有这个内核，tanh 只能靠 2*sigmoid(2x)-1 组合实现，
+// 实测 16 MB 输入会吃掉 176 MiB（11×），是 MoE 每层 450 MiB 的主要来源。
+extern "C" __global__ void ewise_tanh(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = tanhf(a[i]);
+}
+
+// tanh 反向：复用前向输出 y（= tanh(x)），d/dx = 1 - y*y，不需要再存 x。
+extern "C" __global__ void ewise_tanh_bwd(const float* g, const float* y, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { float t = y[i]; c[i] = g[i] * (1.0f - t * t); }
+}
+
+// ── MoE 路由的 top-k（每行一个线程，k 很小、E 很小）────────────────────────────
+// 照 PyTorch 的思路（aten/src/ATen/native/cuda/TensorTopK.cu）：小切片不物化排序，
+// 直接在寄存器里选。这里 E≤64、k≤4，一个线程扫一遍即可，无中间张量、无 mask。
+//   s:    (n, E) softmax 后的亲和度
+//   bias: (E,)   只影响**选择**，不进门控（DeepSeek 的做法）
+//   idx:  (n, k) float 保存下标（≤64，fp32 精确），网关侧再转 int
+//   gate: (n, k) 选中的**原始亲和度** s[r, idx]
+extern "C" __global__ void moe_topk_fwd(const float* s, const float* bias,
+                                        float* idx, float* gate,
+                                        int n, int E, int k) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n) return;
+    const float* row = s + (long long)r * E;
+    for (int slot = 0; slot < k; ++slot) {
+        int best = -1;
+        float bestv = -3.0e38f;
+        for (int e = 0; e < E; ++e) {
+            float v = row[e] + bias[e];
+            bool used = false;
+            for (int j = 0; j < slot; ++j) {
+                if ((int)idx[(long long)r * k + j] == e) { used = true; break; }
+            }
+            if (!used && v > bestv) { bestv = v; best = e; }
+        }
+        if (best < 0) best = 0;
+        idx[(long long)r * k + slot] = (float)best;
+        gate[(long long)r * k + slot] = row[best];
+    }
+}
+
+// 反向：门控的梯度只知道落在被选中的专家上（下标离散，不下传），
+// 其余位置为 0 —— 等价于 PyTorch `gather` 的反向（scatter 回原位置）。
+extern "C" __global__ void moe_topk_bwd(const float* dgate, const float* idx,
+                                        float* ds, int n, int E, int k) {
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n) return;
+    float* row = ds + (long long)r * E;
+    for (int e = 0; e < E; ++e) row[e] = 0.0f;
+    for (int slot = 0; slot < k; ++slot) {
+        int e = (int)idx[(long long)r * k + slot];
+        row[e] += dgate[(long long)r * k + slot];
+    }
+}
+
+// SiTU-GLU 融合门（前向）：out = [β1·tanh(g/β1)·sigmoid(g)] · [β2·tanh(u/β2)]
+// 照 PyTorch 的做法（ActivationSiluKernel.cu）：整个逐元素链一个内核，只产出 out，
+// 不产生 gate/tanh/sigmoid 等中间张量。原先用 7 个算子拼，每步留存 9 个 (N,d_ff) 临时量。
+extern "C" __global__ void situ_glu_fwd(const float* g, const float* u, float* out,
+                                        int n, float b1, float b2) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float gv = g[i], uv = u[i];
+        float t1 = tanhf(gv / b1);
+        float s = 1.0f / (1.0f + expf(-gv));
+        float up = b2 * tanhf(uv / b2);
+        out[i] = (b1 * t1 * s) * up;
+    }
+}
+
+// SiTU-GLU 反向：只读 dout/g/u，重算 gate 与导数，不依赖任何中间量。
+//   gate = β1·tanh(g/β1)·σ(g),  dgate/dg = (1−tanh²)·σ + β1·tanh·σ·(1−σ)
+//   up   = β2·tanh(u/β2),       dup/du  = 1 − tanh²
+extern "C" __global__ void situ_glu_bwd(const float* dout, const float* g, const float* u,
+                                        float* dg, float* du, int n, float b1, float b2) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float gv = g[i], uv = u[i];
+        float t1 = tanhf(gv / b1);
+        float s = 1.0f / (1.0f + expf(-gv));
+        float t2 = tanhf(uv / b2);
+        float gate = b1 * t1 * s;
+        float up = b2 * t2;
+        float dgate = (1.0f - t1 * t1) * s + b1 * t1 * s * (1.0f - s);
+        float dup = 1.0f - t2 * t2;
+        float d = dout[i];
+        dg[i] = d * up * dgate;
+        du[i] = d * gate * dup;
+    }
+}
+
+extern "C" __global__ void ewise_recip(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = __fdiv_rn(1.f, a[i]);
+}
+
+/* ---- 0.9.16：把原来的 CPU-only 算子沉到 C 端（abs / relu / clamp / 逐元素除）---- */
+extern "C" __global__ void ewise_abs(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = fabsf(a[i]);
+}
+
+/* d|x|/dx = sign(x)；x==0 处按 0 处理（与 numpy 一致） */
+extern "C" __global__ void ewise_abs_bwd(const float* a, const float* g, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = (a[i] > 0.f) ? g[i] : ((a[i] < 0.f) ? -g[i] : 0.f);
+}
+
+/* cos / sin：RoPE 等位置编码需要。反向分别是 -sin(x) 与 cos(x)。
+   与 numpy 一致：用 cosf/sinf，不做快速近似（__cosf 精度不够）。 */
+extern "C" __global__ void ewise_cos(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = cosf(a[i]);
+}
+
+extern "C" __global__ void ewise_sin(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = sinf(a[i]);
+}
+
+/* d/dx cos(x) = -sin(x) */
+extern "C" __global__ void ewise_cos_bwd(const float* a, const float* g, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = -sinf(a[i]) * g[i];
+}
+
+/* d/dx sin(x) = cos(x) */
+extern "C" __global__ void ewise_sin_bwd(const float* a, const float* g, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = cosf(a[i]) * g[i];
+}
+
+extern "C" __global__ void ewise_relu(const float* a, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = (a[i] > 0.f) ? a[i] : 0.f;
+}
+
+extern "C" __global__ void ewise_relu_bwd(const float* a, const float* g, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = (a[i] > 0.f) ? g[i] : 0.f;
+}
+
+/* clamp：lo/hi 用 CUDART_INF 表示"该侧不夹"（由 Python 侧换算） */
+extern "C" __global__ void ewise_clamp(const float* a, float lo, float hi, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = a[i];
+        if (v < lo) v = lo;
+        if (v > hi) v = hi;
+        c[i] = v;
+    }
+}
+
+extern "C" __global__ void ewise_clamp_bwd(const float* a, const float* g, float lo, float hi,
+                                           float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = (a[i] >= lo && a[i] <= hi) ? g[i] : 0.f;
+}
+
+extern "C" __global__ void ewise_div(const float* a, const float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = __fdiv_rn(a[i], b[i]);
+}
+
+/* 标量指数。GPT-2 的 sigmoid / LayerNorm 用 x**(-1) 和 x**(-0.5)。 */
+extern "C" __global__ void ewise_pow(const float* a, float p, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = powf(a[i], p);
+}
+
+/* One block, 256 threads. The launch site must use that block size. */
+extern "C" __global__ void reduce_sum(const float* a, float* out, int n) {
+    __shared__ float smem[256];
+    float local = 0.f;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        local += a[i];
+    }
+    smem[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[0] = smem[0];
+}
+
+/* 多 block 部分归约。以前全归约只启 1 个 block（56 个 SM 只用一个），21M 元素实测
+   8.5 GB/s，torch 约 65 GB/s。这里 G 个 block 各归约一段**连续**区间写入 part[G]
+   （连续切分保证合并访存），再由 reduce_sum 把 part[G] 归约成标量。 */
+extern "C" __global__ void reduce_sum_partial(const float* a, float* part, int n) {
+    __shared__ float smem[256];
+    const int nb = (int)gridDim.x;
+    const int bid = (int)blockIdx.x;
+    const int chunk = (n + nb - 1) / nb;
+    const int lo = bid * chunk;
+    int hi = lo + chunk;
+    if (hi > n) hi = n;
+    float local = 0.f;
+    for (int i = lo + (int)threadIdx.x; i < hi; i += (int)blockDim.x) {
+        local += a[i];
+    }
+    smem[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = (int)blockDim.x >> 1; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) part[bid] = smem[0];
+}
+"""
+
+# 下面几段从 training/kernels/tgai_fwd.cu、tgai_bwd.cu 原样摘出来。
+# 不改公式。silu_mul_fwd 是原地的，Python 侧先 clone 再调。
+_M2_KERNELS = r"""
+extern "C" __global__ void rmsnorm_fwd(float* out, const float* x, const float* w,
+                                       int seq, int d, float eps) {
+    const int t = (int)blockIdx.x;
+    if (t >= seq || d <= 0) return;
+
+    const float* row = x + (long long)t * d;
+    float* orow = out + (long long)t * d;
+
+    float local = 0.f;
+    for (int i = (int)threadIdx.x; i < d; i += (int)blockDim.x) {
+        float v = row[i];
+        local += v * v;
+    }
+
+    extern __shared__ float red[];
+    red[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = (int)blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) red[threadIdx.x] += red[threadIdx.x + stride];
+        __syncthreads();
+    }
+
+    float inv = rsqrtf(red[0] / (float)d + eps);
+    for (int i = (int)threadIdx.x; i < d; i += (int)blockDim.x) {
+        orow[i] = row[i] * inv * w[i];
+    }
+}
+
+__device__ __forceinline__ void silu32_pair(float v, float* y_out, float* d_out) {
+    float neg = __fmul_rn(v, -1.0f);
+    float s, ds_dneg;
+    exp32_pair(neg, &s, &ds_dneg);
+    (void)ds_dneg;
+    float ds = __fmul_rn(s, -1.0f);
+    float den = __fadd_rn(s, 1.0f);
+    float inv = __fdiv_rn(1.0f, den);
+    float y = __fmul_rn(v, inv);
+    float ninv = __fmul_rn(__fmul_rn(-1.0f, inv), inv);
+    float dinv = __fmul_rn(ninv, ds);
+    *y_out = y;
+    *d_out = __fadd_rn(inv, __fmul_rn(v, dinv));
+}
+
+extern "C" __global__ void silu_mul_fwd(float* a, const float* b, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        float y, d;
+        silu32_pair(a[i], &y, &d);
+        a[i] = __fmul_rn(y, b[i]);
+    }
+}
+
+/* b==1 的特例：不分配全 1 缓冲。对有限数，少乘一次 1 与 silu_mul_fwd 逐位相同。 */
+extern "C" __global__ void silu_fwd_inplace(float* a, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        float y, d;
+        silu32_pair(a[i], &y, &d);
+        a[i] = y;
+    }
+}
+
+extern "C" __global__ void silu_bwd_da(const float* g, const float* a, float* da, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) {
+        float y, dsilu;
+        silu32_pair(a[i], &y, &dsilu);
+        (void)y;
+        da[i] = __fmul_rn(g[i], dsilu);
+    }
+}
+
+
+/* ★ 2026-11-15：float4 版本。逐分量仍走 silu32_pair + __fmul_rn，结果与标量版逐位相同，
+   只是访存宽度变成 16 B。真机实测标量版比 torch 慢 11.6 倍，这里是主因。 */
+extern "C" __global__ void silu_mul_fwd_v4(float4* a, const float4* b, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        float4 y = b[i];
+        float4 r;
+        float s, d;
+        silu32_pair(x.x, &s, &d); r.x = __fmul_rn(s, y.x);
+        silu32_pair(x.y, &s, &d); r.y = __fmul_rn(s, y.y);
+        silu32_pair(x.z, &s, &d); r.z = __fmul_rn(s, y.z);
+        silu32_pair(x.w, &s, &d); r.w = __fmul_rn(s, y.w);
+        a[i] = r;
+    }
+}
+
+extern "C" __global__ void silu_fwd_inplace_v4(float4* a, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        float4 r;
+        float s, d;
+        silu32_pair(x.x, &s, &d); r.x = s;
+        silu32_pair(x.y, &s, &d); r.y = s;
+        silu32_pair(x.z, &s, &d); r.z = s;
+        silu32_pair(x.w, &s, &d); r.w = s;
+        a[i] = r;
+    }
+}
+
+extern "C" __global__ void silu_bwd_da_v4(const float4* g, const float4* a, float4* da, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        float4 gg = g[i];
+        float4 r;
+        float s, d;
+        silu32_pair(x.x, &s, &d); r.x = __fmul_rn(gg.x, d);
+        silu32_pair(x.y, &s, &d); r.y = __fmul_rn(gg.y, d);
+        silu32_pair(x.z, &s, &d); r.z = __fmul_rn(gg.z, d);
+        silu32_pair(x.w, &s, &d); r.w = __fmul_rn(gg.w, d);
+        da[i] = r;
+    }
+}
+
+
+
+extern "C" __global__ void emb_gather_fwd(float* out, const float* emb, const int* ids,
+                                          int seq, int d, int vocab, int unk) {
+    int t = (int)blockIdx.x;
+    if (t >= seq) return;
+    int id = ids[t];
+    if (id < 0 || id >= vocab) id = unk;
+    const float* src = emb + (long long)id * d;
+    float* dst = out + (long long)t * d;
+    for (int i = (int)threadIdx.x; i < d; i += (int)blockDim.x) dst[i] = src[i];
+}
+
+__device__ __forceinline__ float blk_sum(float v, float* smem) {
+    const int tid = threadIdx.x;
+    smem[tid] = v;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s)
+            smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    const float out = smem[0];
+    __syncthreads();
+    return out;
+}
+
+extern "C" __global__ void rmsnorm_bwd(const float* dy, const float* x, const float* w,
+                                       float* dx, float* dw, int seq, int d, float eps) {
+    __shared__ float smem[256];
+    const int t = (int)blockIdx.x;
+    if (t >= seq)
+        return;
+
+    const int tid = (int)threadIdx.x;
+    const int stride = (int)blockDim.x;
+    const float* xrow = x + t * d;
+    const float* dyrow = dy + t * d;
+    float* dxrow = dx + t * d;
+
+    float sumsq = 0.f;
+    float dot = 0.f;
+    for (int i = tid; i < d; i += stride) {
+        const float xi = xrow[i];
+        sumsq += xi * xi;
+        dot += dyrow[i] * xi * w[i];
+    }
+    sumsq = blk_sum(sumsq, smem);
+    dot = blk_sum(dot, smem);
+
+    const float inv_d = 1.f / (float)d;
+    const float rstd = rsqrtf(sumsq * inv_d + eps);
+    const float scale = rstd * rstd * rstd * inv_d;
+
+    for (int i = tid; i < d; i += stride) {
+        const float xi = xrow[i];
+        const float dyi = dyrow[i];
+        dxrow[i] = rstd * dyi * w[i] - scale * xi * dot;
+        atomicAdd(dw + i, dyi * xi * rstd);
+    }
+}
+
+/* ---- 确定性 rmsnorm 反向（替代 atomicAdd 版本）----
+   1) rms_rstd: 每行算 rstd（block per row，与 fwd 同一归约）
+   2) rmsnorm_bwd_dx: 只写 dx，不碰 dw
+   3) rms_dw_det: 每线程独占一列、按行号升序串行累加 —— 顺序固定，运行间可复现
+*/
+extern "C" __global__ void rms_rstd(const float* x, float* rstd, int rows, int d, float eps) {
+    __shared__ float smem[256];
+    const int r = (int)blockIdx.x;
+    if (r >= rows) return;
+    const float* xrow = x + (long long)r * d;
+    float sumsq = 0.f;
+    for (int i = (int)threadIdx.x; i < d; i += (int)blockDim.x) {
+        const float v = xrow[i];
+        sumsq += v * v;
+    }
+    sumsq = blk_sum(sumsq, smem);
+    if (threadIdx.x == 0) rstd[r] = rsqrtf(sumsq / (float)d + eps);
+}
+
+extern "C" __global__ void rmsnorm_bwd_dx(const float* dy, const float* x, const float* w,
+                                          const float* rstd, float* dx, int rows, int d) {
+    __shared__ float smem[256];
+    const int r = (int)blockIdx.x;
+    if (r >= rows) return;
+    const float* xrow = x + (long long)r * d;
+    const float* dyrow = dy + (long long)r * d;
+    float* dxrow = dx + (long long)r * d;
+    const int stride = (int)blockDim.x;
+    float dot = 0.f;
+    for (int i = (int)threadIdx.x; i < d; i += stride) dot += dyrow[i] * xrow[i] * w[i];
+    dot = blk_sum(dot, smem);
+    const float inv_d = 1.f / (float)d;
+    const float rs = rstd[r];
+    const float scale = rs * rs * rs * inv_d;
+    for (int i = (int)threadIdx.x; i < d; i += stride) {
+        const float xi = xrow[i];
+        const float dyi = dyrow[i];
+        dxrow[i] = __fsub_rn(__fmul_rn(__fmul_rn(rs, dyi), w[i]), __fmul_rn(__fmul_rn(scale, xi), dot));
+    }
+}
+
+extern "C" __global__ void rms_dw_det(const float* dy, const float* x, const float* rstd,
+                                      float* dw, int rows, int d) {
+    const int j = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (j >= d) return;
+    float acc = 0.f;
+    for (int r = 0; r < rows; ++r) {
+        const long long off = (long long)r * d + j;
+        acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(dy[off], x[off]), rstd[r]));
+    }
+    dw[j] = acc;
+}
+
+extern "C" __global__ void silu_mul_bwd(const float* g, const float* a, const float* b,
+                                        float* da, float* db, int n) {
+    const int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n)
+        return;
+    const float av = a[i];
+    float y, dsilu;
+    silu32_pair(av, &y, &dsilu);
+    const float gv = g[i];
+    da[i] = __fmul_rn(__fmul_rn(gv, b[i]), dsilu);
+    db[i] = __fmul_rn(gv, y);
+}
+
+extern "C" __global__ void emb_gather_bwd(const float* g, const int* ids, float* demb,
+                                         int seq, int d) {
+    const int t = (int)blockIdx.x;
+    if (t >= seq)
+        return;
+    const int id = ids[t];
+    const float* grow = g + t * d;
+    float* erow = demb + id * d;
+    for (int j = (int)threadIdx.x; j < d; j += (int)blockDim.x)
+        atomicAdd(erow + j, grow[j]);
+}
+
+/* 长序列、少量重复 id（字节级语料）时，按 id 独占一行再顺序加，避免 atomic 挤在同一行。
+ * 加的顺序是 token 下标从小到大，和 CPU 的 np.add.at 同一方向。
+ */
+extern "C" __global__ void emb_bwd_hist(const int* ids, int* counts, int seq) {
+    int t = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t < seq) atomicAdd(counts + ids[t], 1);
+}
+
+extern "C" __global__ void emb_bwd_plan(const int* counts, int* offsets, int* cursor, int vocab) {
+    if (threadIdx.x || blockIdx.x) return;
+    int sum = 0;
+    for (int i = 0; i < vocab; ++i) {
+        offsets[i] = sum;
+        cursor[i] = sum;
+        sum += counts[i];
+    }
+    offsets[vocab] = sum;
+}
+
+extern "C" __global__ void emb_bwd_fill(const int* ids, int* cursor, int* pos, int seq) {
+    if (threadIdx.x || blockIdx.x) return;
+    for (int t = 0; t < seq; ++t) {
+        int id = ids[t];
+        pos[cursor[id]++] = t;
+    }
+}
+
+extern "C" __global__ void emb_bwd_owned(const float* g, const int* ids, float* demb,
+                                       int seq, int d, int vocab) {
+    int blocks = (int)gridDim.x;
+    int mine = (int)blockIdx.x;
+    if (blocks < 1 || mine >= blocks) return;
+    for (int t = 0; t < seq; ++t) {
+        int id = ids[t];
+        if (id < 0 || id >= vocab || (id % blocks) != mine) continue;
+        const float* grow = g + (long long)t * d;
+        float* erow = demb + (long long)id * d;
+        int j = (int)threadIdx.x;
+        int stride = (int)blockDim.x;
+        for (; j < d; j += stride) erow[j] += grow[j];
+    }
+}
+
+extern "C" __global__ void emb_bwd_rows(const float* g, const int* offsets, const int* pos,
+                                        float* demb, int vocab, int d) {
+    int id = (int)blockIdx.x;
+    if (id >= vocab) return;
+    int begin = offsets[id];
+    int end = offsets[id + 1];
+    if (begin == end) return;
+    float* erow = demb + (long long)id * d;
+    for (int p = begin; p < end; ++p) {
+        const float* grow = g + (long long)pos[p] * d;
+        for (int j = (int)threadIdx.x; j < d; j += (int)blockDim.x)
+            erow[j] += grow[j];
+    }
+}
+
+/* 单线程扫词表，把出现过的 id 收成 active[0:nactive)。顺序是 id 升序，
+ * 每个 id 内部的 token 下标仍由 emb_bwd_fill 按从小到大写入。 */
+extern "C" __global__ void emb_bwd_plan2(const int* counts, int* offsets, int* cursor,
+                                         int* active, int* nactive, int vocab) {
+    if (threadIdx.x || blockIdx.x) return;
+    int sum = 0;
+    int na = 0;
+    for (int i = 0; i < vocab; ++i) {
+        offsets[i] = sum;
+        cursor[i] = sum;
+        int c = counts[i];
+        if (c) active[na++] = i;
+        sum += c;
+    }
+    offsets[vocab] = sum;
+    nactive[0] = na;
+}
+
+/* 一个 block 独占一行。float4 按 token 下标顺序加，和 np.add.at 的逐元素顺序一致。
+ * grid 用 seq 做上界，nactive 在设备上，避免为了读个数把整条流同步回主机。 */
+extern "C" __global__ void emb_bwd_rows4(const float* g, const int* offsets, const int* pos,
+                                         const int* active, const int* nactive, float* demb,
+                                         int d) {
+    int slot = (int)blockIdx.x;
+    int na = nactive[0];
+    if (slot >= na || (d & 3)) return;
+    int id = active[slot];
+    int begin = offsets[id];
+    int end = offsets[id + 1];
+    int d4 = d >> 2;
+    float4* erow = reinterpret_cast<float4*>(demb + (long long)id * d);
+    for (int j4 = (int)threadIdx.x; j4 < d4; j4 += (int)blockDim.x) {
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (int p = begin; p < end; ++p) {
+            const float4* grow = reinterpret_cast<const float4*>(g + (long long)pos[p] * d);
+            float4 v = grow[j4];
+            acc.x += v.x;
+            acc.y += v.y;
+            acc.z += v.z;
+            acc.w += v.w;
+        }
+        erow[j4] = acc;
+    }
+}
+"""
+
+
+# M3：reshape 只改形状（主机 memcpy）。下面是 attention 公式里 CPU 还在用、
+# 但设备上还没有的几步。dh=64 的 flash/tiled kernel 对判分台的 Dh=8 会直接 return，
+# 所以默认 SDPA 仍走和 CPU 相同的 bmm + 掩码 + softmax，不改那两份已验收源码。
+# 不物化 P 的路径不进这份源码：lowmem=True 时单独编译 tgai_attn_nop.cu。
+_M3_KERNELS = r"""
+extern "C" __global__ void swap_last2(const float* a, float* b, int batch, int m, int n) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    int total = batch * n * m;
+    if (i >= total || m <= 0 || n <= 0) return;
+    int m_i = i % m;
+    int n_i = (i / m) % n;
+    int b_i = i / (m * n);
+    b[i] = a[(b_i * m + m_i) * n + n_i];
+}
+
+/* 4D broadcast add. c0..c3 is the output shape (leading dims padded to 1).
+   a0..a3 and b0..b3 are source strides; a broadcast axis has stride 0.
+   Caller guarantees every output extent is >= 1. */
+extern "C" __global__ void bcast_add4(
+    const float* a, const float* b, float* c, int n,
+    int c0, int c1, int c2, int c3,
+    int a0, int a1, int a2, int a3,
+    int b0, int b1, int b2, int b3) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    int t = i;
+    int i3 = t % c3; t /= c3;
+    int i2 = t % c2; t /= c2;
+    int i1 = t % c1; t /= c1;
+    int i0 = t;
+    int ia = i0 * a0 + i1 * a1 + i2 * a2 + i3 * a3;
+    int ib = i0 * b0 + i1 * b1 + i2 * b2 + i3 * b3;
+    c[i] = a[ia] + b[ib];
+}
+
+__device__ __forceinline__ float tg_warp_max(float v) {
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+__device__ __forceinline__ float tg_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    return v;
+}
+
+/* 一行一个 warp：32 个 lane 覆盖连续的 j（合并访存），shuffle 做归约。
+   旧版是一行一个线程、内部串行跑 3 遍 k —— A10 上实测 8 次调用要 5.31 ms，
+   只有 624 个线程在干活（6144 核），是整步最大的单点开销。 */
+extern "C" __global__ void softmax_lastdim(const float* __restrict__ x,
+                                           float* __restrict__ y, int rows, int k) {
+    int warp = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    int lane = (int)(threadIdx.x & 31u);
+    if (warp >= rows || k <= 0) return;
+    const float* row = x + (long long)warp * k;
+    float* orow = y + (long long)warp * k;
+    float m = -3.402823466e+38f;
+    for (int j = lane; j < k; j += 32) m = fmaxf(m, row[j]);
+    m = tg_warp_max(m);
+    float s = 0.f;
+    for (int j = lane; j < k; j += 32) { float e = __expf(row[j] - m); orow[j] = e; s += e; }
+    s = tg_warp_sum(s);
+    float inv = (s > 0.f) ? (1.f / s) : 0.f;
+    for (int j = lane; j < k; j += 32) orow[j] *= inv;
+}
+
+extern "C" __global__ void softmax_lastdim_bwd(const float* __restrict__ g,
+                                              const float* __restrict__ y,
+                                              float* __restrict__ dx, int rows, int k) {
+    int warp = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    int lane = (int)(threadIdx.x & 31u);
+    if (warp >= rows || k <= 0) return;
+    const float* grow = g + (long long)warp * k;
+    const float* yrow = y + (long long)warp * k;
+    float* drow = dx + (long long)warp * k;
+    float dot = 0.f;
+    for (int j = lane; j < k; j += 32) dot += grow[j] * yrow[j];
+    dot = tg_warp_sum(dot);
+    for (int j = lane; j < k; j += 32) drow[j] = yrow[j] * (grow[j] - dot);
+}
+"""
+
+
+# M5：permute / 按轴求和（广播的反向）/ 广播成目标形状 / 最后一维 log_softmax / AdamW。
+# 形状和步长在主机上算（纯标量）。张量值不回主机。
+_M5_KERNELS = r"""
+extern "C" __global__ void permute8(
+    const float* in, float* out, int n,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    int shp[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+    int st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    int rem = i;
+    int src = 0;
+    for (int d = 7; d >= 0; --d) {
+        int sd = shp[d];
+        int coord = rem % sd;
+        rem /= sd;
+        src += coord * st[d];
+    }
+    out[i] = in[src];
+}
+
+/* permute 的 float4 版本：最内层维在源和目的都连续（stride 1）时使用。
+   旧版每个元素要跑 8 次整数除法+取模（8 维通用 gather），实测 64 次调用
+   在 A10 上占 2.55 ms/步 —— 是算除法算死的，不是带宽。
+   这里把最内层维按 4 个一组处理：索引计算量降到 1/4、线程数降到 1/4。 */
+extern "C" __global__ void permute8_v4(
+    const float* __restrict__ in, float* __restrict__ out, int n4,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n4) return;
+    int rem = i;
+    int src = 0;
+    int c = rem % o7; rem /= o7; src += c * 4;          /* 最内层：4 个一组 */
+    c = rem % o6; rem /= o6; src += c * s6;
+    c = rem % o5; rem /= o5; src += c * s5;
+    c = rem % o4; rem /= o4; src += c * s4;
+    c = rem % o3; rem /= o3; src += c * s3;
+    c = rem % o2; rem /= o2; src += c * s2;
+    c = rem % o1; rem /= o1; src += c * s1;
+    src += rem * s0;
+    const float4* pin = (const float4*)(in + src);
+    float4 v = *pin;
+    ((float4*)out)[i] = v;
+}
+
+extern "C" __global__ void broadcast_to8(
+    const float* in, float* out, int n,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    int shp[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+    int st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    int rem = i;
+    int src = 0;
+    for (int d = 7; d >= 0; --d) {
+        int sd = shp[d];
+        int coord = rem % sd;
+        rem /= sd;
+        src += coord * st[d];
+    }
+    out[i] = in[src];
+}
+
+/* 沿 axis 求和，输出按该维长度视为 1 的行主序写下（keepdims 布局）。 */
+/* 2D 沿 axis=0 求和：out[c] = sum_r in[r*nc + c]。
+ * 为什么单独写：通用 sum_axis8 是一个输出一个线程，bias 梯度是 896 输出 x 2048 累加，
+ * 只有 896 个线程（<1 个 block 的并行度），占用率极低。这里一列一个 block、256 线程并行归约。 */
+extern "C" __global__ void sum_axis0_rows(const float* __restrict__ in,
+                                          float* __restrict__ out,
+                                          int n_rows, int n_cols) {
+    int c = blockIdx.x;
+    if (c >= n_cols) return;
+    float acc = 0.0f;
+    for (int r = threadIdx.x; r < n_rows; r += blockDim.x) acc += in[(long)r * n_cols + c];
+    __shared__ float sh[256];
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int step = blockDim.x >> 1; step > 0; step >>= 1) {
+        if (threadIdx.x < step) sh[threadIdx.x] += sh[threadIdx.x + step];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[c] = sh[0];
+}
+
+extern "C" __global__ void sum_axis8(
+    const float* in, float* out, int n_out, int axis, int extent,
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    int t = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (t >= n_out || extent <= 0) return;
+    int shp[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    int ost[8];
+    int stride = 1;
+    for (int d = 7; d >= 0; --d) {
+        ost[d] = stride;
+        stride *= shp[d];
+    }
+    int coords[8];
+    int rem = t;
+    for (int d = 7; d >= 0; --d) {
+        int sd = (d == axis) ? 1 : shp[d];
+        coords[d] = rem % sd;
+        rem /= sd;
+    }
+    float acc = 0.f;
+    for (int k = 0; k < extent; ++k) {
+        coords[axis] = k;
+        int idx = 0;
+        for (int d = 0; d < 8; ++d) idx += coords[d] * ost[d];
+        acc += in[idx];
+    }
+    out[t] = acc;
+}
+
+extern "C" __global__ void log_softmax_lastdim(const float* x, float* y, int rows, int k) {
+    /* warp-per-row：一行由 32 个 lane 并行归约。
+       原来是一条线程串行扫 k —— k=151936 时比 warp 版慢 20 倍以上（实测 144ms vs 6ms）。 */
+    int warp = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    int lane = (int)(threadIdx.x & 31u);
+    if (warp >= rows || k <= 0) return;
+    const float* row = x + (long long)warp * k;
+    float* orow = y + (long long)warp * k;
+    float m = -3.402823466e+38f;
+    for (int j = lane; j < k; j += 32) m = fmaxf(m, row[j]);
+    m = tg_warp_max(m);
+    float sum = 0.f;
+    for (int j = lane; j < k; j += 32) sum = __fadd_rn(sum, expf(__fsub_rn(row[j], m)));
+    sum = tg_warp_sum(sum);
+    float lse = __fadd_rn(m, logf(sum));
+    for (int j = lane; j < k; j += 32) orow[j] = __fsub_rn(row[j], lse);
+}
+
+extern "C" __global__ void log_softmax_lastdim_bwd(const float* g, const float* y, float* dx,
+                                                  int rows, int k) {
+    /* 同样改成 warp-per-row（反向也是串行扫 k，实测同样慢）。 */
+    int warp = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    int lane = (int)(threadIdx.x & 31u);
+    if (warp >= rows || k <= 0) return;
+    const float* grow = g + (long long)warp * k;
+    const float* yrow = y + (long long)warp * k;
+    float* drow = dx + (long long)warp * k;
+    float sg = 0.f;
+    for (int j = lane; j < k; j += 32) sg = __fadd_rn(sg, grow[j]);
+    sg = tg_warp_sum(sg);
+    for (int j = lane; j < k; j += 32) {
+        drow[j] = __fsub_rn(grow[j], __fmul_rn(expf(yrow[j]), sg));
+    }
+}
+
+/* 与 CPU AdamW.step 同一顺序，且每步都是 IEEE 舍入（禁止 FMA 收缩）。
+   标量由主机按 numpy 2 的规则先收成 float32：例如 omb1 = float32(1 - b1)，
+   不是 float32(1) - float32(b1)。wd_lr = float32(lr * wd)。原地写 p/m/v。 */
+extern "C" __global__ void adamw_update(
+    float* p, const float* g, float* m, float* v, int n,
+    float b1, float omb1, float b2, float omb2,
+    float lr, float wd_lr, float eps, float bc1, float bc2, int do_wd) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    float gi = g[i];
+    float pi = p[i];
+    if (do_wd) pi = __fsub_rn(pi, __fmul_rn(wd_lr, pi));
+    float mi = __fadd_rn(__fmul_rn(b1, m[i]), __fmul_rn(omb1, gi));
+    float g2 = __fmul_rn(gi, gi);
+    float vi = __fadd_rn(__fmul_rn(b2, v[i]), __fmul_rn(omb2, g2));
+    m[i] = mi;
+    v[i] = vi;
+    float mh = __fdiv_rn(mi, bc1);
+    float vh = __fdiv_rn(vi, bc2);
+    float denom = __fadd_rn(sqrtf(vh), eps);
+    float step = __fdiv_rn(__fmul_rn(lr, mh), denom);
+    p[i] = __fsub_rn(pi, step);
+}
+
+/* 多张量 AdamW：一次发射更新全部参数。
+   ps/gs/ms/vs 是设备上的指针数组，offs 是长度前缀和（offs[t]..offs[t+1) 属于第 t 个张量）。
+   每个元素的算术与单张量版 adamw_update **逐条相同**（同样的舍入内建函数），因此逐位一致。 */
+extern "C" __global__ void adamw_update_multi(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* ms, const unsigned long long* vs,
+    const int* offs, int ntensors, int total,
+    float b1, float omb1, float b2, float omb2,
+    float lr, float wd_lr, float eps, float bc1, float bc2, int do_wd) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= total) return;
+    int lo = 0;
+    int hi = ntensors - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (offs[mid] <= i) lo = mid; else hi = mid - 1;
+    }
+    int j = i - offs[lo];
+    float* p = (float*)(unsigned long long)ps[lo];
+    const float* g = (const float*)(unsigned long long)gs[lo];
+    float* m = (float*)(unsigned long long)ms[lo];
+    float* v = (float*)(unsigned long long)vs[lo];
+    float gi = g[j];
+    float pi = p[j];
+    if (do_wd) pi = __fsub_rn(pi, __fmul_rn(wd_lr, pi));
+    float mi = __fadd_rn(__fmul_rn(b1, m[j]), __fmul_rn(omb1, gi));
+    float g2 = __fmul_rn(gi, gi);
+    float vi = __fadd_rn(__fmul_rn(b2, v[j]), __fmul_rn(omb2, g2));
+    m[j] = mi;
+    v[j] = vi;
+    float mh = __fdiv_rn(mi, bc1);
+    float vh = __fdiv_rn(vi, bc2);
+    float denom = __fadd_rn(sqrtf(vh), eps);
+    float step = __fdiv_rn(__fmul_rn(lr, mh), denom);
+    p[j] = __fsub_rn(pi, step);
+}
+
+/* Muon 的动量。先 decoupled weight decay，再 buf = mom*buf + g，
+   Nesterov 时 u = g + mom*buf（用刚写完的 buf）。 */
+extern "C" __global__ void muon_momentum(
+    float* p, const float* g, float* buf, float* u, int n,
+    float mom, float wd_lr, int do_wd, int nesterov) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    if (do_wd) p[i] = __fsub_rn(p[i], __fmul_rn(wd_lr, p[i]));
+    float b = __fadd_rn(__fmul_rn(mom, buf[i]), g[i]);
+    buf[i] = b;
+    if (nesterov) u[i] = __fadd_rn(g[i], __fmul_rn(mom, b));
+    else u[i] = b;
+}
+
+extern "C" __global__ void ewise_div_scalar(const float* a, float s, float* c, int n) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < n) c[i] = __fdiv_rn(a[i], s);
+}
+
+extern "C" __global__ void ewise_sub_scale(float* p, const float* o, float scale, int n) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < n) p[i] = __fsub_rn(p[i], __fmul_rn(scale, o[i]));
+}
+
+/* 行优先 C = A@B，多种 K 维累加顺序。用来对齐 numpy 的 matmul，mode 选定后训练走那一种。 */
+extern "C" __global__ void sgemm_mode(
+    const float* A, const float* B, float* C,
+    int M, int N, int K, int mode) {
+    int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    int total = M * N;
+    if (idx >= total || M <= 0 || N <= 0) return;
+    int i = idx / N;
+    int j = idx - i * N;
+    const float* a = A + (long long)i * K;
+    float acc = 0.f;
+    if (K <= 0) {
+        C[idx] = 0.f;
+        return;
+    }
+    if (mode == 0) {
+        for (int k = 0; k < K; ++k)
+            acc = __fadd_rn(acc, __fmul_rn(a[k], B[(long long)k * N + j]));
+    } else if (mode == 1) {
+        for (int k = 0; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 2) {
+        for (int k = K - 1; k >= 0; --k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 3) {
+        float p[32];
+        int n = K;
+        if (n > 32) n = 32;
+        for (int k = 0; k < n; ++k)
+            p[k] = __fmul_rn(a[k], B[(long long)k * N + j]);
+        int len = n;
+        while (len > 1) {
+            int m = len >> 1;
+            for (int t = 0; t < m; ++t)
+                p[t] = __fadd_rn(p[2 * t], p[2 * t + 1]);
+            if (len & 1) {
+                p[m] = p[len - 1];
+                m += 1;
+            }
+            len = m;
+        }
+        acc = p[0];
+        for (int k = n; k < K; ++k)
+            acc = __fadd_rn(acc, __fmul_rn(a[k], B[(long long)k * N + j]));
+    } else if (mode == 4) {
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int k = 0;
+        for (; k + 4 <= K; k += 4) {
+            a0 = __fmaf_rn(a[k], B[(long long)k * N + j], a0);
+            a1 = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], a1);
+            a2 = __fmaf_rn(a[k + 2], B[(long long)(k + 2) * N + j], a2);
+            a3 = __fmaf_rn(a[k + 3], B[(long long)(k + 3) * N + j], a3);
+        }
+        acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
+        for (; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 5) {
+        int k = 0;
+        for (; k + 4 <= K; k += 4) {
+            float s = 0.f;
+            s = __fmaf_rn(a[k], B[(long long)k * N + j], s);
+            s = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], s);
+            s = __fmaf_rn(a[k + 2], B[(long long)(k + 2) * N + j], s);
+            s = __fmaf_rn(a[k + 3], B[(long long)(k + 3) * N + j], s);
+            acc = __fadd_rn(acc, s);
+        }
+        for (; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 6) {
+        float a0 = 0.f, a1 = 0.f;
+        int k = 0;
+        for (; k + 2 <= K; k += 2) {
+            a0 = __fmaf_rn(a[k], B[(long long)k * N + j], a0);
+            a1 = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], a1);
+        }
+        acc = __fadd_rn(a0, a1);
+        for (; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 7) {
+        for (int k = 0; k < K; ++k)
+            acc = __fadd_rn(acc, __fmul_rn(B[(long long)k * N + j], a[k]));
+    } else if (mode == 8) {
+        /* 每 8 个 K 做一对累加器，再加进 acc；尾巴继续一对累加器。 */
+        int k = 0;
+        for (; k + 8 <= K; k += 8) {
+            float a0 = 0.f, a1 = 0.f;
+            for (int t = 0; t < 8; t += 2) {
+                a0 = __fmaf_rn(a[k + t], B[(long long)(k + t) * N + j], a0);
+                a1 = __fmaf_rn(a[k + t + 1], B[(long long)(k + t + 1) * N + j], a1);
+            }
+            acc = __fadd_rn(acc, __fadd_rn(a0, a1));
+        }
+        float b0 = 0.f, b1 = 0.f;
+        int t = k;
+        for (; t + 1 < K; t += 2) {
+            b0 = __fmaf_rn(a[t], B[(long long)t * N + j], b0);
+            b1 = __fmaf_rn(a[t + 1], B[(long long)(t + 1) * N + j], b1);
+        }
+        acc = __fadd_rn(acc, __fadd_rn(b0, b1));
+        if (t < K) acc = __fmaf_rn(a[t], B[(long long)t * N + j], acc);
+    } else if (mode == 9) {
+        /* 前 8 个一对累加器，剩下的顺序 fma 加在和上。 */
+        int n8 = K < 8 ? K : 8;
+        if (n8 & 1) n8 -= 1;
+        float a0 = 0.f, a1 = 0.f;
+        int k = 0;
+        for (; k < n8; k += 2) {
+            a0 = __fmaf_rn(a[k], B[(long long)k * N + j], a0);
+            a1 = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], a1);
+        }
+        acc = __fadd_rn(a0, a1);
+        for (; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 10) {
+        /* 4 路交错累加器，最后 (a0+a1)+(a2+a3)。 */
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int k = 0;
+        for (; k + 3 < K; k += 4) {
+            a0 = __fmaf_rn(a[k], B[(long long)k * N + j], a0);
+            a1 = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], a1);
+            a2 = __fmaf_rn(a[k + 2], B[(long long)(k + 2) * N + j], a2);
+            a3 = __fmaf_rn(a[k + 3], B[(long long)(k + 3) * N + j], a3);
+        }
+        acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
+        for (; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else if (mode == 11) {
+        /* 前 8 个 4 路累加器，剩下顺序 fma。 */
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int n = K < 8 ? K : 8;
+        int k = 0;
+        for (; k + 3 < n; k += 4) {
+            a0 = __fmaf_rn(a[k], B[(long long)k * N + j], a0);
+            a1 = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], a1);
+            a2 = __fmaf_rn(a[k + 2], B[(long long)(k + 2) * N + j], a2);
+            a3 = __fmaf_rn(a[k + 3], B[(long long)(k + 3) * N + j], a3);
+        }
+        acc = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
+        for (; k < K; ++k)
+            acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    } else {
+        /* mode 12：整段 2 路，但 a0+a1 的加法换成 fma 形式的顺序尾巴从 0 开始分块 4。 */
+        int k = 0;
+        for (; k + 4 <= K; k += 4) {
+            float a0 = 0.f, a1 = 0.f;
+            a0 = __fmaf_rn(a[k], B[(long long)k * N + j], a0);
+            a1 = __fmaf_rn(a[k + 1], B[(long long)(k + 1) * N + j], a1);
+            a0 = __fmaf_rn(a[k + 2], B[(long long)(k + 2) * N + j], a0);
+            a1 = __fmaf_rn(a[k + 3], B[(long long)(k + 3) * N + j], a1);
+            acc = __fadd_rn(acc, __fadd_rn(a0, a1));
+        }
+        float b0 = 0.f, b1 = 0.f;
+        int t = k;
+        for (; t + 1 < K; t += 2) {
+            b0 = __fmaf_rn(a[t], B[(long long)t * N + j], b0);
+            b1 = __fmaf_rn(a[t + 1], B[(long long)(t + 1) * N + j], b1);
+        }
+        acc = __fadd_rn(acc, __fadd_rn(b0, b1));
+        if (t < K) acc = __fmaf_rn(a[t], B[(long long)t * N + j], acc);
+    }
+    C[idx] = acc;
+}
+
+/* K 维按给定切块累加。kind=1 块内顺序 fma；kind=2 块内奇偶两路 fma 再相加。块与块左加。 */
+extern "C" __global__ void sgemm_compose(
+    const float* A, const float* B, float* C,
+    int M, int N, int K, int nchunks, int kind,
+    int c0, int c1, int c2, int c3, int c4, int c5, int c6, int c7) {
+    int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    int total = M * N;
+    if (idx >= total) return;
+    int i = idx / N;
+    int j = idx - i * N;
+    const float* a = A + (long long)i * K;
+    int chunks[8] = {c0, c1, c2, c3, c4, c5, c6, c7};
+    float acc = 0.f;
+    int k = 0;
+    int nch = nchunks;
+    if (nch > 8) nch = 8;
+    for (int c = 0; c < nch; ++c) {
+        int len = chunks[c];
+        if (len <= 0) break;
+        float part;
+        if (kind == 2) {
+            float a0 = 0.f, a1 = 0.f;
+            int t = 0;
+            for (; t + 1 < len; t += 2) {
+                a0 = __fmaf_rn(a[k + t], B[(long long)(k + t) * N + j], a0);
+                a1 = __fmaf_rn(a[k + t + 1], B[(long long)(k + t + 1) * N + j], a1);
+            }
+            part = __fadd_rn(a0, a1);
+            if (t < len)
+                part = __fmaf_rn(a[k + t], B[(long long)(k + t) * N + j], part);
+        } else {
+            part = 0.f;
+            for (int t = 0; t < len; ++t)
+                part = __fmaf_rn(a[k + t], B[(long long)(k + t) * N + j], part);
+        }
+        acc = __fadd_rn(acc, part);
+        k += len;
+    }
+    for (; k < K; ++k)
+        acc = __fmaf_rn(a[k], B[(long long)k * N + j], acc);
+    C[idx] = acc;
+}
+
+/* 顺序累加平方和，一个线程。n 很小（优化器里的矩阵）。和 np.sum(x*x) 的左折叠对齐。 */
+extern "C" __global__ void sumsq_sequential(const float* a, float* out, int n) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    float s = 0.f;
+    for (int i = 0; i < n; ++i) {
+        float v = a[i];
+        s = __fadd_rn(s, __fmul_rn(v, v));
+    }
+    out[0] = s;
+}
+
+/* 并行平方和（两段归约）。大张量必须用这条：
+   sumsq_sequential 是单线程，对 1.36 亿元素的嵌入梯度实测 36 s/step。 */
+extern "C" __global__ void sumsq_partial(const float* a, float* part, int n) {
+    float s = 0.f;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+        float v = a[i];
+        s = __fadd_rn(s, __fmul_rn(v, v));
+    }
+    __shared__ float sm[256];
+    sm[threadIdx.x] = s;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (threadIdx.x < off)
+            sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + off]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) part[blockIdx.x] = sm[0];
+}
+
+extern "C" __global__ void sumsq_final(const float* part, float* out, int nb) {
+    float s = 0.f;
+    for (int i = threadIdx.x; i < nb; i += blockDim.x) s = __fadd_rn(s, part[i]);
+    __shared__ float sm[256];
+    sm[threadIdx.x] = s;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (threadIdx.x < off)
+            sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + off]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[0] = sm[0];
+}
+
+/* 多张量平方和（**确定性**）：一个 block 处理一个张量，结果写进自己的槽位 slots[t]。
+   刻意不用 atomicAdd 做跨 block 累加 —— 那会让求和顺序随调度变化，
+   同一次训练重跑会得到相差 1e-7 量级的范数，破坏"逐位可复现"。
+   槽位之后的归约交给 sumsq_final（固定顺序树归约）。
+   用途：clip_grad_norm_ 一次算完所有参数的平方和（原来每参数要 2 次发射）。 */
+extern "C" __global__ void sumsq_multi_slots(const float* raw_ptrs,
+                                             const float* raw_sizes, int n, float* slots) {
+    int t = blockIdx.x;
+    if (t >= n) return;
+    /* 指针/长度是按位重解释成 float32 传上来的（运行时的 h2d 只吃 float32/uint16，
+       直接传 uint64 会被强制转成 float32 变成垃圾）。这里强转回去。 */
+    const unsigned long long* pp = (const unsigned long long*)raw_ptrs;
+    const int* sz = (const int*)raw_sizes;
+    const float* a = (const float*)pp[t];
+    int m = sz[t];
+    float s = 0.f;
+    for (int i = threadIdx.x; i < m; i += blockDim.x) {
+        float v = a[i];
+        s = __fadd_rn(s, __fmul_rn(v, v));
+    }
+    __shared__ float sm[256];
+    sm[threadIdx.x] = s;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (threadIdx.x < off)
+            sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + off]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) slots[t] = sm[0];
+}
+
+/* 多张量原地缩放：一个 block 处理一个张量，无归约 ⇒ 天然确定性。
+   用途：梯度裁剪时一次缩完所有参数（原来 321 次 scale_inplace）。 */
+extern "C" __global__ void scale_multi(const float* raw_ptrs, const float* raw_sizes,
+                                       int n, float s) {
+    int t = blockIdx.x;
+    if (t >= n) return;
+    const unsigned long long* pp = (const unsigned long long*)raw_ptrs;
+    const int* sz = (const int*)raw_sizes;
+    float* a = (float*)pp[t];
+    int m = sz[t];
+    for (int i = threadIdx.x; i < m; i += blockDim.x) a[i] = __fmul_rn(a[i], s);
+}
+
+/* 基础切片 / repeat_interleave 的前向。
+   输出下标按行主序拆开，源下标 = base + sum (coord/div)*stride。
+   div 恒 >= 1。切片的 div 是 1，stride 已经乘过 step（可以为负）。
+   repeat_interleave 的 div 是重复次数，stride 是源张量该维的步长。
+   前导维由主机补成 shape=1、div=1、stride=0，所以这里不会除以 0。 */
+extern "C" __global__ void index_gather8(
+    const float* in, float* out, int n, int base,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int d0, int d1, int d2, int d3, int d4, int d5, int d6, int d7,
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    int shp[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+    int divs[8] = {d0, d1, d2, d3, d4, d5, d6, d7};
+    int st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    int rem = i;
+    long long src = (long long)base;
+    for (int d = 7; d >= 0; --d) {
+        int sd = shp[d];
+        int coord = rem % sd;
+        rem /= sd;
+        src += (long long)(coord / divs[d]) * (long long)st[d];
+    }
+    out[i] = in[src];
+}
+
+/* 反向：调用方先把 full memset 成 0，再把梯度加回源位置。
+   切片各位置不重叠，atomicAdd 只执行一次；repeat 的同一源位置会被加 repeats 次。 */
+/* 确定性 repeat_interleave 反向：out[o,k,inn] = sum_{j=0..r-1} g[o, k*r+j, inn]。
+   一个线程一个输出元素，j 升序累加 —— 顺序固定，无原子，运行间逐位可复现。 */
+extern "C" __global__ void repeat_reduce(const float* g, float* out, long long n_out,
+                                          int repeats, long long kinner, long long inner) {
+    long long i = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+    if (i >= n_out) return;
+    long long inn = i % inner;
+    long long k = (i / inner) % (kinner / inner);
+    long long o = i / kinner;
+    float acc = 0.f;
+    const long long gbase = (o * kinner) * (long long)repeats + k * (long long)repeats * inner + inn;
+    for (int j = 0; j < repeats; ++j) {
+        acc = __fadd_rn(acc, g[gbase + (long long)j * inner]);
+    }
+    out[i] = acc;
+}
+
+extern "C" __global__ void index_scatter_add8(
+    const float* g, float* full, int n, int base,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int d0, int d1, int d2, int d3, int d4, int d5, int d6, int d7,
+    int s0, int s1, int s2, int s3, int s4, int s5, int s6, int s7) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    int shp[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+    int divs[8] = {d0, d1, d2, d3, d4, d5, d6, d7};
+    int st[8] = {s0, s1, s2, s3, s4, s5, s6, s7};
+    int rem = i;
+    long long src = (long long)base;
+    for (int d = 7; d >= 0; --d) {
+        int sd = shp[d];
+        int coord = rem % sd;
+        rem /= sd;
+        src += (long long)(coord / divs[d]) * (long long)st[d];
+    }
+    atomicAdd(full + src, g[i]);
+}
+"""
+
+# MoE 派发/收集。专家 GEMM 仍走已有的 cublas/sgemm_mode，这里只做索引。
+# top-k：logit 更大者优先，平局保留更小的专家下标（与 moeblk 的 strict-greater argmax 一致）。
+_MOE_KERNELS = r"""
+extern "C" __global__ void moe_topk(const float* logits, int* idx, float* val,
+                                     int N, int E, int K) {
+    int t = (int)blockIdx.x;
+    if (t >= N || threadIdx.x != 0) return;
+    const float* row = logits + (long long)t * E;
+    int* irow = idx + (long long)t * K;
+    float* vrow = val + (long long)t * K;
+    for (int s = 0; s < K; ++s) {
+        int best_e = -1;
+        float best_v = 0.f;
+        for (int e = 0; e < E; ++e) {
+            int used = 0;
+            for (int p = 0; p < s; ++p) {
+                if (irow[p] == e) used = 1;
+            }
+            if (used) continue;
+            float v = row[e];
+            if (best_e < 0 || v > best_v || (v == best_v && e < best_e)) {
+                best_e = e;
+                best_v = v;
+            }
+        }
+        irow[s] = best_e;
+        vrow[s] = best_v;
+    }
+}
+
+extern "C" __global__ void moe_sigmoid(const float* x, float* y, int n) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= n) return;
+    float neg = __fmul_rn(x[i], -1.0f);
+    float e = exp32_bits(neg);
+    y[i] = __fdiv_rn(1.0f, __fadd_rn(1.0f, e));
+}
+
+extern "C" __global__ void moe_gather_pairs(const float* src, const int* idx, float* dst,
+                                             int N, int E, int K) {
+    int t = (int)blockIdx.x;
+    if (t >= N) return;
+    for (int s = (int)threadIdx.x; s < K; s += (int)blockDim.x) {
+        int e = idx[(long long)t * K + s];
+        dst[(long long)t * K + s] = src[(long long)t * E + e];
+    }
+}
+
+/* 单线程按 token、slot 的顺序加，和 CPU 的 np.add.at 同一方向。 */
+extern "C" __global__ void moe_scatter_pairs(const float* g, const int* idx, float* dst,
+                                              int N, int E, int K) {
+    if (threadIdx.x || blockIdx.x) return;
+    for (int i = 0; i < N * E; ++i) dst[i] = 0.f;
+    for (int t = 0; t < N; ++t) {
+        for (int s = 0; s < K; ++s) {
+            int e = idx[(long long)t * K + s];
+            dst[(long long)t * E + e] += g[(long long)t * K + s];
+        }
+    }
+}
+
+extern "C" __global__ void moe_compact(const int* idx, int* offsets, int* cursor,
+                                        int* tok, int* slot, int N, int E, int K) {
+    if (threadIdx.x || blockIdx.x) return;
+    for (int e = 0; e < E; ++e) offsets[e] = 0;
+    for (int t = 0; t < N; ++t) {
+        for (int s = 0; s < K; ++s) offsets[idx[(long long)t * K + s]]++;
+    }
+    int sum = 0;
+    for (int e = 0; e < E; ++e) {
+        int c = offsets[e];
+        offsets[e] = sum;
+        cursor[e] = sum;
+        sum += c;
+    }
+    offsets[E] = sum;
+    for (int t = 0; t < N; ++t) {
+        for (int s = 0; s < K; ++s) {
+            int e = idx[(long long)t * K + s];
+            int p = cursor[e]++;
+            tok[p] = t;
+            slot[p] = s;
+        }
+    }
+}
+
+extern "C" __global__ void moe_gather_rows(const float* x, const int* tok, float* out,
+                                            int begin, int m, int d) {
+    int i = (int)blockIdx.x;
+    if (i >= m) return;
+    int t = tok[begin + i];
+    const float* src = x + (long long)t * d;
+    float* dst = out + (long long)i * d;
+    for (int j = (int)threadIdx.x; j < d; j += (int)blockDim.x) dst[j] = src[j];
+}
+
+extern "C" __global__ void moe_scatter_rows(const float* y, const int* tok, float* out,
+                                             int begin, int m, int d) {
+    int i = (int)blockIdx.x;
+    if (i >= m) return;
+    int t = tok[begin + i];
+    const float* src = y + (long long)i * d;
+    float* dst = out + (long long)t * d;
+    for (int j = (int)threadIdx.x; j < d; j += (int)blockDim.x)
+        atomicAdd(dst + j, src[j]);
+}
+
+extern "C" __global__ void moe_gather_slots(const float* w, const int* tok, const int* slot,
+                                             float* out, int begin, int m, int K) {
+    int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= m) return;
+    int t = tok[begin + i];
+    int s = slot[begin + i];
+    out[i] = w[(long long)t * K + s];
+}
+
+extern "C" __global__ void moe_scatter_slots(const float* g, const int* tok, const int* slot,
+                                              float* dst, int begin, int m, int N, int K) {
+    if (threadIdx.x || blockIdx.x) return;
+    for (int i = 0; i < N * K; ++i) dst[i] = 0.f;
+    for (int i = 0; i < m; ++i) {
+        int t = tok[begin + i];
+        int s = slot[begin + i];
+        dst[(long long)t * K + s] += g[i];
+    }
+}
+
+extern "C" __global__ void moe_row_scale(const float* y, const float* w, float* out,
+                                          int m, int d) {
+    int i = (int)blockIdx.x;
+    if (i >= m) return;
+    float s = w[i];
+    const float* src = y + (long long)i * d;
+    float* dst = out + (long long)i * d;
+    for (int j = (int)threadIdx.x; j < d; j += (int)blockDim.x)
+        dst[j] = __fmul_rn(src[j], s);
+}
+
+extern "C" __global__ void moe_row_dot(const float* g, const float* y, float* dw,
+                                        int m, int d) {
+    int i = (int)blockIdx.x;
+    if (i >= m || threadIdx.x != 0) return;
+    const float* gg = g + (long long)i * d;
+    const float* yy = y + (long long)i * d;
+    float s = 0.f;
+    for (int j = 0; j < d; ++j) s = __fadd_rn(s, __fmul_rn(gg[j], yy[j]));
+    dw[i] = s;
+}
+
+/* 把 [rows, cols] 抄进目标的前 rows 行。目标更长的部分由调用方预先清零。 */
+extern "C" __global__ void moe_pad_rows(const float* src, float* dst, int rows, int cols) {
+    int i = (int)blockIdx.x;
+    if (i >= rows) return;
+    const float* s = src + (long long)i * cols;
+    float* d = dst + (long long)i * cols;
+    for (int j = (int)threadIdx.x; j < cols; j += (int)blockDim.x)
+        d[j] = s[j];
+}
+"""
+
+
+# cat：沿任意轴把若干块连续 float32 抄进同一块连续缓冲，反向再按槽切回来。
+# 下标用 long long，避免 outer×span×inner 的中间乘积在 int32 里回绕。
+# 纯赋值，不经过 fma，和 CPU 的 np.concatenate / np.split 逐位相同。
+_CAT_KERNELS = r"""
+extern "C" __global__ void cat_place(
+    const float* src, float* dst, int n,
+    int src_axis, int dst_axis, int inner, int dst_off) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n || inner <= 0 || src_axis <= 0) return;
+    int inner_i = i % inner;
+    int t = i / inner;
+    int s_i = t % src_axis;
+    int o = t / src_axis;
+    long long di = (((long long)o * dst_axis + (long long)dst_off + s_i) * inner) + inner_i;
+    dst[di] = src[i];
+}
+
+extern "C" __global__ void cat_extract(
+    const float* src, float* dst, int n,
+    int src_axis, int dst_axis, int inner, int src_off) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n || inner <= 0 || dst_axis <= 0) return;
+    int inner_i = i % inner;
+    int t = i / inner;
+    int d_i = t % dst_axis;
+    int o = t / dst_axis;
+    long long si = (((long long)o * src_axis + (long long)src_off + d_i) * inner) + inner_i;
+    dst[i] = src[si];
+}
+
+/* ---- 任意索引 gather（torch.index_select / torch.gather 的底座）----
+ * gather_rows : out[r, :] = src[idx[r], :]，row_size = 每行元素数（内层连续）
+ * gather_flat : out[i]     = src[idx[i]]，idx 是**已算好**的扁平下标（用于逐元素 gather）
+ * 反向都用 atomicAdd 散射回去（scatter_add_rows / scatter_add_flat）。
+ * 与 cat 系列一样显式用 __fadd_rn 保证确定性语义（atomicAdd 的浮点加法顺序由硬件决定，
+ * 同一输入下可复现，但与串行顺序相加可能差最后几位——测试里按容差比较）。 */
+extern "C" __global__ void gather_rows(
+    const float* __restrict__ src, const int* __restrict__ idx, float* __restrict__ dst,
+    int n_rows, int row_size) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)n_rows * row_size;
+    if (i >= total) return;
+    int r = (int)(i / row_size);
+    int c = (int)(i - (long long)r * row_size);
+    int sidx = idx[r];
+    dst[i] = __ldg(src + (long long)sidx * row_size + c);
+}
+
+extern "C" __global__ void scatter_add_rows(
+    const float* __restrict__ g, const int* __restrict__ idx, float* __restrict__ out,
+    int n_rows, int row_size) {
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)n_rows * row_size;
+    if (i >= total) return;
+    int r = (int)(i / row_size);
+    int c = (int)(i - (long long)r * row_size);
+    int sidx = idx[r];
+    atomicAdd(out + (long long)sidx * row_size + c, g[i]);
+}
+
+extern "C" __global__ void gather_flat(
+    const float* __restrict__ src, const int* __restrict__ idx, float* __restrict__ dst, int n) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    dst[i] = __ldg(src + idx[i]);
+}
+
+/* ---- MoE 设备侧 permute / unpermute（免排序、免主机往返）-----------------
+ * 为什么需要：路由把专家下标拷回主机（`route_topk` 的 to_numpy）会同步，
+ *   **捕获期间不允许同步**，于是整步无法被 CUDA Graph 捕获（实测
+ *   rc=900 operation not permitted when stream is capturing）。
+ * 做法：每个专家预留固定 C 行（capacity），用 atomicAdd 领号写进槽位；
+ *   空槽 rowid = -1。全程只用设备数据，主机侧只提供 E/C/d 这些标量。
+ * 约束：调用方先把 counts 清零、xp/gp/rowid 分配好（xp 内容不要求清零，空槽靠 rowid 屏蔽）。
+ * rowid 里存的是 (row, slot) 的扁平号 row*k+slot，反向靠它还原。 */
+
+extern "C" __global__ void moe_permute(
+    const long long* __restrict__ eids, const float* __restrict__ x,
+    const float* __restrict__ gate, int* __restrict__ counts,
+    float* __restrict__ xp, float* __restrict__ gp, int* __restrict__ rowid,
+    int n_rows, int k, int d, int E, int C) {
+    long long pair = (long long)blockIdx.x;
+    long long total_pairs = (long long)n_rows * (long long)k;
+    if (pair >= total_pairs) return;
+    long long e = eids[pair];
+    if (e < 0 || e >= (long long)E) return;
+    int row = (int)(pair / k);
+    __shared__ int s_slot;
+    if (threadIdx.x == 0) {
+        int pos = atomicAdd(&counts[e], 1);
+        if (pos < C) {
+            int dst = (int)e * C + pos;
+            s_slot = dst;
+            rowid[dst] = (int)pair;
+            gp[dst] = gate[pair];
+        } else {
+            s_slot = -1;          /* 超出容量：丢弃（训练里容量按 1.5x 均值取，丢的很少） */
+        }
+    }
+    __syncthreads();
+    int dst = s_slot;
+    if (dst < 0) return;
+    for (int c = (int)threadIdx.x; c < d; c += (int)blockDim.x) {
+        xp[(long long)dst * d + c] = x[(long long)row * d + c];
+    }
+}
+
+extern "C" __global__ void moe_unpermute(
+    const float* __restrict__ yp, const int* __restrict__ rowid,
+    float* __restrict__ out, int d, int EC) {
+    int r = (int)blockIdx.x;
+    if (r >= EC) return;
+    int dst = rowid[r];
+    if (dst < 0) return;
+    for (int c = (int)threadIdx.x; c < d; c += (int)blockDim.x) {
+        out[(long long)dst * d + c] = yp[(long long)r * d + c];
+    }
+}
+
+/* 反向：dx 用 atomicAdd（同一 row 的两个 slot 会撞），dgate 每槽一个 warp 归约。 */
+extern "C" __global__ void moe_permute_bwd(
+    const float* __restrict__ dyp, const float* __restrict__ x,
+    const int* __restrict__ rowid, float* __restrict__ dx, float* __restrict__ dgate,
+    int d, int k, int EC) {
+    int r = (int)blockIdx.x;
+    if (r >= EC) return;
+    int dst = rowid[r];
+    if (dst < 0) return;
+    int row = dst / k;
+    float acc = 0.f;
+    for (int c = (int)threadIdx.x; c < d; c += (int)blockDim.x) {
+        float dy = dyp[(long long)r * d + c];
+        acc += dy * x[(long long)row * d + c];
+        atomicAdd(&dx[(long long)row * d + c], dy);
+    }
+    __shared__ float sbuf[256];
+    sbuf[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = ((int)blockDim.x) >> 1; s > 0; s >>= 1) {
+        if ((int)threadIdx.x < s) sbuf[threadIdx.x] += sbuf[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) dgate[dst] = sbuf[0];
+}
+
+extern "C" __global__ void scatter_add_flat(
+    const float* __restrict__ g, const int* __restrict__ idx, float* __restrict__ out, int n) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= n) return;
+    atomicAdd(out + idx[i], g[i]);
+}
+"""
+
+
+_FP16_KERNELS = r"""
+/* ---- Phase 1 fp16：GEMM 用的两个 cast 内核 ----
+ * 刻意不 #include <cuda_fp16.h>（NVRTC 没配 -I，加了会编不过），
+ * 这里只需要 IEEE binary16 的位运算，自己写 round-to-nearest-even 更可控。
+ * 转换结果与 numpy 的 astype(np.float16) 逐位一致（sNaN 归一成 qNaN 除外）。
+ */
+__device__ __forceinline__ unsigned int tg_f32_to_f16_bits(float f) {
+    unsigned int x = __float_as_uint(f);
+    unsigned int s = x & 0x80000000u;
+    unsigned int mag = x & 0x7fffffffu;
+    if (mag >= 0x7f800000u) {                    /* inf / nan */
+        unsigned int payload = (mag > 0x7f800000u) ? 0x200u : 0u;
+        return (s >> 16) | 0x7c00u | payload;
+    }
+    if (mag >= 0x477ff000u) {                    /* >= 65520 一律进位成 inf */
+        return (s >> 16) | 0x7c00u;
+    }
+    int e = (int)(mag >> 23);                    /* 偏置 127 的指数 */
+    unsigned int m = mag & 0x7fffffu;
+    int ne = e - 127 + 15;                       /* 换成偏置 15 */
+    if (ne <= 0) {                               /* half 的次正规 / 0（< 2^-14） */
+        if (ne < -10) return s >> 16;            /* 太小，舍到 0 */
+        m |= 0x800000u;
+        int sh = 14 - ne;                        /* 14..24，留 10 位 */
+        unsigned int h = m >> sh;
+        unsigned int rem = m & ((1u << sh) - 1u);
+        unsigned int mid = 1u << (sh - 1);
+        if (rem > mid || (rem == mid && (h & 1u))) h++;
+        return (s >> 16) | h;
+    }
+    unsigned int h = ((unsigned int)ne << 10) | (m >> 13);
+    unsigned int rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
+    return (s >> 16) | h;
+}
+
+__device__ __forceinline__ float tg_f16_bits_to_f32(unsigned int h) {
+    unsigned int s = (h & 0x8000u) << 16;
+    unsigned int e = (h >> 10) & 0x1fu;
+    unsigned int m = h & 0x3ffu;
+    if (e == 0u) {
+        if (m == 0u) return __uint_as_float(s);
+        int sh = 0;
+        while (!(m & 0x400u)) { m <<= 1; sh++; }
+        m &= 0x3ffu;
+        return __uint_as_float(s | ((unsigned int)(113 - sh) << 23) | (m << 13));
+    }
+    if (e == 31u) return __uint_as_float(s | 0x7f800000u | (m << 13));
+    return __uint_as_float(s | ((e + 112u) << 23) | (m << 13));
+}
+
+extern "C" __global__ void cast_f32_to_f16(const float* __restrict__ src,
+                                           unsigned short* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = (unsigned short)tg_f32_to_f16_bits(src[i]);
+}
+
+extern "C" __global__ void cast_f16_to_f32(const unsigned short* __restrict__ src,
+                                           float* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = tg_f16_bits_to_f32((unsigned int)src[i]);
+}
+
+/* bf16 就是 fp32 的高 16 位。舍入用 round-to-nearest-even，和主机侧
+ * (u + 0x7FFF + ((u >> 16) & 1)) >> 16 逐位一致。回 fp32 只是左移 16 位。 */
+extern "C" __global__ void cast_f32_to_bf16(const float* __restrict__ src,
+                                            unsigned short* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        unsigned int u = __float_as_uint(src[i]);
+        unsigned int r = (u + 0x7FFFu + ((u >> 16) & 1u)) >> 16;   /* RTNE */
+        dst[i] = (unsigned short)r;
+    }
+}
+
+/* 带广播的逐元素乘：按 stride 直接读两个操作数，**不物化广播缓冲**。
+
+ * 现在 `mul` 遇到广播要先 `broadcast_to` 出整尺寸副本（每步 196 次、16% 的内核），
+ * 那些副本纯粹是浪费：既多一次全尺寸写+读，又多一次分配。
+ * 索引算法与 `broadcast_to8` 完全一致（最后一维最快），所以结果**逐位等价**。
+ */
+extern "C" __global__ void mul_bcast8(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ out, int n,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int pa0, int pa1, int pa2, int pa3, int pa4, int pa5, int pa6, int pa7,
+    int pb0, int pb1, int pb2, int pb3, int pb4, int pb5, int pb6, int pb7) {
+  int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+  if (i >= n) return;
+  int shp[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+  int sa[8] = {pa0, pa1, pa2, pa3, pa4, pa5, pa6, pa7};
+  int sb[8] = {pb0, pb1, pb2, pb3, pb4, pb5, pb6, pb7};
+  int rem = i;
+  int ia = 0;
+  int ib = 0;
+  for (int d = 7; d >= 0; --d) {
+    int sz = shp[d];
+    if (sz <= 1) continue;
+    int idx = rem % sz;
+    rem /= sz;
+    ia += idx * sa[d];
+    ib += idx * sb[d];
+  }
+  out[i] = __fmul_rn(a[ia], b[ib]);
+}
+
+/* 带广播的逐元素加：与 `mul_bcast8` 同一套索引，只是把乘换成加。 */
+extern "C" __global__ void add_bcast8(
+    const float* __restrict__ a, const float* __restrict__ b,
+    float* __restrict__ out, int n,
+    int o0, int o1, int o2, int o3, int o4, int o5, int o6, int o7,
+    int pa0, int pa1, int pa2, int pa3, int pa4, int pa5, int pa6, int pa7,
+    int pb0, int pb1, int pb2, int pb3, int pb4, int pb5, int pb6, int pb7) {
+  int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+  if (i >= n) return;
+  int shp[8] = {o0, o1, o2, o3, o4, o5, o6, o7};
+  int sa[8] = {pa0, pa1, pa2, pa3, pa4, pa5, pa6, pa7};
+  int sb[8] = {pb0, pb1, pb2, pb3, pb4, pb5, pb6, pb7};
+  int rem = i;
+  int ia = 0;
+  int ib = 0;
+  for (int d = 7; d >= 0; --d) {
+    int sz = shp[d];
+    if (sz <= 1) continue;
+    int idx = rem % sz;
+    rem /= sz;
+    ia += idx * sa[d];
+    ib += idx * sb[d];
+  }
+  out[i] = __fadd_rn(a[ia], b[ib]);
+}
+
+/* 多张量 int8 分块 AdamW：**量化/更新/反量化全在显存里**完成。
+
+ * 对照 bitsandbytes 的 `kOptimizerStatic8bit2StateBlockwise`（csrc/kernels.cu:915）：
+ * 那边用 256 项 quantile 表做动态量化；这里用**分块对称线性量化**
+ * （每 block 一个 fp32 scale = absmax/127），与 ORV 自己的 `int8_adamw.py` 口径一致。
+ *
+ * 一个 warp 处理一个 block（默认 BLOCK=64 ⇒ 每线程 2 个元素），
+ * 块内 absmax 用 warp shuffle 归约 —— 不需要 shared memory，也不需要额外一趟。
+ * 数学序列与 fp32 AdamW 逐条相同，只有 m/v 的存储是 int8。
+ */
+extern "C" __global__ void adamw_multi_int8(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* mqs, const unsigned long long* vqs,
+    const unsigned long long* mss, const unsigned long long* vss,
+    const int* sizes, int n_tensors, int block,
+    float b1, float omb1, float b2, float omb2,
+    float lr, float wd_lr, float eps, float bc1, float bc2,
+    float grad_scale) {
+  int gw = ((int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x) >> 5;
+  int lane = (int)threadIdx.x & 31;
+  int per = block / 32;                     /* 每线程负责几个元素 */
+  if (per < 1) per = 1;
+  if (per > 8) per = 8;                     /* mv/vv 定长 8，BLOCK<=256 */
+  int ti = 0;
+  long acc = 0;
+  for (; ti < n_tensors; ++ti) {
+    long nb = ((long)sizes[ti] + block - 1) / block;
+    if (gw < acc + nb) break;
+    acc += nb;
+  }
+  if (ti >= n_tensors) return;
+  long nb_in = (long)gw - acc;
+  long n = (long)sizes[ti];
+  long i0 = nb_in * block;
+  if (i0 >= n) return;
+
+  float* p = (float*)ps[ti];
+  const float* g = (const float*)gs[ti];
+  signed char* mq = (signed char*)mqs[ti];
+  signed char* vq = (signed char*)vqs[ti];
+  float* msk = (float*)mss[ti];
+  float* vsk = (float*)vss[ti];
+  float sm = msk[nb_in];
+  float sv = vsk[nb_in];
+
+  float mv[8];
+  float vv[8];
+  float amx_m = 0.f;
+  float amx_v = 0.f;
+  for (int k = 0; k < per; ++k) {
+    long i = i0 + lane + k * 32;
+    float m = 0.f;
+    float v = 0.f;
+    if (i < n) {
+      /* ★ 梯度裁剪的缩放**融合在这里**（grad_scale 由调用方给 1.0 时逐位不变）。
+         物理上先 scale 再读 g[i] 与本式**同为一次 mul.rn**，故逐位等价；
+         省掉裁剪那一趟 读+写 6.8 GB。 */
+      float gi = g[i] * grad_scale;
+      m = (float)mq[i] * sm;
+      v = (float)vq[i] * sv;
+      m = b1 * m + omb1 * gi;
+      v = b2 * v + omb2 * gi * gi;
+      float mh = m / bc1;
+      float vh = v / bc2;
+      float upd = mh / (sqrtf(vh) + eps);
+      float pv = p[i];
+      pv -= lr * (upd + wd_lr * pv);
+      p[i] = pv;
+      amx_m = fmaxf(amx_m, fabsf(m));
+      amx_v = fmaxf(amx_v, fabsf(v));
+    }
+    mv[k] = m;
+    vv[k] = v;
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    amx_m = fmaxf(amx_m, __shfl_xor_sync(0xffffffffu, amx_m, o));
+    amx_v = fmaxf(amx_v, __shfl_xor_sync(0xffffffffu, amx_v, o));
+  }
+  float nsm = amx_m > 0.f ? amx_m / 127.f : 1.f;
+  float nsv = amx_v > 0.f ? amx_v / 127.f : 1.f;
+  if (lane == 0) {
+    msk[nb_in] = nsm;
+    vsk[nb_in] = nsv;
+  }
+  for (int k = 0; k < per; ++k) {
+    long i = i0 + lane + k * 32;
+    if (i < n) {
+      float q1 = rintf(mv[k] / nsm);
+      float q2 = rintf(vv[k] / nsv);
+      mq[i] = (signed char)(q1 > 127.f ? 127.f : (q1 < -127.f ? -127.f : q1));
+      vq[i] = (signed char)(q2 > 127.f ? 127.f : (q2 < -127.f ? -127.f : q2));
+    }
+  }
+}
+
+/* m=**int8 分块**、v=**bf16** 的融合 AdamW。
+
+ * 为什么不是两个都 int8：实测（4 层/20 步）全 int8 会发散 ——
+ * Adam 的二阶动量 v 在同一 block 内动态范围达 1e-8~1e-3，**线性 int8 把小值压成 0**
+ * ⇒ m/sqrt(0) 爆炸（step5 gnorm 405、step19 910）。
+ * bnb 能用全 int8 是因为它用 256 项 quantile **非线性**量化表。
+ *
+ * 折中：v 用 bf16（指数范围同 fp32，不下溢），m 用 int8（量级 ~1e-2，线性量化安全）。
+ * 显存 = 1(m) + 2(v) + 4/64(scale) ≈ **3.06 字节/参数**（bf16 是 4.0，fp32 是 8.0）。
+ */
+extern "C" __global__ void adamw_multi_m8v16(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* mqs, const unsigned long long* mss,
+    const unsigned long long* vbs,
+    const int* sizes, const int* boffs, int n_tensors, int block,
+    float b1, float omb1, float b2, float omb2,
+    float lr, float wd_lr, float eps, float bc1, float bc2,
+    float grad_scale) {
+  int gw = ((int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x) >> 5;
+  int lane = (int)threadIdx.x & 31;
+  int per = block / 32;
+  if (per < 1) per = 1;
+  if (per > 8) per = 8;
+  /* ★ 二分定位张量。原来是线性扫描 109 个（23M 个 warp × 平均 50 次迭代），
+     1.5B 上实测把一步拖慢到 1.17 s（bf16 版是 0.463 s）。 */
+  int lo = 0;
+  int hi = n_tensors - 1;
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    if (gw < boffs[mid + 1]) hi = mid; else lo = mid + 1;
+  }
+  int ti = lo;
+  long nb_in = (long)gw - (long)boffs[ti];
+  long n = (long)sizes[ti];
+  long i0 = nb_in * block;
+  if (i0 >= n) return;
+
+  float* p = (float*)ps[ti];
+  const float* g = (const float*)gs[ti];
+  signed char* mq = (signed char*)mqs[ti];
+  float* msk = (float*)mss[ti];
+  unsigned short* vb = (unsigned short*)vbs[ti];
+  float sm = msk[nb_in];
+
+  float mv[8];
+  float amx_m = 0.f;
+  for (int k = 0; k < per; ++k) {
+    long i = i0 + lane + k * 32;
+    float m = 0.f;
+    if (i < n) {
+      /* ★ 与 `adamw_multi_int8` 同一处融合：读入即乘 grad_scale。
+         `gi` 的全部下游用途（omb1*gi、omb2*gi*gi）自动继承缩放后的值，
+         内核里没有第二处 `g[...]` 读取。 */
+      float gi = g[i] * grad_scale;
+      m = (float)mq[i] * sm;
+      float v = __uint_as_float((unsigned int)vb[i] << 16);
+      m = b1 * m + omb1 * gi;
+      v = b2 * v + omb2 * gi * gi;
+      float mh = m / bc1;
+      float vh = v / bc2;
+      float upd = mh / (sqrtf(vh) + eps);
+      float pv = p[i];
+      pv -= lr * (upd + wd_lr * pv);
+      p[i] = pv;
+      amx_m = fmaxf(amx_m, fabsf(m));
+      unsigned int uv = __float_as_uint(v);
+      vb[i] = (unsigned short)((uv + 0x7FFFu + ((uv >> 16) & 1u)) >> 16);
+    }
+    mv[k] = m;
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    amx_m = fmaxf(amx_m, __shfl_xor_sync(0xffffffffu, amx_m, o));
+  }
+  float nsm = amx_m > 0.f ? amx_m / 127.f : 1.f;
+  if (lane == 0) {
+    msk[nb_in] = nsm;
+  }
+  for (int k = 0; k < per; ++k) {
+    long i = i0 + lane + k * 32;
+    if (i < n) {
+      float q1 = rintf(mv[k] / nsm);
+      mq[i] = (signed char)(q1 > 127.f ? 127.f : (q1 < -127.f ? -127.f : q1));
+    }
+  }
+}
+
+extern "C" __global__ void cast_bf16_to_f32(const unsigned short* __restrict__ src,
+                                            float* __restrict__ dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __uint_as_float((unsigned int)src[i] << 16);
+}
+
+/* ---- 多张量 AdamW（**fp16 动量**）----
+ * 动量以 half 位模式常驻显存，内核里用上面两个 helper 转 float 计算、再写回 half。
+ * 算术序列与「cast_f16_to_f32 → adamw_update_multi → cast_f32_to_f16_into」逐条相同
+ * （同 helper、同 __f*_rn 内建、同 sqrtf），因此与逐张量路径**逐位一致**。
+ * 目的：把每步 2550 个张量 × 5 次发射压成 **1 次**发射。 */
+extern "C" __global__ void adamw_update_multi_f16(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* ms, const unsigned long long* vs,
+    const int* offs, int ntensors, int total,
+    float b1, float omb1, float b2, float omb2,
+    float lr, float wd_lr, float eps, float bc1, float bc2, int do_wd) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= total) return;
+    int lo = 0;
+    int hi = ntensors - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (offs[mid] <= i) lo = mid; else hi = mid - 1;
+    }
+    int j = i - offs[lo];
+    float* p = (float*)(unsigned long long)ps[lo];
+    const float* g = (const float*)(unsigned long long)gs[lo];
+    unsigned short* m = (unsigned short*)(unsigned long long)ms[lo];
+    unsigned short* v = (unsigned short*)(unsigned long long)vs[lo];
+    float gi = g[j];
+    float pi = p[j];
+    if (do_wd) pi = __fsub_rn(pi, __fmul_rn(wd_lr, pi));
+    float mj = tg_f16_bits_to_f32((unsigned int)m[j]);
+    float vj = tg_f16_bits_to_f32((unsigned int)v[j]);
+    float mi = __fadd_rn(__fmul_rn(b1, mj), __fmul_rn(omb1, gi));
+    float g2 = __fmul_rn(gi, gi);
+    float vi = __fadd_rn(__fmul_rn(b2, vj), __fmul_rn(omb2, g2));
+    m[j] = (unsigned short)tg_f32_to_f16_bits(mi);
+    v[j] = (unsigned short)tg_f32_to_f16_bits(vi);
+    float mh = __fdiv_rn(mi, bc1);
+    float vh = __fdiv_rn(vi, bc2);
+    float denom = __fadd_rn(sqrtf(vh), eps);
+    float step = __fdiv_rn(__fmul_rn(lr, mh), denom);
+    p[j] = __fsub_rn(pi, step);
+}
+
+/* ---- 多张量 AdamW（**bf16 动量**）----
+ * 与 f16 版的唯一差别：动量按 bf16 存。为什么需要它 ——
+ *   fp16 的最小正规数是 6.1e-5，而二阶动量 v 在训练早期常是 1e-8 量级，
+ *   直接存 fp16 会下溢成 0，于是 denom = sqrt(0)+eps = eps，步长被放大几个数量级。
+ *   **实测：fp16 动量在 8 层 V3 上 6 步把 loss 从 8.42 推到 552.98（发散）。**
+ *   bf16 与 fp32 指数位相同（下限 ~1.2e-38），不会下溢；尾数 8 位对动量足够。
+ * 舍入：RTNE，与 cast_f32_to_bf16 的主机侧公式逐位一致。 */
+extern "C" __global__ void adamw_update_multi_bf16(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* ms, const unsigned long long* vs,
+    const int* offs, int ntensors, int total,
+    float b1, float omb1, float b2, float omb2,
+    float lr, float wd_lr, float eps, float bc1, float bc2, int do_wd) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i >= total) return;
+    int lo = 0;
+    int hi = ntensors - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (offs[mid] <= i) lo = mid; else hi = mid - 1;
+    }
+    int j = i - offs[lo];
+    float* p = (float*)(unsigned long long)ps[lo];
+    const float* g = (const float*)(unsigned long long)gs[lo];
+    unsigned short* m = (unsigned short*)(unsigned long long)ms[lo];
+    unsigned short* v = (unsigned short*)(unsigned long long)vs[lo];
+    float gi = g[j];
+    float pi = p[j];
+    if (do_wd) pi = __fsub_rn(pi, __fmul_rn(wd_lr, pi));
+    float mj = __uint_as_float((unsigned int)m[j] << 16);
+    float vj = __uint_as_float((unsigned int)v[j] << 16);
+    float mi = __fadd_rn(__fmul_rn(b1, mj), __fmul_rn(omb1, gi));
+    float g2 = __fmul_rn(gi, gi);
+    float vi = __fadd_rn(__fmul_rn(b2, vj), __fmul_rn(omb2, g2));
+    unsigned int um = __float_as_uint(mi);
+    unsigned int uv = __float_as_uint(vi);
+    m[j] = (unsigned short)((um + 0x7FFFu + ((um >> 16) & 1u)) >> 16);
+    v[j] = (unsigned short)((uv + 0x7FFFu + ((uv >> 16) & 1u)) >> 16);
+    float mh = __fdiv_rn(mi, bc1);
+    float vh = __fdiv_rn(vi, bc2);
+    float denom = __fadd_rn(sqrtf(vh), eps);
+    float step = __fdiv_rn(__fmul_rn(lr, mh), denom);
+    p[j] = __fsub_rn(pi, step);
+}
+"""
+
+
+# M6（自研融合内核）：交错式 RoPE / 原地残差加 / causal-mask + softmax。
+# 全部显式用 __fmul_rn / __fadd_rn / __fsub_rn，禁止编译器缩成 FMA：
+# Python 侧的 `x*cos + (x@P)*sin` 是两次独立取整，这里也要两次，才能做到逐位可比。
+_FUSED_KERNELS = r"""
+/* ---- half-split RoPE（rotate_half：配对 d / d+dh/2）----
+   与交错式无关；cos/sin 表是 [seq, dh]，前后半相同，按 (row % seq, d) 取值。 */
+extern "C" __global__ void rope_half_ip(float* x, const float* cs, const float* sn,
+                                        int dh, int seq, long npair) {
+    long p = (long)blockIdx.x * (long)blockDim.x + (long)threadIdx.x;
+    if (p >= npair) return;
+    int h = dh >> 1;
+    int d = (int)(p % h);
+    long rp = p / h;                       /* 行号 = ((b*H + hh)*S + s) */
+    int s = (int)(rp % seq);
+    long base = rp * dh;
+    long i0 = base + d;
+    long i1 = i0 + h;
+    float x0 = x[i0];
+    float x1 = x[i1];
+    float c = cs[(long)s * dh + d];
+    float sv = sn[(long)s * dh + d];
+    x[i0] = __fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, sv));
+    x[i1] = __fadd_rn(__fmul_rn(x1, c), __fmul_rn(x0, sv));
+}
+
+extern "C" __global__ void rope_half_bwd(const float* g, const float* cs, const float* sn,
+                                          float* dx, int dh, int seq, long npair) {
+    long p = (long)blockIdx.x * (long)blockDim.x + (long)threadIdx.x;
+    if (p >= npair) return;
+    int h = dh >> 1;
+    int d = (int)(p % h);
+    long rp = p / h;
+    int s = (int)(rp % seq);
+    long base = rp * dh;
+    long i0 = base + d;
+    long i1 = i0 + h;
+    float g0 = g[i0];
+    float g1 = g[i1];
+    float c = cs[(long)s * dh + d];
+    float sv = sn[(long)s * dh + d];
+    dx[i0] = __fadd_rn(__fmul_rn(g0, c), __fmul_rn(g1, sv));
+    dx[i1] = __fsub_rn(__fmul_rn(g1, c), __fmul_rn(g0, sv));
+}
+
+
+/* ---- 交错式（GPT-2 interleaved）RoPE，原地 ----
+ * 参考实现：y = x*cos + (x@P)*sin，P 是置换矩阵：
+ *   (x@P)[2k]   = -x[2k+1]
+ *   (x@P)[2k+1] =  x[2k]
+ * 展开后：
+ *   y[2k]   = x[2k]*cos[2k]   - x[2k+1]*sin[2k]
+ *   y[2k+1] = x[2k]*sin[2k+1] + x[2k+1]*cos[2k+1]
+ * 一个线程处理一对（2k, 2k+1），读改写同一个缓冲。
+ * ops 为 2*npair 个元素；npair 必须与 cos/sin 的元素数一致（主机侧已校验）。
+ */
+extern "C" __global__ void fused_rope_ip(float* x, const float* cs, const float* sn,
+                                         int npair) {
+    int p = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (p >= npair) return;
+    int i0 = p << 1;
+    int i1 = i0 + 1;
+    float x0 = x[i0];
+    float x1 = x[i1];
+    float c0 = cs[i0];
+    float s0 = sn[i0];
+    float c1 = cs[i1];
+    float s1 = sn[i1];
+    x[i0] = __fsub_rn(__fmul_rn(x0, c0), __fmul_rn(x1, s0));
+    x[i1] = __fadd_rn(__fmul_rn(x0, s1), __fmul_rn(x1, c1));
+}
+
+/* RoPE 反向：对 g 用 -sin 做同一次旋转（P 正交，旋转矩阵的逆即转置）。
+ *   dx[2k]   = g[2k]*cos[2k]   + g[2k+1]*sin[2k+1]
+ *   dx[2k+1] = g[2k+1]*cos[2k+1] - g[2k]*sin[2k]
+ * 前向不改输入（调用方传的是 clone），所以反向不需要保存 x。
+ */
+extern "C" __global__ void fused_rope_bwd(const float* g, const float* cs, const float* sn,
+                                          float* dx, int npair) {
+    int p = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (p >= npair) return;
+    int i0 = p << 1;
+    int i1 = i0 + 1;
+    float g0 = g[i0];
+    float g1 = g[i1];
+    float c0 = cs[i0];
+    float s0 = sn[i0];
+    float c1 = cs[i1];
+    float s1 = sn[i1];
+    dx[i0] = __fadd_rn(__fmul_rn(g0, c0), __fmul_rn(g1, s1));
+    dx[i1] = __fsub_rn(__fmul_rn(g1, c1), __fmul_rn(g0, s0));
+}
+
+/* 原地残差加 x += y。与 ewise_add 用同一条 __fadd_rn，结果逐位相同，
+ * 只是不再分配输出缓冲。 */
+extern "C" __global__ void fused_add_ip(float* x, const float* y, int n) {
+    int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (i < n) x[i] = __fadd_rn(x[i], y[i]);
+}
+
+/* causal mask + softmax（原地），行主序 [rows, k]，一行一个线程。
+ * causal 时第 r 行的 query 下标是 r % k（布局 [BH, S, S]），只对 j <= pos 做归约，
+ * j > pos 的位置直接写 0 —— 等价于先 scores + mask 再 softmax，但省掉 mask 的构造与加法。
+ * want_lse 非 0 时额外写出每行 logsumexp（m + log(sum)），供反向/诊断使用。
+ */
+/* 行内并行归约的两个小工具（warp 内 shfl 折叠）。 */
+__device__ __forceinline__ float _warp_max_f(float v) {
+    for (int off = 16; off > 0; off >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+    return v;
+}
+__device__ __forceinline__ float _warp_sum_f(float v) {
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+    return v;
+}
+
+/* ── 行内 max / argmax（一块一行，warp 归约）───────────────────────────
+ * 为什么要有它：`Tensor.max` 原先用 to_numpy() 取 argmax，再回传 one-hot mask，
+ * 每次调用 = **1 次强制同步 + 全量 D2H + 全量 H2D**。块化注意力每对块要调 2 次，
+ * S=2048 时一层几十次同步 —— 这是块化路径慢、也是 CUDA Graph 无法捕获的根因。
+ * 语义严格对齐 numpy：**并列时取第一个**（下标最小）。
+ */
+extern "C" __global__ void rowwise_max(const float* __restrict__ x, float* out, float* idx,
+                                       int rows, int k) {
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    int r = (int)blockIdx.x;
+    if (r >= rows || k <= 0) return;
+    const float* row = x + (long long)r * k;
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    const int nw = (nt + 31) >> 5;
+
+    float bv = -3.402823466e+38F;
+    int bi = 0;
+    for (int j = tid; j < k; j += nt) {
+        float v = row[j];
+        if (v > bv) { bv = v; bi = j; }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down_sync(0xffffffffu, bv, off);
+        int oi = __shfl_down_sync(0xffffffffu, bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    if ((tid & 31) == 0) { sv[tid >> 5] = bv; si[tid >> 5] = bi; }
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < nw) ? sv[tid] : -3.402823466e+38F;
+        int j = (tid < nw) ? si[tid] : 0;
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_down_sync(0xffffffffu, v, off);
+            int oi = __shfl_down_sync(0xffffffffu, j, off);
+            if (ov > v || (ov == v && oi < j)) { v = ov; j = oi; }
+        }
+        if (tid == 0) { out[r] = v; idx[r] = (float)j; }
+    }
+}
+
+/* 反向：梯度只落到 argmax 位置（与 one-hot mask 的前向语义逐位等价）。 */
+extern "C" __global__ void rowwise_max_bwd(const float* __restrict__ g, const float* __restrict__ idx,
+                                           float* dx, int rows, int k) {
+    int r = (int)blockIdx.x;
+    if (r >= rows || k <= 0) return;
+    float* row = dx + (long long)r * k;
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    for (int j = tid; j < k; j += nt) row[j] = 0.f;
+    __syncthreads();
+    if (tid == 0) row[(int)idx[r]] = g[r];
+}
+
+/* 因果掩码 + softmax，原地写 s。
+ *
+ * ★ 2026-11-13 重写：原版**每行一个线程、串行扫 k**，并行度差，
+ *   实测反而比"掩码 + 通用 softmax"慢（0.800 → 0.893 s），所以一直被关着。
+ *   现在改成**一个 block 处理一行**：每线程按 stride 扫列，warp shfl 归约，
+ *   共享数组再做一次跨 warp 归约 —— 与 PyTorch 的 row-wise softmax 同构。
+ *   grid = rows，block = 256。
+ */
+extern "C" __global__ void attn_mask_softmax(float* s, int rows, int k, int causal,
+                                             int want_lse, float* lse) {
+    __shared__ float red[32];
+    int r = (int)blockIdx.x;
+    if (r >= rows || k <= 0) return;
+    float* row = s + (long long)r * k;
+    int pos = causal ? (r % k) : (k - 1);
+    if (pos > k - 1) pos = k - 1;
+    const int n = pos + 1;
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    const int nw = (nt + 31) >> 5;
+    const float kNeg = -3.402823466e+38F;
+
+    float lm = kNeg;
+    for (int j = tid; j < n; j += nt) lm = fmaxf(lm, row[j]);
+    lm = _warp_max_f(lm);
+    if ((tid & 31) == 0) red[tid >> 5] = lm;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < nw) ? red[tid] : kNeg;
+        v = _warp_max_f(v);
+        if (tid == 0) red[0] = v;
+    }
+    __syncthreads();
+    float m = red[0];
+
+    float ls = 0.f;
+    for (int j = tid; j < n; j += nt) {
+        float e = expf(row[j] - m);
+        row[j] = e;
+        ls += e;
+    }
+    for (int j = n + tid; j < k; j += nt) row[j] = 0.f;
+    ls = _warp_sum_f(ls);
+    if ((tid & 31) == 0) red[tid >> 5] = ls;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < nw) ? red[tid] : 0.f;
+        v = _warp_sum_f(v);
+        if (tid == 0) red[0] = v;
+    }
+    __syncthreads();
+    float sum = red[0];
+    float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
+    for (int j = tid; j < n; j += nt) row[j] *= inv;
+    if (want_lse && lse && tid == 0) lse[r] = (sum > 0.f) ? (m + logf(sum)) : m;
+}
+
+/* softmax 反向：dS = P * (dP - sum(dP*P, axis=-1, keepdim))。
+ * 被 mask 掉的列 P 恒为 0，所以 dS 自动是 0，不需要再乘一次掩码。
+ * 同样改成一块一行 + 归约。 */
+extern "C" __global__ void attn_mask_softmax_bwd(const float* dp, const float* p, float* ds,
+                                                 int rows, int k) {
+    __shared__ float red[32];
+    int r = (int)blockIdx.x;
+    if (r >= rows || k <= 0) return;
+    const float* drow = dp + (long long)r * k;
+    const float* prow = p + (long long)r * k;
+    float* orow = ds + (long long)r * k;
+    const int tid = (int)threadIdx.x;
+    const int nt = (int)blockDim.x;
+    const int nw = (nt + 31) >> 5;
+
+    float ld = 0.f;
+    for (int j = tid; j < k; j += nt) ld = __fadd_rn(ld, __fmul_rn(drow[j], prow[j]));
+    ld = _warp_sum_f(ld);
+    if ((tid & 31) == 0) red[tid >> 5] = ld;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < nw) ? red[tid] : 0.f;
+        v = _warp_sum_f(v);
+        if (tid == 0) red[0] = v;
+    }
+    __syncthreads();
+    float dot = red[0];
+    for (int j = tid; j < k; j += nt)
+        orow[j] = __fmul_rn(prow[j], __fsub_rn(drow[j], dot));
+}
+"""
+
+
+# M7（逐元素 float4 向量化）：小张量比 PyTorch 慢在「每线程 1 个 float + 启动开销」。
+# 主机侧只在 `n % 4 == 0 且所有指针 16B 对齐` 时才走这里的 *_v4 变体，否则原样走上面的
+# 标量内核 —— 非对齐场景的行为一个字节都不变。每个元素仍是独立的 __fmul_rn/__fadd_rn/
+# __fsub_rn，运算顺序和标量版逐条对应，所以结果逐位相同（不留给编译器决定要不要缩 FMA）。
+# 逐元素运算对每个元素独立，所以 4 个 lane 之间没有依赖，向量化不改变任何取整顺序。
+_VEC4_KERNELS = r"""
+/* ---- 逐元素 float4 变体（M7）----
+ * 全部 grid-stride：主机侧 grid 仍按 _vec4_grid(n/4) 算（256 线程/块），
+ * 与 _ewise_grid 的算法同源，n/4 超过一次网格能覆盖的量时靠循环补。
+ * 参数刻意不加 __restrict__：scale_inplace / fused_add_ip 允许输入输出同址。
+ */
+extern "C" __global__ void ewise_mul_v4(const float4* a, const float4* b, float4* c, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        float4 y = b[i];
+        c[i] = make_float4(__fmul_rn(x.x, y.x), __fmul_rn(x.y, y.y),
+                           __fmul_rn(x.z, y.z), __fmul_rn(x.w, y.w));
+    }
+}
+
+extern "C" __global__ void ewise_add_v4(const float4* a, const float4* b, float4* c, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        float4 y = b[i];
+        c[i] = make_float4(__fadd_rn(x.x, y.x), __fadd_rn(x.y, y.y),
+                           __fadd_rn(x.z, y.z), __fadd_rn(x.w, y.w));
+    }
+}
+
+extern "C" __global__ void ewise_scale_v4(const float4* a, float s, float4* c, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        c[i] = make_float4(__fmul_rn(x.x, s), __fmul_rn(x.y, s),
+                           __fmul_rn(x.z, s), __fmul_rn(x.w, s));
+    }
+}
+
+extern "C" __global__ void ewise_exp_v4(const float4* a, float4* c, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 x = a[i];
+        c[i] = make_float4(expf(x.x), expf(x.y), expf(x.z), expf(x.w));
+    }
+}
+
+/* 原地残差加 x += y 的向量版。与 ewise_add_v4 用同一条 __fadd_rn，逐位相同。 */
+extern "C" __global__ void fused_add_ip_v4(float4* x, const float4* y, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 u = x[i];
+        float4 v = y[i];
+        x[i] = make_float4(__fadd_rn(u.x, v.x), __fadd_rn(u.y, v.y),
+                           __fadd_rn(u.z, v.z), __fadd_rn(u.w, v.w));
+    }
+}
+
+/* 广播加的向量版。主机侧保证：n%4==0、c3%4==0，且 a3/b3 只取 0 或 1；
+ * 取 1 时对应的 (a0,a1,a2)/(b0,b1,b2) 都是 4 的倍数，因此 a+ia、b+ib 是 16B 对齐的
+ * 连续 4 个元素。取 0 时该源在末维是广播，4 个 lane 读同一个标量。 */
+extern "C" __global__ void bcast_add4_v4(
+    const float* a, const float* b, float4* c, int n4,
+    int c0, int c1, int c2, int c3,
+    int a0, int a1, int a2, int a3,
+    int b0, int b1, int b2, int b3) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int k = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; k < n4; k += stride) {
+        int t = k << 2;
+        int i3 = t % c3; t /= c3;
+        int i2 = t % c2; t /= c2;
+        int i1 = t % c1; t /= c1;
+        int i0 = t;
+        int ia = i0 * a0 + i1 * a1 + i2 * a2 + i3 * a3;
+        int ib = i0 * b0 + i1 * b1 + i2 * b2 + i3 * b3;
+        float4 va, vb;
+        if (a3) {
+            va = *reinterpret_cast<const float4*>(a + ia);
+        } else {
+            const float s = a[ia];
+            va = make_float4(s, s, s, s);
+        }
+        if (b3) {
+            vb = *reinterpret_cast<const float4*>(b + ib);
+        } else {
+            const float s = b[ib];
+            vb = make_float4(s, s, s, s);
+        }
+        c[k] = make_float4(__fadd_rn(va.x, vb.x), __fadd_rn(va.y, vb.y),
+                           __fadd_rn(va.z, vb.z), __fadd_rn(va.w, vb.w));
+    }
+}
+
+/* 交错式 RoPE 前向的向量版：一个 float4 = 两对 (2k,2k+1)，公式与标量版逐条对应。
+ * x[4k+0]*cos[4k+0] - x[4k+1]*sin[4k+0]
+ * x[4k+0]*sin[4k+1] + x[4k+1]*cos[4k+1]
+ * x[4k+2]*cos[4k+2] - x[4k+3]*sin[4k+2]
+ * x[4k+2]*sin[4k+3] + x[4k+3]*cos[4k+3]  */
+extern "C" __global__ void fused_rope_ip_v4(float4* x, const float4* cs, const float4* sn,
+                                            int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 v = x[i];
+        float4 cf = cs[i];
+        float4 sf = sn[i];
+        x[i] = make_float4(
+            __fsub_rn(__fmul_rn(v.x, cf.x), __fmul_rn(v.y, sf.x)),
+            __fadd_rn(__fmul_rn(v.x, sf.y), __fmul_rn(v.y, cf.y)),
+            __fsub_rn(__fmul_rn(v.z, cf.z), __fmul_rn(v.w, sf.z)),
+            __fadd_rn(__fmul_rn(v.z, sf.w), __fmul_rn(v.w, cf.w)));
+    }
+}
+
+/* RoPE 反向的向量版：
+ * dx[2k]   = g[2k]*cos[2k]   + g[2k+1]*sin[2k+1]
+ * dx[2k+1] = g[2k+1]*cos[2k+1] - g[2k]*sin[2k]  */
+extern "C" __global__ void fused_rope_bwd_v4(const float4* g, const float4* cs,
+                                              const float4* sn, float4* dx, int n4) {
+    const int stride = (int)gridDim.x * (int)blockDim.x;
+    for (int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x; i < n4; i += stride) {
+        float4 v = g[i];
+        float4 cf = cs[i];
+        float4 sf = sn[i];
+        dx[i] = make_float4(
+            __fadd_rn(__fmul_rn(v.x, cf.x), __fmul_rn(v.y, sf.y)),
+            __fsub_rn(__fmul_rn(v.y, cf.y), __fmul_rn(v.x, sf.x)),
+            __fadd_rn(__fmul_rn(v.z, cf.z), __fmul_rn(v.w, sf.w)),
+            __fsub_rn(__fmul_rn(v.w, cf.w), __fmul_rn(v.z, sf.z)));
+    }
+}
+"""
+
+
+def _device_source():
+    return (_CE_AND_HELPERS + "\n" + _M2_KERNELS + "\n" + _M3_KERNELS + "\n"
+            + _M5_KERNELS + "\n" + _MOE_KERNELS + "\n" + _CAT_KERNELS + "\n"
+            + _FP16_KERNELS + "\n" + _FUSED_KERNELS + "\n" + _VEC4_KERNELS)
+
+
+# 逐元素 float4 路径的总开关。TG_NO_VEC4=1 时全部退回标量内核（A/B 对拍和线上排障用）。
+VEC4_ENV = "TG_NO_VEC4"
+
+
+def _vec4_enabled():
+    v = os.environ.get(VEC4_ENV, "").strip().lower()
+    return v not in ("1", "true", "yes", "on")
+
+
+# ---- M8：每次 kernel 调用的固定开销 -------------------------------------------
+# 改动只落在「主机侧怎么把参数交给 cuLaunchKernel」和「池分配怎么拿块」：
+#   1) 参数模板按 (kernel 名, 各参 ctypes 类型) 缓存，每次调用只写 .value；
+#   2) 池命中的分配路径不再调任何 CUDA API（原来每次先 cuCtxSetCurrent）；
+#   3) 归还空闲块时不再为从没被查询过的 event 付一次 cuEventRecord。
+# TG_LAUNCH_FAST=0 全退回改动前的通用路径（默认开）；任何一次模板异常也自动永久退回。
+LAUNCH_FAST_ENV = "TG_LAUNCH_FAST"
+_NULL_STREAM = ctypes.c_void_p(0)
+_F32 = np.dtype(np.float32)
+
+
+def _launch_fast_enabled():
+    v = os.environ.get(LAUNCH_FAST_ENV, "").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+class CudaError(RuntimeError):
+    pass
+
+
+# 已验收内核，不内嵌进主模块，避免宏/符号和现有源码撞车，也避免改默认编译结果。
+_ATTN_NOP_SMEM = 32 * 1024
+_ATTN_NOP_BQ = 64
+# attn_bwd_flash：Q/dO stride 72，K/V/P/dS 各 64*32。见 tgai_attn_nop.cu。
+# 反向 atomic 按 query-tile 分组写到独立 plane，再加回 dK/dV，减轻 128 路冲突。
+_ATTN_FLASH_GROUPS = 8
+# ★ 2026-11-15：key 分块宽 BC 改为可配置（TG_ATTN_BC），以便装不进 96 KB 的卡
+#   （如 P100，48 KB）仍能用**常驻**内核而不是滑窗版。公式已用 45,056 / 40,448
+#   两个实测点反推验证：
+#       smem = 4*64*BC*4 + 2*64*(DH+8)*4
+#   BC=32 -> 69,632（默认，与旧版一致）；BC=11 -> 48,128（P100 可用）。
+_ATTN_BC = int(os.environ.get("TG_ATTN_BC", "32") or "32")
+
+
+def _attn_smem_for_bc(bc):
+    """常驻反向内核的 smem（字节）。"""
+    return 4 * 64 * int(bc) * 4 + 2 * 64 * (64 + 8) * 4
+
+
+_ATTN_FLASH_SMEM = _attn_smem_for_bc(_ATTN_BC)
+# 2026-11-15：P100（sm_60，动态 smem 上限 48 KB）专用变体 attn_bwd_flash_w，
+# Q/dO 沿 head_dim 16 宽滑窗，只要 41472 B（40.5 KB）。数值与原版相差 < 1.1e-7（相对），
+# y 逐位相同。见 lab/attn32/LOG.md。V100 仍走原版（快 34%）。
+# 注意：滑窗版的 smem **不等于**公式值 —— 实测是 40448 B，而 4*64*BC + 2*DCHUNK*QSTR
+# 只能解释 37,376 B，说明它另有约 3 KB 的额外缓冲。所以这里保留字面量，
+# 不随 TG_ATTN_BC 变化；非默认 BC 时应确保走常驻版（见 _attn_flash_launch 的选择顺序）。
+# 滑窗版 smem 的**两点标定**：DCHUNK=8 -> 40,448；DCHUNK=16 -> 45,056。
+# 差值 4,608 = 2*8*72*4，正好是公式里 2*DCHUNK*QSTR*4 的 DCHUNK 项，
+# 所以可用线性式外推（基数 40,448 已含滑窗版那约 3 KB 的额外缓冲）。
+# 默认 16：真机实测反向 82.8 -> 77.6 ms（-6%），且 45,056 B 仍装得进 48 KB。
+# 保持滑窗而非常驻，是因为 BC=32 的常驻版要 69,632 B，48 KB 卡装不下。
+_ATTN_DCHUNK = int(os.environ.get("TG_ATTN_DCHUNK", "16") or "16")
+_ATTN_FLASH_WIN_SMEM = 40448 + 2 * (_ATTN_DCHUNK - 8) * 72 * 4
+# 注：按切分算只有 41472 B，但实测 41472 会越界（rc=700），45056 稳定跑通且数值与上游一致。
+# 两者都 <= 48 KB（sm_60 上限），故取 45056 留余量。真实下界未逐点二分。
+# g2 在 69632 上再加 smDK/smDV（各 64*32 个 float）。
+_ATTN_FLASH_G2_SMEM = 86016
+_ATTN_FLASH_MAX_SMEM = 96 * 1024
+
+
+def attn_nop_source_path():
+    """定位 training/kernels/tgai_attn_nop.cu。可用 TGAI_ATTN_NOP_CU 覆盖。"""
+    env = os.environ.get("TGAI_ATTN_NOP_CU")
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = []
+    if env:
+        cands.append(env)
+    # ① 包内自带（pip 安装后的正常位置）
+    cands.append(os.path.join(here, "kernels", "tgai_attn_nop.cu"))
+    # ② 源码树（开发时从仓库根运行）
+    cands.append(os.path.normpath(os.path.join(
+        here, "..", "..", "..", "training", "kernels", "tgai_attn_nop.cu")))
+    seen = []
+    for p in cands:
+        if not p:
+            continue
+        ap = os.path.abspath(p)
+        seen.append(ap)
+        if os.path.isfile(ap):
+            return ap
+    raise CudaError("找不到已验收的 tgai_attn_nop.cu。已查: %s" % seen + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+
+
+class GpuBuf:
+    """一块设备内存。由创建它的 CudaRuntime 释放。
+
+    视图（reshape）共用同一 ptr，但 _token 为空，析构不归还池。
+    keepalive 拉住被视图的那一块，避免主人先死。不要再把同一个 ptr
+    登记成第二个会 free 的主人。
+    """
+
+    __slots__ = ("rt", "ptr", "nbytes", "shape", "n", "dtype",
+                 "known_scalar", "host_hold", "keepalive", "_token", "_base")
+
+    def __init__(self, rt, ptr, nbytes, shape, n, dtype, view_of=None):
+        self.rt = rt
+        self.ptr = int(ptr)
+        self._token = None
+        self._base = None
+        self.nbytes = int(nbytes)
+        self.shape = tuple(shape)
+        self.n = int(n)
+        self.dtype = np.dtype(dtype)
+        # 主机已经知道的标量（例如 backward() 填的 1）。读它不必再同步设备。
+        self.known_scalar = None
+        # 异步 H2D 期间主机缓冲必须活着。
+        self.host_hold = None
+        # 让还没跑完的 kernel 依赖的临时缓冲跟着本缓冲一起活。
+        self.keepalive = None
+        if view_of is not None:
+            base = getattr(view_of, "_base", None) or view_of
+            self._base = base
+            self.keepalive = view_of
+            if int(n) == 1:
+                self.known_scalar = getattr(view_of, "known_scalar", None)
+        elif rt is not None and self.ptr:
+            self._token = rt._pool_token_of(self.ptr)
+
+    def __del__(self):
+        ptr = getattr(self, "ptr", 0)
+        token = getattr(self, "_token", None)
+        rt = getattr(self, "rt", None)
+        try:
+            self.ptr = 0
+            self._token = None
+        except Exception:
+            pass
+        # token 对不上说明这块已经显式 free 过、或者已被下一个张量领走。
+        # 不能再还一次，否则会把活着的复用块收进池里。
+        if ptr and token is not None and rt is not None:
+            try:
+                rt.free(ptr, token)
+            except Exception:
+                pass
+
+    def to_numpy(self):
+        return self.rt.d2h(self)
+
+
+def _dll_dirs():
+    dirs = []
+    # TGAI_CUDA_BIN 支持多路径（os.pathsep 分隔）：裸机器上 cuBLAS / NVRTC / CUDA runtime
+    # 往往分散在 nvidia/*/lib 三个目录里，只给一个会找不到另一个。
+    extra = os.environ.get("TGAI_CUDA_BIN")
+    if extra:
+        for part in extra.split(os.pathsep):
+            part = part.strip()
+            if part:
+                dirs.append(part)
+    for key in ("CUDA_PATH", "CUDA_HOME"):
+        root = os.environ.get(key)
+        if root:
+            dirs.append(os.path.join(root, "bin"))
+    toolkit = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"
+    if os.path.isdir(toolkit):
+        try:
+            names = sorted(os.listdir(toolkit), reverse=True)
+        except OSError:
+            names = []
+        for name in names:
+            dirs.append(os.path.join(toolkit, name, "bin"))
+    # 不 import torch；只是如果旁边有 CUDA 版 torch 的 DLL 目录，允许拿来当搜索路径。
+    for entry in list(sys.path):
+        if not entry:
+            continue
+        cand = os.path.join(entry, "torch", "lib")
+        if os.path.isdir(cand):
+            dirs.append(cand)
+    # ★ 2026-11-12 修（来自 P100 用户实测报告）：只扫 `torch/lib` 不够。
+    #   症状：`nvrtc: error: failed to open nvrtc-builtins64_118.dll`，
+    #   这两个 DLL 就在 `site-packages/torch/lib` 下，但进程找不到。
+    #   原因：`nvrtc64_*.dll` 是**懒加载** builtins 的，那条加载路径只看 PATH 与
+    #   add_dll_directory；而某些环境下只加后者仍失败（用户实测必须同时进 PATH）。
+    #   所以这里把 pip 装的 CUDA 轮子目录（nvidia/*/lib、nvidia/*/bin）也一并纳入。
+    for entry in list(sys.path):
+        if not entry:
+            continue
+        nv = os.path.join(entry, "nvidia")
+        if not os.path.isdir(nv):
+            continue
+        try:
+            subs = sorted(os.listdir(nv))
+        except OSError:
+            subs = []
+        for sub in subs:
+            for leaf in ("lib", "bin"):
+                cand = os.path.join(nv, sub, leaf)
+                if os.path.isdir(cand):
+                    dirs.append(cand)
+    out = []
+    seen = set()
+    for d in dirs:
+        if not d or d in seen or not os.path.isdir(d):
+            continue
+        seen.add(d)
+        out.append(d)
+    return out
+
+
+def _prepare_dir(path):
+    if hasattr(os, "add_dll_directory"):
+        try:
+            os.add_dll_directory(path)
+        except OSError:
+            pass
+    # ★ 2026-11-12 修（P100 用户实测）：**必须同时进 PATH**。
+    #   `nvrtc64_*.dll` 懒加载 `nvrtc-builtins64_*.dll` 时，某些环境下只靠
+    #   `add_dll_directory` 找不到，但加进 PATH 就能找到。
+    #   用户实测的规避写法正是「PATH 前置 + add_dll_directory」两者都做。
+    try:
+        cur = os.environ.get("PATH", "")
+        if path and path not in cur.split(os.pathsep):
+            os.environ["PATH"] = path + (os.pathsep + cur if cur else "")
+    except Exception:      # noqa: BLE001
+        pass
+
+
+def _find_file(names, dirs):
+    for d in dirs:
+        _prepare_dir(d)
+        for name in names:
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return p
+    for name in names:
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def _find_glob(pred, dirs):
+    found = []
+    for d in dirs:
+        _prepare_dir(d)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            if pred(name) and os.path.isfile(os.path.join(d, name)):
+                found.append(os.path.join(d, name))
+    found.sort()
+    return found[-1] if found else None
+
+
+def _is_nvrtc_main(name):
+    low = name.lower()
+    return low.startswith("nvrtc64_") and low.endswith(".dll") and "builtin" not in low
+
+
+def _is_cublas_main(name):
+    low = name.lower()
+    # 要 cublas64_12.dll，不要 cublasLt。
+    return low.startswith("cublas64_") and low.endswith(".dll") and "lt" not in low
+
+
+def _dedupe_dirs(dirs):
+    out = []
+    seen = set()
+    for d in dirs:
+        if not d or d in seen or not os.path.isdir(d):
+            continue
+        seen.add(d)
+        out.append(d)
+    return out
+
+
+def _linux_lib_dirs():
+    """Linux 上找 libcuda / libcublas / libnvrtc 的目录。不写 LD_LIBRARY_PATH。"""
+    dirs = []
+    # TGAI_CUDA_BIN 支持多路径（os.pathsep 分隔）：裸机器上 cuBLAS / NVRTC / CUDA runtime
+    # 往往分散在 nvidia/*/lib 三个目录里，只给一个会找不到另一个。
+    extra = os.environ.get("TGAI_CUDA_BIN")
+    if extra:
+        for part in extra.split(os.pathsep):
+            part = part.strip()
+            if part:
+                dirs.append(part)
+    for key in ("CUDA_PATH", "CUDA_HOME"):
+        root = os.environ.get(key)
+        if root:
+            dirs.append(os.path.join(root, "lib64"))
+            dirs.append(os.path.join(root, "lib"))
+    try:
+        import sysconfig
+        pure = sysconfig.get_path("purelib")
+    except Exception:
+        pure = None
+    if pure:
+        nvidia = os.path.join(pure, "nvidia")
+        if os.path.isdir(nvidia):
+            try:
+                pkgs = sorted(os.listdir(nvidia))
+            except OSError:
+                pkgs = []
+            for pkg in pkgs:
+                lib = os.path.join(nvidia, pkg, "lib")
+                if os.path.isdir(lib):
+                    dirs.append(lib)
+    # 自动发现：本机任何 Python 环境里的 nvidia/*/lib（很常见的情形是
+    # 系统里装了 torch，CUDA 库随它一起进来，而我们跑在一个干净的 venv 里）。
+    # 这样 `pip install tgai-orv` 在"机器上有 torch 但 venv 里没有"时也能直接用。
+    cands = []
+    for entry in list(sys.path):
+        if entry:
+            cands.append(os.path.join(entry, "nvidia"))
+    cands += glob.glob("/usr/local/lib/python3*/site-packages/nvidia")
+    cands += glob.glob("/usr/local/lib/python3*/dist-packages/nvidia")
+    cands += glob.glob("/usr/lib/python3*/site-packages/nvidia")
+    cands += glob.glob(os.path.expanduser("~/.local/lib/python3*/site-packages/nvidia"))
+    for nv in cands:
+        if not os.path.isdir(nv):
+            continue
+        try:
+            pkgs = sorted(os.listdir(nv))
+        except OSError:
+            continue
+        for pkg in pkgs:
+            for sub in ("lib", "lib64"):
+                d = os.path.join(nv, pkg, sub)
+                if os.path.isdir(d):
+                    dirs.append(d)
+    dirs.append("/usr/lib/x86_64-linux-gnu")
+    dirs.append("/usr/lib64")
+    return _dedupe_dirs(dirs)
+
+
+def _preload(path):
+    if path and os.path.isfile(path):
+        ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+
+
+def _alias_driver_symbol(cu, name, require_v2=True):
+    """优先 _v2（64 位 ABI）。
+
+    cuMemAlloc / cuMemFree / cuMemcpy* 这一族在 Windows 的 nvcuda.dll 里同时导出旧符号和 _v2，
+    旧的仍是 32 位 CUdeviceptr ABI，拿到 primary context 会返回 201，所以**必须**用 _v2。
+
+    但 cuMemsetD32Async 这类**从来就没有 _v2**（它历史上不存在 ABI 变更）。
+    早先对所有符号一刀切要求 _v2，导致在 V100 / 驱动 580.88 上直接初始化失败：
+        CudaError: 驱动库没有 cuMemsetD32Async_v2
+    因此增加 require_v2 开关：没有 _v2 的符号按无后缀解析，缺了才报错。
+    """
+    v2 = getattr(cu, name + "_v2", None)
+    if v2 is not None:
+        setattr(cu, name, v2)
+        return
+    if not require_v2:
+        if getattr(cu, name, None) is not None:
+            return
+        raise CudaError("驱动库没有 %s（该符号本无 _v2 变体）。" % name + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+    if sys.platform != "win32" and getattr(cu, name, None) is not None:
+        return
+    raise CudaError(
+        "驱动库没有 %s_v2。不能用旧入口：primary context 上会 rc=201。" % name
+     + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+
+
+def _pool_bucket(nbytes):
+    """请求向上取整到复用桶。小块 512B 对齐；更大则用不超过 nbytes/16 的 2 的幂对齐。
+
+    因此大块浪费 < 1/16。同一请求每次落在同一桶，桶内任意空闲块都 ≥ nbytes。
+    """
+    nbytes = int(nbytes)
+    if nbytes <= 512:
+        return 512
+    unit = nbytes >> 4
+    if unit <= 512:
+        align = 512
+    else:
+        align = 1 << (unit.bit_length() - 1)
+    if align < 512:
+        align = 512
+    return ((nbytes + align - 1) // align) * align
+
+
+# 空闲块超过这个数就真正 cuMemFree，避免池无限囤积。活着的张量不占这份额度。
+def _pool_cap_from_env(default_bytes=12 * (1024 ** 3)):
+    """显存池上限。**TG_POOL_GB 之前只在错误信息里被承诺、实际没实现**（2026-11-19 补）。
+
+    为什么重要：池缓存顶到 cap 后，每次 `_pool_release` 都会触发 trim 把块还给驱动，
+    下一步再重新 `cuMemAlloc`。V100 / seq2048 / 12 层 MoE 实测：
+      * 命中率 60%，**每步 2015 次 cuMemAlloc + 2016 次 cuMemFree，CPU 368.7 ms**
+        （占步时 47.2%）；seq512 命中率 99.8%，只有 1.6 ms。
+      * 因果 A/B（只改这个上限）：4 GiB → 0.880 s，12 GiB → 0.78 s，16 GiB → **0.699 s（−10%）**。
+    所以卡上显存够时，把它调大是纯收益。默认仍保守取 12 GiB（24 GB 卡上留足余量），
+    32 GB 级别的卡建议 `TG_POOL_GB=16`。
+    """
+    v = os.environ.get("TG_POOL_GB")
+    if not v:
+        return int(default_bytes)
+    try:
+        gb = float(v)
+        if gb <= 0:
+            raise ValueError
+    except Exception:
+        raise CudaError("TG_POOL_GB 必须是正数（单位 GiB），收到 %r" % (v,)
+                        + "。修法：设成如 16，或留空用默认 12")
+    return int(gb * (1024 ** 3))
+
+
+_POOL_CAP_BYTES = _pool_cap_from_env()
+# d2h 已经同步过默认流。这时如果池里堆了超过 2 GiB 的空闲块，
+# 就从最小的开始释放到只留 256 MiB，避免下一步把上一步的尺寸全堆在活张量上。
+# 一步中间的小块不在这里放：那时候核还在飞，同步会把一步切碎。
+_POOL_IDLE_KEEP = 256 * 1024 * 1024
+_POOL_IDLE_TRIGGER = 2 * 1024 * 1024 * 1024
+# 活张量 + 空闲块的上限。超过就同步一次并放掉最小的空闲块。
+# 16.25 GiB 比改前 seq=8192 的 15.74 GiB 约高 3%，给 nvidia-smi 的上下文占用留空。
+_POOL_OCC_LIMIT = (16 * 1024 + 256) * 1024 * 1024
+
+
+class _PinnedHost(object):
+    """页锁定主机缓冲的托管对象（内部用，别直接构造）。
+
+    `ptr` 是 c_void_p，`nbytes` 是容量；`array(dtype, n)` 给出 numpy 视图，
+    这样调用方可以按偏移读写，不需要再拷一份。
+    """
+
+    __slots__ = ("ptr", "nbytes", "_owner")
+
+    def __init__(self, ptr, nbytes, owner=None):
+        self.ptr = ptr
+        self.nbytes = int(nbytes)
+        self._owner = owner          # 退回可分页内存时，必须持有它防止被回收
+
+    def array(self, dtype=np.float32, n=None):
+        dt = np.dtype(dtype)
+        n = int(n) if n is not None else self.nbytes // dt.itemsize
+        raw = (ctypes.c_char * (n * dt.itemsize)).from_address(self.ptr.value)
+        return np.frombuffer(raw, dtype=dt, count=n)
+
+class CudaRuntime:
+    def __init__(self):
+        self.ready = False
+        self.cu = None
+        self.nvrtc = None
+        self.cublas = None
+        self.dev = None
+        self.ctx = None
+        self.handle = None
+        self.mod = None
+        self._fns = {}
+        self._dirs = []
+        self._h2d_cache = {}
+        # M8：参数模板缓存 key=(kernel 名, 各参 ctypes 类型) -> (holders, ptrs)。
+        # _lfast 为 None 表示还没读过开关；False 表示已关闭或曾因异常退回。
+        self._ltmpl = {}
+        self._lfast = None
+        # 默认是 legacy NULL 流（值 0）。只有 TG_CUDA_GRAPH=1 调了 graph_arm()
+        # 才会换成一条可捕获的非默认流。不调用时和改动前逐调用相同。
+        self._stream = ctypes.c_void_p(0)
+        self._stream_ready = False
+        self._blas_stream_set = False
+        self._dto_async_ready = False
+        self._capturing = False
+        # 确定性模式：TG_DETERMINISTIC=1 时反向走无原子内核（慢约 1%，可逐位复现）
+        self.deterministic = str(os.environ.get("TG_DETERMINISTIC", "")).strip().lower() in ("1", "true", "on", "yes")
+        # CUDA Graph 捕获期的预留 arena（bump 分配）
+        self._arena_base = 0
+        self._arena_size = 0
+        self._arena_off = 0
+        self._graph = None
+        self._graph_exec = None
+        self._graph_dead = False
+        self._graph_warned = False
+        self._graph_reason = ""
+        self._graph_poison = None
+        self._graph_api_bound = False
+        self._graph_nodes = 0
+        self._graph_launch_count = 0
+        self._graph_host_keeps = []
+        self._adamw_snaps = []
+        self._adamw_nodes = []
+        self._capture_mode = None
+        self._capture_kernels = 0
+        self._capture_blas = 0
+        self._k_at_begin = 0
+        self._b_at_begin = 0
+        self._kernel_count = 0
+        self._blas_count = 0
+        # nbytes -> 池桶大小（同一个尺寸每步反复申请，省掉一次取整计算）
+        self._bucket = {}
+        # 低显存 attention 是第二份 NVRTC 模块。默认路径不编译它。
+        self._attn_mod = None
+        self._attn_fns = {}
+        self._attn_ptx_keep = None
+        self._attn_nop_path = None
+        # 缓存分配器。热路径只在 CPU 侧交接指针，不调用 cuMemAlloc/cuMemFree。
+        self._pool_cap = _POOL_CAP_BYTES
+        self._adapt_pool_cap()
+        self._pool_free = {}
+        self._pool_live = {}
+        self._pool_seq = 0
+        self._pool_live_bytes = 0
+        self._pool_cached_bytes = 0
+        self._pool_hits = 0
+        self._pool_misses = 0
+        self._pool_trims = 0
+        self._pool_miss_hist = {}
+        # submit_stamp 每次真正把块交给 GPU 就加一。d2h 同步后 done_stamp 追上它。
+        # 释放时 stamp <= done_stamp 说明默认流上已经没有还在用这块的操作，可以直接 cuMemFree。
+        self._submit_stamp = 0
+        self._done_stamp = 0
+        self._pool_peak = 0
+        self._pool_peak_live = 0
+        self._pool_trimming = False
+
+    def ensure(self):
+        if self.cu is None:
+            self._init_driver()
+        self._activate()
+        if self.handle is None:
+            self._init_cublas()
+        if self.mod is None:
+            self._init_kernels()
+        self.ready = True
+        return self
+
+    def _init_driver(self):
+        if sys.platform == "win32":
+            self._dirs = _dll_dirs()
+            for d in self._dirs:
+                _prepare_dir(d)
+            try:
+                self.cu = ctypes.WinDLL("nvcuda.dll")
+            except OSError as ex:
+                raise CudaError(
+                    "找不到 nvcuda.dll（NVIDIA 驱动没加载）。"
+                    "当前进程建不了 CUDA 上下文。需要一台已装驱动的 NVIDIA GPU。"
+                    " 原始错误: %s" % (ex,)
+                 + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）") from ex
+        else:
+            self._dirs = _linux_lib_dirs()
+            path = _find_file(["libcuda.so.1", "libcuda.so"], self._dirs)
+            try:
+                if path:
+                    self.cu = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+                else:
+                    self.cu = ctypes.CDLL("libcuda.so.1", mode=ctypes.RTLD_GLOBAL)
+            except OSError as ex:
+                raise CudaError(
+                    "找不到 libcuda.so.1（NVIDIA 驱动没加载）。已查目录: %s。"
+                    " 原始错误: %s" % (self._dirs or ["<空>"], ex)
+                 + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）") from ex
+        self._bind_driver()
+        self._chk(self.cu.cuInit(0), "cuInit")
+        dev = ctypes.c_int()
+        rc = self.cu.cuDeviceGet(ctypes.byref(dev), 0)
+        if rc != 0:
+            raise CudaError("cuDeviceGet(0) 失败 rc=%d。机器上没有可用的 CUDA 设备。" % rc + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        self.dev = int(dev.value)
+        ctx = ctypes.c_void_p()
+        self._chk(self.cu.cuDevicePrimaryCtxRetain(ctypes.byref(ctx), self.dev),
+                  "cuDevicePrimaryCtxRetain")
+        self.ctx = ctx
+        self._activate()
+
+    def _bind_driver(self):
+        cu = self.cu
+        # Windows 的 nvcuda.dll 同时导出旧符号和 _v2。cuda.h 里的
+        # #define cuMemAlloc cuMemAlloc_v2 对 ctypes 无效。旧的 cuMemAlloc /
+        # cuMemFree / cuMemcpy* 仍是 32 位 CUdeviceptr ABI，拿到
+        # cuDevicePrimaryCtxRetain 的 context 会直接返回
+        # CUDA_ERROR_INVALID_CONTEXT (201)，尽管 cuCtxGetCurrent 对得上。
+        # 有 _v2 的（64 位 ABI 变更过，必须走 _v2）
+        for name in ("cuMemAlloc", "cuMemFree", "cuMemcpyHtoD", "cuMemcpyDtoH", "cuMemcpyDtoD",
+                     "cuMemcpyHtoDAsync", "cuMemcpyDtoHAsync"):
+            _alias_driver_symbol(cu, name)
+        # 本来就没有 _v2 的（缺了就真报错，但不强制后缀）
+        for name in ("cuMemsetD32Async",):
+            _alias_driver_symbol(cu, name, require_v2=False)
+        cu.cuInit.argtypes = [ctypes.c_uint]
+        cu.cuInit.restype = ctypes.c_int
+        cu.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+        cu.cuDeviceGet.restype = ctypes.c_int
+        cu.cuDeviceGetAttribute.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+        cu.cuDeviceGetAttribute.restype = ctypes.c_int
+        cu.cuDevicePrimaryCtxRetain.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+        cu.cuDevicePrimaryCtxRetain.restype = ctypes.c_int
+        cu.cuCtxSetCurrent.argtypes = [ctypes.c_void_p]
+        cu.cuCtxSetCurrent.restype = ctypes.c_int
+        cu.cuCtxSynchronize.argtypes = []
+        cu.cuCtxSynchronize.restype = ctypes.c_int
+        cu.cuMemAlloc.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+        cu.cuMemAlloc.restype = ctypes.c_int
+        cu.cuMemFree.argtypes = [ctypes.c_uint64]
+        cu.cuMemFree.restype = ctypes.c_int
+        cu.cuMemcpyHtoD.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
+        cu.cuMemcpyHtoD.restype = ctypes.c_int
+        cu.cuMemcpyDtoH.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t]
+        cu.cuMemcpyDtoH.restype = ctypes.c_int
+        cu.cuMemcpyDtoD.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_size_t]
+        cu.cuMemcpyDtoD.restype = ctypes.c_int
+        cu.cuMemcpyHtoDAsync.argtypes = [ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+        cu.cuMemcpyHtoDAsync.restype = ctypes.c_int
+        cu.cuMemcpyDtoHAsync.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t, ctypes.c_void_p]
+        cu.cuMemcpyDtoHAsync.restype = ctypes.c_int
+        cu.cuMemsetD32Async.argtypes = [ctypes.c_uint64, ctypes.c_uint, ctypes.c_size_t, ctypes.c_void_p]
+        cu.cuMemsetD32Async.restype = ctypes.c_int
+        cu.cuStreamSynchronize.argtypes = [ctypes.c_void_p]
+        cu.cuStreamSynchronize.restype = ctypes.c_int
+        cu.cuStreamQuery.argtypes = [ctypes.c_void_p]
+        cu.cuStreamQuery.restype = ctypes.c_int
+        cu.cuEventCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+        cu.cuEventCreate.restype = ctypes.c_int
+        cu.cuEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        cu.cuEventRecord.restype = ctypes.c_int
+        cu.cuEventElapsedTime.argtypes = [ctypes.POINTER(ctypes.c_float),
+                                          ctypes.c_void_p, ctypes.c_void_p]
+        cu.cuEventElapsedTime.restype = ctypes.c_int
+        cu.cuEventQuery.argtypes = [ctypes.c_void_p]
+        cu.cuEventQuery.restype = ctypes.c_int
+        try:
+            # 单 event 等待（event 计时用；比 cuCtxSynchronize 精确）。
+            # 驱动一定有这个符号，但按 cuGetErrorString 的先例仍容错处理，
+            # 免得因为一个非必需符号把整个后端初始化拖死。
+            cu.cuEventSynchronize.argtypes = [ctypes.c_void_p]
+            cu.cuEventSynchronize.restype = ctypes.c_int
+        except AttributeError:
+            pass
+        cu.cuEventDestroy.argtypes = [ctypes.c_void_p]
+        cu.cuEventDestroy.restype = ctypes.c_int
+        cu.cuModuleLoadData.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+        cu.cuModuleLoadData.restype = ctypes.c_int
+        cu.cuModuleGetFunction.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_char_p]
+        cu.cuModuleGetFunction.restype = ctypes.c_int
+        cu.cuLaunchKernel.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+            ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+            ctypes.c_uint, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+        ]
+        cu.cuLaunchKernel.restype = ctypes.c_int
+        try:
+            cu.cuGetErrorString.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+            cu.cuGetErrorString.restype = ctypes.c_int
+        except AttributeError:
+            pass
+
+    def _activate(self):
+        # ★ 上下文一旦设为当前，在**单线程、单上下文**的前提下就一直保持当前。
+        #   之前每次 launch 都调一次 cuCtxSetCurrent：4 层一步 **1757 次驱动调用**
+        #   （cProfile: _activate tottime 0.002 s，而且驱动调用本身比 Python 栈更贵）。
+        #   这里记住状态，之后直接返回。任何会改变"当前上下文"的路径（我们只有
+        #   graph 捕获的 THREAD_LOCAL 模式）都要把该标志清掉。
+        if self.ctx is None or getattr(self, "_ctx_cur", False):
+            return
+        self._chk(self.cu.cuCtxSetCurrent(self.ctx), "cuCtxSetCurrent")
+        self._ctx_cur = True
+
+    def _deactivate_hint(self):
+        """告诉运行时"当前上下文可能被改掉了"，下次用到时重新设置。"""
+        self._ctx_cur = False
+
+    def _chk(self, rc, what):
+        if rc == 0:
+            return
+        extra = ""
+        get = getattr(self.cu, "cuGetErrorString", None)
+        if get is not None:
+            msg = ctypes.c_char_p()
+            if get(int(rc), ctypes.byref(msg)) == 0 and msg.value:
+                extra = " " + msg.value.decode("utf-8", "replace")
+        raise CudaError("%s 失败 rc=%d%s" % (what, int(rc), extra) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+
+    def _cublas_path(self):
+        if sys.platform == "win32":
+            path = _find_glob(_is_cublas_main, self._dirs)
+            if path is None:
+                path = _find_file(["cublas64_12.dll", "cublas64_11.dll"], self._dirs)
+            if path is None:
+                raise CudaError(
+                    "找不到 cublas64_*.dll。已查目录: %s\n"
+                    "修法：装 CUDA Toolkit 并设 CUDA_PATH，或用 TGAI_CUDA_BIN 指向含 cublas64_*.dll 的目录"
+                    % (self._dirs or ["<空>"])
+                )
+            return path
+        path = _find_file(["libcublas.so.12", "libcublas.so"], self._dirs)
+        if path is None:
+            raise CudaError(
+                "找不到 libcublas.so.12。已查目录: %s\n"
+                "修法：pip install 'tgai-orv[cuda]'（裸机器），或设 TGAI_CUDA_BIN 指向含 libcublas.so.12 的目录"
+                % (self._dirs or ["<空>"])
+            )
+        return path
+
+    def _init_cublas(self):
+        path = self._cublas_path()
+        folder = os.path.dirname(path)
+        _prepare_dir(folder)
+        if sys.platform != "win32":
+            # 同目录预加载 cublasLt。这台机器的 libcublas 自带 $ORIGIN，
+            # 直接 CDLL 也能开；预加载是为了不依赖 LD_LIBRARY_PATH。
+            for name in ("libcublasLt.so.12", "libcublasLt.so"):
+                try:
+                    _preload(os.path.join(folder, name))
+                except OSError:
+                    pass
+        try:
+            if sys.platform == "win32":
+                self.cublas = ctypes.CDLL(path)
+            else:
+                self.cublas = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+        except OSError as ex:
+            raise CudaError("加载 %s 失败: %s" % (path, ex) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）") from ex
+        self._cublas_path = path
+        cb = self.cublas
+        cb.cublasCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        cb.cublasCreate_v2.restype = ctypes.c_int
+        cb.cublasSetMathMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        cb.cublasSetMathMode.restype = ctypes.c_int
+        cb.cublasSetPointerMode_v2.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        cb.cublasSetPointerMode_v2.restype = ctypes.c_int
+        cb.cublasSetStream_v2.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        cb.cublasSetStream_v2.restype = ctypes.c_int
+        # 设备指针用 c_uint64。c_void_p 是有符号的，地址最高位为 1 时会 OverflowError。
+        cb.cublasSgemm_v2.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_uint64, ctypes.c_int,
+            ctypes.c_uint64, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_uint64, ctypes.c_int,
+        ]
+        cb.cublasSgemm_v2.restype = ctypes.c_int
+        try:
+            cb.cublasGetStatusString.argtypes = [ctypes.c_int]
+            cb.cublasGetStatusString.restype = ctypes.c_char_p
+        except AttributeError:
+            pass
+        handle = ctypes.c_void_p()
+        self._chk_blas(cb.cublasCreate_v2(ctypes.byref(handle)), "cublasCreate_v2")
+        self.handle = handle
+        self._chk_blas(cb.cublasSetPointerMode_v2(handle, CUBLAS_POINTER_MODE_HOST),
+                       "cublasSetPointerMode_v2")
+        self._chk_blas(cb.cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH),
+                       "cublasSetMathMode(PEDANTIC)")
+        self._chk_blas(cb.cublasSetStream_v2(handle, ctypes.c_void_p(0)),
+                       "cublasSetStream_v2")
+
+    def _chk_blas(self, rc, what):
+        if "gemm" in str(what).lower():
+            self._blas_count += 1
+        if rc == 0:
+            return
+        extra = ""
+        get = getattr(self.cublas, "cublasGetStatusString", None)
+        if get is not None:
+            try:
+                s = get(int(rc))
+                if s:
+                    extra = " " + s.decode("utf-8", "replace")
+            except Exception:
+                pass
+        raise CudaError("%s 失败 rc=%d%s" % (what, int(rc), extra) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+
+    def _cc_arch(self):
+        major = ctypes.c_int()
+        minor = ctypes.c_int()
+        self._chk(self.cu.cuDeviceGetAttribute(
+            ctypes.byref(major), CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, self.dev),
+            "compute capability major")
+        self._chk(self.cu.cuDeviceGetAttribute(
+            ctypes.byref(minor), CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, self.dev),
+            "compute capability minor")
+        return "compute_%d%d" % (int(major.value), int(minor.value))
+
+    def _device_smem_limit(self):
+        """单 block 动态共享内存上限（字节）。优先 opt-in 上限，取不到退回普通上限。
+
+        为什么要分两档：Volta/图灵/安培可以通过 cuFuncSetAttribute **opt-in** 到更大上限
+        （V100 是 96 KB），而 Pascal 消费卡（sm_61 等）只有 48 KB **且不支持 opt-in** ——
+        融合注意力的反向内核要 68/84 KB，在那些卡上必然失败（外部实测 2026-11-12）。
+        """
+        val = ctypes.c_int()
+        # 97 = CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN
+        #  8 = CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK
+        for attr in (97, 8):
+            rc = int(self.cu.cuDeviceGetAttribute(ctypes.byref(val), attr, self.dev))
+            if rc == 0 and int(val.value) > 0:
+                return int(val.value)
+        return 0
+
+    def _nvrtc_path(self):
+        if sys.platform == "win32":
+            path = _find_glob(_is_nvrtc_main, self._dirs)
+            if path is None:
+                raise CudaError(
+                    "找不到 nvrtc64_*.dll（NVRTC）。已查目录: %s" % (self._dirs or ["<空>"])
+                 + "。修法：确认 NVRTC/cuBLAS 可用（驱动 >= CUDA 12）；把完整日志和 GPU 型号反馈")
+            return path
+        path = _find_file(["libnvrtc.so.12", "libnvrtc.so"], self._dirs)
+        if path is None:
+            raise CudaError(
+                "找不到 libnvrtc.so.12（NVRTC）。已查目录: %s" % (self._dirs or ["<空>"])
+             + "。修法：确认 NVRTC/cuBLAS 可用（驱动 >= CUDA 12）；把完整日志和 GPU 型号反馈")
+        return path
+
+    def _init_kernels(self):
+        path = self._nvrtc_path()
+        folder = os.path.dirname(path)
+        _prepare_dir(folder)
+        if sys.platform != "win32":
+            try:
+                names = os.listdir(folder)
+            except OSError:
+                names = []
+            for name in names:
+                if name.startswith("libnvrtc-builtins.so"):
+                    try:
+                        _preload(os.path.join(folder, name))
+                    except OSError:
+                        pass
+        try:
+            if sys.platform == "win32":
+                self.nvrtc = ctypes.WinDLL(path)
+            else:
+                self.nvrtc = ctypes.CDLL(path, mode=ctypes.RTLD_GLOBAL)
+        except OSError as ex:
+            raise CudaError("加载 %s 失败: %s" % (path, ex) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）") from ex
+        self._bind_nvrtc()
+        arch = self._cc_arch()                        # compute_86
+        sm = arch.replace("compute_", "sm_")           # sm_86（cubin 要物理架构）
+        # ★ 优先 cubin：驱动只对 PTX 做 JIT，而新版 NVRTC 的 PTX ISA 可能比驱动新
+        #   （实测 NVRTC 12.8 -> .version 8.7，CUDA 12.4 驱动上限 8.4），
+        #   于是任何**新模块** rc=222。基线能跑只因驱动 JIT 缓存里有旧 SASS。
+        cubin_err = None
+        try:
+            cubin = self._compile(sm, want_cubin=True)
+        except Exception as ex:                       # noqa: BLE001
+            cubin, cubin_err = None, ex
+        if cubin:
+            mod = ctypes.c_void_p()
+            buf = ctypes.create_string_buffer(cubin)
+            rc = int(self.cu.cuModuleLoadData(
+                ctypes.byref(mod), ctypes.cast(buf, ctypes.c_void_p)))
+            if rc == 0:
+                self._ptx_keep = buf
+                self.mod = mod
+                self.module_kind = "cubin"
+                return
+            cubin_err = CudaError("cubin 加载失败 rc=%d" % rc)
+        ptx = self._compile(arch)
+        mod = ctypes.c_void_p()
+        buf = ctypes.create_string_buffer(ptx)
+        try:
+            self._chk(self.cu.cuModuleLoadData(
+                ctypes.byref(mod), ctypes.cast(buf, ctypes.c_void_p)), "cuModuleLoadData")
+        except CudaError as ex:
+            raise CudaError(
+                "%s\n（cubin 也没成功：%s）\n修法：① pip install "
+                "'nvidia-cuda-nvrtc-cu12<12.5' 让 NVRTC 与驱动匹配；② 或升级驱动。"
+                "PTX ISA 版本由 NVRTC 决定，**降 arch 到 compute_75 修不了**（已实测）。"
+                % (ex, cubin_err)) from ex
+        self._ptx_keep = buf
+        self.mod = mod
+        self.module_kind = "ptx"
+
+    def _bind_nvrtc(self):
+        n = self.nvrtc
+        n.nvrtcCreateProgram.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        n.nvrtcCreateProgram.restype = ctypes.c_int
+        n.nvrtcCompileProgram.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_char_p)]
+        n.nvrtcCompileProgram.restype = ctypes.c_int
+        n.nvrtcGetPTXSize.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+        n.nvrtcGetPTXSize.restype = ctypes.c_int
+        n.nvrtcGetPTX.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        n.nvrtcGetPTX.restype = ctypes.c_int
+        n.nvrtcGetProgramLogSize.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+        n.nvrtcGetProgramLogSize.restype = ctypes.c_int
+        n.nvrtcGetProgramLog.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        n.nvrtcGetProgramLog.restype = ctypes.c_int
+        n.nvrtcDestroyProgram.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        n.nvrtcDestroyProgram.restype = ctypes.c_int
+
+    def _compile(self, arch, source=None, cu_name=b"tgai_train.cu", want_cubin=False):
+        # 源码没有 #include。不要把带空格的 CUDA include 塞进 -I，NVRTC 会把空格再拆开。
+        if source is None:
+            source = _device_source()
+        if isinstance(cu_name, str):
+            cu_name = cu_name.encode("utf-8")
+        opts = [
+            "--gpu-architecture=%s" % arch,
+            "--std=c++14",
+            "--device-as-default-execution-space",
+        ]
+        opts_b = [o.encode("utf-8") for o in opts]
+        arr = (ctypes.c_char_p * len(opts_b))(*opts_b)
+        prog = ctypes.c_void_p()
+        rc = self.nvrtc.nvrtcCreateProgram(
+            ctypes.byref(prog), source.encode("utf-8"), cu_name, 0, None, None)
+        self._chk_nvrtc(rc, "nvrtcCreateProgram", prog)
+        rc = self.nvrtc.nvrtcCompileProgram(prog, len(opts_b), arr)
+        log = self._nvrtc_log(prog)
+        if rc != 0:
+            self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+            raise CudaError("NVRTC 编译失败 arch=%s\n%s" % (arch, log) + "。修法：确认 NVRTC/cuBLAS 可用（驱动 >= CUDA 12）；把完整日志和 GPU 型号反馈")
+        if want_cubin:
+            # SASS 直接产物：驱动不需要 JIT，不受 PTX ISA 版本闸门约束。
+            # 实测：NVRTC 12.8 产 PTX .version 8.7，CUDA 12.4 驱动上限 8.4 -> rc=222。
+            try:
+                self.nvrtc.nvrtcGetCUBINSize.argtypes = [
+                    ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+                self.nvrtc.nvrtcGetCUBINSize.restype = ctypes.c_int
+                self.nvrtc.nvrtcGetCUBIN.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                self.nvrtc.nvrtcGetCUBIN.restype = ctypes.c_int
+            except AttributeError as ex:
+                self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+                raise CudaError("这个 NVRTC 不支持 nvrtcGetCUBIN：%s" % (ex,) + "。修法：确认 NVRTC/cuBLAS 可用（驱动 >= CUDA 12）；把完整日志和 GPU 型号反馈") from ex
+            sz = ctypes.c_size_t()
+            rc = int(self.nvrtc.nvrtcGetCUBINSize(prog, ctypes.byref(sz)))
+            if rc != 0 or sz.value == 0:
+                self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+                raise CudaError("nvrtcGetCUBINSize 失败 rc=%d（arch=%s）。"
+                                "arch 必须是 sm_XX 物理架构，compute_XX 没有 cubin"
+                                % (rc, arch) + "。修法：确认 NVRTC/cuBLAS 可用（驱动 >= CUDA 12）；把完整日志和 GPU 型号反馈")
+            buf = ctypes.create_string_buffer(sz.value)
+            self._chk_nvrtc(self.nvrtc.nvrtcGetCUBIN(prog, buf), "nvrtcGetCUBIN", prog)
+            self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+            return buf.raw
+        sz = ctypes.c_size_t()
+        self._chk_nvrtc(self.nvrtc.nvrtcGetPTXSize(prog, ctypes.byref(sz)), "nvrtcGetPTXSize", prog)
+        buf = ctypes.create_string_buffer(sz.value)
+        self._chk_nvrtc(self.nvrtc.nvrtcGetPTX(prog, buf), "nvrtcGetPTX", prog)
+        self.nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+        return buf.raw
+
+    def _chk_nvrtc(self, rc, what, prog):
+        if rc == 0:
+            return
+        log = self._nvrtc_log(prog) if prog else ""
+        raise CudaError("%s 失败 rc=%d\n%s" % (what, int(rc), log) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+
+    def _nvrtc_log(self, prog):
+        if not prog:
+            return ""
+        sz = ctypes.c_size_t()
+        if self.nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(sz)) != 0 or sz.value <= 1:
+            return ""
+        buf = ctypes.create_string_buffer(sz.value)
+        self.nvrtc.nvrtcGetProgramLog(prog, buf)
+        return buf.value.decode("utf-8", "replace")
+
+    def sync(self):
+        # 捕获期间设备同步是非法的，而且这条流上的顺序本身就保证了先后。
+        # 真正要读回主机时，捕获已经结束，d2h 会同步这条流。
+        if self._capturing:
+            return
+        self._activate()
+        self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize")
+
+    # ─────────────────── CUDA event 计时（性能归因用）───────────────────
+    # 为什么必须有这一组：用「调用前后各 rt.sync()」去量单个 kernel，会把**探测
+    # 自身的开销**算进 kernel —— 实测 `transpose2d` 被量成 76 ms/步，但端到端把
+    # 它整条替换掉步时一点没变。sync 会强制排空整条流，于是每个 kernel 都要付一次
+    # 全设备同步的代价。
+    #
+    # event 是**流内**打点：`cuEventRecord` 只是往默认流里塞一个"写时间戳"的命令，
+    # 不阻塞主机、不打断发射流水；一步结束后（或任何一次 sync 之后）再批量读
+    # `cuEventElapsedTime`。相邻两个 event 之间的 elapsed 就是这段 GPU 工作的真实
+    # 耗时，不含主机侧开销。
+    #
+    # 约定：
+    #   * event 对象就是 `ctypes.c_void_p`（与 `_pool_ev_acquire` 同一种表示），
+    #     生命周期由调用方负责，用完 `event_destroy`；
+    #   * 全部记录在**当前流**（`self._stream`，默认就是 legacy NULL 流）上，与
+    #     本运行时的其它操作同流 ⇒ 顺序即时间顺序；
+    #   * 只读 CPU 后端/未初始化时不会有这些调用：cuda.py 本来就只在 cuda 路径加载，
+    #     这组方法也不改变任何已有的发射/同步行为。
+
+    def event_create(self):
+        """建一个 CUDA event（flags=0，仅计时用）。返回 ctypes.c_void_p。"""
+        self.ensure()
+        ev = ctypes.c_void_p()
+        self._chk(self.cu.cuEventCreate(ctypes.byref(ev), ctypes.c_uint(0)),
+                  "cuEventCreate")
+        return ev
+
+    def event_record(self, ev):
+        """把 event 记在当前流上（异步；只入队，不阻塞主机）。"""
+        if self.cu is None:
+            raise CudaError("event_record 需要 CUDA 后端已初始化（当前 self.cu 为空）"
+                            + "。修法：先 set_device('cuda')；CPU 后端不提供 event 计时")
+        self._activate()
+        self._chk(self.cu.cuEventRecord(ev, self._stream), "cuEventRecord")
+        return ev
+
+    def event_query(self, ev):
+        """event 是否已经在设备上跑完（True = 完成）。"""
+        if self.cu is None:
+            return False
+        return int(self.cu.cuEventQuery(ev)) == 0
+
+    def event_elapsed_ms(self, start, end):
+        """两个 event 之间的 GPU 毫秒数（float）。
+
+        `end` 必须已经完成；没完成时驱动返回 CUDA_ERROR_NOT_READY(600)，这里给出
+        明确报错而不是吞掉 —— 静默返回 0 会让归因表整体失真。
+        """
+        if self.cu is None:
+            raise CudaError("event_elapsed_ms 需要 CUDA 后端已初始化"
+                            + "。修法：先 set_device('cuda')")
+        ms = ctypes.c_float()
+        rc = int(self.cu.cuEventElapsedTime(ctypes.byref(ms), start, end))
+        if rc == 600:                       # CUDA_ERROR_NOT_READY
+            raise CudaError(
+                "event_elapsed_ms: 第二个 event 还没跑完（rc=600 CUDA_ERROR_NOT_READY）"
+                + "。修法：读 elapsed 之前先 sync()，或只读已经过去的步")
+        self._chk(rc, "cuEventElapsedTime")
+        return float(ms.value)
+
+    def event_sync(self, ev):
+        """等单个 event 完成（比整设备 sync 精确；不改变已入队的工作）。"""
+        if self.cu is None:
+            raise CudaError("event_sync 需要 CUDA 后端已初始化"
+                            + "。修法：先 set_device('cuda')")
+        self._activate()
+        self._chk(self.cu.cuEventSynchronize(ev), "cuEventSynchronize")
+
+    def event_destroy(self, ev):
+        """销毁 event。重复销毁/传 None 都安全跳过（析构路径不该抛）。"""
+        if self.cu is None or ev is None:
+            return
+        try:
+            self.cu.cuEventDestroy(ev)
+        except Exception:                   # noqa: BLE001 - 析构路径不抛
+            pass
+
+    def event_selftest(self, iters=100, elems=(1 << 20)):
+        """event 计时自检：量一批 `add`，核对量级，并与墙钟交叉校验。
+
+        判据：
+          1. 数值正确（`add(1,2)` == 3，读回逐元素比较）；
+          2. 单次耗时落在 [3 µs, 5 ms]（1 M float 的 add 要读写 12 MB；V100 上约
+             13–18 µs，放宽两个数量级只为抓"量错量级"，不锁死具体卡）；
+          3. **event 总和 ≈ 墙钟**（比值在 [0.5, 1.5] 内）：这条是关键 ——
+             「sync 包裹法」正是在这一步失真的；
+          4. 不崩、elapsed 非负且有限。
+
+        返回 dict（含实测数字），失败抛 CudaError。
+        """
+        elems = int(elems)
+        iters = int(iters)
+        if elems <= 0 or iters <= 0:
+            raise CudaError("event_selftest 参数必须为正"
+                            + "。修法：传 iters>=1、elems>=1")
+        a = self.full((elems,), 1.0)
+        b = self.full((elems,), 2.0)
+        # 预热：把内核模块、参数模板、池块都走到稳态，否则第一批含首次开销。
+        for _ in range(5):
+            self.add(a, b)
+        self.sync()
+
+        evs = [self.event_create() for _ in range(2 * iters)]
+        try:
+            t0 = time.perf_counter()
+            for i in range(iters):
+                self.event_record(evs[2 * i])
+                out = self.add(a, b)
+                self.event_record(evs[2 * i + 1])
+            self.sync()
+            wall_ms = (time.perf_counter() - t0) * 1000.0
+            vals = [self.event_elapsed_ms(evs[2 * i], evs[2 * i + 1])
+                    for i in range(iters)]
+        finally:
+            for ev in evs:
+                self.event_destroy(ev)
+
+        # 数值自检：只读首尾两个元素，避免一次 4 MB 的 D2H 干扰计时结论
+        head = np.asarray(out.to_numpy(), dtype=np.float64).reshape(-1)
+        if not (abs(head[0] - 3.0) <= 1e-6 and abs(head[-1] - 3.0) <= 1e-6):
+            raise CudaError("event_selftest 数值错误：add(1,2) 得到 %r"
+                            % (head[:2],) + "。修法：先跑 docs 里的最小闭环确认后端正常")
+
+        total_ms = float(sum(vals))
+        avg_ms = total_ms / float(iters)
+        lo, hi = 0.003, 5.0
+        ok = True
+        why = []
+        if not all(v == v and 0.0 <= v < 1e6 for v in vals):
+            ok = False
+            why.append("elapsed 非法（nan/负数/离谱值）")
+        if not (lo <= avg_ms <= hi):
+            ok = False
+            why.append("单次 %.6f ms 不在 [%.3f, %.1f] 区间" % (avg_ms, lo, hi))
+        if wall_ms > 0:
+            ratio = total_ms / wall_ms
+            if not (0.5 <= ratio <= 1.5):
+                ok = False
+                why.append("event 总和/墙钟 = %.2f（应≈1）" % ratio)
+        else:
+            ratio = float("nan")
+        res = {"ok": bool(ok), "iters": iters, "elems": elems,
+               "avg_ms": avg_ms, "min_ms": float(min(vals)),
+               "max_ms": float(max(vals)), "sum_ms": total_ms,
+               "wall_ms": float(wall_ms), "event_over_wall": float(ratio),
+               "out_head": float(head[0])}
+        if not ok:
+            raise CudaError("event_selftest 失败：%s；实测 %r" % ("；".join(why), res)
+                            + "。修法：把这段数字与 GPU/驱动版本一起反馈")
+        return res
+
+    def free(self, ptr, token=None):
+        """把块还回池，不调用 cuMemFree。
+
+        token 为 None 是显式释放（当前持有者作废）。传入 token 时必须和领出时一致，
+        否则视为过期的析构，直接忽略。这样「先 free(ptr) 再被下一个张量复用」不会
+        在旧 GpuBuf 析构时把活块收走。
+
+        正确性靠默认流的提交顺序，不靠在这里同步：使用这块内存的 kernel / memset /
+        memcpy 都已经排在 legacy 默认流上，下一次复用排在它们之后。真正还给驱动
+        只发生在 empty_cache() 或池超过上限时，并且先 cuCtxSynchronize。
+        本运行时的计算全部在这条默认流上；如果以后引入第二条流，必须改成按流记 event，
+        不能再无条件复用。
+        """
+        try:
+            if self._in_arena(ptr):
+                return                      # arena 内存不归池管，直接跳过
+            self._pool_release(int(ptr or 0), token)
+            # ★ 2026-11-16 修（实测：全尺寸配置下反向梯度爆炸 4130 倍）：
+            #   `_cast_f16_cached` 按**裸指针**缓存 fp16 影子。权重永不释放，缓存安全；
+            #   但**激活值**的地址会被池子复用 —— 同一地址在一步之内先后装不同张量，
+            #   反向时就会命中前向留下的旧 fp16 拷贝 ⇒ GEMM 读到别人的数据 ⇒ 梯度全错。
+            #   实测：缓存开 gnorm=3.3056e+04，缓存关 gnorm=8.0060e+00（fp32 基线 8.0039）。
+            #   修法：块一旦归还池子就丢掉它的影子。这样"地址复用"自动失效，
+            #   而权重（从不归还）继续享受缓存带来的速度。
+            self._f16_cache_drop_ptr(ptr)
+        except Exception:
+            if token is None:
+                raise
+
+    def empty_cache(self):
+        """同步默认流，然后把池里的空闲块真正 cuMemFree。不影响还活着的张量。"""
+        if not self._pool_free:
+            self._pool_cached_bytes = 0
+            return
+        if self.cu is None:
+            self._pool_free.clear()
+            self._pool_cached_bytes = 0
+            return
+        self._activate()
+        self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize(empty_cache)")
+        for size, chain in list(self._pool_free.items()):
+            while chain:
+                node = chain[-1]
+                # 池里的节点可能是 (ptr, event) 二元组，也可能是裸 ptr
+                if isinstance(node, tuple):
+                    ptr, ev = node
+                    if ev is not None:
+                        self.cu.cuEventDestroy(ev)
+                else:
+                    ptr = node
+                self._chk(self.cu.cuMemFree(ctypes.c_uint64(int(ptr))), "cuMemFree(empty_cache)")
+                chain.pop()
+                self._pool_cached_bytes -= size
+            del self._pool_free[size]
+        if self._pool_cached_bytes < 0:
+            self._pool_cached_bytes = 0
+
+    def pool_stats(self):
+        """命中 / 未命中 / 当前占用 / 池峰值。占用 = 活张量 + 池中空闲块。"""
+        hits = int(self._pool_hits)
+        misses = int(self._pool_misses)
+        total = hits + misses
+        occupied = int(self._pool_live_bytes + self._pool_cached_bytes)
+        return {
+            "hits": hits,
+            "misses": misses,
+            "hit_rate": (float(hits) / float(total)) if total else 0.0,
+            "occupied_bytes": occupied,
+            "live_bytes": int(self._pool_live_bytes),
+            "cached_bytes": int(self._pool_cached_bytes),
+            "peak_bytes": int(self._pool_peak),
+            "peak_live_bytes": int(self._pool_peak_live),
+            "cap_bytes": int(self._pool_cap),
+            "trims": int(self._pool_trims),
+            "miss_top": sorted(
+                ((int(n), int(sz)) for sz, n in self._pool_miss_hist.items()),
+                reverse=True,
+            )[:8],
+        }
+
+    def pool_dump_live(self, top=20):
+        """当前**借出未还**的显存按块大小分布 —— 直接读池自己的账本。
+
+        为什么不用 `GpuBuf.__init__/__del__` 挂钩子统计：`__del__` 在引用环下
+        不保证触发，会留下**僵尸条目**（指向已被池复用的内存），
+        我实测因此得到"forward 一次没分配该形状、却报告 120 块活着"的自相矛盾结果。
+
+        `self._pool_live` 是唯一权威来源：借出时写入、归还时删除（`_pool_checkout` /
+        `_pool_return`），与 Python 对象生命周期解耦。
+
+        返回 `{"blocks", "bytes", "top": [(size_bytes, count, total_bytes), ...]}`，
+        按 total_bytes 降序。元素个数 = size_bytes // 4（fp32）。
+        """
+        by = {}
+        tot = 0
+        for rec in self._pool_live.values():
+            sz = int(rec[0])
+            by[sz] = by.get(sz, 0) + 1
+            tot += sz
+        rows = sorted(((sz, n, sz * n) for sz, n in by.items()),
+                      key=lambda t: (-t[2], -t[0]))
+        return {"blocks": len(self._pool_live), "bytes": tot,
+                "top": rows[:int(top)]}
+
+    def _pool_note(self):
+        if self._pool_live_bytes > self._pool_peak_live:
+            self._pool_peak_live = self._pool_live_bytes
+        occupied = self._pool_live_bytes + self._pool_cached_bytes
+        if occupied > self._pool_peak:
+            self._pool_peak = occupied
+
+    def _pool_checkout(self, ptr, size):
+        if ptr in self._pool_live:
+            raise CudaError("分配器把仍在使用的块交了出去: 0x%x" % int(ptr) + "。修法：调小 batch/seq，或开梯度检查点（cfg[GRAD_CKPT]=True）；也可设 TG_POOL_GB 限制池上限")
+        self._pool_seq += 1
+        self._pool_live[int(ptr)] = (int(size), self._pool_seq, self._submit_stamp)
+        self._pool_live_bytes += int(size)
+        self._pool_note()
+
+    def _pool_token_of(self, ptr):
+        rec = self._pool_live.get(int(ptr))
+        if rec is None:
+            return None
+        return rec[1]
+
+    def _pool_take(self, bucket):
+        chain = self._pool_free.get(bucket)
+        if not chain:
+            return 0
+        node = chain.pop()
+        if not chain:
+            del self._pool_free[bucket]
+        self._pool_cached_bytes -= int(bucket)
+        if self._pool_cached_bytes < 0:
+            self._pool_cached_bytes = 0
+        if isinstance(node, tuple):
+            ptr, ev = node
+            self._pool_ev_spare.append(ev)
+            return int(ptr)
+        return int(node)
+
+    def _pool_ev_acquire(self):
+        """从备用池取一个 CUDA event；没有就新建。
+
+        用途：块归还时 cuEventRecord 记一个时间点，复用前先 cuEventQuery，
+        确保还没跑完的 kernel 不会读写同一个块。全部工作在默认流上也完全安全。
+        """
+        spare = getattr(self, "_pool_ev_spare", None)
+        if spare is None:
+            spare = self._pool_ev_spare = []
+        if spare:
+            return spare.pop()
+        ev = ctypes.c_void_p()
+        self._chk(self.cu.cuEventCreate(ctypes.byref(ev), ctypes.c_uint(0)), "cuEventCreate")
+        return ev
+
+    def _adapt_pool_cap(self):
+        """按**设备总显存**自适应决定池上限（0.6×总量，夹在 8–20 GiB）。
+
+        2026-11-19 实测（V100 32 GiB / seq2048 / 12 层 MoE / 20 步稳态）：
+            TG_POOL_GB=12 → 0.775 s      （原默认，池长期顶在 cap 上）
+            TG_POOL_GB=16 → 0.694 s
+            TG_POOL_GB=20 → **0.501 s（−35%）**
+        机制：池缓存顶到 cap 后，每次 `_pool_release` 都会触发 trim 把块还给驱动，
+        下一步再 `cuMemAlloc` —— 实测每步 2015 次 alloc + 2016 次 free、CPU 368.7 ms，
+        占步时 47%。cap 放宽后缓存不再溢出，命中率从 60% 回到接近 100%。
+
+        显式设了 `TG_POOL_GB` 时**不覆盖用户的选择**。
+        拿不到设备总量时保持默认值（行为与之前一致，不会更差）。
+        """
+        # 只做一次成功：拿到总量并设好 cap 后置位。拿不到（上下文未就绪）就下次再试。
+        if getattr(self, "_pool_cap_adapted", False):
+            return
+        if os.environ.get("TG_POOL_GB"):
+            self._pool_cap_adapted = True        # 用户显式指定，不再自动改
+            return
+        total = None
+        for nm in ("_device_total_bytes", "device_total_bytes", "total_device_bytes",
+                   "mem_total_bytes", "total_mem_bytes"):
+            fn = getattr(self, nm, None)
+            if callable(fn):
+                try:
+                    total = int(fn())
+                    break
+                except Exception:                # noqa: BLE001 - 拿不到就算了
+                    total = None
+        if not total or total <= 0:
+            return
+        # ★ 2026-11-19 深夜（子代理实测后修正）：原来是 0.6×总量，在 32 GiB 卡上给 19.1 GiB，
+        #   而**峰值 live 就有 23.7 GiB** ⇒ cap 低于 live，池每步都 trim 再重申请
+        #   （实测 1225 次 alloc + 1333 次 free + 138 次 trim/步，GPU 空转 130 ms）。
+        #   实测 A/B（seq2048，预热+3 次中位数）：
+        #       19.1 GiB → 0.489 s   24 → 0.400 s   26 → 0.398 s   28 → 0.398 s（饱和）
+        #   所以正确规则是"**用满剩余显存**"：cap = 总量 − 预留。
+        #   预留取 max(4 GiB, 15% 总量)：32 GiB 卡 → 27.2 GiB；24 GiB 卡 → 20.4 GiB；
+        #   16 GiB 卡 → 13.6 GiB。留固定余量给驱动/其它进程，避免把缓存变成 OOM 陷阱。
+        reserve = max(4 << 30, int(total * 0.15))
+        cap = total - reserve
+        self._pool_cap = max(8 << 30, min(cap, total - (1 << 30)))
+        self._pool_cap_adapted = True            # 成功才置位
+        # 便于排查：只在 TG_POOL_DEBUG 下打印，避免污染正常日志
+        if os.environ.get("TG_POOL_DEBUG"):
+            print("[pool] 自适应池上限 %.1f GiB（设备总量 %.1f GiB）"
+                  % (self._pool_cap / (1024 ** 3), total / (1024 ** 3)), flush=True)
+
+    def _pool_release(self, ptr, token):
+        if ptr <= 0:
+            return
+        rec = self._pool_live.get(ptr)
+        if rec is None:
+            return
+        size, owner, stamp = rec
+        if token is not None and owner != token:
+            return
+        # 块真的还回去才丢拆分缓存。过期析构（token 对不上）不能清掉新主人的缓存。
+        self._split_forget_ptr(ptr)
+        del self._pool_live[ptr]
+        self._pool_live_bytes -= int(size)
+        if self._pool_live_bytes < 0:
+            self._pool_live_bytes = 0
+        if self.cu is None:
+            return
+        if self._pool_cached_bytes + int(size) > self._pool_cap:
+            self._pool_trim_to(self._pool_cap)
+        if self._lfast is None:
+            self._lfast = _launch_fast_enabled()
+        if self._lfast:
+            # 快路径：默认流上「复用排在使用之后」由流顺序保证（见 free() 注释），
+            # 原来每条 release 都记一个从来没被查询过的 event（cuEventRecord 是一次
+            # CUDA API 调用），这里只把裸指针放回链上 —— 三个读取方都支持裸指针节点。
+            chain = self._pool_free.get(size)
+            if chain is None:
+                self._pool_free[size] = [ptr]
+            else:
+                chain.append(ptr)
+            self._pool_cached_bytes += int(size)
+            self._pool_note()
+            return
+        ev = self._pool_ev_acquire()
+        if self.ctx is not None:
+            self.cu.cuCtxSetCurrent(self.ctx)
+        self._chk(self.cu.cuEventRecord(ev, self._stream), "cuEventRecord")
+        chain = self._pool_free.get(size)
+        if chain is None:
+            chain = []
+            self._pool_free[size] = chain
+        chain.append((ptr, ev))
+        self._pool_cached_bytes += int(size)
+        self._pool_note()
+
+    def _pool_frozen(self):
+        """捕获中或图还活着时，不能 cuMemFree：图里记的是这些地址。"""
+        return bool(self._capturing or self._graph_exec)
+
+    def _pool_shed_ready(self, force=False):
+        """显存真不够时，每个尺寸只留 2 个已完成的空闲块，其余还给驱动。
+
+        旧逻辑把缓存压到 256 MiB，梯度缓冲区每步都被拆掉。全留着又会超过 13 GiB。
+        热尺寸（32MiB/16MiB）留 2 个就能复用，冷块才释放。
+
+        ★ 2026-11-17 重要改动：**不再从 `free()` 里主动调用**，只在 `_alloc`
+          真的分配失败时以 `force=True` 兜底。
+          原因（实测，1.5B / 24 层 / seq512）：`free()` 一步调用 11573 次，
+          即便有 `& 63` 节流，显存一旦低于 2 GiB 仍有约 180 次/步真正走到 trim，
+          而 trim 对裸指针必须先 `cuCtxSynchronize`（**整设备同步**）+ 逐块 `cuMemFree`。
+          实测这一步把本函数从 0.029 s/步 抬到 0.189 s/步，
+          连带 `_alloc` 从 0.033 抬到 0.201 s/步 —— 正好等于慢步多出的 0.35 s。
+          trim 只是"提前腾地方"的优化，真缺显存时 `_alloc` 的失败路径会兜底，
+          所以去掉主动路径不影响 OOM 的正确性。
+        """
+        if not force:
+            return
+        if self._pool_frozen():
+            return
+        if self.cu is None or getattr(self, "_pool_trimming", False):
+            return
+        # ★ 原来这里是**硬编码 12.2 GiB**：工作集一到 13 GiB 就每步狂 trim
+        #   （实测 1190 次/步），而 trim 对裸指针要先 cuCtxSynchronize（整设备同步）。
+        #   改成看设备**真实空闲显存**：只有真不够（< 2 GiB）才丢缓存。
+        # limit 必须在所有分支都有定义（下面循环里要用）——之前漏了，实测 UnboundLocalError
+        limit = (12 * 1024 + 204) * 1024 * 1024
+        # ★ 节流：free() 每次都会调到这里，而 cuMemGetInfo 是一次驱动调用（约 2000 次/步）。
+        #   每 64 次释放才真查一次；真不够时下面会立刻连续触发，不会漏掉。
+        self._shed_probe = int(getattr(self, "_shed_probe", 0)) + 1
+        if (self._shed_probe & 63) != 0:
+            return
+        free_b = self.free_device_bytes()
+        if free_b is None:
+            if self._pool_live_bytes + self._pool_cached_bytes <= limit:
+                return
+        elif free_b >= (2 << 30):
+            return
+        else:
+            # 真不够了：把阈值压到 0，逼它每个尺寸只留 2 块、其余还给驱动
+            limit = 0
+        self._activate()
+        self._pool_trimming = True
+        synced = False
+        try:
+            freed = False
+            for size in sorted(list(self._pool_free.keys()), reverse=True):
+                chain = self._pool_free.get(size) or []
+                keep = []
+                for item in chain:
+                    # 释放记录有两种形态：旧的是 (ptr, event)，launch 快路径改成裸指针。
+                    # 以前这里只认元组，一旦语料大到触发裁剪就会 TypeError 崩掉（已实测）。
+                    if isinstance(item, tuple):
+                        ptr, ev = item
+                    else:
+                        ptr, ev = int(item), None
+                    over = self._pool_live_bytes + self._pool_cached_bytes > limit
+                    done = True if ev is None else (int(self.cu.cuEventQuery(ev)) == 0)
+                    if over and done and len(keep) >= 2:
+                        if ev is not None:
+                            self.cu.cuEventDestroy(ev)
+                        elif not synced:
+                            # 裸指针没有事件可查：释放前整上下文同步一次，
+                            # 保证 GPU 真的不再用这块内存（裁剪是低频路径，同步可接受）。
+                            self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize")
+                            synced = True
+                        self.cu.cuMemFree(ctypes.c_uint64(int(ptr)))
+                        self._pool_cached_bytes -= int(size)
+                        self._pool_trims += 1
+                        freed = True
+                    else:
+                        keep.append(item)
+                if keep:
+                    self._pool_free[size] = keep
+                else:
+                    self._pool_free.pop(size, None)
+                if self._pool_live_bytes + self._pool_cached_bytes <= limit:
+                    break
+            if freed:
+                self._pool_note()
+        finally:
+            self._pool_trimming = False
+
+    def _pool_trim_to(self, limit, sync=True):
+        """从最小的空闲块开始真正释放，直到缓存不超过 limit。sync 时先等默认流。"""
+        if self._pool_frozen():
+            return
+        limit = int(limit)
+        if limit < 0:
+            limit = 0
+        if self._pool_trimming or self.cu is None:
+            return
+        if self._pool_cached_bytes <= limit:
+            return
+        self._pool_trimming = True
+        try:
+            self._pool_trims += 1
+            self._activate()
+            if sync:
+                query = getattr(self.cu, "cuStreamQuery", None)
+                if query is not None and query(ctypes.c_void_p(0)) == 0:
+                    sync = False
+            if sync:
+                self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize(pool)")
+            for size in sorted(self._pool_free):
+                chain = self._pool_free[size]
+                while chain and self._pool_cached_bytes > limit:
+                    node = chain.pop()
+                    if isinstance(node, tuple):
+                        ptr, ev = node
+                        self.cu.cuEventDestroy(ev)
+                    else:
+                        ptr = node
+                    self._chk(self.cu.cuMemFree(ctypes.c_uint64(int(ptr))), "cuMemFree(pool)")
+                    self._pool_cached_bytes -= size
+                if not chain:
+                    del self._pool_free[size]
+                if self._pool_cached_bytes <= limit:
+                    break
+            if self._pool_cached_bytes < 0:
+                self._pool_cached_bytes = 0
+        finally:
+            self._pool_trimming = False
+
+    def _pool_trim(self):
+        self._pool_trim_to(self._pool_cap)
+
+    def _pool_shrink_idle(self):
+        """调用方已经同步过默认流。每个尺寸只留少量空闲块。"""
+        if self.cu is None or self._pool_trimming or not self._pool_free:
+            return
+        self._pool_trimming = True
+        try:
+            self._pool_trims += 1
+            if self.ctx is not None:
+                self.cu.cuCtxSetCurrent(self.ctx)
+            for size, chain in list(self._pool_free.items()):
+                keep_n = 2 if size >= (1 << 20) else 8
+                while len(chain) > keep_n:
+                    ptr = chain.pop(0)
+                    self._chk(self.cu.cuMemFree(ctypes.c_uint64(int(ptr))), "cuMemFree(shrink)")
+                    self._pool_cached_bytes -= size
+                if not chain:
+                    del self._pool_free[size]
+            if self._pool_cached_bytes < 0:
+                self._pool_cached_bytes = 0
+        finally:
+            self._pool_trimming = False
+
+    def _pool_reclaim_idle(self):
+        """默认流空闲时丢掉超过驻留线的小块。忙则直接返回，避免把一步里的核同步掉。"""
+        if self._pool_cached_bytes <= _POOL_IDLE_KEEP or self.cu is None or self._pool_trimming:
+            return
+        query = getattr(self.cu, "cuStreamQuery", None)
+        if query is None:
+            return
+        if query(ctypes.c_void_p(0)) != 0:
+            return
+        self._pool_trim_to(_POOL_IDLE_KEEP, sync=False)
+
+    def device_caps(self):
+        """探测本机 GPU 的精度能力（进程内缓存一次）。
+
+        返回值：
+          `cc`          : (major, minor) 计算能力
+          `fp16_arith`  : 是否支持 fp16 算术/张量核（Volta+，cc >= 7.0）
+          `bf16_arith`  : 是否支持 bf16 算术/张量核（Ampere+，cc >= 8.0）
+          `bf16_store`  : 是否支持 bf16 **存储** —— **任何 GPU 都为真**：
+                          bf16 只是 fp32 的高 16 位（截断/RTP 舍入纯属整数运算，
+                          见本文件 `cast_f32_to_bf16`），不需要任何新硬件指令。
+          `fp16_store`  : 同上，fp16 存储也需要 `cvt` 指令，Volta+ 有；恒为真。
+
+        为什么把「存储」和「算力」分开探测：V100（cc=7.0）没有 bf16 张量核，
+        但把权重/激活/优化器状态**存成 bf16** 再在计算前升到 fp32/fp16，
+        可以拿到同样 2 字节的显存收益，而**指数范围与 fp32 相同、不会下溢**
+        （实测 fp16 存 Adam 的 v 会把 1e-8 压成 0，第 2 步 loss 从 11.7 炸到 135）。
+
+        环境变量用于在旧卡上验证新通路：`TG_FORCE_CC=8.0`、`TG_FORCE_NO_BF16=1`。
+        """
+        caps = getattr(self, "_device_caps", None)
+        if caps is not None:
+            return dict(caps)
+        major = minor = 0
+        try:
+            m, n = ctypes.c_int(), ctypes.c_int()
+            if self.cu.cuDeviceGetAttribute(
+                    ctypes.byref(m), CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    self.dev) == 0:
+                major = int(m.value)
+            if self.cu.cuDeviceGetAttribute(
+                    ctypes.byref(n), CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                    self.dev) == 0:
+                minor = int(n.value)
+        except Exception:
+            major = minor = 0
+        forced = os.environ.get("TG_FORCE_CC", "")
+        if forced:
+            try:
+                a, b = str(forced).split(".")
+                major, minor = int(a), int(b)
+            except Exception:
+                pass
+        cc = major + minor / 10.0
+        bf16_arith = cc >= 8.0
+        if os.environ.get("TG_FORCE_NO_BF16", "") not in ("", "0"):
+            bf16_arith = False
+        caps = {"cc": (major, minor),
+                "fp16_arith": bool(cc >= 7.0),
+                "bf16_arith": bool(bf16_arith),
+                "bf16_store": True,
+                "fp16_store": True}
+        self._device_caps = caps
+        return dict(caps)
+
+    def resolve_precision(self, storage=None, compute=None):
+        """按「用户指定 > 设备能力」给出 `(storage, compute)` 两个 dtype 名。
+
+        存储优先级（用户没说时）：**bf16 > fp32**。
+          bf16 与 fp32 同为 8 位指数 ⇒ 不会下溢；显存只有 fp32 的一半。
+          **永远不默认 fp16 存储** —— Adam 的 v ~1e-8 会在 fp16 里变 0（已实测炸过）。
+        计算优先级（用户没说时）：`bf16_arith ? bf16 : (fp16_arith ? fp16 : fp32)`。
+          V100 上因此是 **bf16 存储 + fp16 计算**；A100/H100 上是 **bf16 + bf16**。
+        """
+        caps = self.device_caps()
+        st = str(storage or "auto").lower()
+        cp = str(compute or "auto").lower()
+        if st in ("", "auto", "none"):
+            st = "bf16" if caps["bf16_store"] else "fp32"
+        if st not in ("bf16", "fp16", "fp32"):
+            raise ValueError("storage dtype 只能是 auto/bf16/fp16/fp32，收到 %r" % (storage,)
+                             + "。修法：传 storage='auto'（推荐，会挑 bf16）或 'bf16'/'fp32'；"
+                               "fp16 存储会让 Adam 的二阶动量 v（~1e-8）下溢成 0")
+        if st == "bf16" and not caps["bf16_store"]:
+            st = "fp32"
+        if cp in ("", "auto", "none"):
+            cp = "bf16" if caps["bf16_arith"] else ("fp16" if caps["fp16_arith"] else "fp32")
+        if cp not in ("bf16", "fp16", "fp32"):
+            raise ValueError("compute dtype 只能是 auto/bf16/fp16/fp32，收到 %r" % (compute,)
+                             + "。修法：传 compute='auto'（按显卡能力挑最快）或显式 "
+                               "'bf16'（需 cc>=8.0）/'fp16'/'fp32'")
+        if cp == "bf16" and not caps["bf16_arith"]:
+            # 没有 bf16 算力就退到 fp16（有张量核）或 fp32
+            cp = "fp16" if caps["fp16_arith"] else "fp32"
+        return {"storage": st, "compute": cp, "caps": caps,
+                "storage_bytes": 2 if st in ("bf16", "fp16") else 4,
+                "compute_supported": (cp != "bf16" or caps["bf16_arith"])}
+
+    def _device_total_bytes(self):
+        """设备总显存（**只查一次**并缓存）。
+
+        `cuMemGetInfo` 实测约 77 µs/次，属于驱动调用，绝不能放在分配热路径上。
+        返回 0 表示查不到（调用方按"未知"处理，保持保守行为）。
+        """
+        tot = getattr(self, "_dev_total_bytes", None)
+        if tot is not None:
+            return int(tot)
+        info = (getattr(self.cu, "cuMemGetInfo_v2", None)
+                or getattr(self.cu, "cuMemGetInfo", None))
+        val = 0
+        if info is not None:
+            try:
+                free_b, total_b = ctypes.c_size_t(), ctypes.c_size_t()
+                if info(ctypes.byref(free_b), ctypes.byref(total_b)) == 0:
+                    val = int(total_b.value)
+            except Exception:
+                val = 0
+        # ★ 2026-11-19：**不要把 0 缓存下来**。首次调用可能发生在 CUDA 上下文就绪之前，
+        #   cuMemGetInfo 失败返回 0，一旦缓存就永远是 0（V100 上实测到 0.0 就是这么来的），
+        #   按显存自适应的池上限因此变成空操作。失败就下次再问。
+        if val > 0:
+            self._dev_total_bytes = val
+        return val
+
+    def free_device_bytes(self):
+        """设备当前可用字节；查不到返回 None。"""
+        info = getattr(self.cu, "cuMemGetInfo_v2", None) or getattr(self.cu, "cuMemGetInfo", None)
+        if info is None:
+            return None
+        try:
+            free_b, _total = ctypes.c_size_t(), ctypes.c_size_t()
+            if info(ctypes.byref(free_b), ctypes.byref(_total)) == 0:
+                return int(free_b.value)
+        except Exception:
+            return None
+        return None
+
+    def reserve_capture_arena(self, nbytes):
+        """捕获前预留一块显存，供 `_capturing` 期间 bump 分配（不调 cuMemAlloc）。
+
+        多图支持：若已有一块 arena，则把它**压栈保留**（不释放）再申请新的，
+        这样每张图都有独立的中间缓冲 —— 否则后捕获的图会覆盖先捕获图的缓冲
+        （实测：两张图共用 arena 时重放梯度差 1.4e+00）。
+        """
+        nbytes = int(nbytes)
+        if nbytes <= 0:
+            return
+        if self._arena_base:
+            stack = getattr(self, "_arena_stack", None)
+            if stack is None:
+                stack = []
+                self._arena_stack = stack
+            stack.append((self._arena_base, self._arena_size))
+            self._arena_base = 0
+            self._arena_size = 0
+            self._arena_off = 0
+        self._activate()
+        raw = ctypes.c_uint64()
+        rc = self.cu.cuMemAlloc(ctypes.byref(raw), ctypes.c_size_t(nbytes))
+        if rc != 0 or not raw.value:
+            raise CudaError(
+                "预留捕获 arena 失败：申请 %.2f GiB（rc=%d）。修法：减小 arena，"
+                "或先 empty_cache() 再试" % (nbytes / float(1 << 30), rc))
+        self._arena_base = int(raw.value)
+        self._arena_size = nbytes
+        self._arena_off = 0
+
+    def _in_arena(self, ptr):
+        """指针是否落在（当前或历史）捕获 arena 内。arena 内存不走池，free 时必须跳过。"""
+        p = int(ptr or 0)
+        if not p:
+            return False
+        b = int(getattr(self, "_arena_base", 0) or 0)
+        sz = int(getattr(self, "_arena_size", 0) or 0)
+        if b and b <= p < b + sz:
+            return True
+        for item in getattr(self, "_arena_stack", None) or []:
+            if isinstance(item, (tuple, list)):
+                ob, osz = int(item[0]), int(item[1] if len(item) > 1 else 0)
+            else:
+                ob, osz = int(item), 0
+            if ob and ob <= p < ob + osz:
+                return True
+        return False
+
+    def _arena_alloc(self, nbytes):
+        """从 arena 切一块（16B 对齐）。不够就抛错并说明差多少。"""
+        if not self._arena_base:
+            return 0
+        n = (int(nbytes) + 15) & ~15
+        if self._arena_off + n > self._arena_size:
+            raise CudaError(
+                "捕获 arena 用尽：已用 %.2f / %.2f GiB，本次要 %d 字节。"
+                "修法：调大 reserve_capture_arena 的字节数"
+                % (self._arena_off / float(1 << 30), self._arena_size / float(1 << 30), n))
+        ptr = self._arena_base + self._arena_off
+        self._arena_off += n
+        return ptr
+
+    def release_capture_arena(self):
+        """归还 arena（图销毁后调用；arena 里的地址此时已不再被引用）。
+
+        多图支持：一并释放压栈保留的历史 arena。
+        """
+        stack = getattr(self, "_arena_stack", None) or []
+        self._arena_stack = []
+        base = int(getattr(self, "_arena_base", 0) or 0)
+        self._arena_base = 0
+        self._arena_size = 0
+        self._arena_off = 0
+        for item in stack:
+            old = int(item[0]) if isinstance(item, (tuple, list)) else int(item)
+            if old and self.cu is not None:
+                try:
+                    self.cu.cuMemFree(ctypes.c_uint64(old))
+                except Exception:
+                    pass
+        if base and self.cu is not None:
+            try:
+                self.cu.cuMemFree(ctypes.c_uint64(base))
+            except Exception:
+                pass
+
+    def _alloc(self, nbytes):
+        nbytes = int(nbytes)
+        # ★ 2026-11-19：池上限自适应必须在**上下文就绪之后**做（构造期查不到设备总量）。
+        #   首次分配是最早能保证就绪的点；失败不抛、下次再试。
+        if not getattr(self, "_pool_cap_adapted", False):
+            try:
+                self._adapt_pool_cap()
+            except Exception:                    # noqa: BLE001 - 自适应失败不能影响分配
+                pass
+        if nbytes <= 0:
+            raise CudaError("cuMemAlloc 拒绝 0 字节" + "。修法：调小 batch/seq，或开梯度检查点（cfg[GRAD_CKPT]=True）；也可设 TG_POOL_GB 限制池上限")
+        bucket = self._bucket.get(nbytes)
+        if bucket is None:
+            bucket = _pool_bucket(nbytes)
+            if bucket < nbytes:
+                raise CudaError("内部分桶 %d 小于请求 %d" % (bucket, nbytes) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            self._bucket[nbytes] = bucket
+        # 捕获期：**只从 arena 分配**，绝不碰池。
+        # 理由（实测）：图节点会引用分配到的缓冲；若来自池，后续捕获/复用/empty_cache 会让
+        # 前一张图的缓冲被改写或释放，表现为"第二张图重放结果不对"或 rc=700 非法访存。
+        if getattr(self, "_capturing", False) and getattr(self, "_arena_base", 0):
+            ap = self._arena_alloc(bucket)
+            if ap:
+                return ap
+        ptr = self._pool_take(bucket)
+        if not ptr and not getattr(self, "_alloc_retry", False) and not self._capturing:
+            # ★ 这里原来的判据是**硬编码 12.2 GiB**：一旦 live+cached 超过它就
+            #   cuCtxSynchronize() + 释放缓存。工作集本来就 13 GiB 左右，于是**每次未命中
+            #   都整设备同步一次**（实测 1190 次/步，1.1 s 里很大一块）。
+            #   改成看**设备真实空闲显存**：真不够（< 本次申请 + 1 GiB 余量）才同步回收。
+            #   正常情况直接 cuMemAlloc；失败路径下面仍有 empty_cache + 重试兜底。
+            need = int(bucket) + (1 << 30)
+            # ★ 2026-11-17 性能修复：只在**接近显存上限**时才问驱动。
+            #   `free_device_bytes()` 是一次 `cuMemGetInfo`，实测约 77 µs/次。
+            #   1.5B 训练一步池未命中约 500 次 ⇒ 光这一项就白烧约 38 ms CPU
+            #   （cProfile：free_device_bytes 496 次 / 0.038 s）。
+            #   而它只在"要不要同步+回收集群"这个决策里用到，显存宽裕时毫无意义。
+            #   做不到判断时（总量未知）保持原行为，绝不牺牲 OOM 兜底。
+            tot = self._device_total_bytes()
+            _occupied = int(self._pool_live_bytes + self._pool_cached_bytes)
+            _near = (tot <= 0) or (_occupied + int(bucket) > int(tot * 0.88))
+            free_b = self.free_device_bytes() if _near else None
+            if free_b is not None and free_b < need and self._pool_cached_bytes:
+                self._alloc_retry = True
+                try:
+                    self._activate()
+                    self._chk(self.cu.cuCtxSynchronize(), "cuCtxSynchronize(alloc-low)")
+                    # 这里是**分配失败**的兜底路径（且上面已整设备同步过），
+                    # 所以显式要求 trim。主动 trim 已从 free() 移除，见 _pool_shed_ready 文档。
+                    self._pool_shed_ready(force=True)
+                    ptr = self._pool_take(bucket)
+                finally:
+                    self._alloc_retry = False
+        got = bucket
+        if ptr:
+            if ptr in self._pool_live:
+                self._pool_free.setdefault(got, []).append(ptr)
+                self._pool_cached_bytes += int(got)
+                raise CudaError("空闲链上的块仍被活张量占用: 0x%x" % int(ptr) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            self._pool_hits += 1
+            self._pool_checkout(ptr, got)
+            return ptr
+        if self._capturing:
+            # 捕获期不允许 cuMemAlloc：先从预留 arena 切，切不出来才报错（说清差多少）
+            aptr = self._arena_alloc(bucket)
+            if aptr:
+                got = bucket
+                self._pool_checkout(aptr, got)
+                self._arena_ptrs = getattr(self, "_arena_ptrs", 0) + 1
+                return aptr
+            raise CudaError(
+                "CUDA Graph 捕获中内存池未命中 %d 字节，且没有预留 arena。"
+                "修法：捕获前调用 rt.reserve_capture_arena(<字节数>)"
+                % int(bucket))
+        # 只有真正要向驱动要内存时才需要设上下文；池命中那条路一个 CUDA API 都不调。
+        self._activate()
+        raw = ctypes.c_uint64()
+        rc = self.cu.cuMemAlloc(ctypes.byref(raw), ctypes.c_size_t(bucket))
+        if rc != 0 and self._pool_free:
+            # 池里是别的尺寸。先还给驱动再试一次，避免「缓存着不用的块」把活张量挤到 OOM。
+            self.empty_cache()
+            raw = ctypes.c_uint64()
+            rc = self.cu.cuMemAlloc(ctypes.byref(raw), ctypes.c_size_t(bucket))
+        if rc != 0:
+            self._raise_alloc_failed(int(bucket), int(rc))
+        if not raw.value:
+            raise CudaError("cuMemAlloc 返回空指针" + "。修法：调小 batch/seq，或开梯度检查点（cfg[GRAD_CKPT]=True）；也可设 TG_POOL_GB 限制池上限")
+
+        ptr = int(raw.value)
+        self._pool_misses += 1
+        self._pool_miss_hist[bucket] = self._pool_miss_hist.get(bucket, 0) + 1
+        self._pool_checkout(ptr, bucket)
+        return ptr
+
+    def _raise_alloc_failed(self, want_bytes, rc):
+        """显存不足时说清楚：要多少、现在用了多少、池里囤了多少、怎么办。
+
+        以前只有一行 `cuMemAlloc 失败 rc=2 out of memory`，用户完全不知道
+        是自己 batch 太大、还是别的进程占卡、还是池缓存挤占。
+        """
+        gib = float(want_bytes) / (1 << 30)
+        live = float(getattr(self, "_pool_live_bytes", 0)) / (1 << 30)
+        cached = float(getattr(self, "_pool_cached_bytes", 0)) / (1 << 30)
+        msg = ("显存不足：本次申请 %.2f GiB；当前活张量 %.2f GiB、池缓存 %.2f GiB"
+               % (gib, live, cached))
+        info = getattr(self.cu, "cuMemGetInfo_v2", None) or getattr(self.cu, "cuMemGetInfo", None)
+        if info is not None:
+            try:
+                free_b, total_b = ctypes.c_size_t(), ctypes.c_size_t()
+                if info(ctypes.byref(free_b), ctypes.byref(total_b)) == 0:
+                    msg += "；设备总共 %.2f GiB、当前可用 %.2f GiB" % (
+                        total_b.value / float(1 << 30), free_b.value / float(1 << 30))
+            except Exception:
+                pass
+        msg += ("（rc=%d）\n"
+                "  怎么办：\n"
+                "   1) 调小 --batch —— 显存只与 batch 有关，与语料大小无关；\n"
+                "   2) 调小 CFG 里的 MAXLEN(S) 或层数 L；\n"
+                "   3) 关掉 TG_CUDA_GRAPH（图捕获会额外占一份显存）；\n"
+                "   4) 用 nvidia-smi 确认没有别的进程占卡；\n"
+                "   5) 若是池缓存挤占，调大池上限或调用 empty_cache()。" % int(rc))
+        raise CudaError(msg)
+
+    def empty(self, shape, dtype=np.float32):
+        shape = tuple(shape)
+        # _alloc 的池命中路径不再设上下文，这里少一次 np.dtype() 归一化
+        dt = _F32 if dtype is np.float32 else np.dtype(dtype)
+        n = 1
+        for s in shape:
+            n *= int(s)
+        # cuMemAlloc(0) 会返回 INVALID_VALUE，空张量也留 1 个元素的垫片，n 仍记 0。
+        nbytes = max(n, 1) * int(dt.itemsize)
+        ptr = self._alloc(nbytes)
+        return GpuBuf(self, ptr, nbytes, shape, n, dt)
+
+    def _memset32(self, buf, word):
+        """按 32 位字填充。走默认流的异步 memset，不把前面的 kernel 同步回来。"""
+        self._split_forget_ptr(buf)
+        n = int(buf.n)
+        if n <= 0:
+            return
+        self._mark_submitted(buf.ptr)
+        self._activate()
+        self._chk(self.cu.cuMemsetD32Async(
+            ctypes.c_uint64(buf.ptr),
+            ctypes.c_uint(int(word) & 0xFFFFFFFF),
+            ctypes.c_size_t(n),
+            self._stream), "cuMemsetD32Async")
+
+    def h2d(self, arr, dtype=np.float32, cache_slot=None):
+        """异步 H2D。cache_slot 命中时复用上一份设备缓冲，避免每步重传小索引。"""
+        src = np.ascontiguousarray(np.asarray(arr), dtype=dtype)
+        if cache_slot:
+            key = (src.shape, src.dtype.str, src.tobytes())
+            hit = self._h2d_cache.get(cache_slot)
+            if hit is not None and hit[0] == key:
+                return hit[1]
+        buf = self.empty(src.shape, dtype=dtype)
+        if src.nbytes:
+            # 调用方的数组可能马上被改掉，异步拷贝必须抓住自己的一份。
+            hold = np.array(src, copy=True, order="C")
+            self._mark_submitted(buf.ptr)
+            self._activate()
+            self._chk(self.cu.cuMemcpyHtoDAsync(
+                ctypes.c_uint64(buf.ptr),
+                hold.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_size_t(int(hold.nbytes)),
+                self._stream), "cuMemcpyHtoDAsync")
+            buf.host_hold = hold
+            if self._capturing:
+                # 图重放还会读这块主机内存（mask 这类每步新建的上传）。
+                self._graph_host_keeps.append(hold)
+        if buf.n == 1 and np.issubdtype(buf.dtype, np.floating):
+            buf.known_scalar = float(src.reshape(-1)[0])
+        if cache_slot:
+            self._h2d_cache[cache_slot] = ((src.shape, src.dtype.str, src.tobytes()), buf)
+        return buf
+
+    def copy_h2d_into(self, buf, arr):
+        """把 host 数据**原地**写进已有的设备缓冲（不新分配）。
+
+        ## 为什么需要
+
+        `h2d()` 每次都 `empty()` 一块新显存。参数广播、权重复原这类"把值写回已有张量"的
+        操作若走 `h2d()`，旧缓冲就没人释放 —— 275 MB 的模型广播一次就漏 275 MB/卡。
+        这里直接用 `cuMemcpyHtoDAsync` 写进 `buf.ptr`。
+
+        要求 **nbytes 完全一致**（形状由调用方校验）：长度不同时不会自动 realloc，
+        因为那会让持有 `buf` 的其它组件（优化器、KV cache）拿到悬空引用。
+        """
+        src = np.ascontiguousarray(np.asarray(arr), dtype=buf.dtype)
+        if int(src.nbytes) != int(buf.nbytes):
+            raise ValueError(
+                "copy_h2d_into 长度不符：目标 %d 字节，源 %d 字节。"
+                "修法：形状不同的张量要重建缓冲（先 self.empty 再拷），不要原地写"
+                % (int(buf.nbytes), int(src.nbytes)))
+        if src.nbytes:
+            # 异步拷贝必须抓住自己的一份 —— 调用方的数组随时可能被改写
+            hold = np.array(src, copy=True, order="C")
+            self._mark_submitted(buf.ptr)
+            self._activate()
+            self._chk(self.cu.cuMemcpyHtoDAsync(
+                ctypes.c_uint64(buf.ptr),
+                hold.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_size_t(int(hold.nbytes)),
+                self._stream), "cuMemcpyHtoDAsync")
+            buf.host_hold = hold
+            if self._capturing:
+                self._graph_host_keeps.append(hold)
+        if buf.n == 1 and np.issubdtype(buf.dtype, np.floating):
+            buf.known_scalar = float(src.reshape(-1)[0])
+        return buf
+
+    def d2h(self, buf):
+        """只同步计算流。拷贝排在这条流已有工作之后，不再先 cuCtxSynchronize 整颗设备。"""
+        if self._capturing:
+            self._graph_poison = "捕获中发生 D2H（%s 字节）" % (int(buf.nbytes),)
+        self._activate()
+        out = np.empty(buf.shape, dtype=buf.dtype)
+        if buf.n:
+            self._chk(self.cu.cuMemcpyDtoHAsync(
+                out.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_uint64(buf.ptr),
+                ctypes.c_size_t(int(out.nbytes)),
+                self._stream), "cuMemcpyDtoHAsync")
+            self._chk(self.cu.cuStreamSynchronize(self._stream), "cuStreamSynchronize")
+            self._done_stamp = self._submit_stamp
+        return out
+
+    def clone(self, buf):
+        out = self.empty(buf.shape, dtype=buf.dtype)
+        if buf.n:
+            self._activate()
+            self._mark_submitted(buf.ptr)
+            self._mark_submitted(out.ptr)
+            nbytes = ctypes.c_size_t(int(buf.n) * int(buf.dtype.itemsize))
+            if self._stream_ready:
+                # 同步 D2D 会打断捕获。图模式改走同一条非默认流上的异步拷贝，
+                # 顺序和原来的默认流一样。开关关闭时仍走下面的同步拷贝。
+                self._bind_dto_async()
+                self._chk(self.cu.cuMemcpyDtoDAsync(
+                    ctypes.c_uint64(out.ptr),
+                    ctypes.c_uint64(buf.ptr),
+                    nbytes, self._stream), "cuMemcpyDtoDAsync")
+            else:
+                self._chk(self.cu.cuMemcpyDtoD(
+                    ctypes.c_uint64(out.ptr),
+                    ctypes.c_uint64(buf.ptr),
+                    nbytes), "cuMemcpyDtoD")
+        out.known_scalar = buf.known_scalar
+        return out
+
+    def full(self, shape, value, dtype=np.float32):
+        dt = np.dtype(dtype)
+        if dt.itemsize != 4:
+            return self.h2d(np.full(tuple(shape), value, dtype=dt), dtype=dt)
+        buf = self.empty(shape, dtype=dt)
+        if buf.n:
+            word = int(np.array([value], dtype=dt).view(np.uint32)[0])
+            self._memset32(buf, word)
+        if buf.n == 1 and np.issubdtype(dt, np.floating):
+            buf.known_scalar = float(np.asarray(value, dtype=np.float32))
+        return buf
+
+    def read_scalar(self, buf):
+        if int(buf.n) != 1:
+            raise CudaError("期望标量梯度，收到 shape=%s" % (buf.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if buf.known_scalar is not None:
+            return float(buf.known_scalar)
+        if self._capturing:
+            self._graph_poison = "捕获中 read_scalar 需要 D2H"
+        return float(np.asarray(self.d2h(buf), dtype=np.float64).reshape(-1)[0])
+
+    def _fn(self, name):
+        fn = self._fns.get(name)
+        if fn is not None:
+            return fn
+        out = ctypes.c_void_p()
+        self._chk(self.cu.cuModuleGetFunction(ctypes.byref(out), self.mod, name.encode("ascii")),
+                  "cuModuleGetFunction(%s)" % name)
+        self._fns[name] = out
+        return out
+
+    def _fn_module(self, module, name):
+        fn = self._attn_fns.get(name)
+        if fn is not None:
+            return fn
+        out = ctypes.c_void_p()
+        self._chk(self.cu.cuModuleGetFunction(ctypes.byref(out), module, name.encode("ascii")),
+                  "cuModuleGetFunction(%s)" % name)
+        self._attn_fns[name] = out
+        return out
+
+    def launch(self, name, grid, block, args, shared=0, module=None):
+        self._activate()
+        if self._capturing and name == "adamw_update" and module is None:
+            self._note_adamw(grid, block, shared, args)
+        fn = self._fn(name) if module is None else self._fn_module(module, name)
+        if self._capturing:
+            # 捕获时不复用参数模板。每个节点一份自己的 ctypes，留到 graph_end。
+            # 否则下一次发射会改掉上一节点还指着的那块主机内存。
+            holders = []
+            ptrs = (ctypes.c_void_p * len(args))()
+            for i, (val, typ) in enumerate(args):
+                obj = val if isinstance(val, ctypes._SimpleCData) else typ(val)
+                holders.append(obj)
+                ptrs[i] = ctypes.cast(ctypes.byref(obj), ctypes.c_void_p)
+            self._graph_host_keeps.append(holders)
+            self._kernel_count += 1
+            rc = self.cu.cuLaunchKernel(
+                fn,
+                int(grid[0]), int(grid[1]), int(grid[2]),
+                int(block[0]), int(block[1]), int(block[2]),
+                int(shared), self._stream, ptrs, None)
+            if rc != 0:
+                self._chk(rc, "cuLaunchKernel(%s)" % name)
+            return holders
+        if self._lfast is None:
+            self._lfast = _launch_fast_enabled()
+        if self._lfast:
+            # 快路径：参数模板按 (kernel 名, 参数类型序列) 缓存，每次只改数值。
+            try:
+                key = (name, tuple(t[1] for t in args))
+                tmpl = self._ltmpl.get(key)
+                if tmpl is None:
+                    tmpl = self._make_tmpl(args)
+                    self._ltmpl[key] = tmpl
+                holders, ptrs = tmpl
+                for i, item in enumerate(args):
+                    holders[i].value = item[0]
+            except Exception:
+                # 模板化出问题（类型不对、参数个数变了……）就永久退回老路径，
+                # 这里还没提交任何 kernel，重做一遍不会重复发射。
+                self._lfast = False
+            else:
+                self._kernel_count += 1
+                rc = self.cu.cuLaunchKernel(
+                    fn, grid[0], grid[1], grid[2], block[0], block[1], block[2],
+                    shared, self._stream, ptrs, None)
+                if rc != 0:
+                    self._chk(rc, "cuLaunchKernel(%s)" % name)
+                return holders
+        holders = []
+        ptrs = (ctypes.c_void_p * len(args))()
+        for i, (val, typ) in enumerate(args):
+            obj = val if isinstance(val, ctypes._SimpleCData) else typ(val)
+            holders.append(obj)
+            ptrs[i] = ctypes.cast(ctypes.byref(obj), ctypes.c_void_p)
+        self._kernel_count += 1
+        rc = self.cu.cuLaunchKernel(
+            fn,
+            int(grid[0]), int(grid[1]), int(grid[2]),
+            int(block[0]), int(block[1]), int(block[2]),
+            int(shared), self._stream, ptrs, None)
+        if rc != 0:
+            self._chk(rc, "cuLaunchKernel(%s)" % name)
+        return holders
+
+    @staticmethod
+    def _make_tmpl(args):
+        """建一次参数模板：(holders, ptrs)。holders 是持久的 ctypes 对象，
+        调用时只写 .value；ptrs 指向这同一个对象的地址，不用每次 byref/cast。"""
+        holders = []
+        ptrs = (ctypes.c_void_p * len(args))()
+        for i, (val, typ) in enumerate(args):
+            obj = val if isinstance(val, ctypes._SimpleCData) else typ(val)
+            holders.append(obj)
+            ptrs[i] = ctypes.cast(ctypes.byref(obj), ctypes.c_void_p)
+        return holders, ptrs
+
+    def _ewise_grid(self, n):
+        block = 256
+        grid = (int(n) + block - 1) // block
+        if grid < 1:
+            grid = 1
+        return (grid, 1, 1), (block, 1, 1)
+
+    # ---- M7：逐元素 float4 向量化 -------------------------------------------
+    def _vec4_grid(self, n4):
+        """n4 = 元素数/4（float4 个数）。和 _ewise_grid 同一套算grid/block的方式。"""
+        block = 256
+        grid = (int(n4) + block - 1) // block
+        if grid < 1:
+            grid = 1
+        return (grid, 1, 1), (block, 1, 1)
+
+    @staticmethod
+    def _vec4_ok(n, *bufs):
+        """能不能走 float4：n%4==0、每个指针 16B 对齐、且没被 TG_NO_VEC4 关掉。
+
+        对齐只在这里判断（主机侧），内核里不再判断。不满足就退回原标量内核，
+        非对齐场景的执行路径和向量化之前完全一样。
+        """
+        if (int(n) & 3) or not _vec4_enabled():
+            return False
+        for buf in bufs:
+            if int(buf.ptr) & 15:
+                return False
+        return True
+
+    @staticmethod
+    def _bcast4_vec_ok(n, c, sa, sb):
+        """广播加走 float4 的额外条件：末维 4 对齐，且每个源的末维步长只取 0 或 1。
+
+        末维步长 1 时更外层步长必须是 4 的倍数，这样 a+ia / b+ib 才是 16B 对齐的
+        连续 4 个 float —— 否则内核里的 float4 读会落到非对齐地址，只能退回标量。
+        """
+        if (int(n) & 3) or (c[3] & 3):
+            return False
+        for st in (sa, sb):
+            if st[3] == 1:
+                if (st[0] | st[1] | st[2]) & 3:
+                    return False
+            elif st[3] != 0:
+                return False
+        return True
+
+    def _mark_submitted(self, ptr):
+        return
+
+    def _ptr(self, buf):
+        self._mark_submitted(buf.ptr)
+        return (int(buf.ptr), ctypes.c_uint64)
+
+    def transpose2d(self, buf):
+        if len(buf.shape) != 2:
+            raise CudaError("transpose2d 只支持 2D，收到 %s" % (buf.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        rows, cols = int(buf.shape[0]), int(buf.shape[1])
+        out = self.empty((cols, rows), dtype=np.float32)
+        n = rows * cols
+        if n:
+            # ★ 2026-11-19：分块版（transpose2d_tiled）在**大形状**上实测快 4.19×
+            #   （2048×1024：168.3 → 704.5 GB/s，逐位一致），但端到端 seq2048 反而
+            #   **慢 12%**（0.690 → 0.772 s）—— 因为模型里的转置多数是小矩阵
+            #   （16×512、4×1024 之类），32×32 分块对它们占用率更差、launch 更多。
+            #   所以默认仍走朴素内核；分块版保留，等加上"按尺寸选择"的阈值后再启用。
+            #   TODO(性能)：rows*cols >= 阈值（待测）时切 transpose2d_tiled。
+            grid, block = self._ewise_grid(n)
+            self.launch("transpose2d", grid, block, [
+                self._ptr(buf), self._ptr(out),
+                (rows, ctypes.c_int), (cols, ctypes.c_int),
+            ])
+        return out
+
+    def add(self, a, b):
+        if tuple(a.shape) == tuple(b.shape):
+            out = self.empty(a.shape, dtype=np.float32)
+            n = int(a.n)
+            if n:
+                if self._vec4_ok(n, a, b, out):
+                    grid, block = self._vec4_grid(n >> 2)
+                    self.launch("ewise_add_v4", grid, block, [
+                        self._ptr(a), self._ptr(b), self._ptr(out),
+                        (n >> 2, ctypes.c_int),
+                    ])
+                else:
+                    grid, block = self._ewise_grid(n)
+                    self.launch("ewise_add", grid, block, [
+                        self._ptr(a), self._ptr(b), self._ptr(out),
+                        (n, ctypes.c_int),
+                    ])
+            return out
+        return self.add_broadcast(a, b)
+
+    def _broadcast_shapes(self, sa, sb):
+        sa = tuple(int(s) for s in sa)
+        sb = tuple(int(s) for s in sb)
+        ndim = max(len(sa), len(sb), 1)
+        if ndim > 4:
+            raise CudaError("broadcast 最高 4 维，收到 %s 和 %s" % (sa, sb) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        pa = (1,) * (ndim - len(sa)) + sa
+        pb = (1,) * (ndim - len(sb)) + sb
+        out = []
+        for x, y in zip(pa, pb):
+            if x == y:
+                out.append(x)
+            elif x == 1:
+                out.append(y)
+            elif y == 1:
+                out.append(x)
+            else:
+                raise CudaError("形状不能广播: %s vs %s" % (sa, sb) + HINT_BCAST + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        return tuple(out), pa, pb
+
+    def _pad4(self, shape):
+        shape = tuple(int(s) for s in shape)
+        if len(shape) > 4:
+            raise CudaError("内部 rank %d > 4" % len(shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        return (1,) * (4 - len(shape)) + shape
+
+    def _strides4(self, padded):
+        """长度为 1 的维步长记 0，这样广播维不会读出源缓冲。"""
+        st = [0, 0, 0, 0]
+        stride = 1
+        for i in range(3, -1, -1):
+            st[i] = 0 if padded[i] == 1 else stride
+            stride *= int(padded[i])
+        return st
+
+    def add_broadcast(self, a, b):
+        out_shape, pa, pb = self._broadcast_shapes(a.shape, b.shape)
+        out = self.empty(out_shape, dtype=np.float32)
+        n = int(out.n)
+        if n == 0:
+            return out
+        if n > 2147483647:
+            raise CudaError("broadcast add 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        c = self._pad4(out_shape)
+        sa = self._strides4(self._pad4(pa))
+        sb = self._strides4(self._pad4(pb))
+        if self._bcast4_vec_ok(n, c, sa, sb) and self._vec4_ok(n, a, b, out):
+            grid, block = self._vec4_grid(n >> 2)
+            self.launch("bcast_add4_v4", grid, block, [
+                self._ptr(a), self._ptr(b), self._ptr(out),
+                (n >> 2, ctypes.c_int),
+                (c[0], ctypes.c_int), (c[1], ctypes.c_int),
+                (c[2], ctypes.c_int), (c[3], ctypes.c_int),
+                (sa[0], ctypes.c_int), (sa[1], ctypes.c_int),
+                (sa[2], ctypes.c_int), (sa[3], ctypes.c_int),
+                (sb[0], ctypes.c_int), (sb[1], ctypes.c_int),
+                (sb[2], ctypes.c_int), (sb[3], ctypes.c_int),
+            ])
+            return out
+        grid, block = self._ewise_grid(n)
+        self.launch("bcast_add4", grid, block, [
+            self._ptr(a), self._ptr(b), self._ptr(out),
+            (n, ctypes.c_int),
+            (c[0], ctypes.c_int), (c[1], ctypes.c_int),
+            (c[2], ctypes.c_int), (c[3], ctypes.c_int),
+            (sa[0], ctypes.c_int), (sa[1], ctypes.c_int),
+            (sa[2], ctypes.c_int), (sa[3], ctypes.c_int),
+            (sb[0], ctypes.c_int), (sb[1], ctypes.c_int),
+            (sb[2], ctypes.c_int), (sb[3], ctypes.c_int),
+        ])
+        return out
+
+    def _left_pad8(self, values, fill):
+        values = tuple(int(v) for v in values)
+        if len(values) > 8:
+            raise CudaError("rank %d > 8" % len(values) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        return (int(fill),) * (8 - len(values)) + values
+
+    def _row_strides(self, shape):
+        shape = tuple(int(s) for s in shape)
+        raw = [0] * len(shape)
+        stride = 1
+        for i in range(len(shape) - 1, -1, -1):
+            raw[i] = stride
+            stride *= shape[i]
+        return raw
+
+    def sum_axis(self, buf, axis, keepdims=False):
+        """沿一轴求和。keepdims=False 时丢掉这一维。值留在 GPU。"""
+        shape = tuple(int(s) for s in buf.shape)
+        nd = len(shape)
+        if nd == 0:
+            raise CudaError("sum_axis 不能用于标量" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if nd > 8:
+            raise CudaError("sum_axis 最高 8 维，收到 %s" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        axis = int(axis)
+        if axis < 0:
+            axis += nd
+        if axis < 0 or axis >= nd:
+            raise CudaError("sum_axis 轴 %d 越界（ndim=%d）" % (axis, nd) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        extent = int(shape[axis])
+        out_keep = list(shape)
+        out_keep[axis] = 1
+        if extent == 0:
+            out = self.zeros(tuple(out_keep), dtype=np.float32)
+        else:
+            out = self.empty(tuple(out_keep), dtype=np.float32)
+            n_out = int(out.n)
+            if n_out:
+                if nd == 2 and axis == 0 and int(shape[1]) <= 4096:
+                    # 常见情形（bias/embedding 的梯度）：一列一个 block，并行归约
+                    self.launch("sum_axis0_rows", (int(shape[1]), 1, 1), (256, 1, 1), [
+                        self._ptr(buf), self._ptr(out),
+                        (int(shape[0]), ctypes.c_int), (int(shape[1]), ctypes.c_int),
+                    ])
+                else:
+                    shp8 = self._left_pad8(shape, 1)
+                    axis8 = axis + (8 - nd)
+                    grid, block = self._ewise_grid(n_out)
+                    self.launch("sum_axis8", grid, block, [
+                        self._ptr(buf), self._ptr(out),
+                        (n_out, ctypes.c_int), (axis8, ctypes.c_int), (extent, ctypes.c_int),
+                    ] + [(int(s), ctypes.c_int) for s in shp8])
+        if keepdims:
+            return out
+        dropped = shape[:axis] + shape[axis + 1:]
+        return self.reshape(out, dropped)
+
+    def unbroadcast(self, g, shape):
+        """把广播后的梯度加回原形状。规则与主机 _unbroadcast 相同，求和在 GPU 上做。"""
+        shape = tuple(int(s) for s in shape)
+        cur = g
+        if tuple(int(s) for s in cur.shape) == shape:
+            return cur
+        while len(cur.shape) > len(shape):
+            cur = self.sum_axis(cur, 0, keepdims=False)
+        for axis, n in enumerate(shape):
+            if n == 1 and int(cur.shape[axis]) != 1:
+                cur = self.sum_axis(cur, axis, keepdims=True)
+        if tuple(int(s) for s in cur.shape) != shape:
+            cur = self.reshape(cur, shape)
+        return cur
+
+    def broadcast_to(self, buf, shape):
+        """右对齐广播到 shape。已经同形就返回原缓冲。"""
+        shape = tuple(int(s) for s in shape)
+        src = tuple(int(s) for s in buf.shape)
+        if src == shape:
+            return buf
+        if len(shape) > 8 or len(src) > len(shape):
+            raise CudaError("broadcast_to %s -> %s" % (src, shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if any(s < 0 for s in shape):
+            raise CudaError("broadcast_to 目标形状非法 %s" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        ndim = len(shape)
+        aligned = (1,) * (ndim - len(src)) + src
+        for a, b in zip(aligned, shape):
+            if a != b and a != 1:
+                raise CudaError("不能广播 %s -> %s" % (src, shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        raw = self._row_strides(src)
+        strides = []
+        base = ndim - len(src)
+        for i, a in enumerate(aligned):
+            if i < base or a == 1:
+                strides.append(0)
+            else:
+                strides.append(int(raw[i - base]))
+        out = self.empty(shape, dtype=np.float32)
+        n = int(out.n)
+        if n:
+            if n > 2147483647:
+                raise CudaError("broadcast_to 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            grid, block = self._ewise_grid(n)
+            self.launch("broadcast_to8", grid, block, [
+                self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
+            ] + [(int(s), ctypes.c_int) for s in self._left_pad8(shape, 1)]
+              + [(int(s), ctypes.c_int) for s in self._left_pad8(strides, 0)])
+        return out
+
+    def permute(self, buf, axes):
+        """按轴排列。输出是新的连续缓冲。axes 是输入轴的一个排列。"""
+        axes = tuple(int(a) for a in axes)
+        in_shape = tuple(int(s) for s in buf.shape)
+        nd = len(in_shape)
+        if nd > 8:
+            raise CudaError("permute 最高 8 维，收到 %s" % (in_shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if sorted(axes) != list(range(nd)):
+            raise CudaError("permute 不是排列: %s" % (axes,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        out_shape = tuple(in_shape[a] for a in axes)
+        in_stride = self._row_strides(in_shape)
+        src_stride = [int(in_stride[a]) for a in axes]
+        out = self.empty(out_shape, dtype=np.float32)
+        n = int(out.n)
+        if n:
+            if n > 2147483647:
+                raise CudaError("permute 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            last = int(out_shape[-1]) if out_shape else 1
+            if last % 4 == 0 and int(src_stride[-1]) == 1 and n % 4 == 0:
+                shp_v4 = list(self._left_pad8(out_shape, 1))
+                shp_v4[-1] = last // 4
+                n4 = n // 4
+                grid, block = self._ewise_grid(n4)
+                self.launch("permute8_v4", grid, block, [
+                    self._ptr(buf), self._ptr(out), (n4, ctypes.c_int),
+                ] + [(int(t), ctypes.c_int) for t in shp_v4]
+                  + [(int(t), ctypes.c_int) for t in self._left_pad8(src_stride, 0)])
+                return out
+            grid, block = self._ewise_grid(n)
+            self.launch("permute8", grid, block, [
+                self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
+            ] + [(int(s), ctypes.c_int) for s in self._left_pad8(out_shape, 1)]
+              + [(int(s), ctypes.c_int) for s in self._left_pad8(src_stride, 0)])
+        return out
+
+    def _index_i32(self, value, what):
+        iv = int(value)
+        if iv < -2147483648 or iv > 2147483647:
+            raise CudaError("%s 超出 int32: %d" % (what, iv) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        return iv
+
+    def _index_launch_args(self, src, dst, n, base, shape, divs, strides):
+        """把输出形状 / div / stride 补到 8 维。0 长度的维不能进到这里。"""
+        shape8 = self._left_pad8(shape, 1)
+        div8 = self._left_pad8(divs, 1)
+        st8 = self._left_pad8(strides, 0)
+        if any(int(s) < 1 for s in shape8):
+            raise CudaError("index 发射时每一维都必须 >= 1，收到 %s" % (shape8,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if any(int(d) < 1 for d in div8):
+            raise CudaError("index div 必须 >= 1，收到 %s" % (div8,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        args = [
+            self._ptr(src), self._ptr(dst),
+            (self._index_i32(n, "index n"), ctypes.c_int),
+            (self._index_i32(base, "index base"), ctypes.c_int),
+        ]
+        args += [(self._index_i32(s, "index shape"), ctypes.c_int) for s in shape8]
+        args += [(self._index_i32(s, "index div"), ctypes.c_int) for s in div8]
+        args += [(self._index_i32(s, "index stride"), ctypes.c_int) for s in st8]
+        return args
+
+    def index_gather(self, buf, out_shape, base, divs, strides):
+        """按主机算好的 (base, div, stride) 从连续缓冲里收集一份新缓冲。"""
+        out_shape = tuple(int(s) for s in out_shape)
+        divs = tuple(int(s) for s in divs)
+        strides = tuple(int(s) for s in strides)
+        if len(divs) != len(out_shape) or len(strides) != len(out_shape):
+            raise CudaError("index_gather 计划长度与输出形状不符: %s" % (out_shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if len(out_shape) > 8:
+            raise CudaError("index_gather 最高 8 维，收到 %s" % (out_shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if any(s < 0 for s in out_shape):
+            raise CudaError("index_gather 形状非法 %s" % (out_shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        out = self.empty(out_shape, dtype=np.float32)
+        n = int(out.n)
+        if n == 0:
+            return out
+        if n > 2147483647:
+            raise CudaError("index_gather 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        grid, block = self._ewise_grid(n)
+        self.launch("index_gather8", grid, block, self._index_launch_args(
+            buf, out, n, base, out_shape, divs, strides))
+        return out
+
+    def repeat_reduce(self, g, repeats, out_shape, axis):
+        """确定性重复归约（replace index_scatter_add 的原子版）。"""
+        rt_shape = tuple(int(x) for x in out_shape)
+        axis = int(axis)
+        if axis < 0:
+            axis += len(rt_shape)
+        outer = 1
+        for v in rt_shape[:axis]:
+            outer *= v
+        inner = 1
+        for v in rt_shape[axis + 1:]:
+            inner *= v
+        k = int(rt_shape[axis])
+        out = self.empty(rt_shape, dtype=np.float32)
+        n_out = int(outer * k * inner)
+        if n_out and int(repeats) > 0:
+            grid, block = self._ewise_grid(n_out)
+            self.launch("repeat_reduce", grid, block, [
+                self._ptr(g), self._ptr(out),
+                (ctypes.c_longlong(n_out), ctypes.c_longlong),
+                (int(repeats), ctypes.c_int),
+                (ctypes.c_longlong(k * inner), ctypes.c_longlong),
+                (ctypes.c_longlong(inner), ctypes.c_longlong),
+            ])
+        return out
+
+    def index_scatter_add(self, grad, in_shape, base, divs, strides):
+        """先把源形状清零，再把 grad 按同一映射 atomicAdd 回去。"""
+        in_shape = tuple(int(s) for s in in_shape)
+        divs = tuple(int(s) for s in divs)
+        strides = tuple(int(s) for s in strides)
+        out_shape = tuple(int(s) for s in grad.shape)
+        if len(divs) != len(out_shape) or len(strides) != len(out_shape):
+            raise CudaError("index_scatter 计划与梯度形状不符: %s" % (out_shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if len(in_shape) > 8 or len(out_shape) > 8:
+            raise CudaError("index_scatter 最高 8 维" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        full = self.zeros(in_shape, dtype=np.float32)
+        n = int(grad.n)
+        if n == 0:
+            return full
+        if n > 2147483647:
+            raise CudaError("index_scatter 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        grid, block = self._ewise_grid(n)
+        self.launch("index_scatter_add8", grid, block, self._index_launch_args(
+            grad, full, n, base, out_shape, divs, strides))
+        return full
+
+    def gather_rows(self, src, idx, n_src_rows, row_size, n_rows):
+        """行 gather：out[r, :] = src[idx[r], :]。idx 是设备上的 **int32** 缓冲。
+
+        `n_src_rows` / `row_size` 必须与 src 的连续布局一致（src 视为 [n_src_rows, row_size]）。
+        """
+        n_rows = int(n_rows)
+        row_size = int(row_size)
+        out = self.empty((n_rows, row_size), dtype=np.float32)
+        total = n_rows * row_size
+        if total:
+            if total > 2147483647:
+                raise CudaError("gather_rows 元素数 %d 超过 int32" % total + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            grid, block = self._ewise_grid(total)
+            self.launch("gather_rows", grid, block, [
+                self._ptr(src), self._ptr(idx), self._ptr(out),
+                (n_rows, ctypes.c_int), (row_size, ctypes.c_int)])
+        return out
+
+    def moe_permute(self, eids, x, gate, counts, xp, gp, rowid,
+                    n_rows, k, d, E, C):
+        """按专家把 (row, slot) 对写进容量 C 的槽位（设备侧，见 moe_permute 内核）。"""
+        total = int(n_rows) * int(k)
+        if total <= 0:
+            return
+        self.launch("moe_permute", (int(total), 1, 1), (256, 1, 1), [
+            self._ptr(eids), self._ptr(x), self._ptr(gate), self._ptr(counts),
+            self._ptr(xp), self._ptr(gp), self._ptr(rowid),
+            (int(n_rows), ctypes.c_int), (int(k), ctypes.c_int),
+            (int(d), ctypes.c_int), (int(E), ctypes.c_int),
+            (int(C), ctypes.c_int)])
+
+    def moe_unpermute(self, yp, rowid, out, d, EC):
+        """把槽位输出写回原 (row, slot) 位置（每槽唯一，无需原子）。"""
+        if int(EC) <= 0:
+            return
+        self.launch("moe_unpermute", (int(EC), 1, 1), (256, 1, 1), [
+            self._ptr(yp), self._ptr(rowid), self._ptr(out),
+            (int(d), ctypes.c_int), (int(EC), ctypes.c_int)])
+
+    def moe_permute_bwd(self, dyp, x, rowid, dx, dgate, d, k, EC):
+        """permute 的反向：dx 用原子加（同 row 的两个 slot 会撞），dgate 每槽归约。"""
+        if int(EC) <= 0:
+            return
+        self.launch("moe_permute_bwd", (int(EC), 1, 1), (256, 1, 1), [
+            self._ptr(dyp), self._ptr(x), self._ptr(rowid), self._ptr(dx),
+            self._ptr(dgate),
+            (int(d), ctypes.c_int), (int(k), ctypes.c_int), (int(EC), ctypes.c_int)])
+
+    def scatter_add_rows(self, g, idx, n_src_rows, row_size, n_rows):
+        """行 gather 的反向：先清零 [n_src_rows, row_size]，再把 g 的行按 idx atomicAdd 回去。"""
+        n_rows = int(n_rows)
+        row_size = int(row_size)
+        out = self.zeros((int(n_src_rows), row_size), dtype=np.float32)
+        total = n_rows * row_size
+        if total:
+            if total > 2147483647:
+                raise CudaError("scatter_add_rows 元素数 %d 超过 int32" % total + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            grid, block = self._ewise_grid(total)
+            self.launch("scatter_add_rows", grid, block, [
+                self._ptr(g), self._ptr(idx), self._ptr(out),
+                (n_rows, ctypes.c_int), (row_size, ctypes.c_int)])
+        return out
+
+    def gather_flat(self, src, idx, n):
+        """逐元素 gather：out[i] = src[idx[i]]（idx 是已算好的 int32 扁平下标）。"""
+        n = int(n)
+        out = self.empty((n,), dtype=np.float32)
+        if n:
+            if n > 2147483647:
+                raise CudaError("gather_flat 元素数 %d 超过 int32" % n + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            grid, block = self._ewise_grid(n)
+            self.launch("gather_flat", grid, block, [
+                self._ptr(src), self._ptr(idx), self._ptr(out), (n, ctypes.c_int)])
+        return out
+
+    def scatter_add_flat(self, g, idx, n_src, n):
+        """逐元素 gather 的反向：zeros(n_src) 后按 idx atomicAdd。"""
+        n = int(n)
+        out = self.zeros((int(n_src),), dtype=np.float32)
+        if n:
+            if n > 2147483647:
+                raise CudaError("scatter_add_flat 元素数 %d 超过 int32" % n + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            grid, block = self._ewise_grid(n)
+            self.launch("scatter_add_flat", grid, block, [
+                self._ptr(g), self._ptr(idx), self._ptr(out), (n, ctypes.c_int)])
+        return out
+
+    def _cat_geom(self, shape, axis):
+        """行主序连续缓冲沿 axis 拆成 outer × span × inner。"""
+        shape = tuple(int(s) for s in shape)
+        axis = int(axis)
+        if not shape or axis < 0 or axis >= len(shape):
+            raise CudaError("cat 轴 %d 越界（shape=%s）" % (axis, shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        outer = 1
+        for s in shape[:axis]:
+            if s < 0:
+                raise CudaError("cat 形状非法 %s" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            outer *= s
+        inner = 1
+        for s in shape[axis + 1:]:
+            if s < 0:
+                raise CudaError("cat 形状非法 %s" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            inner *= s
+        span = int(shape[axis])
+        if span < 0:
+            raise CudaError("cat 形状非法 %s" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        n = outer * span * inner
+        if (n > 2147483647 or outer > 2147483647 or inner > 2147483647
+                or span > 2147483647):
+            raise CudaError("cat 元素个数超过 int32（shape=%s）" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        return int(outer), int(span), int(inner), int(n)
+
+    def cat_place(self, src, dst, axis, dst_off):
+        """把连续 src 抄进 dst 沿 axis 的槽 [dst_off, dst_off+src_span)。纯拷贝。"""
+        if src.dtype != np.float32 or dst.dtype != np.float32:
+            raise CudaError("cat_place 只支持 float32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        _s_outer, s_span, s_inner, s_n = self._cat_geom(src.shape, axis)
+        _d_outer, d_span, d_inner, d_n = self._cat_geom(dst.shape, axis)
+        if _s_outer != _d_outer or s_inner != d_inner:
+            raise CudaError(
+                "cat_place 形状对不上: %s -> %s axis=%d" % (src.shape, dst.shape, axis) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
+        if int(src.n) != s_n or int(dst.n) != d_n:
+            raise CudaError("cat_place 缓冲不是按形状打包的连续块" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        off = int(dst_off)
+        if off < 0 or s_span < 0 or off + s_span > d_span:
+            raise CudaError(
+                "cat_place 槽越界 off=%d len=%d dst=%d" % (off, s_span, d_span) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if s_n == 0:
+            return
+        self._split_forget_ptr(dst)
+        grid, block = self._ewise_grid(s_n)
+        self.launch("cat_place", grid, block, [
+            self._ptr(src), self._ptr(dst),
+            (s_n, ctypes.c_int),
+            (s_span, ctypes.c_int),
+            (d_span, ctypes.c_int),
+            (s_inner, ctypes.c_int),
+            (off, ctypes.c_int),
+        ])
+
+    def cat_extract(self, src, axis, src_off, span, dst_shape):
+        """从连续 src 沿 axis 切出 [src_off, src_off+span)，写成一块新的连续缓冲。"""
+        dst_shape = tuple(int(s) for s in dst_shape)
+        if src.dtype != np.float32:
+            raise CudaError("cat_extract 只支持 float32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        _s_outer, s_span, s_inner, s_n = self._cat_geom(src.shape, axis)
+        _d_outer, d_span, d_inner, d_n = self._cat_geom(dst_shape, axis)
+        if d_span != int(span):
+            raise CudaError(
+                "cat_extract 长度 %d 与目标形状 %s 不符" % (int(span), dst_shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
+        if _s_outer != _d_outer or s_inner != d_inner:
+            raise CudaError(
+                "cat_extract 形状对不上: %s -> %s axis=%d" % (src.shape, dst_shape, axis) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
+        if int(src.n) != s_n:
+            raise CudaError("cat_extract 源缓冲不是按形状打包的连续块" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        off = int(src_off)
+        if off < 0 or d_span < 0 or off + d_span > s_span:
+            raise CudaError(
+                "cat_extract 槽越界 off=%d len=%d src=%d" % (off, d_span, s_span) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        out = self.empty(dst_shape, dtype=np.float32)
+        if d_n == 0:
+            return out
+        grid, block = self._ewise_grid(d_n)
+        self.launch("cat_extract", grid, block, [
+            self._ptr(src), self._ptr(out),
+            (d_n, ctypes.c_int),
+            (s_span, ctypes.c_int),
+            (d_span, ctypes.c_int),
+            (d_inner, ctypes.c_int),
+            (off, ctypes.c_int),
+        ])
+        return out
+
+    def _bcast_strides(self, src, shape):
+        """某个操作数在目标形状下的字节步长（广播维填 0）。与 `broadcast_to` 的算法一致。
+
+        注意 `_row_strides` 收的是**形状**不是缓冲。
+        """
+        shape = tuple(int(s) for s in shape)
+        ndim = len(shape)
+        src = tuple(int(s) for s in src)
+        aligned = (1,) * (ndim - len(src)) + src
+        raw = self._row_strides(src)
+        base = ndim - len(src)
+        strides = []
+        for i, a in enumerate(aligned):
+            if i < base or a == 1:
+                strides.append(0)
+            else:
+                strides.append(int(raw[i - base]))
+        return strides
+
+    def mul_bcast(self, a, b, a_shape, b_shape, out_shape):
+        """带广播的逐元素乘：**一次内核**，不物化任何广播副本。
+
+        原来 `mul` 遇到广播先 `broadcast_to` 出整尺寸副本（每步 196 次 =
+        一步 16% 的内核，且每次都是一次全尺寸写 + 一次全尺寸读）。
+        这里把索引映射放进内核，结果与"先物化再乘"**逐位等价**
+        （同一个乘法、同一对元素，只是不再经过中间缓冲）。
+        """
+        out_shape = tuple(int(s) for s in out_shape)
+        out = self.empty(out_shape, dtype=np.float32)
+        n = int(out.n)
+        if n:
+            if n > 2147483647:
+                raise CudaError("mul_bcast 元素个数超过 int32"
+                                + "。修法：把张量分块相乘；或改用非广播路径")
+            grid, block = self._ewise_grid(n)
+            self._activate()
+            self.launch("mul_bcast8", grid, block, [
+                self._ptr(a), self._ptr(b), self._ptr(out), (n, ctypes.c_int),
+            ] + [(int(s), ctypes.c_int) for s in self._left_pad8(out_shape, 1)]
+              + [(int(s), ctypes.c_int)
+                 for s in self._left_pad8(
+                     self._bcast_strides(a_shape, out_shape), 0)]
+              + [(int(s), ctypes.c_int)
+                 for s in self._left_pad8(
+                     self._bcast_strides(b_shape, out_shape), 0)])
+        return out
+
+    def add_bcast(self, a, b, a_shape, b_shape, out_shape):
+        """带广播的逐元素加：一次内核，不物化广播副本（与 `mul_bcast` 同构）。"""
+        out_shape = tuple(int(s) for s in out_shape)
+        out = self.empty(out_shape, dtype=np.float32)
+        n = int(out.n)
+        if n:
+            if n > 2147483647:
+                raise CudaError("add_bcast 元素个数超过 int32"
+                                + "。修法：把张量分块相加；或改用非广播路径")
+            grid, block = self._ewise_grid(n)
+            self._activate()
+            self.launch("add_bcast8", grid, block, [
+                self._ptr(a), self._ptr(b), self._ptr(out), (n, ctypes.c_int),
+            ] + [(int(s), ctypes.c_int) for s in self._left_pad8(out_shape, 1)]
+              + [(int(s), ctypes.c_int)
+                 for s in self._left_pad8(
+                     self._bcast_strides(a_shape, out_shape), 0)]
+              + [(int(s), ctypes.c_int)
+                 for s in self._left_pad8(
+                     self._bcast_strides(b_shape, out_shape), 0)])
+        return out
+
+    def _broadcast_lead(self, sa, sb):
+        sa = tuple(int(s) for s in sa)
+        sb = tuple(int(s) for s in sb)
+        ndim = max(len(sa), len(sb))
+        if ndim == 0:
+            return ()
+        if ndim > 6:
+            raise CudaError("matmul 前导维 %d 超过 6" % ndim + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        pa = (1,) * (ndim - len(sa)) + sa
+        pb = (1,) * (ndim - len(sb)) + sb
+        out = []
+        for x, y in zip(pa, pb):
+            if x == y:
+                out.append(x)
+            elif x == 1:
+                out.append(y)
+            elif y == 1:
+                out.append(x)
+            else:
+                raise CudaError("matmul 前导维不能广播: %s vs %s" % (sa, sb) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        return tuple(out)
+
+    def matmul_general(self, A, B):
+        """最后两维做矩阵乘，前导维按 PyTorch 右对齐广播。没有前导维时就是 sgemm。"""
+        if len(A.shape) < 2 or len(B.shape) < 2:
+            raise CudaError("matmul 至少 2D，收到 %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if len(A.shape) > 8 or len(B.shape) > 8:
+            raise CudaError("matmul 最高 8 维，收到 %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        M, K = int(A.shape[-2]), int(A.shape[-1])
+        K2, N = int(B.shape[-2]), int(B.shape[-1])
+        if K != K2:
+            raise CudaError("matmul K 不匹配: %s @ %s" % (A.shape, B.shape) + HINT_MATMUL + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        a_lead = tuple(int(s) for s in A.shape[:-2])
+        b_lead = tuple(int(s) for s in B.shape[:-2])
+        if not a_lead and not b_lead:
+            return self.sgemm(A, B)
+        out_lead = self._broadcast_lead(a_lead, b_lead)
+        batch = 1
+        for s in out_lead:
+            batch *= int(s)
+        # ★ 2026-11-17：**不再物化广播副本**。
+        #   原写法 `broadcast_to(A) + broadcast_to(B)` 然后把两个整尺寸副本喂给 bmm，
+        #   一步要为此多 31 次 `broadcast_to8`（前向）+ 31 次（反向经 matmul_general）。
+        #   cuBLAS 的 strided-batched 允许把 stride 传 0 —— 语义就是"所有 batch 复用
+        #   同一块矩阵"，正好是广播。这里直接按元素步长调 `_bmm_op`
+        #   （与 `sgemm_nt/tn_strided_batched` 同一套步长约定）。
+        # ★ 2026-11-19：**batch==1 的批量路径是纯浪费** —— 它让 `x[1,T,d] @ W` 这种
+        #   前导维为 (1,) 的调用绕过下面 `if not a_lead and not b_lead: return self.sgemm(A,B)`
+        #   的 2-D 分支，于是永远吃不到 AMP 的 fp16 路径（cuBLAS 走 fp32 strided-batched，
+        #   实测 9.9 TFLOPS，而 fp16 分支是 64.9）。
+        #   实测（seq2048 / 12 层 MoE / 端到端 A/B）：**−15.0 ms/步**，显存 +0.00 GiB。
+        #   仅在 fp16 打开时生效 ⇒ `--amp off` 的行为与数值**逐位不变**。
+        #   逃生门：TG_AMP_BMM=0。
+        if (batch == 1 and int(A.n) == M * K and int(B.n) == K * N
+                and self._fp16_state()["on"] and os.environ.get("TG_AMP_BMM") != "0"):
+            C2 = self.sgemm(self.reshape(A, (M, K)), self.reshape(B, (K, N)))
+            return self.reshape(C2, out_lead + (M, N))
+        C3 = self.empty((batch, M, N), dtype=np.float32)
+        if batch == 0 or M == 0 or N == 0:
+            return self.reshape(C3, out_lead + (M, N))
+        if K == 0:
+            return self.reshape(self.zeros((batch, M, N), dtype=np.float32),
+                                out_lead + (M, N))
+        sa = int(M * K) if tuple(a_lead) == tuple(out_lead) else 0
+        sb = int(K * N) if tuple(b_lead) == tuple(out_lead) else 0
+        self._bmm_op(CUDA_OP_N, CUDA_OP_N, A.ptr, K, sa,
+                     B.ptr, N, sb, C3, batch, M, N, K)
+        return self.reshape(C3, out_lead + (M, N))
+
+    def reshape(self, buf, shape):
+        """C 顺序重解释。本运行时的缓冲都是打包连续的，只改形状元数据。
+
+        以前每次都 cuMemcpyDtoD 一份新缓冲。seq=8192 上前向和反向各累计约 512 MiB，
+        而且图还活着，池子腾不出来。元素个数必须相等；不连续的 permute 结果
+        本身已经是新的连续缓冲，再 reshape 仍然是视图。
+        """
+        shape = tuple(int(s) for s in shape)
+        if any(s < 0 for s in shape):
+            raise CudaError("reshape 不支持负数维度 %s" % (shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        n = 1
+        for s in shape:
+            n *= int(s)
+        if n != int(buf.n):
+            raise CudaError("reshape %s -> %s 元素个数 %d != %d" % (buf.shape, shape, buf.n, n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        return GpuBuf(self, buf.ptr, buf.nbytes, shape, n, buf.dtype, view_of=buf)
+
+    # ── 大块主机↔设备传输（2026-11-18：数据并行整改）───────────────────
+    # 起因：DP 的梯度归约要把几 GiB 搬过 PCIe。原来每个张量单独 `d2h/h2d`，
+    # 且目标主机内存是**可分页**的（numpy 默认），实测只有 1.5~2.1 GiB/s ——
+    # 而同一张卡在 gen4 x16 上的线速远高于此。可分页内存在传输时还要驱动逐页锁定，
+    # 这是主因。这里提供**页锁定（pinned）**缓冲 + 按偏移的整块拷贝，
+    # 让调用方能把 N 个小张量打包成 1 次传输。
+
+    def host_register(self, obj, nbytes=None, slot=None):
+        """把**已有的主机内存**（比如 multiprocessing 的共享内存）注册成页锁定。
+
+        为什么需要：DP 的梯度要写进共享内存给对端读。若先把数据 d2h 到 pinned 再
+        拷进 shm，就要多一次 3.16 GiB 的主机拷贝（实测约 0.3 s）。直接让 d2h 写进
+        **已注册的** shm，就等于省掉这一整趟。
+
+        返回 `_PinnedHost`（`.ptr` 指向这块内存，不拥有它）。
+        注册失败时返回 None，调用方退回"pinned + 拷贝"的老路。
+        """
+        try:
+            addr = obj if isinstance(obj, int) else ctypes.addressof(
+                ctypes.c_char.from_buffer(obj))
+        except Exception:
+            return None
+        nb = int(nbytes if nbytes is not None else len(obj))
+        reg = getattr(self, "_hostreg", None)
+        if reg is None:
+            reg = self._hostreg = {}
+        key = (addr, nb)
+        if key in reg:
+            return reg[key]
+        fn = getattr(self.cu, "cuMemHostRegister_v2", None) or \
+            getattr(self.cu, "cuMemHostRegister", None)
+        if fn is None:
+            return None
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        rc = fn(ctypes.c_void_p(addr), ctypes.c_size_t(nb), ctypes.c_uint(0))
+        if rc != 0:
+            return None
+        ph = _PinnedHost(ctypes.c_void_p(addr), nb, None)
+        reg[key] = ph
+        return ph
+    def host_pinned(self, nbytes, slot=0):
+        """分配（或复用）一块**页锁定**主机内存，返回托管对象。
+
+        `slot` 用于区分用途（比如打包缓冲 / 收包缓冲），复用可避免反复分配。
+        托管对象有 `.ptr`（c_void_p）与 `.nbytes`；numpy 视图用 `.array(dtype, n)` 取。
+        """
+        nbytes = int(nbytes)
+        cache = getattr(self, "_pinned", None)
+        if cache is None:
+            cache = self._pinned = {}
+        ent = cache.get(slot)
+        if ent is not None and ent["nbytes"] >= nbytes:
+            return _PinnedHost(ent["ptr"], ent["nbytes"], ent.get("owner"))
+        if ent is not None:
+            self._free_pinned(ent)
+        ptr = ctypes.c_void_p()
+        fn = None
+        for nm in ("cuMemAllocHost_v2", "cuMemAllocHost"):
+            if hasattr(self.cu, nm):
+                fn = getattr(self.cu, nm)
+                break
+        if fn is not None:
+            # 驱动库是裸 CDLL，不显式设 argtypes 会按 C int 默认规则乱传
+            fn.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+            fn.restype = ctypes.c_int
+            rc = fn(ctypes.byref(ptr), ctypes.c_size_t(nbytes))
+        else:
+            rc = -1
+        if rc != 0:
+            # 退回普通可分页内存：慢，但不至于跑不了
+            arr = np.zeros(max(1, nbytes // 4), dtype=np.float32)
+            ent = {"ptr": ctypes.c_void_p(arr.ctypes.data), "nbytes": arr.nbytes,
+                   "owner": arr}
+            cache[slot] = ent
+            return _PinnedHost(ent["ptr"], ent["nbytes"], arr)
+        ent = {"ptr": ptr, "nbytes": nbytes, "owner": None}
+        cache[slot] = ent
+        return _PinnedHost(ptr, nbytes, None)
+
+    def _free_pinned(self, ent):
+        if ent.get("owner") is None and ent.get("ptr"):
+            try:
+                self.cu.cuMemFreeHost(ent["ptr"])
+            except Exception:
+                pass
+
+    def d2h_into(self, buf, dst, nbytes=None, dst_off=0, src_off=0):
+        """把设备缓冲拷进给定的主机缓冲（可 pinned），支持字节偏移。"""
+        nb = int(nbytes if nbytes is not None else buf.n * 4)
+        rc = self.cu.cuMemcpyDtoH(ctypes.c_void_p(dst.value + int(dst_off)),
+                                  ctypes.c_uint64(buf.ptr + int(src_off)),
+                                  ctypes.c_size_t(nb))
+        self._chk(rc, "cuMemcpyDtoH(大块)")
+        return nb
+
+    def h2d_into(self, buf, src, nbytes=None, dst_off=0, src_off=0):
+        """把主机缓冲（可 pinned）拷回设备缓冲，支持字节偏移。"""
+        nb = int(nbytes if nbytes is not None else buf.n * 4)
+        rc = self.cu.cuMemcpyHtoD(ctypes.c_uint64(buf.ptr + int(dst_off)),
+                                  ctypes.c_void_p(src.value + int(src_off)),
+                                  ctypes.c_size_t(nb))
+        self._chk(rc, "cuMemcpyHtoD(大块)")
+        return nb
+
+    def copy_d2d(self, dst, src, nbytes=None, dst_off=0, src_off=0):
+        """设备内整块拷贝（用来把多个小梯度拼进一个打包缓冲）。"""
+        nb = int(nbytes if nbytes is not None else src.n * 4)
+        rc = self.cu.cuMemcpyDtoD(ctypes.c_uint64(dst.ptr + int(dst_off)),
+                                  ctypes.c_uint64(src.ptr + int(src_off)),
+                                  ctypes.c_size_t(nb))
+        self._chk(rc, "cuMemcpyDtoD(整块)")
+        return nb
+    def sub_view(self, buf, shape, elem_offset=0):
+        """在 `buf` 的字节区间内做一个**偏移视图**（与 `reshape` 的区别：起点可偏移）。
+
+        用途：把一块大缓冲切成多段共享同一段显存。典型场景是 MoE 专家权重连续存放
+        `[G, N, K]`，每个专家是其中一段 —— 这样 `SgemmStridedBatched` 能直接算，
+        不必每次重排权重（实测重排开销比省下的还多，见 docs/MOE_MODERN_ARCH.md 3.1）。
+
+        安全性：`view_of` 会让新缓冲挂 `keepalive` 指向原缓冲、且 `_token` 为空
+        （析构不归还池），所以原缓冲先死不会被误释放。**不要再把这个 ptr 登记成第二个主人。**
+
+        越界会报错，不会静默读到别人家的显存。
+        """
+        shape = tuple(int(s) for s in shape)
+        n = 1
+        for s in shape:
+            n *= int(s)
+        esz = int(buf.dtype.itemsize)
+        off = int(elem_offset)
+        if off < 0:
+            raise CudaError("sub_view 的 elem_offset 不能为负（%d）" % off +
+                            "。修法：偏移量按元素计，从 0 开始")
+        off_bytes = off * esz
+        nbytes = n * esz
+        if off_bytes + nbytes > int(buf.nbytes):
+            raise CudaError(
+                "sub_view 越界：偏移 %d + %d 字节 > 缓冲 %d 字节（shape=%s, dtype=%s）"
+                % (off_bytes, nbytes, int(buf.nbytes), shape, buf.dtype) +
+                "。修法：检查切分后的总元素数是否超过底层缓冲")
+        return GpuBuf(self, int(buf.ptr) + off_bytes, nbytes, shape, n,
+                      buf.dtype, view_of=buf)
+
+    def swap_last2(self, buf):
+        if len(buf.shape) < 2:
+            raise CudaError("swap_last2 至少要 2 维，收到 %s" % (buf.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        dims = tuple(int(s) for s in buf.shape)
+        m, n = dims[-2], dims[-1]
+        batch = 1
+        for s in dims[:-2]:
+            batch *= int(s)
+        out = self.empty(dims[:-2] + (n, m), dtype=np.float32)
+        total = batch * m * n
+        if total and m > 0 and n > 0:
+            grid, block = self._ewise_grid(total)
+            self.launch("swap_last2", grid, block, [
+                self._ptr(buf), self._ptr(out),
+                (batch, ctypes.c_int), (m, ctypes.c_int), (n, ctypes.c_int),
+            ])
+        return out
+
+    def bmm(self, A, B):
+        """行优先 C[b,M,N] = A[b,M,K] @ B[b,K,N]。每个 batch 走一次已验收的 sgemm。"""
+        if len(A.shape) != 3 or len(B.shape) != 3:
+            raise CudaError("bmm 需要 3D，收到 %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        batch, M, K = (int(s) for s in A.shape)
+        batch2, K2, N = (int(s) for s in B.shape)
+        if batch != batch2:
+            raise CudaError("bmm batch 不同: %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if K != K2:
+            raise CudaError("bmm K 不匹配: %s @ %s" % (A.shape, B.shape) + HINT_MATMUL + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if batch == 0 or M == 0 or N == 0:
+            return self.empty((batch, M, N), dtype=np.float32)
+        if K == 0:
+            return self.zeros((batch, M, N), dtype=np.float32)
+        C = self.empty((batch, M, N), dtype=np.float32)
+        a_bytes = M * K * 4
+        b_bytes = K * N * 4
+        c_bytes = M * N * 4
+        # ★ 批量走 cuBLAS strided-batched（1 次调用），小 batch 才回退到循环
+        if batch >= 4:
+            return self.sgemm_strided_batched(A, B, batch, M, K, N)
+        self._mark_submitted(A.ptr)
+        self._mark_submitted(B.ptr)
+        self._mark_submitted(C.ptr)
+        for i in range(batch):
+            self._sgemm(
+                CUDA_OP_N, CUDA_OP_N, N, M, K,
+                B.ptr + i * b_bytes, N,
+                A.ptr + i * a_bytes, K,
+                C.ptr + i * c_bytes, N,
+            )
+        return C
+
+    def sgemm_strided_batched(self, A, B, batch, M, K, N):
+        """★ 一次 cuBLAS 调用算完整个 batch（行优先 C[b] = A[b] @ B[b]）。
+
+        以前的 bmm 是在 Python 里 for i in range(batch): _sgemm(...)，
+        attention 里 batch = B*NH = 624 ⇒ 每次 bmm 要 624 次 ctypes 调用（约 12 ms）。
+        换成 cublasSgemmStridedBatched 后是 1 次调用。
+        """
+        C = self.empty((batch, M, N), dtype=np.float32)
+        if batch == 0 or M == 0 or N == 0:
+            return C
+        if K == 0:
+            return self.zeros((batch, M, N), dtype=np.float32)
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._capture_keep(alpha, beta)
+        cb = self.cublas
+        cb.cublasSgemmStridedBatched.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong,
+            ctypes.c_int,
+        ]
+        cb.cublasSgemmStridedBatched.restype = ctypes.c_int
+        self._mark_submitted(A.ptr)
+        self._mark_submitted(B.ptr)
+        self._mark_submitted(C.ptr)
+        self._activate()
+        # 行优先 → 列优先：交换 A/B 与其 leading dim（与 _sgemm 同一套转换）
+        self._chk_blas(cb.cublasSgemmStridedBatched(
+            self.handle, CUDA_OP_N, CUDA_OP_N,
+            int(N), int(M), int(K),
+            ctypes.byref(alpha),
+            ctypes.c_void_p(int(B.ptr)), int(N), int(K * N),
+            ctypes.c_void_p(int(A.ptr)), int(K), int(M * K),
+            ctypes.byref(beta),
+            ctypes.c_void_p(int(C.ptr)), int(N), int(M * N),
+            int(batch),
+        ), "cublasSgemmStridedBatched")
+        return C
+
+    def _bmm_op(self, op_a, op_b, Aptr, lda, stride_a, Bptr, ldb, stride_b,
+                C, batch, M, N, K):
+        """批量 GEMM 的公共实现（行优先语义，内部转成列优先调 cuBLAS）。
+
+        调用方保证：(M,N,K) 与 (lda,ldb) 已按"行优先 A[M,K] × B[K,N]"准备好，
+        op_* 指定各自是否转置。返回的 C 是行优先 [batch, M, N]。
+        """
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._capture_keep(alpha, beta)
+        cb = self.cublas
+        cb.cublasSgemmStridedBatched.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong,
+            ctypes.c_int,
+        ]
+        cb.cublasSgemmStridedBatched.restype = ctypes.c_int
+        self._mark_submitted(Aptr)
+        self._mark_submitted(Bptr)
+        self._mark_submitted(C.ptr)
+        self._activate()
+        # 行优先 C[M,N] 按列优先看就是 C^T[N,M]：m=N, n=M，两个操作数交换。
+        self._chk_blas(cb.cublasSgemmStridedBatched(
+            self.handle, op_a, op_b,
+            int(N), int(M), int(K),
+            ctypes.byref(alpha),
+            ctypes.c_void_p(int(Bptr)), int(ldb), int(stride_b),
+            ctypes.c_void_p(int(Aptr)), int(lda), int(stride_a),
+            ctypes.byref(beta),
+            ctypes.c_void_p(int(C.ptr)), int(N), int(M * N),
+            int(batch),
+        ), "cublasSgemmStridedBatched")
+        return C
+
+    def sgemm_nt_strided_batched(self, A, B, batch, M, N, K):
+        """行优先 C[b][M,N] = A[b][M,K] @ B[b][N,K]^T（attention 的 q @ k^T）。
+
+        省掉 k 的转置拷贝：cuBLAS 直接对 B 用 op=T。
+        """
+        C = self.empty((batch, M, N), dtype=np.float32)
+        if batch == 0 or M == 0 or N == 0:
+            return C
+        if K == 0:
+            return self.zeros((batch, M, N), dtype=np.float32)
+        # 列优先视角：C^T = B @ A^T ⇒ 第一操作数取 B 并转置、第二操作数取 A 不转置
+        return self._bmm_op(CUDA_OP_T, CUDA_OP_N, A.ptr, K, int(M * K),
+                            B.ptr, K, int(N * K), C, batch, M, N, K)
+
+    def sgemm_tn_strided_batched(self, A, B, batch, M, N, K):
+        """行优先 C[b][M,N] = A[b][K,M]^T @ B[b][K,N]（attention 反向的 dk = dS^T @ q）。"""
+        C = self.empty((batch, M, N), dtype=np.float32)
+        if batch == 0 or M == 0 or N == 0:
+            return C
+        if K == 0:
+            return self.zeros((batch, M, N), dtype=np.float32)
+        return self._bmm_op(CUDA_OP_N, CUDA_OP_T, A.ptr, M, int(K * M),
+                            B.ptr, N, int(K * N), C, batch, M, N, K)
+
+
+    def _warp_row_grid(self, rows):
+        """一行一个 warp（与 `_row_grid` 同语义）：block 256 线程 = 8 warp，grid = ceil(rows / 8)。
+
+        `log_softmax_lastdim` / `log_softmax_lastdim_bwd` 的内核都是 warp-per-row
+        （32 lane 并行归约），所以这里必须是 8 warp/block 的布局。
+        """
+        wpp = 8
+        return ((int(rows) + wpp - 1) // wpp, 1, 1), (256, 1, 1)
+
+    def _row_grid(self, rows):
+        """一行一个 warp：block 256 线程（8 warp），grid = ceil(rows / 8)。"""
+        wpp = 8
+        return ((int(rows) + wpp - 1) // wpp, 1, 1), (256, 1, 1)
+
+    def softmax_lastdim(self, x):
+        if len(x.shape) < 1:
+            raise CudaError("softmax 需要至少 1 维，收到 %s" % (x.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        k = int(x.shape[-1])
+        if k <= 0:
+            raise CudaError("softmax 最后一维是 %d" % k + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        rows = int(x.n) // k
+        out = self.empty(x.shape, dtype=np.float32)
+        if rows:
+            grid, block = self._row_grid(rows)
+            self.launch("softmax_lastdim", grid, block, [
+                self._ptr(x), self._ptr(out),
+                (rows, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        return out
+
+    def log_softmax_lastdim(self, x):
+        if len(x.shape) < 1:
+            raise CudaError("log_softmax 需要至少 1 维，收到 %s" % (x.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        k = int(x.shape[-1])
+        if k <= 0:
+            raise CudaError("log_softmax 最后一维是 %d" % k + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        rows = int(x.n) // k
+        out = self.empty(x.shape, dtype=np.float32)
+        if rows:
+            grid, block = self._warp_row_grid(rows)
+            self.launch("log_softmax_lastdim", grid, block, [
+                self._ptr(x), self._ptr(out),
+                (rows, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        return out
+
+    def log_softmax_lastdim_bwd(self, g, y):
+        k = int(y.shape[-1])
+        rows = int(y.n) // k if k else 0
+        out = self.empty(y.shape, dtype=np.float32)
+        if rows and k:
+            grid, block = self._warp_row_grid(rows)
+            self.launch("log_softmax_lastdim_bwd", grid, block, [
+                self._ptr(g), self._ptr(y), self._ptr(out),
+                (rows, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        return out
+
+    def softmax_lastdim_bwd(self, g, y):
+        k = int(y.shape[-1])
+        rows = int(y.n) // k if k else 0
+        out = self.empty(y.shape, dtype=np.float32)
+        if rows and k:
+            grid, block = self._row_grid(rows)
+            self.launch("softmax_lastdim_bwd", grid, block, [
+                self._ptr(g), self._ptr(y), self._ptr(out),
+                (rows, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        return out
+
+    def log32(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_log32", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def exp32(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_exp32", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def exp(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        n = int(a.n)
+        if n:
+            if self._vec4_ok(n, a, out):
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("ewise_exp_v4", grid, block, [
+                    self._ptr(a), self._ptr(out), (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(n)
+                self.launch("ewise_exp", grid, block, [
+                    self._ptr(a), self._ptr(out), (n, ctypes.c_int),
+                ])
+        return out
+
+    def tanh(self, a):
+        """tanh 融合核（单次分配）。反向用 `ewise_tanh_bwd`，见 `tanh_bwd`。"""
+        out = self.empty(a.shape, dtype=np.float32)
+        n = int(a.n)
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("ewise_tanh", grid, block, [
+                self._ptr(a), self._ptr(out), (n, ctypes.c_int),
+            ])
+        return out
+
+    def tanh_bwd(self, g, y):
+        """`d tanh = g·(1 − y²)`，y 为前向输出。"""
+        out = self.empty(y.shape, dtype=np.float32)
+        n = int(y.n)
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("ewise_tanh_bwd", grid, block, [
+                self._ptr(g), self._ptr(y), self._ptr(out), (n, ctypes.c_int),
+            ])
+        return out
+
+    def situ_glu(self, g, u, beta1, beta2):
+        """融合 SiTU-GLU 前向：`β1·tanh(g/β1)·σ(g) · β2·tanh(u/β2)`，单次分配。"""
+        out = self.empty(g.shape, dtype=np.float32)
+        n = int(g.n)
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("situ_glu_fwd", grid, block, [
+                self._ptr(g), self._ptr(u), self._ptr(out), (n, ctypes.c_int),
+                (float(beta1), ctypes.c_float), (float(beta2), ctypes.c_float),
+            ])
+        return out
+
+    def situ_glu_bwd(self, dout, g, u, beta1, beta2):
+        """融合反向：返回 (dg, du)，只读 dout/g/u，无中间量。"""
+        dg = self.empty(g.shape, dtype=np.float32)
+        du = self.empty(u.shape, dtype=np.float32)
+        n = int(g.n)
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("situ_glu_bwd", grid, block, [
+                self._ptr(dout), self._ptr(g), self._ptr(u),
+                self._ptr(dg), self._ptr(du), (n, ctypes.c_int),
+                (float(beta1), ctypes.c_float), (float(beta2), ctypes.c_float),
+            ])
+        return dg, du
+
+    def log(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_log", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    # ---- 0.9.16：abs / relu / clamp / div 的 C 端入口 ----
+    def abs(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_abs", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def abs_bwd(self, a, g):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_abs_bwd", grid, block, [
+                self._ptr(a), self._ptr(g), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def cos(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_cos", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def sin(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_sin", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def cos_bwd(self, a, g):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_cos_bwd", grid, block, [
+                self._ptr(a), self._ptr(g), self._ptr(out),
+                (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def sin_bwd(self, a, g):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_sin_bwd", grid, block, [
+                self._ptr(a), self._ptr(g), self._ptr(out),
+                (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def relu(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_relu", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def relu_bwd(self, a, g):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_relu_bwd", grid, block, [
+                self._ptr(a), self._ptr(g), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def clamp(self, a, lo, hi):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_clamp", grid, block, [
+                self._ptr(a), (float(lo), ctypes.c_float), (float(hi), ctypes.c_float),
+                self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def clamp_bwd(self, a, g, lo, hi):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_clamp_bwd", grid, block, [
+                self._ptr(a), self._ptr(g), (float(lo), ctypes.c_float),
+                (float(hi), ctypes.c_float), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def div(self, a, b):
+        """逐元素相除（要求形状一致或已广播）。"""
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_div", grid, block, [
+                self._ptr(a), self._ptr(b), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def recip(self, a):
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_recip", grid, block, [
+                self._ptr(a), self._ptr(out), (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def pow_scalar(self, a, p):
+        """逐元素 a ** p。p 是 Python 标量，在核里按 float32 使用。"""
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            if int(a.n) > 2147483647:
+                raise CudaError("pow 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_pow", grid, block, [
+                self._ptr(a), (float(p), ctypes.c_float), self._ptr(out),
+                (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def scale(self, a, scalar):
+        out = self.empty(a.shape, dtype=np.float32)
+        n = int(a.n)
+        if n:
+            s = float(scalar)
+            if self._vec4_ok(n, a, out):
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("ewise_scale_v4", grid, block, [
+                    self._ptr(a), (s, ctypes.c_float), self._ptr(out),
+                    (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(n)
+                self.launch("ewise_scale", grid, block, [
+                    self._ptr(a), (s, ctypes.c_float), self._ptr(out),
+                    (n, ctypes.c_int),
+                ])
+        return out
+
+    def scale_inplace(self, a, scalar):
+        """c[i] = a[i] * s 写回 a。每个线程只碰自己的下标，可以和输入同址。"""
+        scalar = float(scalar)
+        n = int(a.n)
+        if n and scalar != 1.0:
+            self._split_forget_ptr(a)
+            if self._vec4_ok(n, a, a):
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("ewise_scale_v4", grid, block, [
+                    self._ptr(a), (scalar, ctypes.c_float), self._ptr(a),
+                    (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(n)
+                self.launch("ewise_scale", grid, block, [
+                    self._ptr(a), (scalar, ctypes.c_float), self._ptr(a),
+                    (n, ctypes.c_int),
+                ])
+        if n == 1 and a.known_scalar is not None:
+            a.known_scalar = float(a.known_scalar) * scalar
+        return a
+
+    # ---- Phase 1 fp16：GEMM 快路径（TG_FP16=1 打开，默认关） --------------
+    def _fp16_state(self):
+        """惰性初始化，不改 __init__，也不给没开 fp16 的进程增加任何开销。"""
+        st = getattr(self, "_fp16", None)
+        if st is None:
+            st = {
+                "on": bool(fp16_env_requested()),
+                "warned": False,
+                "inited": False,
+                # True: C 用 fp32 直接落盘（省一次 cast，误差也更小）。
+                # False: C 也用 fp16，再 cast 回 fp32。
+                "c32": True,
+            }
+            self._fp16 = st
+        return st
+
+    def fp16_gemm_on(self):
+        return bool(self._fp16_state()["on"])
+
+    def _fp16_fail(self, ex):
+        """任何异常都关掉 fp16 并只警告一次，后续全部走 fp32。"""
+        st = self._fp16_state()
+        st["on"] = False
+        if not st["warned"]:
+            st["warned"] = True
+            sys.stderr.write(
+                "[tgai] fp16 GEMM 不可用，已回退 fp32（只警告一次）：%s: %s\n"
+                % (type(ex).__name__, str(ex)[:300]))
+            sys.stderr.flush()
+
+    def cast_f32_to_f16_into(self, src, dst):
+        """把 fp32 缓冲 cast 进**已有的** fp16 缓冲（不分配）。两者元素数必须相等。"""
+        n = int(src.n)
+        if int(dst.n) != n:
+            raise CudaError("cast_f32_to_f16_into 元素数不一致：%d vs %d" % (n, int(dst.n)) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("cast_f32_to_f16", grid, block, [
+                self._ptr(src), self._ptr(dst), (n, ctypes.c_int),
+            ])
+        return dst
+
+    def gemm_f16_nt_raw(self, A16, B16, M, N, K):
+        """C[M,N] = A16[M,K] @ B16[N,K]^T；A16/B16 已是 fp16，C 是 fp32。
+
+        与 `_sgemm_f16` 相同的列主序换算（行主序 C=A@B^T <=> 列主序 C^T=B_cm^T @ A_cm），
+        但**跳过内部 cast**：直接 cublasGemmEx，输入 CUDA_R_16F、输出 CUDA_R_32F、
+        computeType 用 fp32 累加。
+        """
+        self._bind_gemm_ex()
+        M, N, K = int(M), int(N), int(K)
+        C = self.empty((M, N), dtype=np.float32)
+        if not (M and N and K):
+            return C
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._activate()
+        self._chk_blas(self.cublas.cublasGemmEx(
+            self.handle,
+            CUDA_OP_T, CUDA_OP_N,          # op(A)=W^T, op(B)=A
+            N, M, K,
+            ctypes.byref(alpha),
+            ctypes.c_uint64(int(B16.ptr)), CUDA_R_16F, K,
+            ctypes.c_uint64(int(A16.ptr)), CUDA_R_16F, K,
+            ctypes.byref(beta),
+            ctypes.c_uint64(int(C.ptr)), CUDA_R_32F, N,
+            CUBLAS_COMPUTE_32F,             # computeType: fp32 累加（68，不是 CUDA_R_32F=0！）
+            CUBLAS_GEMM_DEFAULT,       # 与 _sgemm_f16 一致（fp16 输入自动走 Tensor Core）
+        ), "cublasGemmEx(fp16 raw)")
+        return C
+
+    def _gemm_f16_raw(self, opA, opB, m, n, k, A16, lda, B16, ldb, C, ldc):
+        """零转换 fp16 GEMM 的公共实现（fp16 输入 + fp32 输出 + fp32 累加）。"""
+        self._bind_gemm_ex()
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._activate()
+        self._chk_blas(self.cublas.cublasGemmEx(
+            self.handle, opA, opB, int(m), int(n), int(k),
+            ctypes.byref(alpha),
+            ctypes.c_uint64(int(A16.ptr)), CUDA_R_16F, int(lda),
+            ctypes.c_uint64(int(B16.ptr)), CUDA_R_16F, int(ldb),
+            ctypes.byref(beta),
+            ctypes.c_uint64(int(C.ptr)), CUDA_R_32F, int(ldc),
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT,
+        ), "cublasGemmEx(fp16 raw)")
+
+    def gemm_f16_nn_raw(self, A16, B16, M, N, K):
+        """C[M,K] = A16[M,N] @ B16[N,K]（反向的 dA 就是这个形状）。"""
+        C = self.empty((int(M), int(K)), dtype=np.float32)
+        if int(M) and int(K) and int(N):
+            self._gemm_f16_raw(CUDA_OP_N, CUDA_OP_N, int(K), int(M), int(N),
+                               B16, int(K), A16, int(N), C, int(K))
+        return C
+
+    def gemm_f16_tn_raw(self, A16, B16, M, N, K):
+        """C[N,K] = A16[M,N]^T @ B16[M,K]（反向的 dW 就是这个形状）。"""
+        C = self.empty((int(N), int(K)), dtype=np.float32)
+        if int(N) and int(K) and int(M):
+            self._gemm_f16_raw(CUDA_OP_N, CUDA_OP_T, int(K), int(N), int(M),
+                               B16, int(K), A16, int(N), C, int(K))
+        return C
+
+    def _bind_gemm_ex(self):
+        st = self._fp16_state()
+        if st["inited"]:
+            return
+        cb = self.cublas
+        # cublasStatus_t cublasGemmEx(handle, transa, transb, m, n, k,
+        #     const void* alpha, const void* A, cudaDataType Atype, int lda,
+        #     const void* B, cudaDataType Btype, int ldb,
+        #     const void* beta, void* C, cudaDataType Ctype, int ldc,
+        #     cublasComputeType_t computeType, cublasGemmAlgo_t algo)
+        # 枚举在 ABI 上都是 int；设备指针用 c_uint64（c_void_p 有符号会 OverflowError）。
+        cb.cublasGemmEx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int,
+        ]
+        cb.cublasGemmEx.restype = ctypes.c_int
+        st["inited"] = True
+
+    def _f16_scratch(self, slot, n):
+        """按槽位复用 fp16 临时缓冲（只增不减）。
+
+        ★ 2026-11-17：`_sgemm_f16` 原来每次调用都 `self.empty()` 分配两块 fp16 缓冲。
+        模型一步有 79 次 fp16 GEMM ⇒ 158 次分配，实测让峰值显存 +1.8 GiB，
+        并且看起来是压掉 fp16 收益的主因（微基准里 GEMM 本身快 4–6×）。
+        改成 grow-only 复用后，分配次数降到每次模型规模变化时一次。
+        正确性：cast 与 GEMM 都在同一条默认流上按序入队，下一轮的 cast 一定排在
+        上一轮 GEMM 之后，所以复用不会读到半成品。
+        """
+        key = "_f16_scratch_%d" % int(slot)
+        buf = getattr(self, key, None)
+        if buf is None or int(buf.n) < int(n):
+            buf = self.empty((int(n),), dtype=np.float16)
+            setattr(self, key, buf)
+        return buf
+
+    def _cast_flat_ptr_into(self, src_ptr, count, out):
+        """把 src_ptr 起 count 个 fp32 cast 进**已有**的 fp16 缓冲（不分配）。"""
+        count = int(count)
+        if count:
+            grid, block = self._ewise_grid(count)
+            self._activate()
+            self.launch("cast_f32_to_f16", grid, block, [
+                (int(src_ptr), ctypes.c_uint64), self._ptr(out),
+                (count, ctypes.c_int),
+            ])
+        return out
+
+    def _cast_flat_ptr(self, src_ptr, count, to_f16):
+        """把 src_ptr 起 count 个元素整块 cast 成新缓冲（形状信息不重要）。"""
+        count = int(count)
+        if to_f16:
+            out = self.empty((count,), dtype=np.float16)
+            if count:
+                grid, block = self._ewise_grid(count)
+                self._activate()
+                self.launch("cast_f32_to_f16", grid, block, [
+                    (int(src_ptr), ctypes.c_uint64), self._ptr(out),
+                    (count, ctypes.c_int),
+                ])
+        else:
+            out = self.empty((count,), dtype=np.float32)
+            if count:
+                grid, block = self._ewise_grid(count)
+                self._activate()
+                self.launch("cast_f16_to_f32", grid, block, [
+                    (int(src_ptr), ctypes.c_uint64), self._ptr(out),
+                    (count, ctypes.c_int),
+                ])
+        return out
+
+    def cast_f32_to_f16(self, buf):
+        """fp32 GpuBuf -> fp16 GpuBuf（shape 不变）。给测试和以后的内核用。"""
+        out = self.empty(buf.shape, dtype=np.float16)
+        if int(buf.n):
+            grid, block = self._ewise_grid(int(buf.n))
+            self._activate()
+            self.launch("cast_f32_to_f16", grid, block, [
+                self._ptr(buf), self._ptr(out), (int(buf.n), ctypes.c_int),
+            ])
+        return out
+
+    def cast_f16_to_f32(self, buf):
+        out = self.empty(buf.shape, dtype=np.float32)
+        if int(buf.n):
+            grid, block = self._ewise_grid(int(buf.n))
+            self._activate()
+            self.launch("cast_f16_to_f32", grid, block, [
+                self._ptr(buf), self._ptr(out), (int(buf.n), ctypes.c_int),
+            ])
+        return out
+
+    def _cast_f16_cached(self, src_ptr, count):
+        """带缓存的 fp32→fp16 cast（供 fp16 GEMM 复用**参数**影子）。
+
+        为什么要缓存：实测 nl=8/seq=512 时 `TG_FP16=1` 反而慢 31%（171.9 → 226.0 ms），
+        因为每次 GEMM 都把权重重新 cast 一遍。
+
+        ★★ 2026-11-16 重做（原实现有严重正确性缺陷）★★
+        原实现**按裸指针缓存任意操作数**，注释假设"权重在一个 step 内不变"。
+        但 `_sgemm_f16` 的两个操作数里也有**激活值**，而激活值的地址会被内存池复用 ——
+        同一地址在一步之内先后装不同张量，反向就命中前向留下的旧 fp16 拷贝。
+        实测（csa=4 / d=1024 / seq=512）：缓存开 gnorm=3.3056e+04，
+        缓存关 gnorm=8.0060e+00（fp32 基线 8.0039）⇒ 梯度全错。
+
+        现在的规则：**只缓存显式注册过的地址**（`f16_cache_pin`，优化器把自己的参数注册进来）。
+        参数在一个 step 内不变，缓存安全；激活/中间量一律现 cast，不可能读到陈旧数据。
+        未注册时缓存形同关闭 —— 正确性优先于那 31%。
+        """
+        cache = getattr(self, "_f16_cache", None)
+        pinned = getattr(self, "_f16_pinned", None)
+        p = int(src_ptr)
+        if not pinned or p not in pinned:
+            # 没有登记 ⇒ 内容随时可能变，只能现 cast
+            return self._cast_flat_ptr(p, count, True)
+        if cache is None:
+            cache = {}
+            self._f16_cache = cache
+        key = (p, int(count))
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        buf = self._cast_flat_ptr(p, count, True)
+        cache[key] = buf
+        return buf
+
+    def f16_cache_pin(self, ptrs):
+        """登记「整步内容不变」的地址（参数缓冲），让 fp16 影子缓存只对它们生效。
+
+        优化器在 build 之后调用一次即可；`f16_cache_clear()` 不会清掉登记表。
+        """
+        self._f16_pinned = set(int(x) for x in ptrs)
+        return len(self._f16_pinned)
+
+    def _f16_cache_drop_ptr(self, ptr):
+        """丢掉这个地址上的所有 fp16 影子（地址被归还池子时调用）。
+
+        空缓存时立刻返回，fp32 路径零开销。这是 `_cast_f16_cached` 正确性的前提：
+        缓存只能覆盖"内容在一个 step 内不变"的操作数（权重），
+        而"同一地址装不同张量"必须让缓存失效，否则反向会读到前向的旧影子。
+        """
+        cache = getattr(self, "_f16_cache", None)
+        if not cache:
+            return
+        p = int(ptr or 0)
+        if not p:
+            return
+        for k in [k for k in cache if int(k[0]) == p]:
+            del cache[k]
+
+    def f16_cache_enable(self, on=True):
+        """打开/关闭 fp16 GEMM 的权重影子缓存。关闭时清空。"""
+        self._f16_cache_on = bool(on)
+        if not on:
+            self.f16_cache_clear()
+        return self._f16_cache_on
+
+    def f16_cache_clear(self):
+        """清空影子缓存。**参数被更新后必须调用**（优化器 step 已自动调用）。"""
+        n = len(getattr(self, "_f16_cache", None) or {})
+        self._f16_cache = {}
+        return n
+
+    def f16_cache_stats(self):
+        c = getattr(self, "_f16_cache", None) or {}
+        total = 0
+        for buf in c.values():
+            total += int(getattr(buf, "nbytes", 0) or 0)
+        return {"entries": len(c), "bytes": total, "on": bool(getattr(self, "_f16_cache_on", False))}
+
+    def _sgemm_f16(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
+        """列主序调用和 _sgemm 完全一致，只是 A/B 先转 fp16、按 fp32 累加。
+
+        调用方语义不变：结果仍然写进 fp32 的 C。
+        fp16 缓冲的布局和 fp32 一一对应，所以 lda/ldb/ldc 原样透传。
+        """
+        self._bind_gemm_ex()
+        st = self._fp16_state()
+        # 元素数上界：按 (rows, cols) 的最大那个算，多余部分不会被读到。
+        na = int(lda) * (int(k) if int(transa) == CUDA_OP_N else int(m))
+        nb = int(ldb) * (int(n) if int(transb) == CUDA_OP_N else int(k))
+        nc = int(ldc) * int(n)
+        if max(na, nb, nc) > 2147483647:
+            raise CudaError("fp16 GEMM 元素数超过 int32" + "。修法：确认 cuBLAS 版本与驱动匹配；可先用 TG_FP16=0 关掉 fp16 GEMM 排查")
+        # 参数（整步内容不变）走影子缓存；激活走可复用 scratch。
+        # 两种情况都不再"每次调用新分配"，这正是压掉 fp16 收益的地方。
+        pinned = getattr(self, "_f16_pinned", None) or ()
+        cache_on = bool(getattr(self, "_f16_cache_on", False))
+        if cache_on and int(A) in pinned:
+            a16 = self._cast_f16_cached(A, na)
+        else:
+            a16 = self._f16_scratch(0, na)
+            self._cast_flat_ptr_into(A, na, a16)
+        if cache_on and int(B) in pinned:
+            b16 = self._cast_f16_cached(B, nb)
+        else:
+            b16 = self._f16_scratch(1, nb)
+            self._cast_flat_ptr_into(B, nb, b16)
+        if st["c32"]:
+            c16 = None
+            cptr = int(C)
+            ctype = CUDA_R_32F
+        else:
+            c16 = self.empty((nc,), dtype=np.float16)
+            cptr = int(c16.ptr)
+            ctype = CUDA_R_16F
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._activate()
+        self._chk_blas(self.cublas.cublasGemmEx(
+            self.handle,
+            int(transa), int(transb),
+            int(m), int(n), int(k),
+            ctypes.byref(alpha),
+            ctypes.c_uint64(int(a16.ptr)), CUDA_R_16F, int(lda),
+            ctypes.c_uint64(int(b16.ptr)), CUDA_R_16F, int(ldb),
+            ctypes.byref(beta),
+            ctypes.c_uint64(cptr), ctype, int(ldc),
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), "cublasGemmEx")
+        if c16 is not None and nc:
+            grid, block = self._ewise_grid(nc)
+            self.launch("cast_f16_to_f32", grid, block, [
+                self._ptr(c16), (int(C), ctypes.c_uint64), (nc, ctypes.c_int),
+            ])
+
+    def sgemm_fp16(self, A, B):
+        """行优先 C[M,N] = A[M,K] @ B[K,N]，走 fp16 快路径（不受 TG_FP16 限制）。
+
+        A、B 是 fp32 GpuBuf；返回 fp32 GpuBuf。仅用于单点验证和特殊场景。
+        """
+        if len(A.shape) != 2 or len(B.shape) != 2:
+            raise CudaError("sgemm_fp16 需要 2D，收到 %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        M, K = int(A.shape[0]), int(A.shape[1])
+        K2, N = int(B.shape[0]), int(B.shape[1])
+        if K != K2:
+            raise CudaError("sgemm_fp16 K 不匹配: %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        C = self.empty((M, N), dtype=np.float32)
+        if M and N and K:
+            # 和 sgemm 一样：列主序视角 C^T(N,M) = B^T @ A^T
+            self._sgemm_f16(CUDA_OP_N, CUDA_OP_N, N, M, K, B.ptr, N, A.ptr, K, C.ptr, N)
+        return C
+
+    def sgemm_fp16_nt(self, A, B):
+        """C[M,N] = A[M,K] @ B[N,K]^T，fp16 计算 + fp32 累加，返回 fp32 GpuBuf。
+
+        A/B 都是 fp32 GpuBuf（内部转 fp16）。模型里的线性层正是这个形状
+        （`x @ W.T`，W 是 [N,K]），所以不需要预先转置权重。
+        """
+        if len(A.shape) != 2 or len(B.shape) != 2:
+            raise CudaError("sgemm_fp16_nt 需要 2D，收到 %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        M, K = int(A.shape[0]), int(A.shape[1])
+        N, K2 = int(B.shape[0]), int(B.shape[1])
+        if K != K2:
+            raise CudaError("sgemm_fp16_nt K 不匹配：A%s @ B%s 的 K 是 %d vs %d"
+                            % (A.shape, B.shape, K, K2) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
+        C = self.empty((M, N), dtype=np.float32)
+        if M and N and K:
+            # 行主序 C[M,N]=A[M,K]@B[N,K]^T  <=>  列主序 C^T[N,M] = B_cm^T @ A_cm
+            #   B_cm 是 [K,N]（行主序 [N,K] 的原样），取 T 得 [N,K]
+            #   A_cm 是 [K,M]（行主序 [M,K] 的原样），取 N
+            #   => opA=T(W), opB=N(A)，lda=K, ldb=K, ldc=N
+            self._sgemm_f16(CUDA_OP_T, CUDA_OP_N, N, M, K,
+                            B.ptr, K, A.ptr, K, C.ptr, N)
+        return C
+
+    def _split16_state(self):
+        """惰性读 TG_FP16_SPLIT。没打开时不建缓存，fp32 热路径只多一次属性查找。"""
+        st = getattr(self, "_split16", None)
+        if st is None:
+            st = {
+                "on": bool(fp16_split_env_requested()),
+                "warned": False,
+                "cap_warned": False,
+                "hits": 0,
+                "misses": 0,
+            }
+            self._split16 = st
+            if st["on"] and not hasattr(self, "_split_cache"):
+                self._split_cache = {}
+        return st
+
+    def _split_forget_ptr(self, ptr):
+        """丢掉这个地址上的 hi/lo。空缓存立刻返回，默认 fp32 路径几乎无开销。"""
+        cache = getattr(self, "_split_cache", None)
+        if not cache:
+            return
+        if ptr is None:
+            return
+        if hasattr(ptr, "ptr"):
+            ptr = ptr.ptr
+        ptr = int(ptr or 0)
+        if ptr:
+            cache.pop(ptr, None)
+
+    def _split16_fail(self, ex):
+        """异常后永久回退 fp32，并清掉可能半截的拆分缓存。只警告一次。"""
+        st = self._split16_state()
+        st["on"] = False
+        cache = getattr(self, "_split_cache", None)
+        if cache is not None:
+            cache.clear()
+        if not st["warned"]:
+            st["warned"] = True
+            sys.stderr.write(
+                "[tgai] fp16 split GEMM 不可用，已回退 fp32（只警告一次）：%s: %s\n"
+                % (type(ex).__name__, str(ex)[:300]))
+            sys.stderr.flush()
+
+    def _split16_wanted(self, m, n, k):
+        st = self._split16_state()
+        if not st["on"]:
+            return False
+        if self._capturing:
+            if not st["cap_warned"]:
+                st["cap_warned"] = True
+                sys.stderr.write(
+                    "[tgai] CUDA Graph 捕获中不启用 fp16 split GEMM，这一步走 fp32。\n")
+                sys.stderr.flush()
+            return False
+        m, n, k = int(m), int(n), int(k)
+        return k >= _FP16_SPLIT_MIN_K or m * n >= _FP16_SPLIT_MIN_MN
+
+    def _d2d_bytes(self, dst, src, nbytes):
+        """设备到设备拷贝。有非默认流时走异步，否则同步，都排在当前计算流上。"""
+        nbytes = int(nbytes)
+        if nbytes <= 0:
+            return
+        self._activate()
+        self._mark_submitted(dst)
+        self._mark_submitted(src)
+        if self._stream_ready:
+            self._bind_dto_async()
+            self._chk(self.cu.cuMemcpyDtoDAsync(
+                ctypes.c_uint64(int(dst)),
+                ctypes.c_uint64(int(src)),
+                ctypes.c_size_t(nbytes),
+                self._stream), "cuMemcpyDtoDAsync(split16)")
+        else:
+            self._chk(self.cu.cuMemcpyDtoD(
+                ctypes.c_uint64(int(dst)),
+                ctypes.c_uint64(int(src)),
+                ctypes.c_size_t(nbytes)), "cuMemcpyDtoD(split16)")
+
+    def _split16_pair(self, src_ptr, count):
+        """把一段 fp32 拆成 hi/lo 两个 fp16 缓冲。
+
+        x_hi = fp16(x)，x_lo = fp16(x - fp32(x_hi))。
+        缓存键是（指针，池 token，元素个数）：token 在块被释放复用时变化，
+        原地写会把条目删掉，所以权重在一步里可复用、优化器更新后会重拆。
+        """
+        count = int(count)
+        src_ptr = int(src_ptr)
+        st = self._split16_state()
+        cache = getattr(self, "_split_cache", None)
+        if cache is None:
+            cache = {}
+            self._split_cache = cache
+        token = self._pool_token_of(src_ptr) if count > 0 else None
+        hit = cache.get(src_ptr)
+        if (hit is not None and token is not None
+                and hit[0] == token and hit[1] == count):
+            st["hits"] += 1
+            return hit[2], hit[3]
+        if hit is not None:
+            cache.pop(src_ptr, None)
+        st["misses"] += 1
+        if count <= 0:
+            return (self.empty((0,), dtype=np.float16),
+                    self.empty((0,), dtype=np.float16))
+        if count > 2147483647:
+            raise CudaError("fp16 split 元素数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        hi16 = self._cast_flat_ptr(src_ptr, count, True)
+        hi32 = self._cast_flat_ptr(hi16.ptr, count, False)
+        lo32 = self.empty((count,), dtype=np.float32)
+        self._d2d_bytes(lo32.ptr, src_ptr, count * 4)
+        grid, block = self._ewise_grid(count)
+        self.launch("ewise_sub_scale", grid, block, [
+            self._ptr(lo32), self._ptr(hi32),
+            (1.0, ctypes.c_float), (count, ctypes.c_int),
+        ])
+        lo16 = self._cast_flat_ptr(lo32.ptr, count, True)
+        if token is not None and os.environ.get("TG_FP16_SPLIT_CACHE", "1") != "0":
+            cache[src_ptr] = (token, count, hi16, lo16)
+        return hi16, lo16
+
+    def _gemm_ex_f16(self, transa, transb, m, n, k, A, lda, B, ldb, beta, C, ldc, alpha):
+        """A、B 已是 fp16，C 是 fp32。compute type 固定 32F，和 _sgemm_f16 同一条 GemmEx。"""
+        self._activate()
+        self._chk_blas(self.cublas.cublasGemmEx(
+            self.handle,
+            int(transa), int(transb),
+            int(m), int(n), int(k),
+            ctypes.byref(alpha),
+            ctypes.c_uint64(int(A.ptr)), CUDA_R_16F, int(lda),
+            ctypes.c_uint64(int(B.ptr)), CUDA_R_16F, int(ldb),
+            ctypes.byref(beta),
+            ctypes.c_uint64(int(C)), CUDA_R_32F, int(ldc),
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), "cublasGemmEx")
+
+    def sgemm_split16(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
+        """列主序调用和 _sgemm 完全一致。三次 fp16 GEMM 逼近 fp32，输出仍是 fp32 的 C。
+
+        A@B ≈ Ahi@Bhi + Ahi@Blo + Alo@Bhi。hi@hi 用 beta=0 写 C，后两次 beta=1 累加。
+        不修改 A、B。丢掉的 lo@lo 量级约 2^-22。
+        """
+        self._bind_gemm_ex()
+        m, n, k = int(m), int(n), int(k)
+        lda, ldb, ldc = int(lda), int(ldb), int(ldc)
+        na = lda * (k if int(transa) == CUDA_OP_N else m)
+        nb = ldb * (n if int(transb) == CUDA_OP_N else k)
+        if na < 0 or nb < 0 or na > 2147483647 or nb > 2147483647:
+            raise CudaError("fp16 split GEMM 元素数非法: A=%s B=%s" % (na, nb) + "。修法：确认 cuBLAS 版本与驱动匹配；可先用 TG_FP16=0 关掉 fp16 GEMM 排查")
+        ahi, alo = self._split16_pair(A, na)
+        bhi, blo = self._split16_pair(B, nb)
+        alpha = ctypes.c_float(1.0)
+        beta0 = ctypes.c_float(0.0)
+        beta1 = ctypes.c_float(1.0)
+        self._gemm_ex_f16(transa, transb, m, n, k, ahi, lda, bhi, ldb, beta0, C, ldc, alpha)
+        self._gemm_ex_f16(transa, transb, m, n, k, ahi, lda, blo, ldb, beta1, C, ldc, alpha)
+        self._gemm_ex_f16(transa, transb, m, n, k, alo, lda, bhi, ldb, beta1, C, ldc, alpha)
+        # C 被整块重写。和输入同址时，上面刚放进缓存的拆分已经过期。
+        self._split_forget_ptr(C)
+
+    # ---- bf16 GEMM（TG_BF16=1 打开，默认关；结构照 fp16，不改 fp16 本身）----
+    def _bf16_state(self):
+        """惰性初始化。没开 TG_BF16 时只多一次属性查找，不碰设备。"""
+        st = getattr(self, "_bf16", None)
+        if st is None:
+            st = {
+                "on": bool(bf16_env_requested()),
+                "warned": False,
+                "cap_warned": False,
+            }
+            self._bf16 = st
+        return st
+
+    def _bf16_fail(self, ex):
+        """任何异常都关掉 bf16 并只警告一次，这一次以及以后走原路径（fp16 或 fp32）。"""
+        st = self._bf16_state()
+        st["on"] = False
+        if not st["warned"]:
+            st["warned"] = True
+            sys.stderr.write(
+                "[tgai] bf16 GEMM 不可用，已回退 fp32（只警告一次）：%s: %s\n"
+                % (type(ex).__name__, str(ex)[:300]))
+            sys.stderr.flush()
+
+    def _bf16_wanted(self, m, n, k):
+        st = self._bf16_state()
+        if not st["on"]:
+            return False
+        # 捕获期间 cast 要现分配缓冲，池未命中会直接让 CUDA Graph 失败。不启用。
+        if self._capturing:
+            if not st["cap_warned"]:
+                st["cap_warned"] = True
+                sys.stderr.write(
+                    "[tgai] CUDA Graph 捕获中不启用 bf16 GEMM，这一步走原路径。\n")
+                sys.stderr.flush()
+            return False
+        return int(m) * int(n) >= _BF16_MIN_OUTPUT and int(k) <= _BF16_MAX_K
+
+    def _bf16_epoch_bump(self):
+        """权重即将变化（优化器 step 开始）：让 bf16 影子缓存整体失效。
+
+        为什么放在 step 的开头就够：训练循环是
+            forward(W) → zero_grad → backward(W) → step(W→W')
+        step 开头时 backward 已经用完了这一轮的影子，而下一轮 forward 还没开始，
+        所以此刻失效是唯一正确的位置（放在 zero_grad 会晚半步，实测导致数值错）。
+        """
+        self._bf16_shadow = {}
+        self._bf16_shadow_bytes = 0
+
+    def _cast_flat_ptr_bf16(self, src_ptr, count):
+        """src_ptr 起 count 个 fp32 按 RTNE 收成 bf16（np.uint16 缓冲）。
+
+        ≥64K 元素的块做影子缓存（上限 256 MiB）：一个权重在一次前向里用一次、
+        反向算 grad_x 时又用一次，缓存能把权重的 cast 次数减半。
+        缓存在优化器 step 开头整体清空（见 _bf16_epoch_bump）。
+        """
+        count = int(count)
+        cache = self.__dict__.get("_bf16_shadow")
+        if cache is None:
+            cache = self._bf16_shadow = {}
+            self._bf16_shadow_bytes = 0
+        if count >= 65536:
+            hit = cache.get((int(src_ptr), count))
+            if hit is not None:
+                return hit
+        out = self.empty((count,), dtype=np.uint16)
+        if count:
+            if count > 2147483647:
+                raise CudaError("bf16 cast 元素数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            grid, block = self._ewise_grid(count)
+            self._activate()
+            self.launch("cast_f32_to_bf16", grid, block, [
+                (int(src_ptr), ctypes.c_uint64), self._ptr(out),
+                (count, ctypes.c_int),
+            ])
+        if count >= 65536 and self._bf16_shadow_bytes + count * 2 <= (256 << 20):
+            self._bf16_shadow[(int(src_ptr), count)] = out
+            self._bf16_shadow_bytes += count * 2
+        return out
+
+    def _cast_bf16_to_f32_flat(self, src_buf, count, shape=None):
+        """把 bf16（uint16 位模式）缓冲升回 fp32。
+
+        与 `cast_f32_to_bf16` 的 RTNE 收窄配对后，往返误差上界是 **2^-9 ≈ 1.95e-3**
+        （bf16 只有 8 位尾数）。升宽本身是精确的：内核做
+        `dst[i] = __uint_as_float((unsigned int)src[i] << 16)`，纯左移，不丢位。
+
+        **不做影子缓存**：这是"读时升回来"的路径，缓存住升精度结果就等于没省显存。
+
+        `shape` 给出时**直接按该形状分配**，不经过 `reshape` —— 之前先用一维分配
+        再 reshape 回原形状，实测在算子路径上引出 `ctypes.ArgumentError: RecursionError`，
+        直接按目标形状分配可以绕开那条链。
+        """
+        count = int(count)
+        out = self.empty(tuple(shape) if shape is not None else (count,),
+                         dtype=np.float32)
+        if count:
+            if count > 2147483647:
+                raise CudaError("bf16->f32 元素数超过 int32"
+                                + "。修法：把张量分块升精度；或不要对该张量启用 bf16 存储")
+            grid, block = self._ewise_grid(count)
+            self._activate()
+            self.launch("cast_bf16_to_f32", grid, block, [
+                self._ptr(src_buf), self._ptr(out), (count, ctypes.c_int),
+            ])
+        return out
+
+    def cast_f32_to_bf16_flat(self, src_buf):
+        """fp32 → bf16（uint16 位模式），**不做影子缓存**。
+
+        与 `_cast_flat_ptr_bf16` 的区别：那个是按指针缓存的"权重影子"
+        （同一块显存重复用、省转换），这里用于**激活存储压缩** ——
+        压缩完就要把 fp32 释放，缓存住反而等于没省。
+        收窄用 RTNE，往返误差上界 2^-9 ≈ 1.95e-3。
+        """
+        count = int(src_buf.n)
+        out = self.empty((count,), dtype=np.uint16)
+        if count:
+            if count > 2147483647:
+                raise CudaError("f32->bf16 元素数超过 int32"
+                                + "。修法：把张量分块压缩；或不要对该张量启用 bf16 存储")
+            grid, block = self._ewise_grid(count)
+            self._activate()
+            self.launch("cast_f32_to_bf16", grid, block, [
+                self._ptr(src_buf), self._ptr(out), (count, ctypes.c_int),
+            ])
+        return out
+
+    def _sgemm_bf16(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
+        """列主序调用和 _sgemm_f16 / _sgemm 完全一致。
+
+        A、B 先 cast 成 bf16，cublasGemmEx 用 CUDA_R_16BF 输入、
+        CUBLAS_COMPUTE_32F 累加、CUDA_R_32F 直接写回 C。lda/ldb/ldc 原样透传。
+        """
+        self._bind_gemm_ex()
+        na = int(lda) * (int(k) if int(transa) == CUDA_OP_N else int(m))
+        nb = int(ldb) * (int(n) if int(transb) == CUDA_OP_N else int(k))
+        nc = int(ldc) * int(n)
+        if na < 0 or nb < 0 or nc < 0 or max(na, nb, nc) > 2147483647:
+            raise CudaError("bf16 GEMM 元素数超过 int32" + "。修法：确认 cuBLAS 版本与驱动匹配；可先用 TG_FP16=0 关掉 fp16 GEMM 排查")
+        a16 = self._cast_flat_ptr_bf16(A, na)
+        b16 = self._cast_flat_ptr_bf16(B, nb)
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._activate()
+        self._chk_blas(self.cublas.cublasGemmEx(
+            self.handle,
+            int(transa), int(transb),
+            int(m), int(n), int(k),
+            ctypes.byref(alpha),
+            ctypes.c_uint64(int(a16.ptr)), CUDA_R_16BF, int(lda),
+            ctypes.c_uint64(int(b16.ptr)), CUDA_R_16BF, int(ldb),
+            ctypes.byref(beta),
+            ctypes.c_uint64(int(C)), CUDA_R_32F, int(ldc),
+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), "cublasGemmEx")
+
+    def _sgemm(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
+        if m == 0 or n == 0 or k == 0:
+            return
+        # bf16 先于 fp16。没设 TG_BF16 时 _bf16_wanted 立刻返回，下面的 fp16/fp32 一字不改。
+        if self._bf16_wanted(m, n, k):
+            try:
+                self._sgemm_bf16(transa, transb, m, n, k, A, lda, B, ldb, C, ldc)
+                self._split_forget_ptr(C)
+                return
+            except Exception as ex:
+                # 回退：后面的 fp32 路径 beta=0 会把 C 整个重写。
+                self._bf16_fail(ex)
+        # 只有输出够大时才值得转 fp16。实测（V100 / cublas64_12）：
+        #   m*n = 65536,  k=4992 -> fp16 反而慢一倍（0.073 -> 0.142 ms，cast 占满）
+        #   m*n >= 1.28M, k=256..1280 -> fp16 快 1.6~2.6x
+        # 所以拿 m*n 当门槛；小输出（各层 dW 那种 [256,256] @ k=4992）留 fp32。
+        # ★ 只对「K 不长」的 GEMM 走 fp16：dW 类形状（K=4992 的长累加、数值对消严重）
+        #   实测会让参数梯度的相对误差从 3e-4 恶化到 2e-2（loss 600 步偏 10%）。
+        # 这段必须在函数体上，不能缩进到上面的 m==0 return 里面（那样永远走不到）。
+        if (int(m) * int(n) >= _FP16_MIN_OUTPUT and int(k) <= _FP16_MAX_K
+                and self._fp16_state()["on"]):
+            try:
+                self._sgemm_f16(transa, transb, m, n, k, A, lda, B, ldb, C, ldc)
+                self._split_forget_ptr(C)
+                return
+            except Exception as ex:
+                # 回退：fp32 路径 beta=0 会把 C 整个重写，前面 fp16 的半成品不作数。
+                self._fp16_fail(ex)
+        # 2×fp16 拆分。长 K 或大输出才值得；捕获期间分配/多段 GEMM 会让图失败，直接走 fp32。
+        if self._split16_wanted(m, n, k):
+            try:
+                self.sgemm_split16(transa, transb, m, n, k, A, lda, B, ldb, C, ldc)
+                return
+            except Exception as ex:
+                self._split16_fail(ex)
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._capture_keep(alpha, beta)
+        self._activate()
+        self._chk_blas(self.cublas.cublasSgemm_v2(
+            self.handle,
+            int(transa), int(transb),
+            int(m), int(n), int(k),
+            ctypes.byref(alpha),
+            int(A), int(lda),
+            int(B), int(ldb),
+            ctypes.byref(beta),
+            int(C), int(ldc),
+        ), "cublasSgemm_v2")
+        self._split_forget_ptr(C)
+
+    def sgemm_compose(self, A, B, chunks, kind):
+        M, K = int(A.shape[0]), int(A.shape[1])
+        N = int(B.shape[1])
+        ch = [int(x) for x in chunks][:8]
+        while len(ch) < 8:
+            ch.append(0)
+        C = self.empty((M, N), dtype=np.float32)
+        total = M * N
+        if total and K:
+            grid, block = self._ewise_grid(total)
+            self.launch("sgemm_compose", grid, block, [
+                self._ptr(A), self._ptr(B), self._ptr(C),
+                (M, ctypes.c_int), (N, ctypes.c_int), (K, ctypes.c_int),
+                (len([x for x in chunks if int(x) > 0]), ctypes.c_int),
+                (int(kind), ctypes.c_int),
+            ] + [(int(x), ctypes.c_int) for x in ch])
+        return C
+
+    def sgemm_mode(self, A, B, mode):
+        """对照用：同一种形状的多种累加。mode 见 sgemm_mode kernel。"""
+        if len(A.shape) != 2 or len(B.shape) != 2:
+            raise CudaError("sgemm_mode 需要 2D" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        M, K = int(A.shape[0]), int(A.shape[1])
+        K2, N = int(B.shape[0]), int(B.shape[1])
+        if K != K2:
+            raise CudaError("sgemm_mode K 不匹配" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if K > 32 and int(mode) == 3:
+            raise CudaError("pairwise mode 只支持 K<=32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        C = self.empty((M, N), dtype=np.float32)
+        total = M * N
+        if total and K:
+            grid, block = self._ewise_grid(total)
+            self.launch("sgemm_mode", grid, block, [
+                self._ptr(A), self._ptr(B), self._ptr(C),
+                (M, ctypes.c_int), (N, ctypes.c_int), (K, ctypes.c_int),
+                (int(mode), ctypes.c_int),
+            ])
+        elif total:
+            return self.full((M, N), 0.0)
+        return C
+
+    def _numpy_exact_gemm(self, M, N, K):
+        """这些尺寸上 NumPy 1.26 / OpenBLAS 的 float32 matmul 就是顺序 FMA。
+
+        实测 K<=16、M,N<=64 时 sgemm_mode 1 与 `@` 逐位相同。
+        cublasSgemm_v2 即使 PEDANTIC 也有约 3e-8，Muon 五轮迭代后超过 1e-7。
+        更大的矩阵仍走 cuBLAS，避免朴素 kernel 拖垮以后的训练。
+        """
+        return 0 <= M <= 64 and 0 <= N <= 64 and 0 <= K <= 16
+
+    def sgemm(self, A, B):
+        """行优先 C[M,N] = A[M,K] @ B[K,N]。"""
+        if len(A.shape) != 2 or len(B.shape) != 2:
+            raise CudaError("sgemm 需要 2D，收到 %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        M, K = int(A.shape[0]), int(A.shape[1])
+        K2, N = int(B.shape[0]), int(B.shape[1])
+        if K != K2:
+            raise CudaError("sgemm K 不匹配: %s @ %s" % (A.shape, B.shape) + HINT_MATMUL + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if M == 0 or N == 0 or K == 0:
+            return self.full((M, N), 0.0)
+        if self._numpy_exact_gemm(M, N, K):
+            return self.sgemm_mode(A, B, 1)
+        C = self.empty((M, N), dtype=np.float32)
+        # 列主序视角: C^T(N,M) = B^T(op=N, ld=N) @ A^T(op=N, ld=K)
+        self._mark_submitted(A.ptr)
+        self._mark_submitted(B.ptr)
+        self._mark_submitted(C.ptr)
+        self._sgemm(CUDA_OP_N, CUDA_OP_N, N, M, K, B.ptr, N, A.ptr, K, C.ptr, N)
+        return C
+
+    def gemm_nt(self, A, B):
+        """行优先 C[M,N] = A[M,K] @ B[N,K]^T。"""
+        if len(A.shape) != 2 or len(B.shape) != 2:
+            raise CudaError("gemm_nt 需要 2D，收到 %s @ %s^T" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        M, K = int(A.shape[0]), int(A.shape[1])
+        N, K2 = int(B.shape[0]), int(B.shape[1])
+        if K != K2:
+            raise CudaError("gemm_nt K 不匹配: %s @ %s^T" % (A.shape, B.shape) + HINT_MATMUL + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if M == 0 or N == 0 or K == 0:
+            return self.full((M, N), 0.0)
+        if self._numpy_exact_gemm(M, N, K):
+            return self.sgemm_mode(A, self.transpose2d(B), 1)
+        C = self.empty((M, N), dtype=np.float32)
+        self._mark_submitted(A.ptr)
+        self._mark_submitted(B.ptr)
+        self._mark_submitted(C.ptr)
+        self._sgemm(CUDA_OP_T, CUDA_OP_N, N, M, K, B.ptr, K, A.ptr, K, C.ptr, N)
+        return C
+
+    def gemm_tn(self, A, B):
+        """行优先 C[M,N] = A[K,M]^T @ B[K,N]。"""
+        if len(A.shape) != 2 or len(B.shape) != 2:
+            raise CudaError("gemm_tn 需要 2D，收到 %s^T @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        K, M = int(A.shape[0]), int(A.shape[1])
+        K2, N = int(B.shape[0]), int(B.shape[1])
+        if K != K2:
+            raise CudaError("gemm_tn K 不匹配: %s^T @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if M == 0 or N == 0 or K == 0:
+            return self.full((M, N), 0.0)
+        if self._numpy_exact_gemm(M, N, K):
+            return self.sgemm_mode(self.transpose2d(A), B, 1)
+        C = self.empty((M, N), dtype=np.float32)
+        self._mark_submitted(A.ptr)
+        self._mark_submitted(B.ptr)
+        self._mark_submitted(C.ptr)
+        self._sgemm(CUDA_OP_N, CUDA_OP_T, N, M, K, B.ptr, N, A.ptr, M, C.ptr, N)
+        return C
+
+    def _grouped_ready(self):
+        if getattr(self, "_grouped_missing", False):
+            return None
+        fn = getattr(self, "_grouped_fn", None)
+        if fn is not None:
+            return fn
+        try:
+            fn = self.cublas.cublasSgemmGroupedBatched
+        except AttributeError:
+            # 这台机器运行时加载的 libcublas 没有 grouped 符号。退回紧凑的
+            # 多次 cublasSgemm：仍然是一次 Python 调用发出全部专家，不再逐个建反传节点。
+            self._grouped_missing = True
+            return None
+        fn.restype = ctypes.c_int
+        # ★ 2026-11-11 修正：这里是 **非 Ex** 版 `cublasSgemmGroupedBatched`，
+        # 签名要求 m/n/k 是**标量 int**、alpha/beta 是**单个主机标量指针**，
+        # 且顺序是 `alpha, A[], lda, B[], ldb, beta, C[], ldc`（beta 在 B 之后）。
+        #
+        # 旧实现按 Ex 版声明成 `int*` 并传了指针数组 —— 驱动会把指针低 32 位当成 `m` 读，
+        # 得到一个天文数字，于是必然非法访存（实测 rc=700）。旧注释把它归因为
+        # "某专家行数 >64 越界"，是误判：只要分组路径被走到就必崩。
+        #
+        # 非 Ex 版还要求**所有组共享 m/n/k**，所以 `_grouped_sgemm` 现在会先检查一致性，
+        # 不一致就安全回退到逐次 sgemm（不再崩溃）。
+        # 指针数组在主机上，元素是设备地址；用 c_uint64 避免高位地址被当成负数。
+        fn.argtypes = [
+            ctypes.c_void_p,          # handle
+            ctypes.c_int,             # transa
+            ctypes.c_int,             # transb
+            ctypes.c_int,             # m
+            ctypes.c_int,             # n
+            ctypes.c_int,             # k
+            ctypes.POINTER(ctypes.c_float),      # alpha（单个主机标量）
+            ctypes.POINTER(ctypes.c_uint64),     # A 指针数组
+            ctypes.c_int,                        # lda
+            ctypes.POINTER(ctypes.c_uint64),     # B 指针数组
+            ctypes.c_int,                        # ldb
+            ctypes.POINTER(ctypes.c_float),      # beta（单个主机标量）
+            ctypes.POINTER(ctypes.c_uint64),     # C 指针数组
+            ctypes.c_int,                        # ldc
+            ctypes.c_int,                        # batchCount
+            ctypes.POINTER(ctypes.c_int),        # groupSize 数组
+        ]
+        self._grouped_fn = fn
+        return fn
+
+    def _grouped_fail_note(self, rc):
+        """分组 GEMM 失败只提示一次，之后不再重复刷屏。"""
+        if getattr(self, "_grouped_noted", False):
+            return
+        self._grouped_noted = True
+        try:
+            sys.stderr.write(
+                "[tgai] 分组 GEMM（cublasSgemmGroupedBatched）返回 rc=%d，"
+                "已自动退回逐次 sgemm（结果正确，只是没有融合）。\n" % int(rc))
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    def _grouped_sgemm(self, specs):
+        """一批 sgemm，一次 `cublasSgemmGroupedBatched`。
+
+        **非 Ex 版要求所有组共享 m/n/k**（`int m, int n, int k` 是标量）。
+        各组形状不一致时**安全回退**到逐次 `_sgemm`（结果相同，只是不融合）——
+        旧实现没有这个检查，且按 Ex 版签名调用，导致必然 rc=700。
+
+        specs: (transa, transb, m, n, k, A, lda, B, ldb, C, ldc)，指针是 int。
+        """
+        specs = [s for s in specs if int(s[2]) > 0 and int(s[3]) > 0 and int(s[4]) > 0]
+        if not specs:
+            return None
+        # 一致性检查：非 Ex 版只能接受"所有组 m/n/k 相同"
+        m0, n0, k0 = int(specs[0][2]), int(specs[0][3]), int(specs[0][4])
+        uniform = all(int(s[2]) == m0 and int(s[3]) == n0 and int(s[4]) == k0
+                      for s in specs)
+        fn = None if not uniform else self._grouped_ready()
+        if fn is None:
+            for s in specs:
+                self._sgemm(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10])
+            return None
+        g = len(specs)
+        aa = (ctypes.c_uint64 * g)()
+        lda = (ctypes.c_int * g)()
+        ba = (ctypes.c_uint64 * g)()
+        ldb = (ctypes.c_int * g)()
+        ca = (ctypes.c_uint64 * g)()
+        ldc = (ctypes.c_int * g)()
+        gsize = (ctypes.c_int * g)()
+        for i, s in enumerate(specs):
+            aa[i] = ctypes.c_uint64(int(s[5]))
+            lda[i] = int(s[6])
+            ba[i] = ctypes.c_uint64(int(s[7]))
+            ldb[i] = int(s[8])
+            ca[i] = ctypes.c_uint64(int(s[9]))
+            ldc[i] = int(s[10])
+            gsize[i] = 1
+            self._mark_submitted(int(s[5]))
+            self._mark_submitted(int(s[7]))
+            self._mark_submitted(int(s[9]))
+        self._activate()
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        try:
+            rc = fn(
+                self.handle,
+                int(specs[0][0]), int(specs[0][1]),
+                m0, n0, k0,
+                ctypes.byref(alpha),
+                aa, lda[0], ba, ldb[0],
+                ctypes.byref(beta),
+                ca, ldc[0],
+                int(g), gsize,
+            )
+        except Exception:
+            rc = -1
+        # ★ 失败即回退，绝不抛异常：分组路径目前仍返回 rc=7（参数校验不过），
+        # 在彻底调通之前，任何失败都必须静默退回逐次 sgemm，保证结果正确、库不崩。
+        if int(rc) != 0:
+            for s in specs:
+                self._sgemm(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10])
+            self._grouped_fail_note(int(rc))
+            return None
+        # 主机数组要活到内核真正跑完
+        return (aa, lda, ba, ldb, ca, ldc, gsize, alpha, beta)
+
+    def grouped_nt(self, As, Bs):
+        """每个 C[M,N] = A[M,K] @ B[N,K]^T。M 可以各不相同，K/N 按各对自己的形状。"""
+        if len(As) != len(Bs):
+            raise CudaError("grouped_nt 两边条数不同" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        Cs = []
+        specs = []
+        for A, B in zip(As, Bs):
+            if len(A.shape) != 2 or len(B.shape) != 2:
+                raise CudaError("grouped_nt 需要 2D" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            M, K = int(A.shape[0]), int(A.shape[1])
+            N, K2 = int(B.shape[0]), int(B.shape[1])
+            if K != K2:
+                raise CudaError("grouped_nt K 不匹配: %s @ %s^T" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            C = self.empty((M, N), dtype=np.float32)
+            Cs.append(C)
+            if M and N and K:
+                # 与 gemm_nt 同一套列主序：C^T = B(T) @ A(N)
+                specs.append((CUDA_OP_T, CUDA_OP_N, N, M, K, B.ptr, K, A.ptr, K, C.ptr, N))
+            else:
+                self._memset32(C, 0)
+        hold = self._grouped_sgemm(specs)
+        if Cs:
+            Cs[0].keepalive = hold
+        return Cs
+
+    def grouped_nn(self, As, Bs):
+        """每个 C[M,N] = A[M,K] @ B[K,N]。"""
+        if len(As) != len(Bs):
+            raise CudaError("grouped_nn 两边条数不同" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        Cs = []
+        specs = []
+        for A, B in zip(As, Bs):
+            M, K = int(A.shape[0]), int(A.shape[1])
+            K2, N = int(B.shape[0]), int(B.shape[1])
+            if K != K2:
+                raise CudaError("grouped_nn K 不匹配: %s @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            C = self.empty((M, N), dtype=np.float32)
+            Cs.append(C)
+            if M and N and K:
+                specs.append((CUDA_OP_N, CUDA_OP_N, N, M, K, B.ptr, N, A.ptr, K, C.ptr, N))
+            else:
+                self._memset32(C, 0)
+        hold = self._grouped_sgemm(specs)
+        if Cs:
+            prev = Cs[0].keepalive
+            Cs[0].keepalive = (hold, prev) if prev is not None else hold
+        return Cs
+
+    def _strided_ready(self):
+        if getattr(self, "_strided_missing", False):
+            return None
+        fn = getattr(self, "_strided_fn", None)
+        if fn is not None:
+            return fn
+        try:
+            fn = self.cublas.cublasSgemmStridedBatched
+        except AttributeError:
+            self._strided_missing = True
+            return None
+        fn.restype = ctypes.c_int
+        fn.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_longlong,
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.c_uint64, ctypes.c_int, ctypes.c_longlong,
+            ctypes.c_int,
+        ]
+        self._strided_fn = fn
+        return fn
+
+    def _grouped_tn_strided(self, As, Bs):
+        """把专家垫到同一个 K，一次 cublasSgemmStridedBatched。
+
+        垫出来的行是 0，乘进去是精确的 +0，不改变和。K 差太多就不要垫，
+        调用方会退回 grouped。空专家整块是 0。
+        """
+        ks = [int(A.shape[0]) for A in As]
+        positive = [k for k in ks if k > 0]
+        if not positive:
+            M = int(As[0].shape[1]) if As else 0
+            N = int(Bs[0].shape[1]) if Bs else 0
+            return [self.zeros((M, N), dtype=np.float32) for _ in As]
+        kmax = max(positive)
+        M = int(As[0].shape[1])
+        N = int(Bs[0].shape[1])
+        nexp = len(As)
+        Ap = self.zeros((nexp, kmax, M), dtype=np.float32)
+        Bp = self.zeros((nexp, kmax, N), dtype=np.float32)
+        for e, (A, B, k) in enumerate(zip(As, Bs, ks)):
+            if k <= 0 or M <= 0:
+                continue
+            self._mark_submitted(A.ptr)
+            self.launch("moe_pad_rows", (k, 1, 1), (self._moe_row_block(M), 1, 1), [
+                (int(A.ptr), ctypes.c_uint64),
+                (int(Ap.ptr) + e * kmax * M * 4, ctypes.c_uint64),
+                (k, ctypes.c_int), (M, ctypes.c_int),
+            ])
+            if N > 0:
+                self._mark_submitted(B.ptr)
+                self.launch("moe_pad_rows", (k, 1, 1), (self._moe_row_block(N), 1, 1), [
+                    (int(B.ptr), ctypes.c_uint64),
+                    (int(Bp.ptr) + e * kmax * N * 4, ctypes.c_uint64),
+                    (k, ctypes.c_int), (N, ctypes.c_int),
+                ])
+        Cp = self.empty((nexp, M, N), dtype=np.float32)
+        fn = self._strided_ready()
+        if fn is None or M <= 0 or N <= 0 or kmax <= 0:
+            raise CudaError("strided gemm 不可用" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        alpha = ctypes.c_float(1.0)
+        beta = ctypes.c_float(0.0)
+        self._mark_submitted(Ap.ptr)
+        self._mark_submitted(Bp.ptr)
+        self._mark_submitted(Cp.ptr)
+        self._activate()
+        self._chk_blas(fn(
+            self.handle, CUDA_OP_N, CUDA_OP_T,
+            ctypes.c_int(N), ctypes.c_int(M), ctypes.c_int(kmax),
+            ctypes.byref(alpha),
+            ctypes.c_uint64(int(Bp.ptr)), ctypes.c_int(N), ctypes.c_longlong(kmax * N),
+            ctypes.c_uint64(int(Ap.ptr)), ctypes.c_int(M), ctypes.c_longlong(kmax * M),
+            ctypes.byref(beta),
+            ctypes.c_uint64(int(Cp.ptr)), ctypes.c_int(N), ctypes.c_longlong(M * N),
+            ctypes.c_int(nexp),
+        ), "cublasSgemmStridedBatched")
+        Cs = []
+        for e in range(nexp):
+            C = self.empty((M, N), dtype=np.float32)
+            if M and N:
+                self.launch("moe_pad_rows", (M, 1, 1), (self._moe_row_block(N), 1, 1), [
+                    (int(Cp.ptr) + e * M * N * 4, ctypes.c_uint64),
+                    (int(C.ptr), ctypes.c_uint64),
+                    (M, ctypes.c_int), (N, ctypes.c_int),
+                ])
+            Cs.append(C)
+        # 设备垫片只活到本函数返回：kernel 已排进默认流，下一次复用排在它们之后。
+        # 主机上的 alpha/beta 是按值传入的，cublas 返回后不再读。别把 Ap/Bp/Cp
+        # 挂在梯度上活过整个反传，那是一份和 token 数成正比的额外占用。
+        if Cs:
+            Cs[0].keepalive = (alpha, beta)
+        return Cs
+
+    def grouped_tn(self, As, Bs):
+        """每个 C[M,N] = A[K,M]^T @ B[K,N]。"""
+        if len(As) != len(Bs):
+            raise CudaError("grouped_tn 两边条数不同" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if len(As) >= 2:
+            shapes_ok = True
+            ks = []
+            M0 = int(As[0].shape[1])
+            N0 = int(Bs[0].shape[1])
+            for A, B in zip(As, Bs):
+                K, M = int(A.shape[0]), int(A.shape[1])
+                K2, N = int(B.shape[0]), int(B.shape[1])
+                if K != K2 or M != M0 or N != N0:
+                    shapes_ok = False
+                    break
+                ks.append(K)
+            positive = [k for k in ks if k > 0]
+            # 专家 token 数接近时，垫零后一次 strided 比 8 次不同 K 的 grouped 更合适。
+            if (shapes_ok and positive and max(positive) > 64
+                    and max(positive) <= min(positive) * 8
+                    and self._strided_ready() is not None):
+                return self._grouped_tn_strided(As, Bs)
+        Cs = []
+        specs = []
+        for A, B in zip(As, Bs):
+            K, M = int(A.shape[0]), int(A.shape[1])
+            K2, N = int(B.shape[0]), int(B.shape[1])
+            if K != K2:
+                raise CudaError("grouped_tn K 不匹配: %s^T @ %s" % (A.shape, B.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            C = self.empty((M, N), dtype=np.float32)
+            Cs.append(C)
+            if M and N and K:
+                specs.append((CUDA_OP_N, CUDA_OP_T, N, M, K, B.ptr, N, A.ptr, M, C.ptr, N))
+            else:
+                self._memset32(C, 0)
+        hold = self._grouped_sgemm(specs)
+        if Cs:
+            prev = Cs[0].keepalive
+            Cs[0].keepalive = (hold, prev) if prev is not None else hold
+        return Cs
+
+    def ce_fwd(self, logits, targets, n, v):
+        n = int(n)
+        v = int(v)
+        loss = self.empty((), dtype=np.float32)
+        if n <= 0 or v <= 0:
+            self._memset32(loss, 0)
+            loss.known_scalar = 0.0
+            return loss
+        terms = self.empty((n,), dtype=np.float32)
+        self.launch("ce_fwd_rows", (n, 1, 1), (256, 1, 1), [
+            self._ptr(logits), self._ptr(targets), self._ptr(terms),
+            (n, ctypes.c_int), (v, ctypes.c_int),
+        ])
+        self.launch("ce_fwd_mean", (1, 1, 1), (1, 1, 1), [
+            self._ptr(terms), self._ptr(loss), (n, ctypes.c_int),
+        ])
+        # terms 还被 ce_fwd_mean 读着。挂在 loss 上，避免函数返回时 free() 把整条流同步掉。
+        loss.keepalive = terms
+        return loss
+
+    def ce_bwd(self, logits, targets, n, v, out=None):
+        """out 与 logits 可以是同一块。
+
+        写阶段每个线程只读自己即将覆盖的元素，max/sum 在写之前已经归约完，
+        所以原地写 dlogits 与另开缓冲逐位相同。调用方必须保证没有第二个读者。
+        """
+        n = int(n)
+        v = int(v)
+        if out is None:
+            dl = self.empty((n, v), dtype=np.float32)
+        else:
+            if tuple(int(s) for s in out.shape) != (n, v) or int(out.n) != n * v:
+                raise CudaError("ce_bwd 输出形状 %s 不是 (%d, %d)" % (out.shape, n, v) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            dl = out
+            dl.known_scalar = None
+        if n > 0 and v > 0:
+            self._split_forget_ptr(dl)
+            self.launch("ce_bwd", (n, 1, 1), (256, 1, 1), [
+                self._ptr(logits), self._ptr(targets), self._ptr(dl),
+                (n, ctypes.c_int), (v, ctypes.c_int),
+            ])
+        return dl
+
+    def zeros(self, shape, dtype=np.float32):
+        return self.full(shape, 0, dtype=dtype)
+
+    def mul(self, a, b):
+        if a.shape != b.shape or a.n != b.n:
+            raise CudaError("ewise_mul 形状不同: %s vs %s" % (a.shape, b.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        out = self.empty(a.shape, dtype=np.float32)
+        n = int(a.n)
+        if n:
+            if self._vec4_ok(n, a, b, out):
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("ewise_mul_v4", grid, block, [
+                    self._ptr(a), self._ptr(b), self._ptr(out),
+                    (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(n)
+                self.launch("ewise_mul", grid, block, [
+                    self._ptr(a), self._ptr(b), self._ptr(out),
+                    (n, ctypes.c_int),
+                ])
+        return out
+
+    def sum_all(self, buf):
+        """全归约。一个 256 线程的 block，M2 的张量都很小。"""
+        out = self.empty((), dtype=np.float32)
+        n = int(buf.n)
+        if n <= 0:
+            zero = np.zeros((), dtype=np.float32)
+            self._activate()
+            self._mark_submitted(out.ptr)
+            self._chk(self.cu.cuMemcpyHtoD(
+                ctypes.c_uint64(out.ptr),
+                zero.ctypes.data_as(ctypes.c_void_p),
+                ctypes.c_size_t(4)), "cuMemcpyHtoD(sum0)")
+            return out
+        if n > (1 << 20):
+            # 大张量：两遍式。每块至少约 64K 元素，块数上限 1024。
+            nb = min(1024, (n + 65535) // 65536)
+            part = self.empty((nb,), dtype=np.float32)
+            self.launch("reduce_sum_partial", (nb, 1, 1), (256, 1, 1), [
+                self._ptr(buf), self._ptr(part), (n, ctypes.c_int),
+            ])
+            self.launch("reduce_sum", (1, 1, 1), (256, 1, 1), [
+                self._ptr(part), self._ptr(out), (nb, ctypes.c_int),
+            ])
+            return out
+        self.launch("reduce_sum", (1, 1, 1), (256, 1, 1), [
+            self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
+        ])
+        return out
+
+    def rmsnorm_fwd(self, x, w, seq, d, eps):
+        out = self.empty(x.shape, dtype=np.float32)
+        if seq and d:
+            # 动态共享内存按 256 个 float。block 必须是 256，和 kernel 里的树归约一致。
+            self.launch("rmsnorm_fwd", (int(seq), 1, 1), (256, 1, 1), [
+                self._ptr(out), self._ptr(x), self._ptr(w),
+                (int(seq), ctypes.c_int), (int(d), ctypes.c_int),
+                (float(eps), ctypes.c_float),
+            ], shared=256 * 4)
+        return out
+
+    def rmsnorm_bwd_det(self, dy, x, w, seq, d, eps, dw_out):
+        """确定性 rmsnorm 反向：返回 dx，把 dw 写进 dw_out（按列升序累加，可复现）。"""
+        seq, d = int(seq), int(d)
+        dx = self.empty((seq, d), dtype=np.float32)
+        if seq and d:
+            rstd = self._rms_rstd_scratch(seq)
+            self.launch("rms_rstd", (seq, 1, 1), (256, 1, 1), [
+                self._ptr(x), self._ptr(rstd), (seq, ctypes.c_int), (d, ctypes.c_int),
+                (float(eps), ctypes.c_float),
+            ])
+            self.launch("rmsnorm_bwd_dx", (seq, 1, 1), (256, 1, 1), [
+                self._ptr(dy), self._ptr(x), self._ptr(w), self._ptr(rstd), self._ptr(dx),
+                (seq, ctypes.c_int), (d, ctypes.c_int),
+            ])
+            grid, block = self._ewise_grid(d)
+            self.launch("rms_dw_det", grid, block, [
+                self._ptr(dy), self._ptr(x), self._ptr(rstd), self._ptr(dw_out),
+                (seq, ctypes.c_int), (d, ctypes.c_int),
+            ])
+        return dx
+
+    def _rms_rstd_scratch(self, seq):
+        buf = getattr(self, "_rstd_scratch", None)
+        if buf is None or int(buf.n) < int(seq):
+            buf = self.empty((int(seq),), dtype=np.float32)
+            self._rstd_scratch = buf
+        return buf
+
+    def rmsnorm_bwd(self, dy, x, w, seq, d, eps):
+        dx = self.empty(x.shape, dtype=np.float32)
+        dw = self.zeros(w.shape, dtype=np.float32)
+        if seq and d:
+            # rmsnorm_bwd 的静态 smem 是 256，block 不能改。
+            self.launch("rmsnorm_bwd", (int(seq), 1, 1), (256, 1, 1), [
+                self._ptr(dy), self._ptr(x), self._ptr(w),
+                self._ptr(dx), self._ptr(dw),
+                (int(seq), ctypes.c_int), (int(d), ctypes.c_int),
+                (float(eps), ctypes.c_float),
+            ])
+        return dx, dw
+
+    def silu_mul_fwd(self, a, b):
+        """原地：a[i] = silu(a[i]) * b[i]。调用方要先 clone。"""
+        if a.n != b.n:
+            raise CudaError("silu_mul 长度不同: %s vs %s" % (a.n, b.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if a.n:
+            self._split_forget_ptr(a)
+            if self._vec4_ok(a.n, a, b):
+                n4 = int(a.n) >> 2
+                grid, block = self._ewise_grid(n4)
+                self.launch("silu_mul_fwd_v4", grid, block, [
+                    self._ptr(a), self._ptr(b), (n4, ctypes.c_int),
+                ])
+                return a
+            grid, block = self._ewise_grid(a.n)
+            self.launch("silu_mul_fwd", grid, block, [
+                self._ptr(a), self._ptr(b), (int(a.n), ctypes.c_int),
+            ])
+        return a
+
+    def silu_fwd_inplace(self, a):
+        """原地 a[i] = silu(a[i])。b 恒为 1 时用这个，省掉一份全 1。"""
+        if a.n:
+            self._split_forget_ptr(a)
+            if self._vec4_ok(a.n, a):
+                n4 = int(a.n) >> 2
+                grid, block = self._ewise_grid(n4)
+                self.launch("silu_fwd_inplace_v4", grid, block, [
+                    self._ptr(a), (n4, ctypes.c_int),
+                ])
+                return a
+            grid, block = self._ewise_grid(a.n)
+            self.launch("silu_fwd_inplace", grid, block, [
+                self._ptr(a), (int(a.n), ctypes.c_int),
+            ])
+        return a
+
+    def silu_bwd_da(self, g, a):
+        """da = g * dsilu(a)，对应 b==1 且不需要 db。"""
+        if g.n != a.n:
+            raise CudaError("silu_bwd_da 长度不同: %s vs %s" % (g.n, a.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        da = self.empty(a.shape, dtype=np.float32)
+        n = int(a.n)
+        if n:
+            if self._vec4_ok(n, g, a, da):
+                n4 = n >> 2
+                grid, block = self._ewise_grid(n4)
+                self.launch("silu_bwd_da_v4", grid, block, [
+                    self._ptr(g), self._ptr(a), self._ptr(da), (n4, ctypes.c_int),
+                ])
+                return da
+            grid, block = self._ewise_grid(n)
+            self.launch("silu_bwd_da", grid, block, [
+                self._ptr(g), self._ptr(a), self._ptr(da), (n, ctypes.c_int),
+            ])
+        return da
+
+    def silu_mul_bwd(self, g, a, b):
+        da = self.empty(a.shape, dtype=np.float32)
+        db = self.empty(b.shape, dtype=np.float32)
+        n = int(a.n)
+        if n:
+            grid, block = self._ewise_grid(n)
+            self.launch("silu_mul_bwd", grid, block, [
+                self._ptr(g), self._ptr(a), self._ptr(b),
+                self._ptr(da), self._ptr(db), (n, ctypes.c_int),
+            ])
+        return da, db
+
+    # ---- M6：自研融合内核的封装 ----
+    def _pairs(self, x, cos, sin, what):
+        """校验 fused_rope 的三个输入，返回 (元素数, 对数)。"""
+        n = int(x.n)
+        if int(cos.n) != n or int(sin.n) != n:
+            raise CudaError("%s 长度不同: x=%d cos=%d sin=%d"
+                            % (what, n, cos.n, sin.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if n % 2:
+            raise CudaError("%s 要求元素个数为偶数（交错配对），收到 %d" % (what, n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        npair = n // 2
+        if npair > 2147483647:
+            raise CudaError("%s 元素个数超过 int32" % what + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        return n, npair
+
+    def fused_rope_(self, x, cos, sin):
+        """原地交错式 RoPE（一个 kernel）。调用方要先 clone 再传进来。"""
+        n, npair = self._pairs(x, cos, sin, "fused_rope_fwd")
+        if npair:
+            self._split_forget_ptr(x)
+            if self._vec4_ok(n, x, cos, sin):
+                # float4 一次两对：n%4==0 就等价于 npair 是偶数。
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("fused_rope_ip_v4", grid, block, [
+                    self._ptr(x), self._ptr(cos), self._ptr(sin),
+                    (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(npair)
+                self.launch("fused_rope_ip", grid, block, [
+                    self._ptr(x), self._ptr(cos), self._ptr(sin),
+                    (npair, ctypes.c_int),
+                ])
+        return x
+
+    def fused_rope_bwd(self, g, cos, sin):
+        """RoPE 反向，dx 是新缓冲（前向不改输入，反向不需要 x）。"""
+        n, npair = self._pairs(g, cos, sin, "fused_rope_bwd")
+        dx = self.empty(g.shape, dtype=np.float32)
+        if npair:
+            if self._vec4_ok(n, g, cos, sin, dx):
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("fused_rope_bwd_v4", grid, block, [
+                    self._ptr(g), self._ptr(cos), self._ptr(sin), self._ptr(dx),
+                    (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(npair)
+                self.launch("fused_rope_bwd", grid, block, [
+                    self._ptr(g), self._ptr(cos), self._ptr(sin), self._ptr(dx),
+                    (npair, ctypes.c_int),
+                ])
+        return dx
+
+    def rope_half_ip(self, x, cos, sin, seq):
+        """原地 half-split RoPE（rotate_half）。调用方先 clone。"""
+        dh = int(x.shape[-1])
+        rows = int(x.n) // dh
+        npair = rows * (dh >> 1)
+        if int(cos.n) != int(seq) * dh or int(sin.n) != int(seq) * dh:
+            raise CudaError(
+                "rope_half: cos/sin 形状不对（要 [seq,dh] = %d 个元素），"
+                "收到 cos=%d sin=%d" % (int(seq) * dh, int(cos.n), int(sin.n)) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
+        if npair:
+            self._split_forget_ptr(x)
+            grid, block = self._ewise_grid(npair)
+            self.launch("rope_half_ip", grid, block, [
+                self._ptr(x), self._ptr(cos), self._ptr(sin),
+                (dh, ctypes.c_int), (int(seq), ctypes.c_int),
+                (ctypes.c_longlong(npair), ctypes.c_longlong),
+            ])
+        return x
+
+    def rope_half_bwd(self, g, cos, sin, seq):
+        """half-split RoPE 反向：dx 是新缓冲（旋转正交，用转置）。"""
+        dh = int(g.shape[-1])
+        rows = int(g.n) // dh
+        npair = rows * (dh >> 1)
+        dx = self.empty(g.shape, dtype=np.float32)
+        if npair:
+            grid, block = self._ewise_grid(npair)
+            self.launch("rope_half_bwd", grid, block, [
+                self._ptr(g), self._ptr(cos), self._ptr(sin), self._ptr(dx),
+                (dh, ctypes.c_int), (int(seq), ctypes.c_int),
+                (ctypes.c_longlong(npair), ctypes.c_longlong),
+            ])
+        return dx
+
+    def add_(self, x, y):
+        """原地 x += y。逐位等同 ewise_add/cuMemcpy 语义，只是不分配新缓冲。"""
+        if int(x.n) != int(y.n):
+            raise CudaError("add_ 长度不同: %s vs %s" % (x.n, y.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        n = int(x.n)
+        if n:
+            self._split_forget_ptr(x)
+            if n > 2147483647:
+                raise CudaError("add_ 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            if self._vec4_ok(n, x, y):
+                grid, block = self._vec4_grid(n >> 2)
+                self.launch("fused_add_ip_v4", grid, block, [
+                    self._ptr(x), self._ptr(y), (n >> 2, ctypes.c_int),
+                ])
+            else:
+                grid, block = self._ewise_grid(n)
+                self.launch("fused_add_ip", grid, block, [
+                    self._ptr(x), self._ptr(y), (n, ctypes.c_int),
+                ])
+        return x
+
+    def rowwise_max(self, x):
+        """沿最后一维取 max 与 argmax。x 可任意维，末维为 k；返回 (值, 下标) 都是 float32。"""
+        k = int(x.shape[-1])
+        rows = int(x.n) // k if k else 0
+        val = self.empty((rows,) if rows else x.shape, dtype=np.float32)
+        idx = self.empty((rows,) if rows else x.shape, dtype=np.float32)
+        if rows > 0 and k > 0:
+            self.launch("rowwise_max", (rows, 1, 1), (256, 1, 1), [
+                self._ptr(x), self._ptr(val), self._ptr(idx),
+                (rows, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        return val, idx
+
+    def rowwise_max_bwd(self, g, idx, shape):
+        """把 g 散射回 argmax 位置，其余为 0；shape 与正向输入一致。"""
+        k = int(shape[-1])
+        rows = int(np.prod(shape[:-1])) if len(shape) > 1 else 1
+        dx = self.empty(shape, dtype=np.float32)
+        if rows > 0 and k > 0:
+            self.launch("rowwise_max_bwd", (rows, 1, 1), (256, 1, 1), [
+                self._ptr(g), self._ptr(idx), self._ptr(dx),
+                (rows, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        return dx
+
+    def attn_mask_softmax_(self, s, causal=True, want_lse=False):
+        """原地 causal-mask + softmax。s 是 [rows, k] 行主序；返回 (s, lse|None)。"""
+        if len(s.shape) < 2:
+            raise CudaError("attn_mask_softmax 需要至少 2 维，收到 %s" % (s.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        # n-D：末维是 k，其余维展平成 rows（行内连续，causal 的 pos=r%k 仍然正确）
+        k = int(s.shape[-1])
+        rows = int(s.n) // k if k else 0
+        lse = None
+        if rows <= 0 or k <= 0:
+            return s, lse
+        self._split_forget_ptr(s)
+        if want_lse:
+            lse = self.empty((rows,), dtype=np.float32)
+        lse_ptr = (0, ctypes.c_uint64) if lse is None else self._ptr(lse)
+        # 一块一行（块内并行归约），不再是"每行一个线程串行扫" —— 后者并行度差，
+        # 实测比"掩码 + 通用 softmax"还慢，所以融合路径以前一直被关着。
+        grid, block = (rows, 1, 1), (256, 1, 1)
+        self.launch("attn_mask_softmax", grid, block, [
+            self._ptr(s), (rows, ctypes.c_int), (k, ctypes.c_int),
+            (1 if causal else 0, ctypes.c_int),
+            (1 if want_lse else 0, ctypes.c_int), lse_ptr,
+        ])
+        return s, lse
+
+    def attn_mask_softmax_bwd(self, dp, p):
+        """dS = P * (dP - sum(dP*P))，就地写到新缓冲。"""
+        if len(dp.shape) < 2 or tuple(dp.shape) != tuple(p.shape):
+            raise CudaError("attn_mask_softmax_bwd 形状不一致: %s vs %s"
+                            % (dp.shape, p.shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
+        k = int(dp.shape[-1])
+        rows = int(dp.n) // k if k else 0
+        ds = self.empty(dp.shape, dtype=np.float32)
+        if rows <= 0 or k <= 0:
+            return ds
+        grid, block = (rows, 1, 1), (256, 1, 1)
+        self.launch("attn_mask_softmax_bwd", grid, block, [
+            self._ptr(dp), self._ptr(p), self._ptr(ds),
+            (rows, ctypes.c_int), (k, ctypes.c_int),
+        ])
+        return ds
+
+    def emb_fwd(self, table, ids, seq, d, vocab, out_shape):
+        out = self.empty(out_shape, dtype=np.float32)
+        if seq and d:
+            self.launch("emb_gather_fwd", (int(seq), 1, 1), (256, 1, 1), [
+                self._ptr(out), self._ptr(table), self._ptr(ids),
+                (int(seq), ctypes.c_int), (int(d), ctypes.c_int),
+                (int(vocab), ctypes.c_int), (0, ctypes.c_int),
+            ])
+        return out
+
+    def emb_bwd(self, grad, ids, seq, d, table_shape):
+        dw = self.zeros(table_shape, dtype=np.float32)
+        seq = int(seq)
+        d = int(d)
+        if not seq or not d:
+            return dw
+        vocab = int(table_shape[0])
+        # 短序列保持原来的 atomic。长序列按 id % 256 把一行交给一个 block，
+        # 块内按 token 顺序加，不再 atomic。分段归约（plan2/rows4）在 8192 上
+        # 比这条慢：单线程扫 3 万词表的开销盖过了写梯度本身。
+        # 2026-10-30 实测（语料 78 条 / seq=4992 / vocab=360）：
+        #   独占版让每个 block 扫全部 seq 再按 id % blocks 过滤，99.7% 的迭代空转。
+        #   A10：我们 kernel 的 GPU 合计 20.07 → 15.77 ms；V100：整步 53.3 → 46.0 ms。
+        # 所以把阈值抬到 8192：常规序列一律走原子版；
+        # 独占版只留给"超长序列 + 小词表"（原来那条注释针对的 8192 场景）。
+        # 确定性模式：强制走"按 id 独占一行、块内按 token 顺序累加"的 emb_bwd_owned，
+        # 它没有 atomicAdd，所以同一输入两次运行结果逐位相同（代价是每块扫全部 seq）。
+        if getattr(self, "deterministic", False) and vocab >= 2 and d >= 128:
+            self.launch("emb_bwd_owned", (256, 1, 1), (256, 1, 1), [
+                self._ptr(grad), self._ptr(ids), self._ptr(dw),
+                (seq, ctypes.c_int), (d, ctypes.c_int), (vocab, ctypes.c_int),
+            ])
+            return dw
+        if seq < 8192 or d < 128 or vocab < 2:
+            self.launch("emb_gather_bwd", (seq, 1, 1), (256, 1, 1), [
+                self._ptr(grad), self._ptr(ids), self._ptr(dw),
+                (seq, ctypes.c_int), (d, ctypes.c_int),
+            ])
+            return dw
+        self.launch("emb_bwd_owned", (256, 1, 1), (256, 1, 1), [
+            self._ptr(grad), self._ptr(ids), self._ptr(dw),
+            (seq, ctypes.c_int), (d, ctypes.c_int), (vocab, ctypes.c_int),
+        ])
+        return dw
+
+    def adamw_multi(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):
+        """一次发射更新全部参数。entries = [(p, g, m, v), ...]，全是 GpuBuf。
+
+        指针表按 id 缓存（训练中地址不变），只在第一次或换模型时重建。
+        """
+        if not entries:
+            return
+        for p, g, m, v in entries:
+            self._split_forget_ptr(p)
+            self._split_forget_ptr(m)
+            self._split_forget_ptr(v)
+        key = tuple(id(x) for ent in entries for x in ent)
+        tb = getattr(self, "_adamw_table", None)
+        if tb is None or tb[0] != key:
+            sizes = [int(ent[0].n) for ent in entries]
+            offs = [0]
+            for n in sizes:
+                offs.append(offs[-1] + n)
+            total = offs[-1]
+            if total > 2147483647:
+                raise CudaError("fused AdamW 元素总数 %d 超过 int32" % total + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            ps = self.h2d(np.array([int(ent[0].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            gs = self.h2d(np.array([int(ent[1].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            ms = self.h2d(np.array([int(ent[2].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            vs = self.h2d(np.array([int(ent[3].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            of = self.h2d(np.array(offs[:-1], np.int32), dtype=np.int32)
+            tb = (key, ps, gs, ms, vs, of, len(entries), total)
+            self._adamw_table = tb
+        _, ps, gs, ms, vs, of, ntensors, total = tb
+        grid, block = self._ewise_grid(total)
+        self.launch("adamw_update_multi", grid, block, [
+            self._ptr(ps), self._ptr(gs), self._ptr(ms), self._ptr(vs), self._ptr(of),
+            (int(ntensors), ctypes.c_int), (int(total), ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (float(eps), ctypes.c_float),
+            (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+            (1 if do_wd else 0, ctypes.c_int),
+        ])
+
+    def adamw_multi_f16(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):
+        """一次发射更新全部参数，**动量是 fp16（uint16 位模式）**。
+
+        entries = [(p, g, m16, v16), ...] 全是 GpuBuf。与 `adamw_multi` 的差别只有动量类型：
+        内核里 half→float→half，算术序列与「cast→fp32 adamw_update_multi→cast」逐条相同，
+        所以结果与逐张量路径**逐位一致**，但发射次数从 5×N 降到 1。
+        指针表按 id 缓存（训练中地址不变），换模型/换参数量时才重建。
+        """
+        if not entries:
+            return
+        for p, g, m, v in entries:
+            self._split_forget_ptr(p)
+            self._split_forget_ptr(m)
+            self._split_forget_ptr(v)
+        key = tuple(id(x) for ent in entries for x in ent)
+        tb = getattr(self, "_adamw_table_f16", None)
+        if tb is None or tb[0] != key:
+            sizes = [int(ent[0].n) for ent in entries]
+            offs = [0]
+            for n in sizes:
+                offs.append(offs[-1] + n)
+            total = offs[-1]
+            if total > 2147483647:
+                raise CudaError("fused AdamW(fp16) 元素总数 %d 超过 int32" % total + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            ps = self.h2d(np.array([int(ent[0].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            gs = self.h2d(np.array([int(ent[1].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            ms = self.h2d(np.array([int(ent[2].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            vs = self.h2d(np.array([int(ent[3].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            of = self.h2d(np.array(offs[:-1], np.int32), dtype=np.int32)
+            tb = (key, ps, gs, ms, vs, of, len(entries), total)
+            self._adamw_table_f16 = tb
+        _, ps, gs, ms, vs, of, ntensors, total = tb
+        grid, block = self._ewise_grid(total)
+        self.launch("adamw_update_multi_f16", grid, block, [
+            self._ptr(ps), self._ptr(gs), self._ptr(ms), self._ptr(vs), self._ptr(of),
+            (int(ntensors), ctypes.c_int), (int(total), ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (float(eps), ctypes.c_float),
+            (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+            (1 if do_wd else 0, ctypes.c_int),
+        ])
+
+    def adamw_multi_bf16(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):
+        """一次发射更新全部参数，动量是 **bf16**（uint16 位模式）。
+
+        与 `adamw_multi_f16` 只差动量类型。选它是因为 fp16 存二阶动量会下溢
+        （实测 6 步发散到 loss 552.98），而 bf16 与 fp32 同指数范围，不会下溢。
+        """
+        if not entries:
+            return
+        for p, g, m, v in entries:
+            self._split_forget_ptr(p)
+            self._split_forget_ptr(m)
+            self._split_forget_ptr(v)
+        key = tuple(id(x) for ent in entries for x in ent)
+        tb = getattr(self, "_adamw_table_bf16", None)
+        if tb is None or tb[0] != key:
+            sizes = [int(ent[0].n) for ent in entries]
+            offs = [0]
+            for n in sizes:
+                offs.append(offs[-1] + n)
+            total = offs[-1]
+            if total > 2147483647:
+                raise CudaError("fused AdamW(bf16) 元素总数 %d 超过 int32" % total + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            ps = self.h2d(np.array([int(ent[0].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            gs = self.h2d(np.array([int(ent[1].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            ms = self.h2d(np.array([int(ent[2].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            vs = self.h2d(np.array([int(ent[3].ptr) for ent in entries], np.uint64),
+                          dtype=np.uint64)
+            of = self.h2d(np.array(offs[:-1], np.int32), dtype=np.int32)
+            tb = (key, ps, gs, ms, vs, of, len(entries), total)
+            self._adamw_table_bf16 = tb
+        _, ps, gs, ms, vs, of, ntensors, total = tb
+        grid, block = self._ewise_grid(total)
+        self.launch("adamw_update_multi_bf16", grid, block, [
+            self._ptr(ps), self._ptr(gs), self._ptr(ms), self._ptr(vs), self._ptr(of),
+            (int(ntensors), ctypes.c_int), (int(total), ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (float(eps), ctypes.c_float),
+            (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+            (1 if do_wd else 0, ctypes.c_int),
+        ])
+
+    def adamw_multi_int8(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps,
+                         bc1, bc2, block=64, grad_scale=1.0):
+        """一次发射更新全部参数，动量是 **int8 + 每 block 一个 fp32 scale**。
+
+        `entries` 里每项是 `(p, g, mq, vq, ms, vs)`；`mq/vq` 是 int8 缓冲，
+        `ms/vs` 是每 block 一个 fp32 的 scale（块数 = ceil(n/block)）。
+        显存占用 = 2 字节/参数 + 8/block 字节，BLOCK=64 时 **2.125 B/参数**
+        （fp32 是 8 B、bf16 是 4 B）。
+
+        `grad_scale`：读梯度时乘的系数（梯度裁剪的缩放融合进来）。默认 1.0
+        ⇒ 与旧行为**逐位相同**（乘 1.0 是精确恒等）；`g` 本身不再被原地缩放。
+
+        为什么要有这个：`int8_adamw.py` 是**主机侧 numpy** 实现，
+        1.5B 上每步要把约 12 GiB 搬过 PCIe，实际不可用。
+        这个内核把量化/更新/反量化全留在显存，一次发射完成。
+        """
+        if not entries:
+            return
+        block = int(block)
+        for ent in entries:
+            for buf in ent:
+                self._split_forget_ptr(buf)
+        key = (tuple(id(x) for ent in entries for x in ent), block)
+        tb = getattr(self, "_adamw_i8_table", None)
+        if tb is None or tb[0] != key:
+            n_par = len(entries)
+
+            def _ptrs(idx):
+                return self.h2d(np.array([int(ent[idx].ptr) for ent in entries],
+                                         np.uint64), dtype=np.uint64)
+
+            ps, gs = _ptrs(0), _ptrs(1)
+            mqs, vqs = _ptrs(2), _ptrs(3)
+            mss, vss = _ptrs(4), _ptrs(5)
+            sizes = [int(ent[0].n) for ent in entries]
+
+            def _check(i):
+                n = sizes[i]
+                nb = (n + block - 1) // block
+                if int(entries[i][2].n) != n or int(entries[i][3].n) != n:
+                    raise CudaError(
+                        "int8 AdamW 第 %d 项 mq/vq 长度 ≠ 参数长度（%d/%d vs %d）"
+                        % (i, entries[i][2].n, entries[i][3].n, n)
+                        + "。修法：用 Int8AdamWGpu 重新分配状态，或改回 --opt adamw")
+                if int(entries[i][4].n) != nb or int(entries[i][5].n) != nb:
+                    raise CudaError(
+                        "int8 AdamW 第 %d 项 scale 块数不对（期望 %d）。修法：用 Int8AdamWGpu 重建状态"
+                        % (i, nb))
+            for i in range(n_par):
+                _check(i)
+            szs = self.h2d(np.array(sizes, np.int32), dtype=np.int32)
+            warps = sum((n + block - 1) // block for n in sizes)
+            tb = (key, ps, gs, mqs, vqs, mss, vss, szs, n_par, warps)
+            self._adamw_i8_table = tb
+        _, ps, gs, mqs, vqs, mss, vss, szs, n_par, warps = tb
+        if warps <= 0:
+            return
+        grid, tpb = self._ewise_grid(int(warps) * 32)
+        self._activate()
+        self.launch("adamw_multi_int8", grid, tpb, [
+            self._ptr(ps), self._ptr(gs), self._ptr(mqs), self._ptr(vqs),
+            self._ptr(mss), self._ptr(vss), self._ptr(szs),
+            (int(n_par), ctypes.c_int), (int(block), ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (float(eps), ctypes.c_float),
+            (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+            (float(grad_scale), ctypes.c_float),
+        ])
+
+    def adamw_multi_m8v16(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps,
+                          bc1, bc2, block=64, grad_scale=1.0):
+        """一次发射更新全部参数：`m` 是 int8 分块、`v` 是 bf16。
+
+        `entries` 每项 `(p, g, mq, ms, vb)`：`mq` int8、`ms` 每 block 一个 fp32、`vb` uint16(bf16)。
+        ≈3.06 字节/参数。为什么不全 int8 见内核注释（v 会下溢 ⇒ 实测发散）。
+
+        `grad_scale`：读梯度时乘的系数（梯度裁剪的缩放融合进来）。默认 1.0
+        ⇒ 与旧行为**逐位相同**（乘 1.0 是精确恒等）；`g` 本身不再被原地缩放。
+        """
+        if not entries:
+            return
+        block = int(block)
+        for ent in entries:
+            for buf in ent:
+                self._split_forget_ptr(buf)
+        key = (tuple(id(x) for ent in entries for x in ent), block)
+        tb = getattr(self, "_adamw_m8v16_table", None)
+        if tb is None or tb[0] != key:
+            n_par = len(entries)
+
+            def _ptrs(idx):
+                return self.h2d(np.array([int(ent[idx].ptr) for ent in entries],
+                                         np.uint64), dtype=np.uint64)
+
+            ps, gs = _ptrs(0), _ptrs(1)
+            mqs, mss = _ptrs(2), _ptrs(3)
+            vbs = _ptrs(4)
+            sizes = [int(ent[0].n) for ent in entries]
+            for i, n in enumerate(sizes):
+                nb = (n + block - 1) // block
+                if int(entries[i][2].n) != n or int(entries[i][4].n) != n:
+                    raise CudaError(
+                        "m8v16 AdamW 第 %d 项 mq/vb 长度 ≠ 参数长度（%d/%d vs %d）"
+                        % (i, entries[i][2].n, entries[i][4].n, n)
+                        + "。修法：用 Int8AdamWGpu(state='m8v16') 重建状态")
+                if int(entries[i][3].n) != nb:
+                    raise CudaError("m8v16 AdamW 第 %d 项 scale 块数不对（期望 %d，实际 %d）"
+                                    % (i, nb, entries[i][3].n)
+                                    + "。修法：用 Int8AdamWGpu(state='m8v16') 重建状态，"
+                                      "或检查 block 是否与分配时一致")
+            szs = self.h2d(np.array(sizes, np.int32), dtype=np.int32)
+            # 每个张量的**块偏移**（内核里二分用）；线性扫描会把 1.5B 拖慢 2.5 倍
+            boff = [0]
+            for n in sizes:
+                boff.append(boff[-1] + (n + block - 1) // block)
+            bos = self.h2d(np.array(boff, np.int64).astype(np.int32),
+                           dtype=np.int32)
+            warps = boff[-1]
+            tb = (key, ps, gs, mqs, mss, vbs, szs, bos, n_par, warps)
+            self._adamw_m8v16_table = tb
+        _, ps, gs, mqs, mss, vbs, szs, bos, n_par, warps = tb
+        if warps <= 0:
+            return
+        grid, tpb = self._ewise_grid(int(warps) * 32)
+        self._activate()
+        self.launch("adamw_multi_m8v16", grid, tpb, [
+            self._ptr(ps), self._ptr(gs), self._ptr(mqs), self._ptr(mss),
+            self._ptr(vbs), self._ptr(szs), self._ptr(bos),
+            (int(n_par), ctypes.c_int), (int(block), ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (float(eps), ctypes.c_float),
+            (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+            (float(grad_scale), ctypes.c_float),
+        ])
+
+    def adamw(self, p, g, m, v, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):
+        """原地更新参数和两份动量。标量必须已经按 numpy 的 float32 规则收好。"""
+        self._split_forget_ptr(p)
+        self._split_forget_ptr(m)
+        self._split_forget_ptr(v)
+        n = int(p.n)
+        if int(g.n) != n or int(m.n) != n or int(v.n) != n:
+            raise CudaError(
+                "adamw 长度不一致: p=%d g=%d m=%d v=%d" % (n, g.n, m.n, v.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if n <= 0:
+            return
+        if n > 2147483647:
+            raise CudaError("adamw 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        grid, block = self._ewise_grid(n)
+        self.launch("adamw_update", grid, block, [
+            self._ptr(p), self._ptr(g), self._ptr(m), self._ptr(v),
+            (n, ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (float(eps), ctypes.c_float),
+            (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+            (1 if do_wd else 0, ctypes.c_int),
+        ])
+
+    def div_scalar(self, a, scalar):
+        """c = a / scalar。真除法，不是乘倒数。"""
+        out = self.empty(a.shape, dtype=np.float32)
+        if a.n:
+            if int(a.n) > 2147483647:
+                raise CudaError("div_scalar 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            grid, block = self._ewise_grid(a.n)
+            self.launch("ewise_div_scalar", grid, block, [
+                self._ptr(a), (float(scalar), ctypes.c_float), self._ptr(out),
+                (int(a.n), ctypes.c_int),
+            ])
+        return out
+
+    def sub_scale_(self, p, o, scale):
+        """原地 p = p - scale * o。"""
+        self._split_forget_ptr(p)
+        n = int(p.n)
+        if int(o.n) != n:
+            raise CudaError("sub_scale 长度不一致: p=%d o=%d" % (n, o.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if n <= 0:
+            return p
+        if n > 2147483647:
+            raise CudaError("sub_scale 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        grid, block = self._ewise_grid(n)
+        self.launch("ewise_sub_scale", grid, block, [
+            self._ptr(p), self._ptr(o), (float(scale), ctypes.c_float),
+            (n, ctypes.c_int),
+        ])
+        return p
+
+    def muon_momentum(self, p, g, buf, u, mom, wd_lr, do_wd, nesterov):
+        """原地写 p（weight decay）和 buf，u 是正交化的输入。"""
+        self._split_forget_ptr(p)
+        self._split_forget_ptr(buf)
+        self._split_forget_ptr(u)
+        n = int(p.n)
+        if int(g.n) != n or int(buf.n) != n or int(u.n) != n:
+            raise CudaError(
+                "muon_momentum 长度不一致: p=%d g=%d buf=%d u=%d" % (n, g.n, buf.n, u.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if n <= 0:
+            return
+        if n > 2147483647:
+            raise CudaError("muon_momentum 元素个数超过 int32" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        grid, block = self._ewise_grid(n)
+        self.launch("muon_momentum", grid, block, [
+            self._ptr(p), self._ptr(g), self._ptr(buf), self._ptr(u),
+            (n, ctypes.c_int),
+            (float(mom), ctypes.c_float), (float(wd_lr), ctypes.c_float),
+            (1 if do_wd else 0, ctypes.c_int),
+            (1 if nesterov else 0, ctypes.c_int),
+        ])
+
+    def sumsq_parallel(self, buf):
+        """并行平方和（两段归约），大张量用它。
+
+        `sumsq_sequential` 是单线程，136M 元素梯度实测 36 s/step；
+        这条按 256 线程 × 最多 1024 block 切分。
+        归约顺序与 numpy 左折叠不同，有 ~1e-6 相对差（裁剪用足够）。
+        """
+        n = int(buf.n)
+        if n <= 0:
+            out = self.empty((), dtype=np.float32)
+            self._memset32(out, 0)
+            return out
+        nb = max(1, min(1024, (n + 255) // 256))
+        part = self.empty((nb,), dtype=np.float32)
+        self.launch("sumsq_partial", (nb, 1, 1), (256, 1, 1), [
+            self._ptr(buf), self._ptr(part), (n, ctypes.c_int),
+        ])
+        out = self.empty((), dtype=np.float32)
+        self.launch("sumsq_final", (1, 1, 1), (256, 1, 1), [
+            self._ptr(part), self._ptr(out), (nb, ctypes.c_int),
+        ])
+        out.keepalive = part
+        return out
+
+    def _ptrs_and_sizes(self, bufs):
+        """把一组张量打包成设备侧的（指针数组, 长度数组），供多张量 kernel 使用。
+
+        两个数组都很小（n=321 时分别是 2.5 KB / 1.3 KB），一次 h2d 即可。
+        """
+        n = len(bufs)
+        ptrs = np.empty(n, dtype=np.uint64)
+        sizes = np.empty(n, dtype=np.int32)
+        for i, b in enumerate(bufs):
+            ptrs[i] = int(b.ptr)
+            sizes[i] = int(b.n)
+        # ★ 2026-11-19：运行时的 h2d 只接受 float32 / uint16，传 uint64 会被**强制转成
+        #   float32**（实测 ptrs.dtype 变成 float32，内核拿到垃圾指针 → rc=700 非法访存）。
+        #   所以这里把指针与长度**按位重解释**成 float32 上传，内核里再强转回
+        #   unsigned long long / int。池的缓冲按 256 字节对齐，8 字节对齐无忧。
+        return (self.h2d(np.ascontiguousarray(ptrs).view(np.float32)),
+                self.h2d(np.ascontiguousarray(sizes).view(np.float32)))
+
+    def sumsq_multi_total(self, bufs):
+        """所有张量的平方和（**确定性**），返回 float。2 次发射取代 2n 次。
+
+        为什么能保证确定性：
+          * kernel A `sumsq_multi_slots`：**每张量一个 block**，把自己那个张量的
+            平方和写进 slots[t]，**不做跨 block 原子累加**（原子加会让求和顺序随
+            调度变化，重跑会差 1e-7 量级，破坏逐位可复现）。
+          * kernel B `sumsq_final`：对 slots 做固定顺序的树归约（与原来同一套算法）。
+        张量之间的求和顺序由 slot 下标固定，因此结果与张量个数、调度无关。
+        """
+        bufs = [b for b in bufs if b is not None and int(b.n) > 0]
+        n = len(bufs)
+        if n == 0:
+            return 0.0
+        if n == 1:                           # 单个张量走已验证的两段式，逐位一致
+            return float(self.read_scalar(self.sumsq_parallel(bufs[0])))
+        slots = self.empty((n,), dtype=np.float32)
+        ptrs, sizes = self._ptrs_and_sizes(bufs)
+        self.launch("sumsq_multi_slots", (n, 1, 1), (256, 1, 1), [
+            self._ptr(ptrs), self._ptr(sizes), (n, ctypes.c_int), self._ptr(slots)])
+        out = self.empty((), dtype=np.float32)
+        self.launch("sumsq_final", (1, 1, 1), (256, 1, 1), [
+            self._ptr(slots), self._ptr(out), (n, ctypes.c_int)])
+        out.keepalive = (slots, ptrs, sizes)  # 防缓冲被池提前回收
+        return float(self.read_scalar(out))
+
+    def scale_multi(self, bufs, scalar):
+        """所有张量原地乘同一标量（**确定性**，无归约）。1 次发射取代 n 次。"""
+        bufs = [b for b in bufs if b is not None and int(b.n) > 0]
+        n = len(bufs)
+        if n == 0:
+            return
+        s = float(scalar)
+        if n == 1:
+            self.scale_inplace(bufs[0], s)
+            return
+        ptrs, sizes = self._ptrs_and_sizes(bufs)
+        self.launch("scale_multi", (n, 1, 1), (256, 1, 1), [
+            self._ptr(ptrs), self._ptr(sizes), (n, ctypes.c_int),
+            (s, ctypes.c_float)])
+
+    def sumsq_sequential(self, buf):
+        """一个标量：按地址顺序的 sum(x*x)。调用方只把这个标量降回主机。"""
+        out = self.empty((), dtype=np.float32)
+        n = int(buf.n)
+        if n < 0 or n > 2147483647:
+            raise CudaError("sumsq 元素个数非法: %d" % n + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        self.launch("sumsq_sequential", (1, 1, 1), (1, 1, 1), [
+            self._ptr(buf), self._ptr(out), (n, ctypes.c_int),
+        ])
+        return out
+
+    def _moe_row_block(self, d):
+        d = int(d)
+        if d <= 32:
+            return 32
+        if d <= 128:
+            return 128
+        return 256
+
+    def moe_topk(self, logits, k):
+        """每个 token 的 top-k。返回 (idx int32 [N,K], 选中 logit [N,K])。"""
+        if len(logits.shape) != 2:
+            raise CudaError("moe_topk 需要 [N,E]，收到 %s" % (logits.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        n, e = int(logits.shape[0]), int(logits.shape[1])
+        k = int(k)
+        if k < 1 or k > e:
+            raise CudaError("moe_topk k=%d 超出专家数 %d" % (k, e) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        idx = self.empty((n, k), dtype=np.int32)
+        val = self.empty((n, k), dtype=np.float32)
+        if n and e:
+            self.launch("moe_topk", (n, 1, 1), (1, 1, 1), [
+                self._ptr(logits), self._ptr(idx), self._ptr(val),
+                (n, ctypes.c_int), (e, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        idx.keepalive = val
+        return idx, val
+
+    def moe_sigmoid(self, x):
+        out = self.empty(x.shape, dtype=np.float32)
+        if x.n:
+            grid, block = self._ewise_grid(x.n)
+            self.launch("moe_sigmoid", grid, block, [
+                self._ptr(x), self._ptr(out), (int(x.n), ctypes.c_int),
+            ])
+        return out
+
+    def moe_gather_pairs(self, src, idx, n, e, k):
+        out = self.empty((int(n), int(k)), dtype=np.float32)
+        if n and k:
+            self.launch("moe_gather_pairs", (int(n), 1, 1), (32, 1, 1), [
+                self._ptr(src), self._ptr(idx), self._ptr(out),
+                (int(n), ctypes.c_int), (int(e), ctypes.c_int), (int(k), ctypes.c_int),
+            ])
+        return out
+
+    def moe_scatter_pairs(self, g, idx, n, e, k):
+        out = self.zeros((int(n), int(e)), dtype=np.float32)
+        if n and e and k:
+            self.launch("moe_scatter_pairs", (1, 1, 1), (1, 1, 1), [
+                self._ptr(g), self._ptr(idx), self._ptr(out),
+                (int(n), ctypes.c_int), (int(e), ctypes.c_int), (int(k), ctypes.c_int),
+            ])
+        return out
+
+    def moe_compact(self, idx, n, e, k):
+        """按专家把 (token, slot) 收成三段连续区间。offsets 长度 E+1。"""
+        n, e, k = int(n), int(e), int(k)
+        offsets = self.empty((e + 1,), dtype=np.int32)
+        cursor = self.empty((max(e, 1),), dtype=np.int32)
+        slots = n * k
+        tok = self.empty((max(slots, 1),), dtype=np.int32)
+        slot = self.empty((max(slots, 1),), dtype=np.int32)
+        tok.n = slots
+        slot.n = slots
+        tok.shape = (slots,)
+        slot.shape = (slots,)
+        if e:
+            self.launch("moe_compact", (1, 1, 1), (1, 1, 1), [
+                self._ptr(idx), self._ptr(offsets), self._ptr(cursor),
+                self._ptr(tok), self._ptr(slot),
+                (n, ctypes.c_int), (e, ctypes.c_int), (k, ctypes.c_int),
+            ])
+        offsets.keepalive = (cursor, tok, slot, idx)
+        return offsets, tok, slot
+
+    def moe_gather_rows(self, x, tok, begin, m, d):
+        out = self.empty((int(m), int(d)), dtype=np.float32)
+        if m and d:
+            self.launch("moe_gather_rows", (int(m), 1, 1), (self._moe_row_block(d), 1, 1), [
+                self._ptr(x), self._ptr(tok), self._ptr(out),
+                (int(begin), ctypes.c_int), (int(m), ctypes.c_int), (int(d), ctypes.c_int),
+            ])
+        return out
+
+    def moe_scatter_rows(self, y, tok, begin, m, n, d):
+        out = self.zeros((int(n), int(d)), dtype=np.float32)
+        if m and d:
+            self.launch("moe_scatter_rows", (int(m), 1, 1), (self._moe_row_block(d), 1, 1), [
+                self._ptr(y), self._ptr(tok), self._ptr(out),
+                (int(begin), ctypes.c_int), (int(m), ctypes.c_int), (int(d), ctypes.c_int),
+            ])
+        return out
+
+    def moe_scatter_rows_add(self, y, tok, begin, m, out):
+        """往已有 [N,D] 上 atomicAdd。调用方保证 out 已经清零，专家按顺序发射。"""
+        d = int(out.shape[1]) if len(out.shape) == 2 else int(y.shape[1])
+        if m and d:
+            self._split_forget_ptr(out)
+            self.launch("moe_scatter_rows", (int(m), 1, 1), (self._moe_row_block(d), 1, 1), [
+                self._ptr(y), self._ptr(tok), self._ptr(out),
+                (int(begin), ctypes.c_int), (int(m), ctypes.c_int), (int(d), ctypes.c_int),
+            ])
+        return out
+
+    def moe_gather_slots(self, w, tok, slot, begin, m, k):
+        out = self.empty((int(m),), dtype=np.float32)
+        if m:
+            grid, block = self._ewise_grid(m)
+            self.launch("moe_gather_slots", grid, block, [
+                self._ptr(w), self._ptr(tok), self._ptr(slot), self._ptr(out),
+                (int(begin), ctypes.c_int), (int(m), ctypes.c_int), (int(k), ctypes.c_int),
+            ])
+        return out
+
+    def moe_scatter_slots(self, g, tok, slot, begin, m, n, k):
+        out = self.zeros((int(n), int(k)), dtype=np.float32)
+        if m and n and k:
+            self.launch("moe_scatter_slots", (1, 1, 1), (1, 1, 1), [
+                self._ptr(g), self._ptr(tok), self._ptr(slot), self._ptr(out),
+                (int(begin), ctypes.c_int), (int(m), ctypes.c_int),
+                (int(n), ctypes.c_int), (int(k), ctypes.c_int),
+            ])
+        return out
+
+    def moe_row_scale(self, y, w):
+        if len(y.shape) != 2:
+            raise CudaError("moe_row_scale 需要 2D，收到 %s" % (y.shape,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        m, d = int(y.shape[0]), int(y.shape[1])
+        if int(w.n) != m:
+            raise CudaError("moe_row_scale 权重长度 %d != 行数 %d" % (w.n, m) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        out = self.empty((m, d), dtype=np.float32)
+        if m and d:
+            self.launch("moe_row_scale", (m, 1, 1), (self._moe_row_block(d), 1, 1), [
+                self._ptr(y), self._ptr(w), self._ptr(out),
+                (m, ctypes.c_int), (d, ctypes.c_int),
+            ])
+        return out
+
+    def moe_row_dot(self, g, y):
+        m, d = int(g.shape[0]), int(g.shape[1])
+        out = self.empty((m,), dtype=np.float32)
+        if m and d:
+            self.launch("moe_row_dot", (m, 1, 1), (1, 1, 1), [
+                self._ptr(g), self._ptr(y), self._ptr(out),
+                (m, ctypes.c_int), (d, ctypes.c_int),
+            ])
+        elif m:
+            self._memset32(out, 0)
+        return out
+
+    def ensure_attn_nop(self):
+        """编译并加载 tgai_attn_nop.cu。重复调用不再编译。默认 SDPA 不走这里。"""
+        self.ensure()
+        if self._attn_mod is not None:
+            return self._attn_mod
+        path = attn_nop_source_path()
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        if _ATTN_DCHUNK != 8:
+            src = re.sub(r"#define\s+DCHUNK\s+\d+", "#define DCHUNK %d" % _ATTN_DCHUNK, src, count=1)
+        if _ATTN_BC != 32:
+            # 只在非默认时替换，避免影响既有编译结果
+            src = re.sub(r"#define\s+BC\s+\d+", "#define BC %d" % _ATTN_BC, src, count=1)
+        arch = self._cc_arch()
+        ptx = self._compile(arch, source=src, cu_name=b"tgai_attn_nop.cu")
+        mod = ctypes.c_void_p()
+        buf = ctypes.create_string_buffer(ptx)
+        self._chk(self.cu.cuModuleLoadData(
+            ctypes.byref(mod), ctypes.cast(buf, ctypes.c_void_p)),
+            "cuModuleLoadData(attn_nop)")
+        self._attn_ptx_keep = buf
+        self._attn_mod = mod
+        self._attn_fns = {}
+        self._attn_nop_path = path
+        self._attn_flash_ready = False
+        return mod
+
+    def attn_flash_bwd_supported(self):
+        """本卡能否为**融合反向**设上所需的动态 smem（结果缓存，只探一次）。
+
+        为什么要事前探：属性设置失败发生在 backward 的内核启动时，前向看不出问题，
+        于是整步在 backward 里硬崩（真机 P100 就是这样）。先试一次，就能在**选择路径**
+        的时候决定要不要走融合，避免半路炸。
+        """
+        cached = getattr(self, "_attn_flash_bwd_ok", None)
+        if cached is not None:
+            return bool(cached)
+        ok = True
+        try:
+            self.ensure_attn_nop()
+            lim = int(self._device_smem_limit() or 0)
+            if lim and _ATTN_FLASH_WIN_SMEM <= lim < _ATTN_FLASH_SMEM:
+                self._attn_set_dyn_smem("attn_bwd_flash_w", _ATTN_FLASH_WIN_SMEM)
+            else:
+                self._attn_set_dyn_smem("attn_bwd_flash", _ATTN_FLASH_SMEM)
+        except Exception:            # noqa: BLE001  探测失败就当不支持，走物化（正确性优先）
+            ok = False
+        self._attn_flash_bwd_ok = ok
+        return ok
+
+    def _attn_set_dyn_smem(self, name, smem):
+        """抬高动态 smem 上限并偏向 shared carveout。
+
+        ★ 2026-11-15（真机 P100 实测）：`cuFuncSetAttribute(..., 8, 45056)` 会返回
+          rc=1 invalid argument —— 即使 45056 看起来 <= 该卡申报的 48 KB。以前这里
+          直接 `_chk` 抛异常，表现成「一个属性设置失败 ⇒ 整个训练步硬崩」，且报错只有
+          `rc=1` 看不出怎么办。现在：
+            * 失败时把「请求值 / 设备申报上限 / 可选出路」一次性写清楚；
+            * 记下本进程这张卡在哪个 (kernel, smem) 上失败过，后续同组合**快速失败**，
+              不再反复尝试（避免每步都撞一次驱动）；
+            * 置 `_attn_flash_bwd_limited`，供上层决定是否回退物化注意力。
+        """
+        fn = self._fn_module(self._attn_mod, name)
+        cu = self.cu
+        if not hasattr(cu, "_fnattr_ready"):
+            cu.cuFuncSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+            cu.cuFuncSetAttribute.restype = ctypes.c_int
+            cu._fnattr_ready = True
+
+        bad = getattr(self, "_attn_smem_rejected", None) or ()
+        if (name, int(smem)) in bad:
+            raise CudaError(self._smem_reject_msg(name, smem)
+                            + "。修法：设 TGAI_ATTN_FLASH=0 走物化注意力，或换 V100 及以上")
+
+        # 8 = CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+        # 9 = CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT（百分数）
+        rc = cu.cuFuncSetAttribute(fn, 8, int(smem))
+        if rc != 0:
+            self._attn_smem_rejected = tuple(bad) + ((name, int(smem)),)
+            self._attn_flash_bwd_limited = (name, int(smem), int(rc))
+            raise CudaError(self._smem_reject_msg(name, smem, rc=rc)
+                            + "。修法：设 TGAI_ATTN_FLASH=0 走物化注意力，或换 V100 及以上")
+        self._chk(cu.cuFuncSetAttribute(fn, 9, 100),
+                  "cuFuncSetAttribute(%s carveout)" % name)
+
+    def _smem_reject_msg(self, name, smem, rc=None):
+        """把「属性设不上」翻译成能照着做的说明。"""
+        lim = 0
+        try:
+            lim = int(self._device_smem_limit() or 0)
+        except Exception:            # noqa: BLE001  查询失败也不能掩盖原始错误
+            lim = 0
+        head = ("内核 %s 申请 %d B（%d KB）动态共享内存被驱动拒绝"
+                % (name, int(smem), int(smem) // 1024))
+        if rc is not None:
+            head += "（cuFuncSetAttribute rc=%d）" % int(rc)
+        return (
+            head
+            + "；本设备申报上限 %d B（%d KB）。" % (lim, lim // 1024)
+            + "修法（按代价从小到大）："
+              "① 关掉融合反向、走物化注意力 —— 设环境变量 TGAI_ATTN_FLASH=0，"
+              "或调用时传 lowmem=False（多花显存但结果正确）；"
+              "② 减小 batch/seq 让同一内核的内存需求降到上限内；"
+              "③ 换 V100（sm_70）及以上，可 opt-in 到 96 KB。"
+              "注意：本卡（Pascal 类，sm_60/61）上限 48 KB 且不支持 opt-in，"
+              "融合反向的大 smem 变体在它上面本来就用不了")
+
+    def _attn_nop_launch(self, name, seq, nh, dh, args):
+        """grid=(nh, ceil(seq/64), 1)，block=256，dynamic smem=32KB。
+        seq 能被 64 整除时第二维就是 seq//64，和内核注释一致。"""
+        if dh != 64:
+            raise CudaError("attn_nop 只接受 dh=64，收到 %d" % dh + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if seq < 0 or nh < 0:
+            raise CudaError("attn_nop 形状非法 seq=%d nh=%d" % (seq, nh) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        gy = (int(seq) + _ATTN_NOP_BQ - 1) // _ATTN_NOP_BQ
+        if gy < 1:
+            gy = 1
+        if seq == 0 or nh == 0:
+            return
+        self.launch(
+            name, (int(nh), gy, 1), (256, 1, 1), args,
+            shared=_ATTN_NOP_SMEM, module=self._attn_mod)
+
+    def _attn_flash_launch(self, name, seq, nh, dh, args):
+        """与 nop 同一网格（query 块 64），动态 smem 给 flash 反向。"""
+        if dh != 64:
+            raise CudaError("attn_flash 只接受 dh=64，收到 %d" % dh + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        if seq < 0 or nh < 0:
+            raise CudaError("attn_flash 形状非法 seq=%d nh=%d" % (seq, nh) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        tile = 128 if name == "attn_bwd_flash_g2" else _ATTN_NOP_BQ
+        smem = _ATTN_FLASH_G2_SMEM if name == "attn_bwd_flash_g2" else _ATTN_FLASH_SMEM
+        # ★ 2026-11-12（外部实测）：Pascal 消费卡（sm_61 等）单 block 动态 smem 上限只有 48 KB
+        #   且不支持 opt-in，而这里要 68/84 KB ⇒ 之前会以 `cuFuncSetAttribute rc=1 invalid argument`
+        #   这种看不懂的形式炸掉。现在**先查上限再设 opt-in**，把"为什么"和"怎么办"说清楚。
+        _lim = self._device_smem_limit()
+        # 装不下常驻版（68 KB）但装得下窗口版（40.5 KB）时自动降级 —— P100 就是这种情况。
+        if (name == "attn_bwd_flash" and _lim and int(smem) > _lim
+                and _ATTN_FLASH_WIN_SMEM <= _lim):
+            name = "attn_bwd_flash_w"
+            smem = _ATTN_FLASH_WIN_SMEM
+        if _lim and int(smem) > _lim:
+            _cc = self._cc_arch().replace("compute_", "sm_")
+            raise CudaError(
+                "融合注意力反向需要 %d KB 动态共享内存，本卡（%s）上限只有 %d KB"
+                % (int(smem) // 1024, _cc, int(_lim) // 1024)
+                + "。修法：改用 lowmem=False（默认，走物化注意力，多花显存但能出结果）；"
+                  "或减小 seq / batch。Pascal 消费卡（sm_61 等）上限 48 KB 且不支持 opt-in，"
+                  "该路径在那些卡上不可用；V100（sm_70）可 opt-in 到 96 KB 正常使用")
+        # ★ 2026-11-15 真机 P100 定位：这里以前**无条件**把动态 smem 上限设成 96 KB
+        #   （_ATTN_FLASH_MAX_SMEM），而实际启动只用到 smem（滑窗版 39.5 KB）。
+        #   结果：V100 上限 96 KB 能过，P100（申报 48 KB）直接被拒 rc=1 ——
+        #   和"44 KB ≤ 48 KB 所以能跑"的推断完全不是一回事。
+        #   现在按**真正要用的值**设，并且按 name 记住已设到多少，需要更多时才再抬。
+        have = getattr(self, "_attn_flash_smem_set", None)
+        if have is None:
+            have = self._attn_flash_smem_set = {}
+        if int(smem) > int(have.get(name, 0)):
+            self._attn_set_dyn_smem(name, int(smem))
+            have[name] = int(smem)
+        gy = (int(seq) + tile - 1) // tile
+        if gy < 1:
+            gy = 1
+        if seq == 0 or nh == 0:
+            return
+        self.launch(
+            name, (int(nh), gy, 1), (256, 1, 1), args,
+            shared=smem, module=self._attn_mod)
+
+    def attn_nop_fwd(self, q, k, v, scale):
+        """q,k,v 为 [seq, nh, dh] fp32。只写 O，不写 P。"""
+        self.ensure_attn_nop()
+        if len(q.shape) != 3 or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape):
+            raise CudaError("attn_nop_fwd 需要同形状 3D，收到 %s %s %s" % (q.shape, k.shape, v.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        seq, nh, dh = (int(x) for x in q.shape)
+        o = self.zeros((seq, nh, dh), dtype=np.float32)
+        self._attn_nop_launch("attn_fwd_nop", seq, nh, dh, [
+            self._ptr(q), self._ptr(k), self._ptr(v), self._ptr(o),
+            (seq, ctypes.c_int), (nh, ctypes.c_int), (dh, ctypes.c_int),
+            (float(scale), ctypes.c_float),
+        ])
+        return o
+
+    def attn_nop_bwd(self, do, q, k, v, scale):
+        """不读 P。dQ/dK/dV 与 q 同为 [seq, nh, dh]。"""
+        self.ensure_attn_nop()
+        if (len(do.shape) != 3 or tuple(do.shape) != tuple(q.shape)
+                or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape)):
+            raise CudaError("attn_nop_bwd 形状不一致: dO%s Q%s K%s V%s" % (
+                do.shape, q.shape, k.shape, v.shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
+        seq, nh, dh = (int(x) for x in q.shape)
+        dq = self.zeros((seq, nh, dh), dtype=np.float32)
+        dk = self.zeros((seq, nh, dh), dtype=np.float32)
+        dv = self.zeros((seq, nh, dh), dtype=np.float32)
+        self._attn_nop_launch("attn_bwd_recompute", seq, nh, dh, [
+            self._ptr(do), self._ptr(q), self._ptr(k), self._ptr(v),
+            self._ptr(dq), self._ptr(dk), self._ptr(dv),
+            (seq, ctypes.c_int), (nh, ctypes.c_int), (dh, ctypes.c_int),
+            (float(scale), ctypes.c_float),
+        ])
+        return dq, dk, dv
+
+    def attn_nop_fwd_stats(self, q, k, v, scale):
+        """同 attn_nop_fwd，额外写出每行 online-softmax 的 m、l，形状 [seq, nh]。"""
+        self.ensure_attn_nop()
+        if len(q.shape) != 3 or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape):
+            raise CudaError("attn_nop_fwd_stats 需要同形状 3D，收到 %s %s %s" % (q.shape, k.shape, v.shape) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        seq, nh, dh = (int(x) for x in q.shape)
+        o = self.zeros((seq, nh, dh), dtype=np.float32)
+        m = self.empty((seq, nh), dtype=np.float32)
+        lse = self.empty((seq, nh), dtype=np.float32)
+        self._attn_nop_launch("attn_fwd_stats", seq, nh, dh, [
+            self._ptr(q), self._ptr(k), self._ptr(v), self._ptr(o),
+            self._ptr(m), self._ptr(lse),
+            (seq, ctypes.c_int), (nh, ctypes.c_int), (dh, ctypes.c_int),
+            (float(scale), ctypes.c_float),
+        ])
+        return o, m, lse
+
+    def attn_nop_bwd_flash(self, do, q, k, v, o, m, lse, scale):
+        """标准 flash 反向。P 不落全局。m/l 来自 attn_nop_fwd_stats，O 用来算 D。"""
+        self.ensure_attn_nop()
+        if (len(do.shape) != 3 or tuple(do.shape) != tuple(q.shape)
+                or tuple(q.shape) != tuple(k.shape) or tuple(q.shape) != tuple(v.shape)
+                or tuple(o.shape) != tuple(q.shape)):
+            raise CudaError("attn_nop_bwd_flash 形状不一致: dO%s Q%s K%s V%s O%s" % (
+                do.shape, q.shape, k.shape, v.shape, o.shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
+        seq, nh, dh = (int(x) for x in q.shape)
+        if tuple(m.shape) != (seq, nh) or tuple(lse.shape) != (seq, nh):
+            raise CudaError("attn_nop_bwd_flash 的 m/l 应为 [%d,%d]，收到 %s %s" % (
+                seq, nh, m.shape, lse.shape) + "。修法：检查上面给出的形状：左边最后一维要等于右边倒数第二维；需要广播时先 reshape")
+        dq = self.zeros((seq, nh, dh), dtype=np.float32)
+        dk = self.zeros((seq, nh, dh), dtype=np.float32)
+        dv = self.zeros((seq, nh, dh), dtype=np.float32)
+        # seq>=4096 时一个 block 吃两个 query tile，dK/dV 在 smem 里加完再 atomic 一次。
+        # 短序列仍走原来的 attn_bwd_flash，attn_lowmem_check 的形状不变。
+        # 内核签名到 scale 为止。以前多传的 plane 指针已经不用，传进去会被当成下一次参数。
+        # g2（两 tile 合并 atomic）在 8192 上测得 57ms，比单 tile 的 37ms 差，默认关闭。
+        # TGAI_ATTN_G2=1 才启用，留给数值对照。
+        name = "attn_bwd_flash_g2" if os.environ.get("TGAI_ATTN_G2") == "1" else "attn_bwd_flash"
+        self._attn_flash_launch(name, seq, nh, dh, [
+            self._ptr(do), self._ptr(q), self._ptr(k), self._ptr(v), self._ptr(o),
+            self._ptr(m), self._ptr(lse),
+            self._ptr(dq), self._ptr(dk), self._ptr(dv),
+            (seq, ctypes.c_int), (nh, ctypes.c_int), (dh, ctypes.c_int),
+            (float(scale), ctypes.c_float),
+        ])
+        return dq, dk, dv
+
+
+    def _capture_keep(self, *objs):
+        if self._capturing and objs:
+            self._graph_host_keeps.append(objs)
+
+    def _note_adamw(self, grid, block, shared, args):
+        """捕获时记下每次 adamw 的参数值。偏差校正 bc1/bc2 每步变，重放前要改。"""
+        copied = []
+        for val, typ in args:
+            if isinstance(val, ctypes._SimpleCData):
+                val = val.value
+            copied.append((val, typ))
+        self._adamw_snaps.append((
+            (int(grid[0]), int(grid[1]), int(grid[2])),
+            (int(block[0]), int(block[1]), int(block[2])),
+            int(shared),
+            copied,
+        ))
+
+    def _bind_dto_async(self):
+        if self._dto_async_ready:
+            return
+        cu = self.cu
+        sym = getattr(cu, "cuMemcpyDtoDAsync_v2", None) or getattr(cu, "cuMemcpyDtoDAsync", None)
+        if sym is None:
+            raise CudaError("驱动没有 cuMemcpyDtoDAsync" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        sym.argtypes = [ctypes.c_uint64, ctypes.c_uint64, ctypes.c_size_t, ctypes.c_void_p]
+        sym.restype = ctypes.c_int
+        cu.cuMemcpyDtoDAsync = sym
+        self._dto_async_ready = True
+
+    def _bind_sym(self, name, argtypes, prefer_v2=False):
+        cu = self.cu
+        sym = None
+        if prefer_v2:
+            sym = getattr(cu, name + "_v2", None)
+        if sym is None:
+            sym = getattr(cu, name, None)
+        if sym is None:
+            return None
+        sym.argtypes = argtypes
+        sym.restype = ctypes.c_int
+        setattr(cu, name, sym)
+        return sym
+
+    def _bind_graph_api(self):
+        if self._graph_api_bound:
+            return True
+        cu = self.cu
+        pvoid = ctypes.POINTER(ctypes.c_void_p)
+        begin = self._bind_sym(
+            "cuStreamBeginCapture",
+            [ctypes.c_void_p, ctypes.c_uint],
+            prefer_v2=True,
+        )
+        # _v2 才带 mode。上面 setattr 到了无后缀名字。
+        if getattr(cu, "cuStreamBeginCapture_v2", None) is not None:
+            v2 = cu.cuStreamBeginCapture_v2
+            v2.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+            v2.restype = ctypes.c_int
+            cu.cuStreamBeginCapture = v2
+            begin = v2
+        need = [
+            begin,
+            self._bind_sym("cuStreamCreate", [pvoid, ctypes.c_uint], prefer_v2=False),
+            self._bind_sym("cuStreamEndCapture", [ctypes.c_void_p, pvoid], prefer_v2=False),
+            self._bind_sym("cuGraphDestroy", [ctypes.c_void_p], prefer_v2=False),
+            self._bind_sym("cuGraphExecDestroy", [ctypes.c_void_p], prefer_v2=False),
+            self._bind_sym("cuGraphLaunch", [ctypes.c_void_p, ctypes.c_void_p], prefer_v2=False),
+            self._bind_sym(
+                "cuGraphGetNodes",
+                [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)],
+                prefer_v2=False,
+            ),
+            self._bind_sym(
+                "cuGraphNodeGetType",
+                [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)],
+                prefer_v2=False,
+            ),
+            self._bind_sym(
+                "cuGraphKernelNodeGetParams",
+                [ctypes.c_void_p, ctypes.POINTER(_CudaKernelNodeParams)],
+                prefer_v2=False,
+            ),
+            self._bind_sym(
+                "cuGraphExecKernelNodeSetParams",
+                [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_CudaKernelNodeParams)],
+                prefer_v2=False,
+            ),
+        ]
+        flags = getattr(cu, "cuGraphInstantiateWithFlags", None)
+        if flags is not None:
+            flags.argtypes = [pvoid, ctypes.c_void_p, ctypes.c_ulonglong]
+            flags.restype = ctypes.c_int
+        legacy = getattr(cu, "cuGraphInstantiate", None)
+        if legacy is not None:
+            # 先按 CUDA 12 的 3 参数绑。失败再在 _instantiate 里试 5 参数。
+            legacy.argtypes = [pvoid, ctypes.c_void_p, ctypes.c_ulonglong]
+            legacy.restype = ctypes.c_int
+        self._graph_api_bound = True
+        self._graph_api_ok = all(x is not None for x in need) and (
+            flags is not None or legacy is not None)
+        return bool(self._graph_api_ok)
+
+    def _err_text(self, rc):
+        extra = ""
+        get = getattr(self.cu, "cuGetErrorString", None)
+        if get is not None:
+            msg = ctypes.c_char_p()
+            try:
+                if get(int(rc), ctypes.byref(msg)) == 0 and msg.value:
+                    extra = " " + msg.value.decode("utf-8", "replace")
+            except Exception:
+                pass
+        return "rc=%d%s" % (int(rc), extra)
+
+    def _graph_destroy(self):
+        # 多图支持（apply_multigraph.py）：只要还有 slot 引用已捕获的图，就**不能**释放
+        # arena 或 exec —— 否则重放会访问已释放显存（实测 cuGraphLaunch 访问违例）。
+        slots = getattr(self, "_graph_slots", []) or []
+        if not slots:
+            self.release_capture_arena()
+        cu = self.cu
+        nodes = self._adamw_nodes
+        self._adamw_nodes = []
+        exec_ = self._graph_exec
+        graph = self._graph
+        self._graph_exec = None
+        self._graph = None
+        if cu is None:
+            return
+        if exec_ and not any(e is exec_ for _g, e in slots):
+            try:
+                cu.cuGraphExecDestroy(exec_)
+            except Exception:
+                pass
+        if graph:
+            try:
+                cu.cuGraphDestroy(graph)
+            except Exception:
+                pass
+        # 解开对节点参数的引用。图已经销毁，节点句柄作废。
+        del nodes
+
+    def _graph_disable(self, exc):
+        self._capturing = False
+        self._graph_dead = True
+        self._graph_reason = "%s" % (exc,)
+        if self.cu is not None and self._stream_ready:
+            leftover = ctypes.c_void_p()
+            try:
+                # 还在捕获就收掉；已经结束则驱动返回错误，忽略。
+                rc = self.cu.cuStreamEndCapture(self._stream, ctypes.byref(leftover))
+                if rc == 0 and leftover.value:
+                    self.cu.cuGraphDestroy(leftover)
+            except Exception:
+                pass
+        self._graph_destroy()
+        if not self._graph_warned:
+            self._graph_warned = True
+            sys.stderr.write(
+                "[TG_CUDA_GRAPH] 捕获失败，已永久回退到逐步执行：%s\n" % (exc,)
+            )
+            sys.stderr.flush()
+
+    def graph_abort(self, exc=None):
+        self._graph_disable(exc if exc is not None else "graph_abort")
+        return False
+
+    def graph_available(self):
+        """没永久回退、且驱动导出了捕获入口时为 True。还没初始化驱动时也先视为可用。"""
+        if self._graph_dead:
+            return False
+        cu = self.cu
+        if cu is None:
+            return True
+        return bool(
+            getattr(cu, "cuStreamBeginCapture_v2", None) is not None
+            or getattr(cu, "cuStreamBeginCapture", None) is not None
+        )
+
+    def graph_arm(self):
+        """切到一条非默认流。legacy NULL 流不能 cuStreamBeginCapture。
+
+        必须在第一步训练之前调用，这样预热和捕获走同一条流，cuBLAS
+        工作区也不会在捕获中途才分配。开关关闭时不要调用。
+        """
+        if self._graph_dead:
+            return False
+        if self._stream_ready:
+            return True
+        try:
+            self.ensure()
+            if not self._bind_graph_api():
+                raise CudaError("驱动没有完整的 CUDA Graph 入口" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            self._bind_dto_async()
+            self._activate()
+            st = ctypes.c_void_p()
+            self._chk(self.cu.cuStreamCreate(ctypes.byref(st), 0), "cuStreamCreate")
+            if not st.value:
+                raise CudaError("cuStreamCreate 返回空流" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            self._stream = st
+            self._stream_ready = True
+            if self.handle is not None:
+                self._chk_blas(
+                    self.cublas.cublasSetStream_v2(self.handle, self._stream),
+                    "cublasSetStream_v2(graph)")
+                self._blas_stream_set = True
+            return True
+        except Exception as ex:
+            self._stream_ready = False
+            self._stream = ctypes.c_void_p(0)
+            self._graph_disable(ex)
+            return False
+
+    def graph_begin(self):
+        """开始捕获当前计算流。先 RELAXED，失败再 THREAD_LOCAL。失败则永久回退。"""
+        if self._graph_dead:
+            return False
+        if self._capturing:
+            return True
+        try:
+            if self._graph_exec is not None or self._graph is not None:
+                # 再捕获一次时丢掉上一张图，否则池会被冻住。
+                self._graph_destroy()
+            # 多图：为本次捕获换一块独立 arena（旧的原样保留，供已捕获的图继续用）
+            slots = getattr(self, "_graph_slots", None) or []
+            if slots and self._arena_base:
+                prev = self._arena_size
+                self.reserve_capture_arena(prev)
+            if not self._stream_ready and not self.graph_arm():
+                return False
+            if not self._bind_graph_api():
+                raise CudaError("驱动没有完整的 CUDA Graph 入口" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            # 把预热剩下的工作排空，避免它和捕获缠在一起。此时还没开始捕获，同步是合法的。
+            self.sync()
+            self._adamw_snaps = []
+            self._graph_poison = None
+            self._graph_host_keeps = []
+            self._k_at_begin = int(self._kernel_count)
+            self._b_at_begin = int(self._blas_count)
+            err = None
+            for mode in (CU_STREAM_CAPTURE_MODE_RELAXED, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL):
+                rc = self.cu.cuStreamBeginCapture(self._stream, ctypes.c_uint(mode))
+                if rc == 0:
+                    self._capturing = True
+                    self._capture_mode = int(mode)
+                    return True
+                err = self._err_text(rc)
+            raise CudaError("cuStreamBeginCapture 失败 %s" % (err,) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        except Exception as ex:
+            self._graph_disable(ex)
+            return False
+
+    def _graph_node_list(self, graph):
+        n = ctypes.c_size_t(0)
+        self._chk(
+            self.cu.cuGraphGetNodes(graph, None, ctypes.byref(n)),
+            "cuGraphGetNodes(count)")
+        count = int(n.value)
+        if count <= 0:
+            return []
+        arr = (ctypes.c_void_p * count)()
+        n = ctypes.c_size_t(count)
+        self._chk(
+            self.cu.cuGraphGetNodes(graph, ctypes.cast(arr, ctypes.c_void_p), ctypes.byref(n)),
+            "cuGraphGetNodes")
+        return [ctypes.c_void_p(int(arr[i])) for i in range(int(n.value))]
+
+    def _instantiate_graph(self, graph):
+        exec_ = ctypes.c_void_p()
+        flags = getattr(self.cu, "cuGraphInstantiateWithFlags", None)
+        errs = []
+        if flags is not None:
+            rc = flags(ctypes.byref(exec_), graph, ctypes.c_ulonglong(0))
+            if rc == 0 and exec_.value:
+                return exec_
+            errs.append("WithFlags %s" % self._err_text(rc))
+            exec_ = ctypes.c_void_p()
+        legacy = getattr(self.cu, "cuGraphInstantiate", None)
+        if legacy is not None:
+            legacy.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_ulonglong,
+            ]
+            legacy.restype = ctypes.c_int
+            rc = legacy(ctypes.byref(exec_), graph, ctypes.c_ulonglong(0))
+            if rc == 0 and exec_.value:
+                return exec_
+            errs.append("3-arg %s" % self._err_text(rc))
+            # CUDA 11 的 5 参数签名。只在 3 参数没成功时试，避免把 3 参数入口叫错。
+            legacy.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_size_t,
+            ]
+            exec_ = ctypes.c_void_p()
+            log = ctypes.create_string_buffer(2048)
+            rc = legacy(
+                ctypes.byref(exec_), graph, None, log, ctypes.c_size_t(2048))
+            if rc == 0 and exec_.value:
+                return exec_
+            tail = log.value.decode("utf-8", "replace") if log.value else ""
+            errs.append("5-arg %s %s" % (self._err_text(rc), tail))
+        raise CudaError("cuGraphInstantiate 失败：%s" % ("; ".join(errs) or "no symbol",) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+
+    def _collect_adamw(self, graph):
+        snaps = list(self._adamw_snaps)
+        if not snaps:
+            self._adamw_nodes = []
+            return
+        want = int(self._fn("adamw_update").value or 0)
+        found = []
+        for node in self._graph_node_list(graph):
+            typ = ctypes.c_int()
+            rc = self.cu.cuGraphNodeGetType(node, ctypes.byref(typ))
+            if rc != 0 or int(typ.value) != CU_GRAPH_NODE_TYPE_KERNEL:
+                continue
+            got = _CudaKernelNodeParams()
+            rc = self.cu.cuGraphKernelNodeGetParams(node, ctypes.byref(got))
+            if rc != 0:
+                continue
+            if int(got.func or 0) == want:
+                found.append(node)
+        if len(found) != len(snaps):
+            raise CudaError(
+                "AdamW 图节点 %d 与捕获时的调用 %d 不一致（struct 大小 %d）"
+                % (len(found), len(snaps), ctypes.sizeof(_CudaKernelNodeParams)) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+        packed = []
+        for node, snap in zip(found, snaps):
+            grid, block, shared, args = snap
+            holders = []
+            ptrs = (ctypes.c_void_p * len(args))()
+            for i, (val, typ) in enumerate(args):
+                obj = typ(val)
+                holders.append(obj)
+                ptrs[i] = ctypes.cast(ctypes.byref(obj), ctypes.c_void_p)
+            if len(holders) < 14:
+                raise CudaError("adamw 参数只有 %d 个" % len(holders) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            params = _CudaKernelNodeParams()
+            params.func = want
+            params.gridDimX, params.gridDimY, params.gridDimZ = grid
+            params.blockDimX, params.blockDimY, params.blockDimZ = block
+            params.sharedMemBytes = int(shared)
+            params.kernelParams = ctypes.cast(ptrs, ctypes.c_void_p)
+            params.extra = None
+            packed.append((node, params, holders, ptrs))
+        self._adamw_nodes = packed
+
+    def graph_end(self):
+        """结束捕获并实例化。失败则永久回退，返回 False。这一步的 GPU 工作已经真实执行过。"""
+        if self._graph_dead:
+            return False
+        if not self._capturing:
+            return self._graph_exec is not None
+        self._capturing = False
+        graph = ctypes.c_void_p()
+        try:
+            rc = self.cu.cuStreamEndCapture(self._stream, ctypes.byref(graph))
+            if rc != 0 or self._graph_poison:
+                why = self._graph_poison or ""
+                raise CudaError(
+                    "cuStreamEndCapture %s %s" % (self._err_text(rc), why) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            if not graph.value:
+                raise CudaError("cuStreamEndCapture 没有返回图" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
+            self._graph = graph
+            self._graph_exec = self._instantiate_graph(graph)
+            # 多图支持（应用 apply_multigraph.py 后存在）：保留一份引用，供逐层重放
+            if not hasattr(self, "_graph_slots"):
+                self._graph_slots = []
+            self._graph_slots.append((graph, self._graph_exec))
+            nodes = self._graph_node_list(graph)
+            self._graph_nodes = len(nodes)
+            self._collect_adamw(graph)
+            self._capture_kernels = int(self._kernel_count - self._k_at_begin)
+            self._capture_blas = int(self._blas_count - self._b_at_begin)
+            return True
+        except Exception as ex:
+            self._graph_disable(ex)
+            return False
+
+    def graph_count(self):
+        """已捕获并保留的图数量（多图支持）。"""
+        return len(getattr(self, "_graph_slots", []) or [])
+
+    def graph_release_all(self):
+        """释放所有已捕获的图与捕获 arena（多图支持）。用完必须调用，否则显存不回收。"""
+        slots = getattr(self, "_graph_slots", []) or []
+        self._graph_slots = []
+        self._graph = None
+        self._graph_exec = None
+        cu = self.cu
+        for graph, exec_ in slots:
+            try:
+                if exec_ and cu is not None:
+                    cu.cuGraphExecDestroy(exec_)
+            except Exception:
+                pass
+            try:
+                if graph and cu is not None:
+                    cu.cuGraphDestroy(graph)
+            except Exception:
+                pass
+        self.release_capture_arena()
+        return len(slots)
+
+    def graph_launch_slot(self, i):
+        """重放第 i 张已捕获的图（不影响 graph_launch 的"最近一张"语义）。"""
+        slots = getattr(self, "_graph_slots", None) or []
+        if not slots or i < 0 or i >= len(slots):
+            return False
+        _graph, exec_ = slots[i]
+        if self._graph_dead or not exec_:
+            return False
+        self._activate()
+        self._chk(self.cu.cuGraphLaunch(exec_, self._stream), "cuGraphLaunch(slot)")
+        return True
+
+    def graph_launch(self, bc1=None, bc2=None):
+        """重放已实例化的图。给出 bc1/bc2 时先改写全部 adamw 节点的偏差校正。"""
+        if self._graph_dead or not self._graph_exec:
+            return False
+        try:
+            if bc1 is not None and bc2 is not None and self._adamw_nodes:
+                b1 = float(np.float32(bc1))
+                b2 = float(np.float32(bc2))
+                for node, params, holders, _ptrs in self._adamw_nodes:
+                    holders[12].value = b1
+                    holders[13].value = b2
+                    self._chk(
+                        self.cu.cuGraphExecKernelNodeSetParams(
+                            self._graph_exec, node, ctypes.byref(params)),
+                        "cuGraphExecKernelNodeSetParams")
+            self._activate()
+            self._chk(
+                self.cu.cuGraphLaunch(self._graph_exec, self._stream),
+                "cuGraphLaunch")
+            self._graph_launch_count += 1
+            return True
+        except Exception as ex:
+            self._graph_disable(ex)
+            return False
+
+    def graph_stats(self):
+        return {
+            "kernel_launches": int(self._kernel_count),
+            "blas_launches": int(self._blas_count),
+            "graph_launches": int(self._graph_launch_count),
+            "graph_nodes": int(self._graph_nodes),
+            "adamw_nodes": len(self._adamw_nodes),
+            "capture_kernels": int(self._capture_kernels),
+            "capture_blas": int(self._capture_blas),
+            "dead": bool(self._graph_dead),
+            "reason": self._graph_reason,
+            "mode": self._capture_mode,
+            "armed": bool(self._stream_ready),
+        }
+
+
+_RT = None
+
+
+def runtime():
+    """进程内唯一运行时。第一次调用才加载 DLL。"""
+    global _RT
+    if _RT is None:
+        _RT = CudaRuntime()
+    return _RT.ensure()

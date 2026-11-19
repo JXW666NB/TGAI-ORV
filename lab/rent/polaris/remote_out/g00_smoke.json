@@ -1,0 +1,45 @@
+{
+ "device": "cuda",
+ "caps": {
+  "cc": [
+   7,
+   0
+  ],
+  "fp16_arith": true,
+  "bf16_arith": false,
+  "bf16_store": true,
+  "fp16_store": true
+ },
+ "pool_stats_keys": [
+  "hits",
+  "misses",
+  "hit_rate",
+  "occupied_bytes",
+  "live_bytes",
+  "cached_bytes",
+  "peak_bytes",
+  "peak_live_bytes",
+  "cap_bytes",
+  "trims",
+  "miss_top"
+ ],
+ "matmul_backward": "ok grad_type=Tensor",
+ "model_device": "cuda",
+ "fwd_ok": true,
+ "fwd_s": 0.01,
+ "logits_shape": [
+  64,
+  4096
+ ],
+ "model_err": "NotImplementedError: 切片暂不支持索引类型 ndarray。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）",
+ "tb": "Traceback (most recent call last):\n  File \"D:\\orv_bench\\polaris\\g00_smoke.py\", line 59, in <module>\n    loss = L.ce_vec(T, lg, y)\n           ^^^^^^^^^^^^^^^^^^\n  File \"D:\\orv_bench\\polaris\\pbench_lib.py\", line 108, in ce_vec\n    picked = lp[idx, y]\n             ~~^^^^^^^^\n  File \"D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py\", line 1859, in __getitem__\n    return self._getitem_cuda(idx)\n           ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py\", line 1893, in _getitem_cuda\n    out_shape, base, divs, strides = _slice_gather_plan(self.shape, idx)\n                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py\", line 2269, in _slice_gather_plan\n    raise NotImplementedError(\"切片暂不支持索引类型 %s\" % type(it).__name__ + \"。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）\")\nNotImplementedError: 切片暂不支持索引类型 ndarray。修法：看 docs/OP_COVERAGE.md 的支持矩阵；或用已有算子组合实现（ops_plugin.register）\n",
+ "first_step_ms": {
+  "AdamW": 0.5,
+  "Adafactor": 0.0,
+  "Muon": 0.0,
+  "LAMB": "ERR NotImplementedError: LAMB 目前只支持 CPU 张量（参数 (4096, 128) 在 cuda 上）。修法：① 先用 AdamW（CUDA 已支持）；② 或把参数搬到 CPU；③ 要真正在 GPU 上用 LAMB，需要照 AdamW 的 CUDA 分支补一套内核调用",
+  "Lion": 0.0,
+  "Polaris": "ERR TypeError: 'NoneType' object is not callable"
+ },
+ "mem_peak_gib": 0.015
+}

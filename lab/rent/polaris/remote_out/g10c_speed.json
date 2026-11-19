@@ -1,0 +1,95 @@
+{
+ "speed": {
+  "AdamW": {
+   "step_ms_median": 11.362,
+   "step_ms_all": [
+    13.215,
+    11.252,
+    11.362
+   ],
+   "opt_step_ms_median": 0.043,
+   "opt_step_ms_all": [
+    0.048,
+    0.043,
+    0.043
+   ],
+   "tokens_per_s": 45061.7,
+   "peak_gib": 0.1055,
+   "peak_gib_before": 0.1055
+  },
+  "Adafactor": {
+   "step_ms_median": 27.292,
+   "step_ms_all": [
+    27.292,
+    24.172,
+    31.195
+   ],
+   "opt_step_ms_median": 11.409,
+   "opt_step_ms_all": [
+    11.339,
+    11.409,
+    15.614
+   ],
+   "tokens_per_s": 18759.8,
+   "peak_gib": 0.1055,
+   "peak_gib_before": 0.1055
+  },
+  "Muon": {
+   "step_ms_median": 21.642,
+   "step_ms_all": [
+    21.642,
+    26.61,
+    21.238
+   ],
+   "opt_step_ms_median": 9.512,
+   "opt_step_ms_all": [
+    9.485,
+    11.893,
+    9.512
+   ],
+   "tokens_per_s": 23657.3,
+   "peak_gib": 0.1055,
+   "peak_gib_before": 0.1055
+  },
+  "Lion": {
+   "step_ms_median": 25.564,
+   "step_ms_all": [
+    25.564,
+    24.518,
+    25.638
+   ],
+   "opt_step_ms_median": 10.964,
+   "opt_step_ms_all": [
+    12.543,
+    10.676,
+    10.964
+   ],
+   "tokens_per_s": 20028.2,
+   "peak_gib": 0.1055,
+   "peak_gib_before": 0.1055
+  },
+  "Polaris": {
+   "step_ms_median": 27.942,
+   "step_ms_all": [
+    29.899,
+    27.942,
+    25.093
+   ],
+   "opt_step_ms_median": 13.107,
+   "opt_step_ms_all": [
+    12.826,
+    15.395,
+    13.107
+   ],
+   "tokens_per_s": 18323.9,
+   "peak_gib": 0.1055,
+   "peak_gib_before": 0.1055
+  }
+ },
+ "batch": 8,
+ "seq": 64,
+ "reps": 3,
+ "nsteps": 20,
+ "warm": 5,
+ "timer": "cuda events (event_record/event_elapsed_ms)"
+}

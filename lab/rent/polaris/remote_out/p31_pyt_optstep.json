@@ -1,0 +1,22 @@
+{
+ "device": "cuda",
+ "torch": "2.6.0+cu124",
+ "mini_1.05M": {
+  "n_params": 1049216,
+  "opt_step_ms_median": 0.2786,
+  "reps_ms": [
+   0.2931,
+   0.2786,
+   0.2767
+  ]
+ },
+ "big_9.4M": {
+  "n_params": 9441536,
+  "opt_step_ms_median": 0.9971,
+  "reps_ms": [
+   0.9929,
+   0.9971,
+   1.0001
+  ]
+ }
+}

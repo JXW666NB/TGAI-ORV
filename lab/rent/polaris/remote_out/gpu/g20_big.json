@@ -1,0 +1,264 @@
+{
+ "big_9.4M": {
+  "AdamW": {
+   "opt_step_ms_median": 0.341,
+   "opt_step_ms_all": [
+    0.3412,
+    0.341,
+    0.341
+   ],
+   "n_params": 9441536,
+   "peak_gib": 0.1427,
+   "full_step_ms_median": 19.6475,
+   "full_step_ms_all": [
+    23.7181,
+    18.17,
+    19.6475
+   ],
+   "tokens_per_s": 6514.8
+  },
+  "Fp16MomAdamW": {
+   "opt_step_ms_median": 0.3322,
+   "opt_step_ms_all": [
+    0.3327,
+    0.3322,
+    0.3305
+   ],
+   "n_params": 9441536,
+   "peak_gib": 0.2671,
+   "full_step_ms_median": 21.7202,
+   "full_step_ms_all": [
+    22.7871,
+    17.5172,
+    21.7202
+   ],
+   "tokens_per_s": 5893.1
+  },
+  "Int8AdamWGpu": {
+   "opt_step_ms_median": 0.2607,
+   "opt_step_ms_all": [
+    0.2621,
+    0.2606,
+    0.2607
+   ],
+   "n_params": 9441536,
+   "peak_gib": 0.2671,
+   "full_step_ms_median": 20.4285,
+   "full_step_ms_all": [
+    23.4196,
+    17.5831,
+    20.4285
+   ],
+   "tokens_per_s": 6265.8
+  },
+  "Adafactor": {
+   "opt_step_ms_median": 160.8087,
+   "opt_step_ms_all": [
+    160.8087,
+    175.6491,
+    153.1961
+   ],
+   "n_params": 9441536,
+   "peak_gib": 0.2671,
+   "full_step_ms_median": 172.7995,
+   "full_step_ms_all": [
+    189.849,
+    166.7743,
+    172.7995
+   ],
+   "tokens_per_s": 740.7
+  },
+  "Muon": {
+   "opt_step_ms_median": 40.0394,
+   "opt_step_ms_all": [
+    40.0394,
+    40.7983,
+    39.4485
+   ],
+   "n_params": 9441536,
+   "peak_gib": 0.2671,
+   "full_step_ms_median": 59.488,
+   "full_step_ms_all": [
+    63.289,
+    57.894,
+    59.488
+   ],
+   "tokens_per_s": 2151.7
+  },
+  "Lion": {
+   "opt_step_ms_median": 149.3303,
+   "opt_step_ms_all": [
+    129.2904,
+    149.5941,
+    149.3303
+   ],
+   "n_params": 9441536,
+   "peak_gib": 0.2671,
+   "full_step_ms_median": 159.7777,
+   "full_step_ms_all": [
+    152.3265,
+    161.8421,
+    159.7777
+   ],
+   "tokens_per_s": 801.1
+  },
+  "Polaris": {
+   "opt_step_ms_median": 56.7942,
+   "opt_step_ms_all": [
+    61.0231,
+    55.6266,
+    56.7942
+   ],
+   "n_params": 9441536,
+   "peak_gib": 0.2671,
+   "full_step_ms_median": 75.5962,
+   "full_step_ms_all": [
+    75.5962,
+    77.4212,
+    73.8712
+   ],
+   "tokens_per_s": 1693.2,
+   "status": {
+    "step": 33,
+    "auto": true,
+    "orth_freq": 1,
+    "dir_cos": 0.9691,
+    "gate_hit": 0.99073,
+    "gate_k": 2.0,
+    "ns_calls": 1353,
+    "ns_saved_pct": 0.0
+   }
+  }
+ },
+ "mini_1.05M": {
+  "AdamW": {
+   "opt_step_ms_median": 0.0506,
+   "opt_step_ms_all": [
+    0.0506,
+    0.0506,
+    0.0502
+   ],
+   "n_params": 1049216,
+   "peak_gib": 0.3374,
+   "full_step_ms_median": 8.1814,
+   "full_step_ms_all": [
+    8.1814,
+    8.1359,
+    8.1838
+   ],
+   "tokens_per_s": 15645.3
+  },
+  "Fp16MomAdamW": {
+   "opt_step_ms_median": 0.0424,
+   "opt_step_ms_all": [
+    0.0427,
+    0.0424,
+    0.0422
+   ],
+   "n_params": 1049216,
+   "peak_gib": 0.3374,
+   "full_step_ms_median": 6.4822,
+   "full_step_ms_all": [
+    6.5494,
+    6.4822,
+    6.4368
+   ],
+   "tokens_per_s": 19746.3
+  },
+  "Int8AdamWGpu": {
+   "opt_step_ms_median": 0.0364,
+   "opt_step_ms_all": [
+    0.0367,
+    0.0362,
+    0.0364
+   ],
+   "n_params": 1049216,
+   "peak_gib": 0.3374,
+   "full_step_ms_median": 7.8847,
+   "full_step_ms_all": [
+    8.8158,
+    7.8847,
+    7.5634
+   ],
+   "tokens_per_s": 16234.0
+  },
+  "Adafactor": {
+   "opt_step_ms_median": 13.3882,
+   "opt_step_ms_all": [
+    14.8509,
+    13.0937,
+    13.3882
+   ],
+   "n_params": 1049216,
+   "peak_gib": 0.3374,
+   "full_step_ms_median": 20.2132,
+   "full_step_ms_all": [
+    18.071,
+    20.2132,
+    26.0265
+   ],
+   "tokens_per_s": 6332.5
+  },
+  "Muon": {
+   "opt_step_ms_median": 10.6836,
+   "opt_step_ms_all": [
+    10.6836,
+    11.2826,
+    9.6407
+   ],
+   "n_params": 1049216,
+   "peak_gib": 0.3374,
+   "full_step_ms_median": 17.723,
+   "full_step_ms_all": [
+    16.5714,
+    20.3368,
+    17.723
+   ],
+   "tokens_per_s": 7222.3
+  },
+  "Lion": {
+   "opt_step_ms_median": 11.0743,
+   "opt_step_ms_all": [
+    11.2397,
+    11.0743,
+    10.172
+   ],
+   "n_params": 1049216,
+   "peak_gib": 0.3374,
+   "full_step_ms_median": 19.6883,
+   "full_step_ms_all": [
+    18.7312,
+    19.6883,
+    24.1627
+   ],
+   "tokens_per_s": 6501.3
+  },
+  "Polaris": {
+   "opt_step_ms_median": 14.299,
+   "opt_step_ms_all": [
+    14.8054,
+    13.348,
+    14.299
+   ],
+   "n_params": 1049216,
+   "peak_gib": 0.3374,
+   "full_step_ms_median": 22.0489,
+   "full_step_ms_all": [
+    24.3322,
+    20.4554,
+    22.0489
+   ],
+   "tokens_per_s": 5805.3,
+   "status": {
+    "step": 33,
+    "auto": true,
+    "orth_freq": 1,
+    "dir_cos": 0.9691,
+    "gate_hit": 0.99073,
+    "gate_k": 2.0,
+    "ns_calls": 363,
+    "ns_saved_pct": 0.0
+   }
+  }
+ }
+}

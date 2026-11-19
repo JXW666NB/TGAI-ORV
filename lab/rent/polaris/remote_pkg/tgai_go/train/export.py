@@ -1,0 +1,187 @@
+# -*- coding: utf-8 -*-
+"""把训练侧的模型导出成引擎能加载的 `.TG`。
+
+设计要点：
+1. **名字映射**：训练侧用 `nn.MoE` 的命名（`experts.{e}.gate/up/down`），
+   引擎期望 `experts.{e}.w1/w2/w3` 且需要 `moe.gate.weight` 与 `moe._qb_bias`。
+   映射集中在 `_ENGINE_MAP` 一处，改架构只改这张表。
+2. **RoPE 的 cos/sin 由引擎按 `rope_theta` 自己算**，我们只需把 theta 传对；
+   若训练侧用的是同一 theta，两边位置编码一致。
+3. **词表与 merges 一起写进去**，用户不需要单独提供分词表（引擎自训 → 直接内嵌）。
+4. 权重默认写 fp32（`weight_dtype=0`），便于先把数值对齐；换 fp16 是后续优化。
+
+用法：
+    from tgai_go.train.export import save_tg
+    save_tg("m.TG", params, cfg, vocab_tokens, merges)
+其中 params 是 {训练侧名字: numpy 数组}。
+"""
+import numpy as np
+
+from ..pack import TGWriter
+
+DT_FP32 = 0
+DT_FP16 = 1
+
+
+def _engine_name(name, n_experts):
+    """训练侧参数名 -> 引擎期望的参数名。返回 None 表示该参数不写进 .TG。"""
+    n = name
+    if n in ("token_embedding.weight", "embed.weight", "wte.weight"):
+        return "token_embedding.weight"
+    if n in ("final_norm.weight", "ln_f.weight"):
+        return "final_norm.weight"
+    if n.startswith("lm_head"):
+        return None                                  # 与词表共享，引擎不接受独立头
+    # MoE 专家：experts.{e}.gate/up/down -> **moe.experts.{e}.w1/w2/w3**
+    # ★ 引擎的命名里 `experts` 挂在 `moe.` 下面（`blocks.{i}.moe.experts.{e}.w1.weight`）。
+    #   漏掉 `.moe.` 时 .TG 仍能写、能 load，但引擎按名取权重拿不到 → generate 时 access violation
+    #   （实测 0x1A00）。这是 3 处命名不匹配的根因。
+    if ".experts." in n:
+        head, tail = n.split(".experts.", 1)
+        idx, _, rest = tail.partition(".")
+        rest = rest.replace(".weight", "")
+        m = {"gate": "w1", "up": "w2", "down": "w3"}
+        if head.endswith(".moe"):
+            block = head[: -len(".moe")]
+        else:
+            block = head
+        if rest in m:
+            return "%s.moe.experts.%s.%s.weight" % (block, idx, m[rest])
+        # ★ 已经是引擎命名（w1/w2/w3）时必须**原样保留**。
+        #   早期版本这里直接 return None，把 w1/w2/w3 全丢了 ⇒ 导出的 .TG **没有任何专家权重**，
+        #   引擎前向取专家指针拿到 NULL，崩在 access violation（0x1A000）。
+        if rest in ("w1", "w2", "w3"):
+            return "%s.moe.experts.%s.%s.weight" % (block, idx, rest)
+        return None
+    if n.endswith(".router.weight"):
+        return n
+    if n.endswith(".gate.weight") and ".experts." not in n:
+        return n                                     # moe.gate.weight（负载均衡门控，占位）
+    return n
+
+
+def collect(params, n_experts, n_layers, d_model, n_heads, d_ff, vocab, max_seq,
+            rope_theta=10000.0, n_activated=2, n_kv_heads=0, head_dim=None):
+    """把训练侧 dict 变成引擎可写的 (cfg, weights)。"""
+    out = {}
+    for k, v in params.items():
+        ek = _engine_name(k, n_experts)
+        if ek is None:
+            continue
+        out[ek] = np.ascontiguousarray(np.asarray(v, dtype=np.float32))
+    # ★ 引擎会**直接按指针读** RoPE 的 cos/sin buffer，文件里缺了就是空指针：
+    #   实测症状 = generate 时 `access violation reading 0x...`（加载能过，生成才崩）。
+    #   这里按与 build_dummy_tg 完全相同的公式补齐。
+    # ★ head_dim 必须能单独指定：Qwen3-0.6B 是 128，而 d_model/n_heads = 1024/16 = 64。
+    #   用 d_model//n_heads 硬算会把 RoPE 表和 q_proj 的行数一起弄错，
+    #   且**不会报错** —— 导出的模型加载正常、生成全错。
+    DH = int(head_dim or (d_model // n_heads))
+    if DH <= 0 or DH % 2 != 0:
+        raise ValueError("head_dim=%r 非法（必须是正偶数）。"
+                         "修法：从 config.json 的 head_dim 或 q_proj.shape[0]//n_heads 取"
+                         % (head_dim,))
+    # 权重形状与 head_dim 必须自洽，否则宁可现在报错
+    want = {"attn.q_proj.weight": n_heads * DH,
+            "attn.k_proj.weight": (n_kv_heads or n_heads) * DH,
+            "attn.v_proj.weight": (n_kv_heads or n_heads) * DH}
+    for name, arr in out.items():
+        for suffix, rows in want.items():
+            if name.endswith(suffix) and int(np.shape(arr)[0]) != rows:
+                raise ValueError(
+                    "导出形状不符：%s 的行数是 %d，但 n_heads*head_dim=%d"
+                    "（head_dim=%d, n_heads=%d, n_kv_heads=%d）。"
+                    "修法：确认 head_dim 取自该模型的 config.json，"
+                    "或检查权重是否来自另一个模型"
+                    % (name, int(np.shape(arr)[0]), rows, DH, n_heads, n_kv_heads or n_heads))
+    half = DH // 2
+    pos = np.arange(max_seq, dtype=np.float64)[:, None]
+    inv = float(rope_theta) ** (-2.0 * np.arange(half, dtype=np.float64) / DH)
+    ang = pos * inv[None, :]
+    cos = np.concatenate([np.cos(ang)] * 2, 1).astype(np.float32).reshape(1, 1, max_seq, DH)
+    sin = np.concatenate([np.sin(ang)] * 2, 1).astype(np.float32).reshape(1, 1, max_seq, DH)
+    for i in range(n_layers):
+        p2 = "blocks.%d.attn." % i
+        if p2 + "rope.cos" not in out:
+            out[p2 + "rope.cos"] = cos
+        if p2 + "rope.sin" not in out:
+            out[p2 + "rope.sin"] = sin
+
+    # 引擎要求每个专家都有 `moe.gate.weight` 与 `moe._qb_bias`（负载均衡用的旁路参数）
+    for i in range(n_layers):
+        p = "blocks.%d.moe." % i
+        if p + "gate.weight" not in out:
+            if p + "router.weight" in out:
+                out[p + "gate.weight"] = np.zeros_like(out[p + "router.weight"])
+        if p + "_qb_bias" not in out:
+            out[p + "_qb_bias"] = np.zeros(n_experts, np.float32)
+    return out
+
+
+def save_tg(path, params, *, n_layers, d_model, n_heads, d_ff, vocab_tokens, merges=None,
+            max_seq=512, n_experts=1, n_activated=1, rope_theta=10000.0,
+            special_ids=None, weight_dtype=DT_FP32, n_kv_heads=0, arch=None,
+            head_dim=None):
+    """写 `.TG`。vocab_tokens 是词表（list[str]），merges 是 BPE 合并表。"""
+    # ★ .TG 头字段是 `n_layers/d_model/n_heads/...`，**没有 head_dim**。
+    #   所以只要 head_dim != d_model//n_heads，这个格式就表达不了，
+    #   现有 C 引擎会按 d_model//n_heads 去解析 —— 导出必错、且不报错。
+    #   与其产出一个"能加载、生成全错"的模型，不如在这里停下。
+    natural = d_model // n_heads
+    if head_dim is not None and int(head_dim) != natural:
+        raise ValueError(
+            "无法导出：head_dim=%d，而 .TG 头里只有一个 d_model/n_heads=%d 的隐含值"
+            "（Qwen3-0.6B 这类模型 head_dim=128 而 1024/16=64）。"
+            "修法：① 在 .TG 扩展区写入 head_dim 并同步修改 C 引擎读取逻辑（需两边配合）；"
+            "② 或先不导出该类模型，训练侧继续用 npz 存档；"
+            "③ 若只是本地推理验证，可用 head_dim 与原模型一致的模型（如 Qwen2.5）"
+            % (int(head_dim), natural))
+    w = collect(params, n_experts, n_layers, d_model, n_heads, d_ff,
+                len(vocab_tokens), max_seq, rope_theta, n_activated, n_kv_heads, head_dim)
+    kw = {}
+    if arch is not None:
+        kw["arch"] = arch
+    # .TG 头部把 rope_theta 按无符号整型写（struct "<16I6Q4I"），
+    # 而 θ 通常是浮点（10000.0 / 500000.0）。这里要求它是整数值再取 int，避免静默截断。
+    th = float(rope_theta)
+    if abs(th - round(th)) > 1e-9:
+        raise ValueError("rope_theta 必须是整数值才能写进 .TG 头（收到 %r）" % (rope_theta,) + "。修法：把 rope_theta 设成整数（例如 10000）；.TG 头只存整数")
+    rope_theta = int(round(th))
+    # ★ 2026-11-13：导出改写成 **TG4** 容器（自描述分区 + NAM 名字表 + 内置分词表）。
+    #   为什么：v3 家族的权重表只有 FNV 哈希、没有名字，做不了按名映射/部分加载；
+    #   而 TG4 的 NAM 直接带名字，且头里有独立的 `head_dim` 字段。
+    #
+    #   `TGWriter` 在这里只用来**编码分词段字节**（v3 与 TG4 的 TOK 布局完全一致），
+    #   避免再写一份编码器；权重本身走 `tg4.write_tg4_stream`（流式，峰值=单张量）。
+    wr = TGWriter(n_layers=n_layers, d_model=d_model, n_heads=n_heads, d_ff=d_ff,
+                  vocab=len(vocab_tokens), max_seq=max_seq,
+                  n_experts=n_experts, n_activated=n_activated, rope_theta=rope_theta,
+                  n_kv_heads=n_kv_heads, weight_dtype=weight_dtype, **kw)
+    wr.set_tokenizer(vocab_tokens, merges=merges,
+                     special_ids=special_ids or [0, 0, 0, 0])
+    tok_blob = wr._tokenizer_bytes()
+
+    from .. import tg4
+    cfg4 = dict(n_layers=n_layers, d_model=d_model, n_heads=n_heads,
+                head_dim=int(head_dim or natural), d_ff=d_ff,
+                vocab=len(vocab_tokens), max_seq=max_seq,
+                n_kv_heads=n_kv_heads, n_experts=n_experts, n_activated=n_activated,
+                arch=int(arch or 0), weight_dtype=int(weight_dtype),
+                rope_theta=int(rope_theta),
+                pad_id=0, bos_id=0, eos_id=0, unk_id=0)
+    tg4.write_tg4_stream(path, iter(w.items()), cfg4, tok=tok_blob)
+    # ★ 旁挂名字表（2026-11-08）：`.TG` 表里只有 FNV 哈希，不存名字 —— 推理够用，
+    #   但当检查点用就**无法枚举参数**（做不了优化器映射/LoRA 挂载/部分加载）。
+    #   这里顺手写一个 `<model>.TG.names.json`：纯旁挂，引擎不读 ⇒ 对产线零风险。
+    #   哪怕名字表生成失败也**不影响** .TG 本身可用，所以整体 try 住。
+    try:
+        from ..read_tg import read_tg as _read_tg, write_names as _write_names, \
+            fnv1a64 as _fnv1a64, close_tg as _close_tg
+        _info = _read_tg(path)
+        try:
+            _write_names(path, _info,
+                         {"name_by_hash": {"%016x" % _fnv1a64(n): n for n in w}})
+        finally:
+            _close_tg(_info)
+    except Exception:                                       # noqa: BLE001
+        pass
+    return path

@@ -1,0 +1,25 @@
+{
+ "np_matmul_512_gflops": 414.91,
+ "np_matmul_512_ms": 0.65,
+ "fwd_s": 10.534,
+ "fwd1_s": 10.548,
+ "bwd_s": 0.303,
+ "opt_step_s": {
+  "AdamW": 2.565,
+  "Muon": 1.049,
+  "Adafactor": 0.011,
+  "LAMB": 0.02,
+  "Polaris": 0.728
+ },
+ "polaris_status_1": {
+  "step": 1,
+  "auto": true,
+  "orth_freq": 1,
+  "dir_cos": 0.1,
+  "gate_hit": 0.73,
+  "gate_k": 6.25,
+  "ns_calls": 11,
+  "ns_saved_pct": 0.0
+ },
+ "profile": "         25181701 function calls (25181663 primitive calls) in 30.937 seconds\n\n   Ordered by: cumulative time\n   List reduced from 172 to 28 due to restriction <28>\n\n   ncalls  tottime  percall  cumtime  percall filename:lineno(function)\n     40/2    0.000    0.000   30.515   15.257 D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py:3797(__call__)\n        2    0.000    0.000   30.515   15.257 D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\preset.py:81(forward)\n        2    0.000    0.000   30.354   15.177 D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py:3149(cross_entropy)\n        2    0.000    0.000   30.354   15.177 D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py:3159(_cross_entropy_cpu)\n        2    0.000    0.000   30.354   15.177 D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py:251(_cross_entropy_fused)\n        2    2.084    1.042   30.354   15.177 D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py:218(_ce32)\n   524288    2.098    0.000   28.266    0.000 D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py:149(_exp32)\n   524288    6.665    0.000   13.758    0.000 D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py:136(_exp32_wide)\n   524288    8.818    0.000   11.997    0.000 D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py:128(_exp32_taylor)\n  1048594    0.399    0.000    5.130    0.000 D:\\orv_pip_0962\\Lib\\site-packages\\numpy\\lib\\_stride_tricks_impl.py:400(broadcast_to)\n  1048594    3.318    0.000    4.731    0.000 D:\\orv_pip_0962\\Lib\\site-packages\\numpy\\lib\\_stride_tricks_impl.py:373(_broadcast_to)\n   524292    0.467    0.000    1.784    0.000 D:\\orv_pip_0962\\Lib\\site-packages\\numpy\\_core\\fromnumeric.py:2207(clip)\n   524364    0.272    0.000    1.317    0.000 D:\\orv_pip_0962\\Lib\\site-packages\\numpy\\_core\\fromnumeric.py:48(_wrapfunc)\n  2097284    1.273    0.000    1.273    0.000 {method 'view' of 'numpy.generic' objects}\n   524292    0.174    0.000    0.987    0.000 {method 'clip' of 'numpy.ndarray' objects}\n   524292    0.813    0.000    0.813    0.000 D:\\orv_pip_0962\\Lib\\site-packages\\numpy\\_core\\_methods.py:96(_clip)\n  1048832    0.790    0.000    0.790    0.000 {method 'astype' of 'numpy.generic' objects}\n  1572876    0.569    0.000    0.569    0.000 {method 'astype' of 'numpy.ndarray' objects}\n  1048596    0.279    0.000    0.397    0.000 {built-in method builtins.any}\n        2    0.002    0.001    0.397    0.198 D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py:772(backward)\n       22    0.385    0.017    0.385    0.017 D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\__init__.py:967(bw)\n  1049148    0.345    0.000    0.345    0.000 {built-in method numpy.array}\n  1048594    0.260    0.000    0.343    0.000 D:\\orv_pip_0962\\Lib\\site-packages\\numpy\\lib\\_function_base_impl.py:363(iterable)\n  1573636    0.326    0.000    0.326    0.000 {built-in method numpy.asarray}\n  1048594    0.249    0.000    0.249    0.000 {method 'copy' of 'numpy.ndarray' objects}\n  1048594    0.212    0.000    0.212    0.000 D:\\orv_pip_0962\\Lib\\site-packages\\numpy\\lib\\_stride_tricks_impl.py:24(_maybe_view_as_subclass)\n  1048584    0.175    0.000    0.175    0.000 D:\\orv_pip_0962\\Lib\\site-packages\\numpy\\_core\\fromnumeric.py:2084(shape)\n        4    0.000    0.000    0.156    0.039 D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\train\\preset.py:138(forward)\n\n\n"
+}

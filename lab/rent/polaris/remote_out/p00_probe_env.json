@@ -1,0 +1,48 @@
+{
+ "python": "3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]",
+ "exe": "D:\\orv_pip_0962\\Scripts\\python.exe",
+ "orv_file": "D:\\orv_pip_0962\\Lib\\site-packages\\tgai_go\\__init__.py",
+ "orv_version": "0.9.97",
+ "orv_dist": "0.9.97",
+ "device_api": {
+  "set_device": true,
+  "set_default_device": true,
+  "get_device": true,
+  "device_caps": true
+ },
+ "get_device": "cpu",
+ "T_optim_names": [
+  "Accumulator",
+  "Adafactor",
+  "AdamW",
+  "LAMB",
+  "Lion",
+  "Muon",
+  "SGD",
+  "lr_scheduler",
+  "scale_grads"
+ ],
+ "plugin_autoload": true,
+ "plugin_registered_before": [],
+ "polaris": {
+  "polaris_file": "D:\\orv_pip_0962\\Lib\\site-packages\\polaris.py",
+  "polaris_version": null,
+  "PLUGIN": {
+   "name": "polaris-orv",
+   "version": "1.0.0",
+   "api_version": 1,
+   "description": "POLARIS 自适应正交融合优化器（单文件 ORV 插件，CPU/CUDA）",
+   "author": "BLLM",
+   "license": "MIT",
+   "ops": {}
+  },
+  "resolve": "<class 'polaris.Polaris'>"
+ },
+ "smoke": {
+  "grad_type": "ndarray",
+  "grad_shape": "(4, 3)",
+  "data_type": "ndarray",
+  "adamw_ok": true
+ },
+ "has_help": true
+}

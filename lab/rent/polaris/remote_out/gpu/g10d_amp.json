@@ -1,0 +1,74 @@
+{
+ "AdamW_amp_off": {
+  "error": "KeyError: 'opt_status'"
+ },
+ "AdamW_amp_on": {
+  "error": "KeyError: 'opt_status'"
+ },
+ "Polaris_amp_off": {
+  "last10_mean": 1.1491272562125233e-05,
+  "min": 9.488945579505526e-06,
+  "loss_at_50": 0.00040002912282943726,
+  "loss_at_100": 1.7455229681218043e-05,
+  "t_step_s": 0.09221554599993396,
+  "all_finite": true,
+  "nan_step": null,
+  "opt_status": {
+   "step": 120,
+   "auto": true,
+   "orth_freq": 1,
+   "dir_cos": 0.98571,
+   "gate_hit": 0.07691,
+   "gate_k": 12.0,
+   "ns_calls": 1265,
+   "ns_saved_pct": 4.2
+  }
+ },
+ "Polaris_amp_on": {
+  "last10_mean": 1.3683772885997314e-05,
+  "min": 7.839109457563609e-06,
+  "loss_at_50": 0.00040053343400359154,
+  "loss_at_100": 1.6566988051636145e-05,
+  "t_step_s": 0.02593216200126335,
+  "all_finite": true,
+  "nan_step": null,
+  "opt_status": {
+   "step": 120,
+   "auto": true,
+   "orth_freq": 1,
+   "dir_cos": 0.9857,
+   "gate_hit": 0.05661,
+   "gate_k": 12.0,
+   "ns_calls": 1265,
+   "ns_saved_pct": 4.2
+  }
+ },
+ "amp_state": {
+  "on": false,
+  "fp16": false,
+  "bf16": false,
+  "available": true,
+  "c32": true,
+  "cache": {
+   "entries": 0,
+   "bytes": 0,
+   "on": false
+  }
+ },
+ "precision_policy": {
+  "storage": "bf16",
+  "compute": "fp16",
+  "caps": {
+   "cc": [
+    7,
+    0
+   ],
+   "fp16_arith": true,
+   "bf16_arith": false,
+   "bf16_store": true,
+   "fp16_store": true
+  },
+  "storage_bytes": 2,
+  "compute_supported": true
+ }
+}

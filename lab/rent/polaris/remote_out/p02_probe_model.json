@@ -1,0 +1,349 @@
+{
+ "npz": {
+  "input_ids": {
+   "shape": [
+    16,
+    2048
+   ],
+   "dtype": "int32",
+   "min": 0,
+   "max": 4095
+  },
+  "labels": {
+   "shape": [
+    16,
+    2048
+   ],
+   "dtype": "int32",
+   "min": 0,
+   "max": 4095
+  }
+ },
+ "npz_files": [
+  "input_ids",
+  "labels"
+ ],
+ "model": {
+  "cfg": {
+   "vocab": 4096,
+   "d_model": 128,
+   "n_layers": 2,
+   "n_heads": 4,
+   "d_ff": 512,
+   "norm": "rms",
+   "tie_embedding": true
+  },
+  "n_params_listed": 16,
+  "n_unique": 16,
+  "n_duplicate_entries": 0,
+  "n_params_model": 1049216,
+  "total_numel_listed": 1049216,
+  "params": [
+   {
+    "shape": [
+     4096,
+     128
+    ],
+    "numel": 524288,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     128
+    ],
+    "numel": 128,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     128
+    ],
+    "numel": 128,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     384,
+     128
+    ],
+    "numel": 49152,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     128,
+     128
+    ],
+    "numel": 16384,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     512,
+     128
+    ],
+    "numel": 65536,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     512,
+     128
+    ],
+    "numel": 65536,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     128,
+     512
+    ],
+    "numel": 65536,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     128
+    ],
+    "numel": 128,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     128
+    ],
+    "numel": 128,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     384,
+     128
+    ],
+    "numel": 49152,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     128,
+     128
+    ],
+    "numel": 16384,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     512,
+     128
+    ],
+    "numel": 65536,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     512,
+     128
+    ],
+    "numel": 65536,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     128,
+     512
+    ],
+    "numel": 65536,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   },
+   {
+    "shape": [
+     128
+    ],
+    "numel": 128,
+    "device": "cpu",
+    "dtype": "torch.float32"
+   }
+  ]
+ },
+ "init_dist": [
+  {
+   "shape": [
+    4096,
+    128
+   ],
+   "std": 0.01995975151658058,
+   "mean": -3.431961522437632e-05,
+   "absmax": 0.09765346348285675
+  },
+  {
+   "shape": [
+    128
+   ],
+   "std": 0.0,
+   "mean": 1.0,
+   "absmax": 1.0
+  },
+  {
+   "shape": [
+    128
+   ],
+   "std": 0.0,
+   "mean": 1.0,
+   "absmax": 1.0
+  },
+  {
+   "shape": [
+    384,
+    128
+   ],
+   "std": 0.08830750733613968,
+   "mean": -0.0006453539244830608,
+   "absmax": 0.37013888359069824
+  },
+  {
+   "shape": [
+    128,
+    128
+   ],
+   "std": 0.088173508644104,
+   "mean": 0.0001354973646812141,
+   "absmax": 0.3773673176765442
+  },
+  {
+   "shape": [
+    512,
+    128
+   ],
+   "std": 0.0885266363620758,
+   "mean": 0.000167657490237616,
+   "absmax": 0.3763444125652313
+  },
+  {
+   "shape": [
+    512,
+    128
+   ],
+   "std": 0.08887716382741928,
+   "mean": 0.00019488456018734723,
+   "absmax": 0.3945530354976654
+  },
+  {
+   "shape": [
+    128,
+    512
+   ],
+   "std": 0.04416657239198685,
+   "mean": -0.00013518020568881184,
+   "absmax": 0.20798420906066895
+  },
+  {
+   "shape": [
+    128
+   ],
+   "std": 0.0,
+   "mean": 1.0,
+   "absmax": 1.0
+  },
+  {
+   "shape": [
+    128
+   ],
+   "std": 0.0,
+   "mean": 1.0,
+   "absmax": 1.0
+  },
+  {
+   "shape": [
+    384,
+    128
+   ],
+   "std": 0.0885174497961998,
+   "mean": 0.00036734496825374663,
+   "absmax": 0.41583558917045593
+  },
+  {
+   "shape": [
+    128,
+    128
+   ],
+   "std": 0.08762243390083313,
+   "mean": -0.0002220602473244071,
+   "absmax": 0.35035306215286255
+  },
+  {
+   "shape": [
+    512,
+    128
+   ],
+   "std": 0.08808759599924088,
+   "mean": -0.00025428435765206814,
+   "absmax": 0.3862370550632477
+  },
+  {
+   "shape": [
+    512,
+    128
+   ],
+   "std": 0.0887073427438736,
+   "mean": -0.00014321465278044343,
+   "absmax": 0.42205747961997986
+  },
+  {
+   "shape": [
+    128,
+    512
+   ],
+   "std": 0.044087003916502,
+   "mean": 0.0001959602814167738,
+   "absmax": 0.19868499040603638
+  },
+  {
+   "shape": [
+    128
+   ],
+   "std": 0.0,
+   "mean": 1.0,
+   "absmax": 1.0
+  }
+ ],
+ "tokens_total_shard0": 32768,
+ "x_first8": [
+  4011,
+  4000,
+  4046,
+  1557,
+  701,
+  3781,
+  429,
+  1071
+ ],
+ "step_s": [
+  12.733754299988504,
+  10.326258399989456,
+  10.331776999984868
+ ],
+ "loss_at_init": 8.370789527893066,
+ "loss_after3": 7.385542869567871,
+ "has_clip_grad_norm_": true,
+ "has_amp": true,
+ "default_device": "cpu",
+ "torch_mod_used": "tgai_go.train",
+ "cpu_count": 12,
+ "np_show_config": "",
+ "numpy_threads": "unset"
+}
