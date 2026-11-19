@@ -394,3 +394,33 @@ docs/                      设计文档、计划、实测报告
 ## 许可
 
 MIT，见 [`LICENSE`](LICENSE)。
+
+## 社区与示例插件
+
+ORV 的插件系统允许第三方**不改核心**就扩展算子、层与优化器（规范见 [PLUGINS.md](PLUGINS.md)）。
+目前社区的示例插件：
+
+### Polaris（社区示例插件 · experimental）
+
+自适应正交融合优化器（Muon 系：2D 权重走 Polar-Express 正交化 + 逐行 RMS + Cautious 门，
+1D 参数走 AdamW），由社区用户 **yyfdfs** 开发，并作为本项目的**官方示例插件**收录。
+
+- 作者主页：<https://github.com/yyfdfsyyf-source>
+- 形态：单文件插件 `polaris.py` + `tgai_go.ops` entry point，`T.plugin.autoload()` 自动发现
+- 安装：`pip install tgai-polaris`（独立包，尚未随 `tgai-orv` 一起分发）
+- 用法：`import tgai_go.train as T; import polaris; opt = T.optim.Polaris(params, lr=1e-3)`
+- 它的真正价值是**插件 API 的参考实现**：注册幂等、`status()` 诊断、entry point 发现、
+  CPU/CUDA 双路径，都在这一个文件里演示完整
+
+**数值现状（实测，如实公开）**
+
+| 口径 | AdamW | Polaris |
+| --- | --- | --- |
+| 同 lr（1e-2）末段 loss | **6.06** | 112.77 |
+| 各自最优 lr 末段 loss | **0.296**（lr 1e-2）| 8.376（lr 1e-3）|
+
+其 CUDA 路径与 CPU 路径**并非完全等价**：文档声明可以把「逐行 RMS」近似为「整体 RMS」
+（已定位、待修）。因此它**不是**默认优化器的替代品 —— 官方默认仍是 `--opt int8gpu`。
+把它放进主线，是为了给社区一个可运行的范例，而不是推荐它替换 AdamW。
+
+想要自己的插件进官方索引，请看 [PLUGINS.md](PLUGINS.md)。

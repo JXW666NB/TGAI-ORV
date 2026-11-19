@@ -33,6 +33,11 @@ cuda = [
   "nvidia-cuda-nvrtc-cu12>=12.1; sys_platform == 'linux'",
 ]
 
+dev = [
+    "pytest>=7",
+    "safetensors>=0.4",
+]
+
 [project.urls]
 Homepage = "https://github.com/JXW666NB/TGAI-ORV"
 Source = "https://github.com/JXW666NB/TGAI-ORV"

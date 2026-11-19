@@ -21,7 +21,6 @@ jobs:
       - name: install
         run: |
           python -m pip install -U pip
-          python -m pip install -e .
-          python -m pip install pytest
+          python -m pip install -e ".[dev]"
       - name: "test (no GPU; CUDA 用例会被 skipif 跳过)"
         run: python -m pytest tests -q

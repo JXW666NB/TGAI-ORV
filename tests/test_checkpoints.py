@@ -212,7 +212,12 @@ def test_npz_missing_file_errors():
 def _write_hf_dir(dirpath, D=96, NH=4, KV=2, DH=32, L=1, V=128, tie=True,
                   lm_head_equal=True, FF=160):
     """造一个迷你 HF 权重目录（config.json + model.safetensors）。"""
-    from safetensors.numpy import save_file
+    # ★ 2026-11-19：safetensors 是可选依赖。没装时**跳过**而不是失败，
+    #   否则贡献者/CI 环境会因为一个可选项而红（GitHub CI 上就这样挂了 5 个用例）。
+    try:
+        from safetensors.numpy import save_file
+    except ImportError:
+        pytest.skip("需要 safetensors：pip install safetensors")
     rng = np.random.default_rng(0)
     w = {"model.embed_tokens.weight": rng.normal(0, 0.02, (V, D)).astype(np.float32),
          "model.norm.weight": np.ones(D, np.float32)}
