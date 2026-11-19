@@ -125,3 +125,61 @@ def test_chunk_layout_handles_many_short_documents():
     assert int(out["Tc"]) >= T, "Tc 必须放大到实际 chunk 数，否则槽位越界"
     assert out["cnt"].shape[0] == B * int(out["Tc"]), "cnt 长度必须等于 B*Tc"
     assert out["slot_doc"].shape[0] == B * int(out["Tc"]), "slot_doc 长度必须等于 B*Tc"
+
+
+# ---------------------------------------------------------------------------
+# 回归：`slot_doc` 必须存 seg 的值（2026-11-19 的真实 bug，影响 9/12 层注意力）
+# ---------------------------------------------------------------------------
+
+def test_chunk_layout_slot_doc_stores_seg_values_not_ordinals():
+    """回归：`slot_doc` 必须存**数据里的文档号**（`seg` 的值），不是窗口内序号。
+
+    实测过的真实 bug：旧实现存 `doc_ord`（1 起），而 `_mask_global_seg` /
+    `_mask_local_seg` 拿它跟原始 `seg` 比（`cseg[b,k] == seg[b,i]`）。
+    两个不同的量一比，只要文档号不等于序号（例如 seg 全 0、或文档号是 5/9），
+    掩码就全变成 `NEG_BIG` ⇒ **9 个 CSA 层的注意力输出恒 0、梯度恒 0**，
+    但每层 12 次 GEMM 照跑（白付算力）。
+
+    bench 数据没有 `seg_id`（`v3_pretrain` 填 `seg=zeros`）正是这种情形，
+    所以这个 bug 在很长一段时间里没被发现：注意力"看起来在跑"。
+    参考实现 `model_v3.py:908-911` 是 `cseg_ext.scatter_(0, take_ok, seg)`
+    —— 同样存 seg 的原始值。
+    """
+    from tgai_go.train import v3_csa as C
+
+    B, T, c = 1, 16, 4
+    # 关键：这几个取值都 != 序号 1,2,3...，旧实现会全部不匹配
+    for seg_val in (0, 5, 9):
+        seg = np.full((B, T), seg_val, np.int32)
+        lay = C._chunk_layout(seg, c)
+        sd = np.asarray(lay["slot_doc"])
+        occ = sd[sd >= 0]
+        assert occ.size > 0, "seg 全 %d 时应至少有一个有效 chunk" % seg_val
+        assert set(occ.tolist()) == {seg_val}, (
+            "slot_doc 必须存 seg 的值 %r，实际 %r（存成序号就是那个 bug）"
+            % (seg_val, sorted(set(occ.tolist()))))
+
+
+def test_global_seg_mask_not_dead_for_single_document_window():
+    """回归：整窗单文档（`seg` 全 0）时掩码不能全 `NEG_BIG`。
+
+    这是 bench 数据的真实情形（没有 seg_id ⇒ `seg=zeros`）。
+    掩码全 `NEG_BIG` 会让 softmax 之后全 0，注意力输出、梯度都为 0。
+    """
+    from tgai_go.train import v3_csa as C
+
+    B, T, c = 1, 16, 4
+    seg = np.zeros((B, T), np.int32)
+    lay = C._chunk_layout(seg, c)
+    Tc = int(lay["Tc"])
+
+    m, row = C._mask_global_seg(seg, lay, Tc)
+    m = np.asarray(m)
+    row = np.asarray(row).reshape(B, T)
+
+    assert m.shape == (B, 1, T, Tc)
+    frac_dead = float((m < -1e29).mean())
+    assert frac_dead < 1.0, "掩码全部是 NEG_BIG ⇒ 注意力恒 0（就是那个 bug）"
+    assert float(row.sum()) > 0, "row mask 全 0 ⇒ 该位置输出恒 0"
+    # 同一文档且因果 ⇒ 每个 token 至少能看到 chunk 0
+    assert (row > 0).all(), "整窗单文档时每个 token 都应可见至少一个 chunk"
