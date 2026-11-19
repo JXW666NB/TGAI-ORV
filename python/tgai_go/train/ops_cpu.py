@@ -36,8 +36,29 @@ _CACHE = {}
 _COMPILERS = ("clang", "gcc", "cc", "tcc", "cl")
 
 
+def _find_zig():
+    """便携 Zig（pip install ziglang）——零配置可用，且**默认导出符号**。"""
+    try:
+        import ziglang
+        for nm in ("zig.exe", "zig"):
+            z = os.path.join(os.path.dirname(ziglang.__file__), nm)
+            if os.path.isfile(z):
+                return z
+    except Exception:                    # noqa: BLE001 - 没装就是没有
+        pass
+    return None
+
+
 def find_compiler():
-    """返回 (可执行路径, 种类) 或 (None, None)。"""
+    """返回 (可执行路径, 种类) 或 (None, None)。
+
+    ★ 2026-11-20：Windows 上优先避开 clang → MSVC 目标。它编译能过，但产物
+      **没有导出表**，ctypes 找不到插件函数（Linux 默认全导出，所以只有 Windows 红）。
+      这是 CI windows-latest 连续失败的第二个原因（第一个是 `-fPIC`）。
+      所以：在 Windows 上如果按名单先命中 clang，而我们又能拿到 zig（ziglang），
+      就直接用 zig —— 它默认导出符号，是文档推荐的零配置路径。
+      用户显式设了 `TGAI_CC` 时始终尊重用户的选择。
+    """
     env = os.environ.get("TGAI_CC")
     if env:
         p = shutil.which(env) or (env if os.path.isfile(env) else None)
@@ -51,18 +72,17 @@ def find_compiler():
     for name in _COMPILERS:
         p = shutil.which(name)
         if p:
+            # Windows 上 clang → MSVC 目标不导出符号；若能拿到 zig 就换掉它
+            if sys.platform == "win32" and "clang" in os.path.basename(p).lower():
+                _z = _find_zig()
+                if _z:
+                    return _z, "zig"
             return p, ("msvc" if name == "cl" else
                        "tcc" if name == "tcc" else "unix")
     # 4) 便携 Zig（pip install ziglang）——零配置可用，且自带 libc 头
-    try:
-        import ziglang
-        z = os.path.join(os.path.dirname(ziglang.__file__), "zig.exe")
-        if not os.path.isfile(z):
-            z = os.path.join(os.path.dirname(ziglang.__file__), "zig")
-        if os.path.isfile(z):
-            return z, "zig"
-    except Exception:
-        pass
+    _z = _find_zig()
+    if _z:
+        return _z, "zig"
     return None, None
 
 
