@@ -62,22 +62,47 @@ def find_compiler():
 
 
 def _compile(src_path, out_path, cc, kind):
+    """编译 C 源码为共享库。失败抛 RuntimeError（带编译器原始 stderr）。
+
+    ★ 2026-11-20 修 CI（windows-latest 长期是红的）：
+      通用分支原来**无条件**加 `-fPIC`，还插一个 MinGW 专有的
+      `-Wl,--out-implib,<out>.a`。GitHub Actions 的 Windows 镜像里 `cc` 是 clang，
+      默认目标 `x86_64-pc-windows-msvc`，于是直接报
+          clang: error: unsupported option '-fPIC' for target 'x86_64-pc-windows-msvc'
+      三个 CPU 插件用例全挂（Linux 腿不受影响，所以只有 Windows 红）。
+
+      事实依据：Windows 的 PE/DLL **不需要** `-fPIC`（代码本身位置无关）；
+      `--out-implib` 只为"链接期生成导入库"服务，ctypes 运行时加载用不到。
+      所以改成"平台优先 + 失败回退"：Windows 先不加 `-fPIC`，不成就再试一次加上的
+      （覆盖 MinGW/gcc 这类要求它的工具链）；非 Windows 保持原来的 `-fPIC`。
+    """
+    def _try(cmds):
+        last = ""
+        for cmd in cmds:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0 and os.path.isfile(out_path):
+                return True, ""
+            last = ((r.stderr or r.stdout) or "")[:800]
+        return False, last
+
     if kind == "msvc":
-        cmd = [cc, "/nologo", "/O2", "/LD", src_path, "/Fe:" + out_path]
+        cmds = [[cc, "/nologo", "/O2", "/LD", src_path, "/Fe:" + out_path]]
     elif kind == "tcc":
-        cmd = [cc, "-shared", "-O2", "-o", out_path, src_path]
+        cmds = [[cc, "-shared", "-O2", "-o", out_path, src_path]]
     elif kind == "zig":
-        cmd = [cc, "cc", "-shared", "-O3", "-o", out_path, src_path]
+        cmds = [[cc, "cc", "-shared", "-O3", "-o", out_path, src_path]]
+    elif sys.platform == "win32":
+        cmds = [[cc, "-shared", "-O3", "-o", out_path, src_path],
+                [cc, "-shared", "-fPIC", "-O3", "-o", out_path, src_path]]
     else:
-        cmd = [cc, "-shared", "-fPIC", "-O3", "-o", out_path, src_path]
-        if sys.platform == "win32":
-            cmd.insert(1, "-Wl,--out-implib," + out_path + ".a")
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0 or not os.path.isfile(out_path):
+        cmds = [[cc, "-shared", "-fPIC", "-O3", "-o", out_path, src_path]]
+
+    ok, err = _try(cmds)
+    if not ok:
         raise RuntimeError(
             "编译 CPU 插件失败（%s）：\n%s\n修法：确认源码是纯 C（无 C++ 特性）、"
             "导出符号用 extern \"C\"，或用 TGAI_CC 指定编译器"
-            % (os.path.basename(cc), ((r.stderr or r.stdout) or "")[:800]))
+            % (os.path.basename(cc), err))
 
 
 def load_source(source, name="tgai_cpu_plugin"):
