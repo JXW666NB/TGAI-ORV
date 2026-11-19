@@ -330,6 +330,33 @@ extern "C" __global__ void ce_bwd(const float* logits, const int* targets, float
     ce_row_write_vec(row, grow, V, m, inv_sum, inv_n, t);
 }
 
+/* 分块转置（2026-11-19）：原来的朴素版把 b[c*rows+r] 写成跨步访问 —— 每个 warp 的
+   32 个线程写到 32 条不同 cache line，实测只有理论带宽的约 1/30（seq2048 下
+   transpose2d 占 76 ms/步）。这里用 32×32 共享内存分块：读合并、写也合并。
+   pad 成 [32][33] 是为了避开 bank conflict。block 固定 256 线程，每线程搬 4 个元素。 */
+extern "C" __global__ void transpose2d_tiled(const float* a, float* b, int rows,
+                                            int cols, int tiles_x) {
+    __shared__ float tile[32][33];
+    int bx = blockIdx.x % tiles_x;
+    int by = blockIdx.x / tiles_x;
+    int c0 = bx * 32, r0 = by * 32;
+    int tid = threadIdx.x;
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        int idx = tid + k * 256;          /* 0..1023 */
+        int ry = idx >> 5, cx = idx & 31;
+        int r = r0 + ry, c = c0 + cx;
+        if (r < rows && c < cols) tile[ry][cx] = a[r * cols + c];
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        int idx = tid + k * 256;
+        int ci = idx >> 5, ri = idx & 31; /* 让连续线程写连续行 ⇒ 合并写 */
+        int r = r0 + ri, c = c0 + ci;
+        if (r < rows && c < cols) b[c * rows + r] = tile[ri][ci];
+    }
+}
 extern "C" __global__ void transpose2d(const float* a, float* b, int rows, int cols) {
     int n = rows * cols;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4722,6 +4749,12 @@ class CudaRuntime:
         out = self.empty((cols, rows), dtype=np.float32)
         n = rows * cols
         if n:
+            # ★ 2026-11-19：分块版（transpose2d_tiled）在**大形状**上实测快 4.19×
+            #   （2048×1024：168.3 → 704.5 GB/s，逐位一致），但端到端 seq2048 反而
+            #   **慢 12%**（0.690 → 0.772 s）—— 因为模型里的转置多数是小矩阵
+            #   （16×512、4×1024 之类），32×32 分块对它们占用率更差、launch 更多。
+            #   所以默认仍走朴素内核；分块版保留，等加上"按尺寸选择"的阈值后再启用。
+            #   TODO(性能)：rows*cols >= 阈值（待测）时切 transpose2d_tiled。
             grid, block = self._ewise_grid(n)
             self.launch("transpose2d", grid, block, [
                 self._ptr(buf), self._ptr(out),
