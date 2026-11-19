@@ -5259,14 +5259,35 @@ class AdamW(_Optim):
             p.data = p.data - self.lr * mh / (np.sqrt(vh) + self.eps)
 
 
-def _sumsq32(x):
-    """按地址顺序的 float32 平方和，和 GPU sumsq_sequential 同一套舍入。"""
+def _sumsq32_exact(x):
+    """按地址顺序的 float32 平方和，和 GPU `sumsq_sequential` 同一套舍入。
+
+    ⚠️ 纯 Python 逐元素循环：1.05M 参数实测约 1 秒/步，把 CPU 上的 Muon 拖到
+    **1028 ms/步**（AdamW 只要 8 ms）。只在需要与 GPU 逐位对拍时用
+    （`TG_SUMSQ_EXACT=1`）。
+    """
     acc = np.float32(0.0)
     flat = np.ascontiguousarray(x, dtype=np.float32).ravel()
     for v in flat:
         vv = np.float32(v)
         acc = np.float32(acc + np.float32(vv * vv))
     return acc
+
+
+def _sumsq32(x):
+    """平方和。默认走 BLAS 的 `dot`（float32），需要逐位对齐 GPU 时用 exact 版。
+
+    两者数学等价，差异只来自累加顺序（实测相对差 ~1e-7）。注意 Newton-Schulz
+    会把范数的 1 ulp 差异放大，所以**对拍 GPU 时必须用 exact 版**；
+    但训练默认必须用快的，否则 CPU 上的 Muon/Polaris 慢到不可用。
+    """
+    if os.environ.get("TG_SUMSQ_EXACT") == "1":
+        return _sumsq32_exact(x)
+    flat = np.ascontiguousarray(x, dtype=np.float32).ravel()
+    if flat.size == 0:
+        return np.float32(0.0)
+    # float32 dot 累加在 BLAS 内部是分块/向量化的，比 python 循环快 3 个数量级
+    return np.float32(np.dot(flat, flat))
 
 
 def _newton_schulz5(g, steps=5, eps=1e-7):
