@@ -1,0 +1,1663 @@
+{
+ "measured_steps": 20,
+ "steps": [
+  {
+   "step1": 1,
+   "step0": 0,
+   "wall_s": 0.6180001000175253,
+   "d2h_n": 30,
+   "d2h_ms": 77.14340015081689,
+   "d2h_bytes": 2490376,
+   "route_n": 12,
+   "route_ms": 18.901699979323894
+  },
+  {
+   "step1": 2,
+   "step0": 1,
+   "wall_s": 0.3878611999680288,
+   "d2h_n": 26,
+   "d2h_ms": 128.93260002601892,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 30.81740002380684
+  },
+  {
+   "step1": 3,
+   "step0": 2,
+   "wall_s": 0.38214349996997043,
+   "d2h_n": 26,
+   "d2h_ms": 132.92309996904805,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 33.4906000061892
+  },
+  {
+   "step1": 4,
+   "step0": 3,
+   "wall_s": 0.38211179996142164,
+   "d2h_n": 26,
+   "d2h_ms": 133.78269993700087,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 33.113099925685674
+  },
+  {
+   "step1": 5,
+   "step0": 4,
+   "wall_s": 0.38176190003287047,
+   "d2h_n": 26,
+   "d2h_ms": 132.36839999444783,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 33.68390002287924
+  },
+  {
+   "step1": 6,
+   "step0": 5,
+   "wall_s": 0.39002379996236414,
+   "d2h_n": 26,
+   "d2h_ms": 129.3728998862207,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 33.086500014178455
+  },
+  {
+   "step1": 7,
+   "step0": 6,
+   "wall_s": 0.38259649998508394,
+   "d2h_n": 26,
+   "d2h_ms": 128.74289992032573,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 32.775300031062216
+  },
+  {
+   "step1": 8,
+   "step0": 7,
+   "wall_s": 0.3806221000268124,
+   "d2h_n": 26,
+   "d2h_ms": 132.31050013564527,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 34.0373000362888
+  },
+  {
+   "step1": 9,
+   "step0": 8,
+   "wall_s": 0.3810031999601051,
+   "d2h_n": 26,
+   "d2h_ms": 134.12709988187999,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 33.82400004193187
+  },
+  {
+   "step1": 10,
+   "step0": 9,
+   "wall_s": 0.38236239994876087,
+   "d2h_n": 26,
+   "d2h_ms": 131.89890020294115,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 32.388399878982455
+  },
+  {
+   "step1": 11,
+   "step0": 10,
+   "wall_s": 0.3807539000408724,
+   "d2h_n": 26,
+   "d2h_ms": 129.38710005255416,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 32.70139987580478
+  },
+  {
+   "step1": 12,
+   "step0": 11,
+   "wall_s": 0.38734640000620857,
+   "d2h_n": 26,
+   "d2h_ms": 132.7311001950875,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 32.52109995810315
+  },
+  {
+   "step1": 13,
+   "step0": 12,
+   "wall_s": 0.38243150000926107,
+   "d2h_n": 26,
+   "d2h_ms": 135.70099999196827,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 33.898500085342675
+  },
+  {
+   "step1": 14,
+   "step0": 13,
+   "wall_s": 0.38016389997210354,
+   "d2h_n": 26,
+   "d2h_ms": 135.7577999588102,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 33.53049996076152
+  },
+  {
+   "step1": 15,
+   "step0": 14,
+   "wall_s": 0.3814698000205681,
+   "d2h_n": 26,
+   "d2h_ms": 134.3831999693066,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 32.88990003056824
+  },
+  {
+   "step1": 16,
+   "step0": 15,
+   "wall_s": 0.3896783000091091,
+   "d2h_n": 26,
+   "d2h_ms": 135.78860007692128,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 34.15270004188642
+  },
+  {
+   "step1": 17,
+   "step0": 16,
+   "wall_s": 0.3810269999667071,
+   "d2h_n": 26,
+   "d2h_ms": 134.5942000625655,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 34.84690003097057
+  },
+  {
+   "step1": 18,
+   "step0": 17,
+   "wall_s": 0.3814639000338502,
+   "d2h_n": 26,
+   "d2h_ms": 136.40560006024316,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 34.12979998392984
+  },
+  {
+   "step1": 19,
+   "step0": 18,
+   "wall_s": 0.3799478000146337,
+   "d2h_n": 26,
+   "d2h_ms": 135.3639000444673,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 34.499799949117005
+  },
+  {
+   "step1": 20,
+   "step0": 19,
+   "wall_s": 0.7121994000044651,
+   "d2h_n": 26,
+   "d2h_ms": 136.6625998634845,
+   "d2h_bytes": 393224,
+   "route_n": 12,
+   "route_ms": 33.469200134277344
+  }
+ ],
+ "d2h_tags": {
+  "moe.route_topk(idx_buf.to_numpy)": {
+   "n_per_step": 12.0,
+   "ms_per_step": 29.790459998184815,
+   "ms_per_call": 2.482538333182068,
+   "bytes_per_step": 196608.0,
+   "shapes": {
+    "2048x2": 240
+   },
+   "dtypes": {
+    "int32": 240
+   },
+   "frames": {
+    "probe_moe_d2h.py:_d2h:78 <- cuda.py:to_numpy:3009": 240
+   }
+  },
+  "other": {
+   "n_per_step": 13.2,
+   "ms_per_step": 100.59720001590904,
+   "ms_per_call": 7.62100000120523,
+   "bytes_per_step": 301469.6,
+   "shapes": {
+    "2048x64": 4,
+    "": 20,
+    "4096": 240
+   },
+   "dtypes": {
+    "float32": 264
+   },
+   "frames": {
+    "probe_moe_d2h.py:_d2h:78 <- cuda.py:to_numpy:3009": 240,
+    "probe_moe_d2h.py:_d2h:78 <- __init__.py:to_numpy:2108": 24
+   }
+  },
+  "clip_grad_norm_": {
+   "n_per_step": 1.0,
+   "ms_per_step": 0.03122000489383936,
+   "ms_per_call": 0.03122000489383936,
+   "bytes_per_step": 4.0,
+   "shapes": {
+    "": 20
+   },
+   "dtypes": {
+    "float32": 20
+   },
+   "frames": {
+    "probe_moe_d2h.py:_d2h:78 <- cuda.py:read_scalar:4881": 20
+   }
+  }
+ },
+ "d2h_sites": {
+  "v3_moe.py:route_topk:112": {
+   "n_per_step": 12.0,
+   "ms_per_step": 29.790459998184815,
+   "ms_per_call": 2.482538333182068,
+   "bytes_per_step": 196608.0,
+   "shapes": {
+    "2048x2:int32": 240
+   }
+  },
+  "v3_ops.py:_rope_table:354": {
+   "n_per_step": 0.1,
+   "ms_per_step": 0.016235001385211945,
+   "ms_per_call": 0.16235001385211945,
+   "bytes_per_step": 52428.8,
+   "shapes": {
+    "2048x64:float32": 2
+   }
+  },
+  "v3_ops.py:_rope_table:355": {
+   "n_per_step": 0.1,
+   "ms_per_step": 0.015864998567849398,
+   "ms_per_call": 0.15864998567849398,
+   "bytes_per_step": 52428.8,
+   "shapes": {
+    "2048x64:float32": 2
+   }
+  },
+  "v3_pretrain.py:_scalar:125": {
+   "n_per_step": 1.0,
+   "ms_per_step": 9.838080007466488,
+   "ms_per_call": 9.838080007466488,
+   "bytes_per_step": 4.0,
+   "shapes": {
+    ":float32": 20
+   }
+  },
+  "__init__.py:bw:1954": {
+   "n_per_step": 12.0,
+   "ms_per_step": 90.72702000848949,
+   "ms_per_call": 7.560585000707458,
+   "bytes_per_step": 196608.0,
+   "shapes": {
+    "4096:float32": 240
+   }
+  },
+  "nn_ops.py:clip_grad_norm_:248": {
+   "n_per_step": 1.0,
+   "ms_per_step": 0.03122000489383936,
+   "ms_per_call": 0.03122000489383936,
+   "bytes_per_step": 4.0,
+   "shapes": {
+    ":float32": 20
+   }
+  }
+ },
+ "route_saved": {
+  "step2": {
+   "layers": 12,
+   "route_ms_per_layer": [
+    0.819,
+    1.319,
+    1.33,
+    7.464,
+    0.705,
+    0.869,
+    1.364,
+    7.631,
+    1.405,
+    0.801,
+    0.881,
+    6.228
+   ],
+   "counts": [
+    [
+     1051,
+     962,
+     1010,
+     1073
+    ],
+    [
+     1009,
+     1032,
+     1023,
+     1032
+    ],
+    [
+     1009,
+     1041,
+     1010,
+     1036
+    ],
+    [
+     1018,
+     1052,
+     985,
+     1041
+    ],
+    [
+     1032,
+     1110,
+     1040,
+     914
+    ],
+    [
+     1029,
+     1061,
+     1007,
+     999
+    ],
+    [
+     1053,
+     1061,
+     1021,
+     961
+    ],
+    [
+     1070,
+     1001,
+     1024,
+     1001
+    ],
+    [
+     1015,
+     1014,
+     1026,
+     1041
+    ],
+    [
+     1013,
+     960,
+     1041,
+     1082
+    ],
+    [
+     1042,
+     1055,
+     946,
+     1053
+    ],
+    [
+     1030,
+     965,
+     1038,
+     1063
+    ]
+   ],
+   "min": [
+    962,
+    1009,
+    1009,
+    985,
+    914,
+    999,
+    961,
+    1001,
+    1014,
+    960,
+    946,
+    965
+   ],
+   "median": [
+    1030.5,
+    1027.5,
+    1023.0,
+    1029.5,
+    1036.0,
+    1018.0,
+    1037.0,
+    1012.5,
+    1020.5,
+    1027.0,
+    1047.5,
+    1034.0
+   ],
+   "max": [
+    1073,
+    1032,
+    1041,
+    1052,
+    1110,
+    1061,
+    1061,
+    1070,
+    1041,
+    1082,
+    1055,
+    1063
+   ],
+   "cv": [
+    0.0413,
+    0.0092,
+    0.0143,
+    0.025,
+    0.0687,
+    0.0235,
+    0.0384,
+    0.0275,
+    0.0106,
+    0.0433,
+    0.0442,
+    0.0353
+   ],
+   "d2h_calls": [
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 0.5418999935500324,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 1.1223999899812043,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 1.1322000063955784,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 7.2595999808982015,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 0.4914000164717436,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 0.667500018607825,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 1.1570000206120312,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 7.376800000201911,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 1.1790000135079026,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 0.5847999709658325,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 0.6352000054903328,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 6.006499985232949,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 4,
+     "ms": 9.066900005564094,
+     "shape": [],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "__init__.py:to_numpy:2108",
+      "v3_pretrain.py:_scalar:125",
+      "v3_pretrain.py:main:1303"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 17.634999996516854,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 12.200199998915195,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.634600016288459,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.736799979582429,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.60929999826476,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 12.463799968827516,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.8673999845050275,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.1251000366173685,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.694300005212426,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 12.465999985579401,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.819699970539659,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.423100035637617,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "clip_grad_norm_",
+     "bytes": 4,
+     "ms": 0.036100042052567005,
+     "shape": [],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:read_scalar:4881",
+      "nn_ops.py:clip_grad_norm_:248",
+      "v3_pretrain.py:main:1323"
+     ]
+    }
+   ]
+  },
+  "step18": {
+   "layers": 12,
+   "route_ms_per_layer": [
+    0.789,
+    1.243,
+    1.376,
+    7.548,
+    1.419,
+    1.431,
+    0.95,
+    7.586,
+    1.093,
+    1.563,
+    1.424,
+    7.708
+   ],
+   "counts": [
+    [
+     985,
+     1057,
+     1040,
+     1014
+    ],
+    [
+     1028,
+     1011,
+     1100,
+     957
+    ],
+    [
+     1003,
+     1009,
+     1039,
+     1045
+    ],
+    [
+     995,
+     1155,
+     900,
+     1046
+    ],
+    [
+     953,
+     1092,
+     1055,
+     996
+    ],
+    [
+     1034,
+     1051,
+     994,
+     1017
+    ],
+    [
+     974,
+     978,
+     1131,
+     1013
+    ],
+    [
+     1012,
+     1015,
+     1021,
+     1048
+    ],
+    [
+     1311,
+     951,
+     945,
+     889
+    ],
+    [
+     978,
+     1032,
+     1102,
+     984
+    ],
+    [
+     1131,
+     902,
+     986,
+     1077
+    ],
+    [
+     1176,
+     1279,
+     857,
+     784
+    ]
+   ],
+   "min": [
+    985,
+    957,
+    1003,
+    900,
+    953,
+    994,
+    974,
+    1012,
+    889,
+    978,
+    902,
+    784
+   ],
+   "median": [
+    1027.0,
+    1019.5,
+    1024.0,
+    1020.5,
+    1025.5,
+    1025.5,
+    995.5,
+    1018.0,
+    948.0,
+    1008.0,
+    1031.5,
+    1016.5
+   ],
+   "max": [
+    1057,
+    1100,
+    1045,
+    1155,
+    1092,
+    1051,
+    1131,
+    1048,
+    1311,
+    1102,
+    1131,
+    1279
+   ],
+   "cv": [
+    0.0266,
+    0.0499,
+    0.0178,
+    0.0899,
+    0.0522,
+    0.0206,
+    0.0621,
+    0.0139,
+    0.1635,
+    0.0485,
+    0.0854,
+    0.2035
+   ],
+   "d2h_calls": [
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 0.46850001672282815,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 1.0460999910719693,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 1.1799000203609467,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 7.345399993937463,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 1.2162000057287514,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 1.2283999822102487,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 0.7040000054985285,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 7.369400002062321,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 0.8863999973982573,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 1.3561000232584774,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 1.2189000262878835,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "moe.route_topk(idx_buf.to_numpy)",
+     "bytes": 16384,
+     "ms": 7.496200036257505,
+     "shape": [
+      2048,
+      2
+     ],
+     "dtype": "int32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "v3_moe.py:route_topk:112",
+      "probe_moe_d2h.py:_route_topk:134"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 4,
+     "ms": 10.244599950965494,
+     "shape": [],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "__init__.py:to_numpy:2108",
+      "v3_pretrain.py:_scalar:125",
+      "v3_pretrain.py:main:1303"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 18.424100009724498,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 12.703099986538291,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 5.039999959990382,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.929699993226677,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 5.024300015065819,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 12.742499995511025,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.645499982871115,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.782000032719225,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.784799995832145,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 12.659599946346134,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.201800038572401,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "other",
+     "bytes": 16384,
+     "ms": 4.669100046157837,
+     "shape": [
+      4096
+     ],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:to_numpy:3009",
+      "__init__.py:bw:1954",
+      "__init__.py:_backward_cuda:1346"
+     ]
+    },
+    {
+     "tag": "clip_grad_norm_",
+     "bytes": 4,
+     "ms": 0.039000005926936865,
+     "shape": [],
+     "dtype": "float32",
+     "frames": [
+      "probe_moe_d2h.py:_d2h:78",
+      "cuda.py:read_scalar:4881",
+      "nn_ops.py:clip_grad_norm_:248",
+      "v3_pretrain.py:main:1323"
+     ]
+    }
+   ]
+  }
+ },
+ "route_layers": [
+  {
+   "layer": 0,
+   "counts_mean": [
+    1013.6,
+    1035.7,
+    1023.6,
+    1023.0
+   ],
+   "min": 962,
+   "median": 1022.0,
+   "max": 1076,
+   "cv": [
+    0.0219,
+    0.0254,
+    0.0174,
+    0.0193
+   ]
+  },
+  {
+   "layer": 1,
+   "counts_mean": [
+    1024.3,
+    1019.5,
+    1060.3,
+    991.9
+   ],
+   "min": 957,
+   "median": 1022.0,
+   "max": 1100,
+   "cv": [
+    0.018,
+    0.0153,
+    0.0186,
+    0.0205
+   ]
+  },
+  {
+   "layer": 2,
+   "counts_mean": [
+    1017.5,
+    1018.5,
+    1033.8,
+    1026.2
+   ],
+   "min": 979,
+   "median": 1022.0,
+   "max": 1078,
+   "cv": [
+    0.0191,
+    0.017,
+    0.0211,
+    0.0176
+   ]
+  },
+  {
+   "layer": 3,
+   "counts_mean": [
+    966.7,
+    1172.5,
+    906.9,
+    1049.8
+   ],
+   "min": 829,
+   "median": 1014.5,
+   "max": 1232,
+   "cv": [
+    0.0456,
+    0.0413,
+    0.0422,
+    0.0274
+   ]
+  },
+  {
+   "layer": 4,
+   "counts_mean": [
+    978.9,
+    1125.1,
+    1036.8,
+    955.3
+   ],
+   "min": 881,
+   "median": 1011.5,
+   "max": 1182,
+   "cv": [
+    0.0404,
+    0.0271,
+    0.0343,
+    0.0324
+   ]
+  },
+  {
+   "layer": 5,
+   "counts_mean": [
+    1024.9,
+    1035.8,
+    1000.8,
+    1034.5
+   ],
+   "min": 930,
+   "median": 1023.5,
+   "max": 1086,
+   "cv": [
+    0.0284,
+    0.0259,
+    0.0327,
+    0.0255
+   ]
+  },
+  {
+   "layer": 6,
+   "counts_mean": [
+    1003.1,
+    1020.3,
+    1068.0,
+    1004.5
+   ],
+   "min": 943,
+   "median": 1015.0,
+   "max": 1138,
+   "cv": [
+    0.0297,
+    0.0374,
+    0.0428,
+    0.0221
+   ]
+  },
+  {
+   "layer": 7,
+   "counts_mean": [
+    982.4,
+    1049.0,
+    1058.2,
+    1006.4
+   ],
+   "min": 888,
+   "median": 1026.0,
+   "max": 1126,
+   "cv": [
+    0.0481,
+    0.0297,
+    0.0349,
+    0.0346
+   ]
+  },
+  {
+   "layer": 8,
+   "counts_mean": [
+    1173.2,
+    985.1,
+    984.5,
+    953.1
+   ],
+   "min": 880,
+   "median": 992.5,
+   "max": 1311,
+   "cv": [
+    0.0848,
+    0.0355,
+    0.0287,
+    0.0722
+   ]
+  },
+  {
+   "layer": 9,
+   "counts_mean": [
+    1004.0,
+    1004.3,
+    1090.8,
+    997.0
+   ],
+   "min": 945,
+   "median": 1016.5,
+   "max": 1165,
+   "cv": [
+    0.0281,
+    0.0261,
+    0.0335,
+    0.0377
+   ]
+  },
+  {
+   "layer": 10,
+   "counts_mean": [
+    1093.8,
+    930.7,
+    1018.2,
+    1053.3
+   ],
+   "min": 881,
+   "median": 1029.5,
+   "max": 1164,
+   "cv": [
+    0.0294,
+    0.0448,
+    0.0314,
+    0.0349
+   ]
+  },
+  {
+   "layer": 11,
+   "counts_mean": [
+    1073.8,
+    1196.5,
+    969.6,
+    856.1
+   ],
+   "min": 769,
+   "median": 1030.0,
+   "max": 1337,
+   "cv": [
+    0.0497,
+    0.1109,
+    0.0859,
+    0.1098
+   ]
+  }
+ ],
+ "env": {
+  "cwd": "C:\\Users\\Administrator",
+  "argv": [
+   "D:\\orv_bench\\probe_moe_d2h.py",
+   "--data",
+   "D:\\orv_bench\\data2048_v96000",
+   "--vocab",
+   "96000",
+   "--seq",
+   "2048",
+   "--d",
+   "1024",
+   "--layers",
+   "12",
+   "--E",
+   "4",
+   "--n_q",
+   "16",
+   "--d_ff",
+   "3328",
+   "--top_k",
+   "2",
+   "--csa",
+   "4",
+   "--opt",
+   "int8gpu",
+   "--amp",
+   "gemm",
+   "--batch",
+   "1",
+   "--steps",
+   "20",
+   "--log-every",
+   "99",
+   "--no-final-save"
+  ],
+  "orv_version": "0.9.97"
+ }
+}

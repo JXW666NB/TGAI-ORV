@@ -1,0 +1,170 @@
+===== MODE=none RUN=1 =====
+[ablate] mode=none  routing layers=0
+[data] 8 shards {'npz': 8}  seq=2048  windows=128  tokens=262144  scan=0.00s
+[data] 1 epoch = 128 windows = 262144 tokens; steps/epoch @B=1 = 128
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=1024 layers=12 E=4 d_ff=3328 vocab=96000 n_q=16 top_k=2 csa=4 (csa=9 global=3) tensors=321 params=848.645M build=12.08s seed=42
+[int8gpu] state=m8v16，动量 3.062 字节/参数（bf16 4.0，fp32 8.0）
+[amp] 已登记 321 个参数地址给 fp16 影子缓存
+[amp] mode=gemm state={'on': True, 'fp16': True, 'bf16': False, 'available': True, 'c32': True, 'cache': {'entries': 0, 'bytes': 0, 'on': True}}
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=20 eta_min=3.000e-05 horizon=20
+step      0/20 loss=11.659793 lr=3.000e-04 gnorm=    5.429 0.598s tok/s=  3424.8 peak_live=23.70GiB consumed=1
+step     19/20 loss=11.669065 lr=3.166e-05 gnorm=    5.046 0.379s tok/s=  5399.5 peak_live=23.71GiB consumed=20
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 1024, "d_ff": 3328, "E": 4, "layers": 12, "n_q": 16, "n_kv": 2, "vocab": 96000, "seq": 2048, "csa": 4, "n_kv_attn": 16, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 20], "loss_first": 11.65979290008545, "loss_last": 11.669065475463867, "step_s_mean": 0.3928832099976717, "step_s_steady": 0.3816918055526912, "tok_s_steady": 5365.585454564549, "pool_peak_live_bytes": 25457111552, "pool_peak_bytes": 29158163968, "pool_peak_live_gib": 23.709, "nvidia_base_mib": 330, "nvidia_peak_mib": 29578, "data": {"shards": 8, "windows": 128, "tokens": 262144, "seq": 2048, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95996, "scan_sec": 0.004}, "consumed": 20, "data_state": {"epoch": 0, "rank": 1, "offset": 4, "consumed": 20, "n_shards": 8, "seq": 2048, "seed": 42, "windows_per_epoch": 128}, "params": 848645257, "wall_sec": 8.011, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [11.6597929, 11.64706421, 11.66565609, 11.66520405, 11.71642685, 11.6855135, 11.6829958, 11.6904707, 11.68252087, 11.686409, 11.65315914, 11.65818024, 11.66177464, 11.65138435, 11.65133476, 11.6843853, 11.69429302, 11.66923237, 11.679636, 11.66906548]
+[ablate] bypassed={'route': 0, 'gatebwd': 0, 'scalar': 0} real={'route': 240, 'gatebwd': 240, 'scalar': 40}
+
+===== MODE=none RUN=2 =====
+[ablate] mode=none  routing layers=0
+[data] 8 shards {'npz': 8}  seq=2048  windows=128  tokens=262144  scan=0.00s
+[data] 1 epoch = 128 windows = 262144 tokens; steps/epoch @B=1 = 128
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=1024 layers=12 E=4 d_ff=3328 vocab=96000 n_q=16 top_k=2 csa=4 (csa=9 global=3) tensors=321 params=848.645M build=12.12s seed=42
+[int8gpu] state=m8v16，动量 3.062 字节/参数（bf16 4.0，fp32 8.0）
+[amp] 已登记 321 个参数地址给 fp16 影子缓存
+[amp] mode=gemm state={'on': True, 'fp16': True, 'bf16': False, 'available': True, 'c32': True, 'cache': {'entries': 0, 'bytes': 0, 'on': True}}
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=20 eta_min=3.000e-05 horizon=20
+step      0/20 loss=11.659793 lr=3.000e-04 gnorm=    5.429 0.584s tok/s=  3506.6 peak_live=23.70GiB consumed=1
+step     19/20 loss=11.669449 lr=3.166e-05 gnorm=    5.045 0.381s tok/s=  5382.3 peak_live=23.71GiB consumed=20
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 1024, "d_ff": 3328, "E": 4, "layers": 12, "n_q": 16, "n_kv": 2, "vocab": 96000, "seq": 2048, "csa": 4, "n_kv_attn": 16, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 20], "loss_first": 11.65979290008545, "loss_last": 11.669448852539062, "step_s_mean": 0.39110795000451615, "step_s_steady": 0.3806657055619225, "tok_s_steady": 5380.048609781724, "pool_peak_live_bytes": 25456062976, "pool_peak_bytes": 29262366208, "pool_peak_live_gib": 23.708, "nvidia_base_mib": 330, "nvidia_peak_mib": 29682, "data": {"shards": 8, "windows": 128, "tokens": 262144, "seq": 2048, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95996, "scan_sec": 0.004}, "consumed": 20, "data_state": {"epoch": 0, "rank": 1, "offset": 4, "consumed": 20, "n_shards": 8, "seq": 2048, "seed": 42, "windows_per_epoch": 128}, "params": 848645257, "wall_sec": 8.014, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [11.6597929, 11.64710903, 11.66640663, 11.66520691, 11.7166872, 11.68584919, 11.68405056, 11.6905632, 11.68257904, 11.68793964, 11.65369511, 11.65875149, 11.66428089, 11.64999294, 11.65045834, 11.6842947, 11.69430923, 11.66919422, 11.67882919, 11.66944885]
+[ablate] bypassed={'route': 0, 'gatebwd': 0, 'scalar': 0} real={'route': 240, 'gatebwd': 240, 'scalar': 40}
+
+===== MODE=route RUN=1 =====
+[ablate] mode=route  routing layers=12
+[data] 8 shards {'npz': 8}  seq=2048  windows=128  tokens=262144  scan=0.00s
+[data] 1 epoch = 128 windows = 262144 tokens; steps/epoch @B=1 = 128
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=1024 layers=12 E=4 d_ff=3328 vocab=96000 n_q=16 top_k=2 csa=4 (csa=9 global=3) tensors=321 params=848.645M build=12.08s seed=42
+[int8gpu] state=m8v16，动量 3.062 字节/参数（bf16 4.0，fp32 8.0）
+[amp] 已登记 321 个参数地址给 fp16 影子缓存
+[amp] mode=gemm state={'on': True, 'fp16': True, 'bf16': False, 'available': True, 'c32': True, 'cache': {'entries': 0, 'bytes': 0, 'on': True}}
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=20 eta_min=3.000e-05 horizon=20
+step      0/20 loss=11.658247 lr=3.000e-04 gnorm=    5.436 0.583s tok/s=  3511.7 peak_live=23.70GiB consumed=1
+step     19/20 loss=11.667397 lr=3.166e-05 gnorm=    5.188 0.375s tok/s=  5459.4 peak_live=23.70GiB consumed=20
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 1024, "d_ff": 3328, "E": 4, "layers": 12, "n_q": 16, "n_kv": 2, "vocab": 96000, "seq": 2048, "csa": 4, "n_kv_attn": 16, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 20], "loss_first": 11.658246994018555, "loss_last": 11.667396545410156, "step_s_mean": 0.3866730599926086, "step_s_steady": 0.3760381722176034, "tok_s_steady": 5446.255596665533, "pool_peak_live_bytes": 25450033664, "pool_peak_bytes": 26589545984, "pool_peak_live_gib": 23.702, "nvidia_base_mib": 330, "nvidia_peak_mib": 26954, "data": {"shards": 8, "windows": 128, "tokens": 262144, "seq": 2048, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95996, "scan_sec": 0.002}, "consumed": 20, "data_state": {"epoch": 0, "rank": 1, "offset": 4, "consumed": 20, "n_shards": 8, "seq": 2048, "seed": 42, "windows_per_epoch": 128}, "params": 848645257, "wall_sec": 7.765, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [11.65824699, 11.65201092, 11.65308094, 11.68163395, 11.69321728, 11.67582798, 11.70003319, 11.67478466, 11.65149879, 11.68328857, 11.68230057, 11.64366531, 11.67526436, 11.67352962, 11.66398048, 11.6928339, 11.66848469, 11.67714119, 11.66298389, 11.66739655]
+[ablate] bypassed={'route': 240, 'gatebwd': 0, 'scalar': 0} real={'route': 0, 'gatebwd': 240, 'scalar': 40}
+
+===== MODE=route RUN=2 =====
+[ablate] mode=route  routing layers=12
+[data] 8 shards {'npz': 8}  seq=2048  windows=128  tokens=262144  scan=0.00s
+[data] 1 epoch = 128 windows = 262144 tokens; steps/epoch @B=1 = 128
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=1024 layers=12 E=4 d_ff=3328 vocab=96000 n_q=16 top_k=2 csa=4 (csa=9 global=3) tensors=321 params=848.645M build=12.08s seed=42
+[int8gpu] state=m8v16，动量 3.062 字节/参数（bf16 4.0，fp32 8.0）
+[amp] 已登记 321 个参数地址给 fp16 影子缓存
+[amp] mode=gemm state={'on': True, 'fp16': True, 'bf16': False, 'available': True, 'c32': True, 'cache': {'entries': 0, 'bytes': 0, 'on': True}}
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=20 eta_min=3.000e-05 horizon=20
+step      0/20 loss=11.658247 lr=3.000e-04 gnorm=    5.436 0.582s tok/s=  3519.4 peak_live=23.70GiB consumed=1
+step     19/20 loss=11.667386 lr=3.166e-05 gnorm=    5.188 0.377s tok/s=  5434.6 peak_live=23.70GiB consumed=20
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 1024, "d_ff": 3328, "E": 4, "layers": 12, "n_q": 16, "n_kv": 2, "vocab": 96000, "seq": 2048, "csa": 4, "n_kv_attn": 16, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 20], "loss_first": 11.658246994018555, "loss_last": 11.667386054992676, "step_s_mean": 0.3866302549984539, "step_s_steady": 0.37614212222009274, "tok_s_steady": 5444.7504786545815, "pool_peak_live_bytes": 25450033664, "pool_peak_bytes": 26589545984, "pool_peak_live_gib": 23.702, "nvidia_base_mib": 330, "nvidia_peak_mib": 26954, "data": {"shards": 8, "windows": 128, "tokens": 262144, "seq": 2048, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95996, "scan_sec": 0.002}, "consumed": 20, "data_state": {"epoch": 0, "rank": 1, "offset": 4, "consumed": 20, "n_shards": 8, "seq": 2048, "seed": 42, "windows_per_epoch": 128}, "params": 848645257, "wall_sec": 7.797, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [11.65824699, 11.65202522, 11.65302372, 11.6815176, 11.69323635, 11.67589569, 11.69995403, 11.67457581, 11.65133572, 11.68316364, 11.68232059, 11.64371109, 11.67518425, 11.67363834, 11.66389465, 11.69251347, 11.66847801, 11.67706966, 11.66275311, 11.66738605]
+[ablate] bypassed={'route': 240, 'gatebwd': 0, 'scalar': 0} real={'route': 0, 'gatebwd': 240, 'scalar': 40}
+
+===== MODE=gatebwd RUN=1 =====
+[ablate] mode=gatebwd  routing layers=0
+[data] 8 shards {'npz': 8}  seq=2048  windows=128  tokens=262144  scan=0.00s
+[data] 1 epoch = 128 windows = 262144 tokens; steps/epoch @B=1 = 128
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=1024 layers=12 E=4 d_ff=3328 vocab=96000 n_q=16 top_k=2 csa=4 (csa=9 global=3) tensors=321 params=848.645M build=12.09s seed=42
+[int8gpu] state=m8v16，动量 3.062 字节/参数（bf16 4.0，fp32 8.0）
+[amp] 已登记 321 个参数地址给 fp16 影子缓存
+[amp] mode=gemm state={'on': True, 'fp16': True, 'bf16': False, 'available': True, 'c32': True, 'cache': {'entries': 0, 'bytes': 0, 'on': True}}
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=20 eta_min=3.000e-05 horizon=20
+step      0/20 loss=11.659793 lr=3.000e-04 gnorm= 5693.318 0.592s tok/s=  3456.8 peak_live=23.70GiB consumed=1
+step     19/20 loss=11.692996 lr=3.166e-05 gnorm= 5520.618 0.380s tok/s=  5391.9 peak_live=23.71GiB consumed=20
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 1024, "d_ff": 3328, "E": 4, "layers": 12, "n_q": 16, "n_kv": 2, "vocab": 96000, "seq": 2048, "csa": 4, "n_kv_attn": 16, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 20], "loss_first": 11.65979290008545, "loss_last": 11.69299602508545, "step_s_mean": 0.3917286200070521, "step_s_steady": 0.3807458888946308, "tok_s_steady": 5378.915596293601, "pool_peak_live_bytes": 25453703680, "pool_peak_bytes": 29434463744, "pool_peak_live_gib": 23.706, "nvidia_base_mib": 330, "nvidia_peak_mib": 29874, "data": {"shards": 8, "windows": 128, "tokens": 262144, "seq": 2048, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95996, "scan_sec": 0.004}, "consumed": 20, "data_state": {"epoch": 0, "rank": 1, "offset": 4, "consumed": 20, "n_shards": 8, "seq": 2048, "seed": 42, "windows_per_epoch": 128}, "params": 848645257, "wall_sec": 8.026, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [11.6597929, 11.65331173, 11.67077637, 11.6617651, 11.72412491, 11.68166542, 11.68283367, 11.69564629, 11.67410278, 11.6733427, 11.64071178, 11.67249012, 11.67417622, 11.65765381, 11.68472767, 11.66782665, 11.69269943, 11.68729687, 11.69430065, 11.69299603]
+[ablate] bypassed={'route': 0, 'gatebwd': 240, 'scalar': 0} real={'route': 240, 'gatebwd': 0, 'scalar': 40}
+
+===== MODE=gatebwd RUN=2 =====
+[ablate] mode=gatebwd  routing layers=0
+[data] 8 shards {'npz': 8}  seq=2048  windows=128  tokens=262144  scan=0.00s
+[data] 1 epoch = 128 windows = 262144 tokens; steps/epoch @B=1 = 128
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=1024 layers=12 E=4 d_ff=3328 vocab=96000 n_q=16 top_k=2 csa=4 (csa=9 global=3) tensors=321 params=848.645M build=12.10s seed=42
+[int8gpu] state=m8v16，动量 3.062 字节/参数（bf16 4.0，fp32 8.0）
+[amp] 已登记 321 个参数地址给 fp16 影子缓存
+[amp] mode=gemm state={'on': True, 'fp16': True, 'bf16': False, 'available': True, 'c32': True, 'cache': {'entries': 0, 'bytes': 0, 'on': True}}
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=20 eta_min=3.000e-05 horizon=20
+step      0/20 loss=11.659793 lr=3.000e-04 gnorm= 5693.318 0.587s tok/s=  3489.0 peak_live=23.70GiB consumed=1
+step     19/20 loss=11.691097 lr=3.166e-05 gnorm= 5974.829 0.380s tok/s=  5394.4 peak_live=23.71GiB consumed=20
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 1024, "d_ff": 3328, "E": 4, "layers": 12, "n_q": 16, "n_kv": 2, "vocab": 96000, "seq": 2048, "csa": 4, "n_kv_attn": 16, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 20], "loss_first": 11.65979290008545, "loss_last": 11.691097259521484, "step_s_mean": 0.3919537199952174, "step_s_steady": 0.3814202222145266, "tok_s_steady": 5369.4059221855305, "pool_peak_live_bytes": 25456849408, "pool_peak_bytes": 29478372864, "pool_peak_live_gib": 23.709, "nvidia_base_mib": 330, "nvidia_peak_mib": 29932, "data": {"shards": 8, "windows": 128, "tokens": 262144, "seq": 2048, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95996, "scan_sec": 0.004}, "consumed": 20, "data_state": {"epoch": 0, "rank": 1, "offset": 4, "consumed": 20, "n_shards": 8, "seq": 2048, "seed": 42, "windows_per_epoch": 128}, "params": 848645257, "wall_sec": 8.032, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [11.6597929, 11.65332413, 11.67041302, 11.66160297, 11.72539616, 11.68104839, 11.6833849, 11.69508171, 11.6741724, 11.67252541, 11.63786697, 11.66691875, 11.67220116, 11.65858936, 11.68321228, 11.66647243, 11.69421291, 11.68404675, 11.69171238, 11.69109726]
+[ablate] bypassed={'route': 0, 'gatebwd': 240, 'scalar': 0} real={'route': 240, 'gatebwd': 0, 'scalar': 40}
+
+===== MODE=both RUN=1 =====
+[ablate] mode=both  routing layers=12
+[data] 8 shards {'npz': 8}  seq=2048  windows=128  tokens=262144  scan=0.00s
+[data] 1 epoch = 128 windows = 262144 tokens; steps/epoch @B=1 = 128
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=1024 layers=12 E=4 d_ff=3328 vocab=96000 n_q=16 top_k=2 csa=4 (csa=9 global=3) tensors=321 params=848.645M build=12.07s seed=42
+[int8gpu] state=m8v16，动量 3.062 字节/参数（bf16 4.0，fp32 8.0）
+[amp] 已登记 321 个参数地址给 fp16 影子缓存
+[amp] mode=gemm state={'on': True, 'fp16': True, 'bf16': False, 'available': True, 'c32': True, 'cache': {'entries': 0, 'bytes': 0, 'on': True}}
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=20 eta_min=3.000e-05 horizon=20
+step      0/20 loss=11.658247 lr=3.000e-04 gnorm= 5636.885 0.585s tok/s=  3503.4 peak_live=23.70GiB consumed=1
+step     19/20 loss=11.677611 lr=3.166e-05 gnorm= 4760.943 0.376s tok/s=  5445.9 peak_live=23.70GiB consumed=20
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 1024, "d_ff": 3328, "E": 4, "layers": 12, "n_q": 16, "n_kv": 2, "vocab": 96000, "seq": 2048, "csa": 4, "n_kv_attn": 16, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 20], "loss_first": 11.658246994018555, "loss_last": 11.677611351013184, "step_s_mean": 0.3863077200076077, "step_s_steady": 0.3756024444559848, "tok_s_steady": 5452.573672586937, "pool_peak_live_bytes": 25450033664, "pool_peak_bytes": 26589545984, "pool_peak_live_gib": 23.702, "nvidia_base_mib": 330, "nvidia_peak_mib": 26954, "data": {"shards": 8, "windows": 128, "tokens": 262144, "seq": 2048, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95996, "scan_sec": 0.002}, "consumed": 20, "data_state": {"epoch": 0, "rank": 1, "offset": 4, "consumed": 20, "n_shards": 8, "seq": 2048, "seed": 42, "windows_per_epoch": 128}, "params": 848645257, "wall_sec": 7.798, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [11.65824699, 11.65398979, 11.65676117, 11.69429779, 11.68944073, 11.67062473, 11.69438457, 11.67835903, 11.65348625, 11.66476822, 11.68920898, 11.66609192, 11.67310047, 11.64785957, 11.68405914, 11.67827511, 11.69078636, 11.69740868, 11.66820908, 11.67761135]
+[ablate] bypassed={'route': 240, 'gatebwd': 240, 'scalar': 0} real={'route': 0, 'gatebwd': 0, 'scalar': 40}
+
+===== MODE=both RUN=2 =====
+[ablate] mode=both  routing layers=12
+[data] 8 shards {'npz': 8}  seq=2048  windows=128  tokens=262144  scan=0.00s
+[data] 1 epoch = 128 windows = 262144 tokens; steps/epoch @B=1 = 128
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=1024 layers=12 E=4 d_ff=3328 vocab=96000 n_q=16 top_k=2 csa=4 (csa=9 global=3) tensors=321 params=848.645M build=12.10s seed=42
+[int8gpu] state=m8v16，动量 3.062 字节/参数（bf16 4.0，fp32 8.0）
+[amp] 已登记 321 个参数地址给 fp16 影子缓存
+[amp] mode=gemm state={'on': True, 'fp16': True, 'bf16': False, 'available': True, 'c32': True, 'cache': {'entries': 0, 'bytes': 0, 'on': True}}
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=20 eta_min=3.000e-05 horizon=20
+step      0/20 loss=11.658247 lr=3.000e-04 gnorm= 5636.885 0.574s tok/s=  3570.2 peak_live=23.70GiB consumed=1
+step     19/20 loss=11.677953 lr=3.166e-05 gnorm= 5286.372 0.375s tok/s=  5457.4 peak_live=23.70GiB consumed=20
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 1024, "d_ff": 3328, "E": 4, "layers": 12, "n_q": 16, "n_kv": 2, "vocab": 96000, "seq": 2048, "csa": 4, "n_kv_attn": 16, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 20], "loss_first": 11.658246994018555, "loss_last": 11.677952766418457, "step_s_mean": 0.3855795300012687, "step_s_steady": 0.3754446111140876, "tok_s_steady": 5454.865882673882, "pool_peak_live_bytes": 25450033664, "pool_peak_bytes": 26589545984, "pool_peak_live_gib": 23.702, "nvidia_base_mib": 330, "nvidia_peak_mib": 26954, "data": {"shards": 8, "windows": 128, "tokens": 262144, "seq": 2048, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95996, "scan_sec": 0.002}, "consumed": 20, "data_state": {"epoch": 0, "rank": 1, "offset": 4, "consumed": 20, "n_shards": 8, "seq": 2048, "seed": 42, "windows_per_epoch": 128}, "params": 848645257, "wall_sec": 7.774, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [11.65824699, 11.65399265, 11.65667343, 11.6942358, 11.68970585, 11.67083549, 11.6944809, 11.67847538, 11.65304947, 11.6645422, 11.68932819, 11.66586018, 11.67277718, 11.64667988, 11.68369484, 11.67819405, 11.69094944, 11.69749641, 11.66744041, 11.67795277]
+[ablate] bypassed={'route': 240, 'gatebwd': 240, 'scalar': 0} real={'route': 0, 'gatebwd': 0, 'scalar': 40}
+
+===== MODE=scalar RUN=1 =====
+[ablate] mode=scalar  routing layers=12
+[data] 8 shards {'npz': 8}  seq=2048  windows=128  tokens=262144  scan=0.00s
+[data] 1 epoch = 128 windows = 262144 tokens; steps/epoch @B=1 = 128
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=1024 layers=12 E=4 d_ff=3328 vocab=96000 n_q=16 top_k=2 csa=4 (csa=9 global=3) tensors=321 params=848.645M build=12.04s seed=42
+[int8gpu] state=m8v16，动量 3.062 字节/参数（bf16 4.0，fp32 8.0）
+[amp] 已登记 321 个参数地址给 fp16 影子缓存
+[amp] mode=gemm state={'on': True, 'fp16': True, 'bf16': False, 'available': True, 'c32': True, 'cache': {'entries': 0, 'bytes': 0, 'on': True}}
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=20 eta_min=3.000e-05 horizon=20
+step      0/20 loss=1.000000 lr=3.000e-04 gnorm=    1.000 0.574s tok/s=  3568.5 peak_live=23.70GiB consumed=1
+step     19/20 loss=1.000000 lr=3.166e-05 gnorm=    1.000 0.365s tok/s=  5615.1 peak_live=23.70GiB consumed=20
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 1024, "d_ff": 3328, "E": 4, "layers": 12, "n_q": 16, "n_kv": 2, "vocab": 96000, "seq": 2048, "csa": 4, "n_kv_attn": 16, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 20], "loss_first": 1.0, "loss_last": 1.0, "step_s_mean": 0.37832042499794627, "step_s_steady": 0.3679053444421798, "tok_s_steady": 5566.649223607201, "pool_peak_live_bytes": 25450033664, "pool_peak_bytes": 26589545984, "pool_peak_live_gib": 23.702, "nvidia_base_mib": 330, "nvidia_peak_mib": 26954, "data": {"shards": 8, "windows": 128, "tokens": 262144, "seq": 2048, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95996, "scan_sec": 0.002}, "consumed": 20, "data_state": {"epoch": 0, "rank": 1, "offset": 4, "consumed": 20, "n_shards": 8, "seq": 2048, "seed": 42, "windows_per_epoch": 128}, "params": 848645257, "wall_sec": 7.784, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+[ablate] bypassed={'route': 240, 'gatebwd': 240, 'scalar': 40} real={'route': 0, 'gatebwd': 0, 'scalar': 0}
+
+===== MODE=scalar RUN=2 =====
+[ablate] mode=scalar  routing layers=12
+[data] 8 shards {'npz': 8}  seq=2048  windows=128  tokens=262144  scan=0.00s
+[data] 1 epoch = 128 windows = 262144 tokens; steps/epoch @B=1 = 128
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=1024 layers=12 E=4 d_ff=3328 vocab=96000 n_q=16 top_k=2 csa=4 (csa=9 global=3) tensors=321 params=848.645M build=12.13s seed=42
+[int8gpu] state=m8v16，动量 3.062 字节/参数（bf16 4.0，fp32 8.0）
+[amp] 已登记 321 个参数地址给 fp16 影子缓存
+[amp] mode=gemm state={'on': True, 'fp16': True, 'bf16': False, 'available': True, 'c32': True, 'cache': {'entries': 0, 'bytes': 0, 'on': True}}
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=20 eta_min=3.000e-05 horizon=20
+step      0/20 loss=1.000000 lr=3.000e-04 gnorm=    1.000 0.567s tok/s=  3614.1 peak_live=23.70GiB consumed=1
+step     19/20 loss=1.000000 lr=3.166e-05 gnorm=    1.000 0.365s tok/s=  5604.0 peak_live=23.70GiB consumed=20
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 1024, "d_ff": 3328, "E": 4, "layers": 12, "n_q": 16, "n_kv": 2, "vocab": 96000, "seq": 2048, "csa": 4, "n_kv_attn": 16, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 20], "loss_first": 1.0, "loss_last": 1.0, "step_s_mean": 0.3763288150017615, "step_s_steady": 0.36612778889118797, "tok_s_steady": 5593.675383675013, "pool_peak_live_bytes": 25450033664, "pool_peak_bytes": 26589545984, "pool_peak_live_gib": 23.702, "nvidia_base_mib": 330, "nvidia_peak_mib": 26954, "data": {"shards": 8, "windows": 128, "tokens": 262144, "seq": 2048, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95996, "scan_sec": 0.003}, "consumed": 20, "data_state": {"epoch": 0, "rank": 1, "offset": 4, "consumed": 20, "n_shards": 8, "seq": 2048, "seed": 42, "windows_per_epoch": 128}, "params": 848645257, "wall_sec": 7.567, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+[ablate] bypassed={'route': 240, 'gatebwd': 240, 'scalar': 40} real={'route': 0, 'gatebwd': 0, 'scalar': 0}
+
