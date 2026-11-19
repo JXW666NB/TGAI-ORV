@@ -1637,6 +1637,50 @@ extern "C" __global__ void sumsq_final(const float* part, float* out, int nb) {
     if (threadIdx.x == 0) out[0] = sm[0];
 }
 
+/* 多张量平方和（**确定性**）：一个 block 处理一个张量，结果写进自己的槽位 slots[t]。
+   刻意不用 atomicAdd 做跨 block 累加 —— 那会让求和顺序随调度变化，
+   同一次训练重跑会得到相差 1e-7 量级的范数，破坏"逐位可复现"。
+   槽位之后的归约交给 sumsq_final（固定顺序树归约）。
+   用途：clip_grad_norm_ 一次算完所有参数的平方和（原来每参数要 2 次发射）。 */
+extern "C" __global__ void sumsq_multi_slots(const float* raw_ptrs,
+                                             const float* raw_sizes, int n, float* slots) {
+    int t = blockIdx.x;
+    if (t >= n) return;
+    /* 指针/长度是按位重解释成 float32 传上来的（运行时的 h2d 只吃 float32/uint16，
+       直接传 uint64 会被强制转成 float32 变成垃圾）。这里强转回去。 */
+    const unsigned long long* pp = (const unsigned long long*)raw_ptrs;
+    const int* sz = (const int*)raw_sizes;
+    const float* a = (const float*)pp[t];
+    int m = sz[t];
+    float s = 0.f;
+    for (int i = threadIdx.x; i < m; i += blockDim.x) {
+        float v = a[i];
+        s = __fadd_rn(s, __fmul_rn(v, v));
+    }
+    __shared__ float sm[256];
+    sm[threadIdx.x] = s;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (threadIdx.x < off)
+            sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + off]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) slots[t] = sm[0];
+}
+
+/* 多张量原地缩放：一个 block 处理一个张量，无归约 ⇒ 天然确定性。
+   用途：梯度裁剪时一次缩完所有参数（原来 321 次 scale_inplace）。 */
+extern "C" __global__ void scale_multi(const float* raw_ptrs, const float* raw_sizes,
+                                       int n, float s) {
+    int t = blockIdx.x;
+    if (t >= n) return;
+    const unsigned long long* pp = (const unsigned long long*)raw_ptrs;
+    const int* sz = (const int*)raw_sizes;
+    float* a = (float*)pp[t];
+    int m = sz[t];
+    for (int i = threadIdx.x; i < m; i += blockDim.x) a[i] = __fmul_rn(a[i], s);
+}
+
 /* 基础切片 / repeat_interleave 的前向。
    输出下标按行主序拆开，源下标 = base + sum (coord/div)*stride。
    div 恒 >= 1。切片的 div 是 1，stride 已经乘过 step（可以为负）。
@@ -8237,6 +8281,65 @@ class CudaRuntime:
         ])
         out.keepalive = part
         return out
+
+    def _ptrs_and_sizes(self, bufs):
+        """把一组张量打包成设备侧的（指针数组, 长度数组），供多张量 kernel 使用。
+
+        两个数组都很小（n=321 时分别是 2.5 KB / 1.3 KB），一次 h2d 即可。
+        """
+        n = len(bufs)
+        ptrs = np.empty(n, dtype=np.uint64)
+        sizes = np.empty(n, dtype=np.int32)
+        for i, b in enumerate(bufs):
+            ptrs[i] = int(b.ptr)
+            sizes[i] = int(b.n)
+        # ★ 2026-11-19：运行时的 h2d 只接受 float32 / uint16，传 uint64 会被**强制转成
+        #   float32**（实测 ptrs.dtype 变成 float32，内核拿到垃圾指针 → rc=700 非法访存）。
+        #   所以这里把指针与长度**按位重解释**成 float32 上传，内核里再强转回
+        #   unsigned long long / int。池的缓冲按 256 字节对齐，8 字节对齐无忧。
+        return (self.h2d(np.ascontiguousarray(ptrs).view(np.float32)),
+                self.h2d(np.ascontiguousarray(sizes).view(np.float32)))
+
+    def sumsq_multi_total(self, bufs):
+        """所有张量的平方和（**确定性**），返回 float。2 次发射取代 2n 次。
+
+        为什么能保证确定性：
+          * kernel A `sumsq_multi_slots`：**每张量一个 block**，把自己那个张量的
+            平方和写进 slots[t]，**不做跨 block 原子累加**（原子加会让求和顺序随
+            调度变化，重跑会差 1e-7 量级，破坏逐位可复现）。
+          * kernel B `sumsq_final`：对 slots 做固定顺序的树归约（与原来同一套算法）。
+        张量之间的求和顺序由 slot 下标固定，因此结果与张量个数、调度无关。
+        """
+        bufs = [b for b in bufs if b is not None and int(b.n) > 0]
+        n = len(bufs)
+        if n == 0:
+            return 0.0
+        if n == 1:                           # 单个张量走已验证的两段式，逐位一致
+            return float(self.read_scalar(self.sumsq_parallel(bufs[0])))
+        slots = self.empty((n,), dtype=np.float32)
+        ptrs, sizes = self._ptrs_and_sizes(bufs)
+        self.launch("sumsq_multi_slots", (n, 1, 1), (256, 1, 1), [
+            self._ptr(ptrs), self._ptr(sizes), (n, ctypes.c_int), self._ptr(slots)])
+        out = self.empty((), dtype=np.float32)
+        self.launch("sumsq_final", (1, 1, 1), (256, 1, 1), [
+            self._ptr(slots), self._ptr(out), (n, ctypes.c_int)])
+        out.keepalive = (slots, ptrs, sizes)  # 防缓冲被池提前回收
+        return float(self.read_scalar(out))
+
+    def scale_multi(self, bufs, scalar):
+        """所有张量原地乘同一标量（**确定性**，无归约）。1 次发射取代 n 次。"""
+        bufs = [b for b in bufs if b is not None and int(b.n) > 0]
+        n = len(bufs)
+        if n == 0:
+            return
+        s = float(scalar)
+        if n == 1:
+            self.scale_inplace(bufs[0], s)
+            return
+        ptrs, sizes = self._ptrs_and_sizes(bufs)
+        self.launch("scale_multi", (n, 1, 1), (256, 1, 1), [
+            self._ptr(ptrs), self._ptr(sizes), (n, ctypes.c_int),
+            (s, ctypes.c_float)])
 
     def sumsq_sequential(self, buf):
         """一个标量：按地址顺序的 sum(x*x)。调用方只把这个标量降回主机。"""

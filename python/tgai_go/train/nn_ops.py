@@ -204,7 +204,12 @@ def clip_grad_norm_(params, max_norm):
     use_dev = False
     total = 0.0
     if rt is not None:
-        acc = None
+        # ★ 2026-11-19：改成**一次多张量 kernel** 求所有参数的平方和。
+        #   原来是"每参数 sumsq_parallel（2 次发射）+ add" —— 321 个参数约 640 次发射，
+        #   实测占 45.7 ms/步（其中 n=1 的 ewise_add 有 347 次、每次 12 µs 纯发射地板）。
+        #   现在 2 次发射搞定，且**确定性不变**：kernel A 每张量一个 block 写独立槽位
+        #   （不用原子加），kernel B 用 sumsq_final 做固定顺序树归约。
+        bufs = []
         for p in params:
             g = getattr(p, "grad", None)
             if g is None:
@@ -212,35 +217,52 @@ def clip_grad_norm_(params, max_norm):
             gpu = getattr(g, "_gpu", None)
             if gpu is None:
                 return _clip_grad_norm_host(params, max_norm)
-            ss = rt.sumsq_parallel(gpu)
-            # ★ 2026-11-19：原地累加（`add_`），省掉每参数一次临时缓冲分配。
-            #   原来 `rt.add(acc, ss)` 每步新建 320 个缓冲 —— 池健康时开销不大，
-            #   但长序列下池一抖动就会被放大。语义完全一致（都只求和）。
-            if acc is None:
-                acc = ss
-            else:
-                try:
-                    rt.add_(acc, ss)
-                except Exception:                # noqa: BLE001 - 后端无 add_ 时退回旧路径
-                    acc = rt.add(acc, ss)
-        if acc is not None:
-            total = float(rt.read_scalar(acc))
-            use_dev = True
+            bufs.append(gpu)
+        if bufs:
+            try:
+                total = float(rt.sumsq_multi_total(bufs))
+                use_dev = True
+            except Exception:                    # noqa: BLE001 - 老后端没有多张量核
+                acc = None
+                for gpu in bufs:
+                    ss = rt.sumsq_parallel(gpu)
+                    if acc is None:
+                        acc = ss
+                    else:
+                        try:
+                            rt.add_(acc, ss)
+                        except Exception:        # noqa: BLE001
+                            acc = rt.add(acc, ss)
+                if acc is not None:
+                    total = float(rt.read_scalar(acc))
+                    use_dev = True
     if not use_dev:
         return _clip_grad_norm_host(params, max_norm)
 
     norm = float(np.sqrt(max(total, 0.0)))
     if max_norm is not None and max_norm > 0 and norm > max_norm:
         scale = max_norm / (norm + 1e-6)
+        # ★ 同一次改动：裁剪时的 n 次 `scale_inplace` 合成一次 `scale_multi`
+        #   （每 block 处理一个张量，无归约 ⇒ 天然确定性，结果与逐张量逐位一致）。
+        gbufs = []
+        cpu_ps = []
         for p in params:
             g = getattr(p, "grad", None)
             if g is None:
                 continue
             gpu = getattr(g, "_gpu", None)
-            if gpu is not None:
-                rt.scale_inplace(gpu, float(scale))     # 原地缩放，省一次分配
+            if gpu is None:
+                cpu_ps.append((p, g))
             else:
-                p.grad = g * scale
+                gbufs.append(gpu)
+        if gbufs:
+            try:
+                rt.scale_multi(gbufs, float(scale))
+            except Exception:                    # noqa: BLE001 - 回退到逐张量
+                for gpu in gbufs:
+                    rt.scale_inplace(gpu, float(scale))
+        for p, g in cpu_ps:
+            p.grad = g * scale
     return norm
 
 
