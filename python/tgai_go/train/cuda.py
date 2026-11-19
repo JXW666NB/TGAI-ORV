@@ -4121,8 +4121,33 @@ class CudaRuntime:
         if self._pool_cached_bytes < 0:
             self._pool_cached_bytes = 0
 
+    def reset_peak(self):
+        """把"峰值"类统计归零到**当前值**，用于分阶段/分优化器测量。
+
+        ★ 2026-11-20 新增。原来的 `peak_live_bytes` / `peak_bytes` 是**进程级累积**
+          峰值、只增不减，于是"同一个模型换不同优化器测显存"会读到同一个数
+          （实测 9.4M 参数下 6 个优化器都报 0.2671 GiB ⇒ 显存对比做不出来）。
+          社区插件基准测试时踩到了这个坑。
+
+        语义：归零后，下一次 `pool_stats()` 的 peak 只反映**从此刻起**的峰值；
+        计数类（hits/misses/trims）与 `miss_top` 一并清零，便于分阶段统计。
+        不改任何分配行为。
+        """
+        self._pool_peak = int(self._pool_live_bytes + self._pool_cached_bytes)
+        self._pool_peak_live = int(self._pool_live_bytes)
+        self._pool_hits = 0
+        self._pool_misses = 0
+        self._pool_trims = 0
+        try:
+            self._pool_miss_hist.clear()
+        except Exception:                    # noqa: BLE001 - 老版本没有这个字段
+            self._pool_miss_hist = {}
+
     def pool_stats(self):
-        """命中 / 未命中 / 当前占用 / 池峰值。占用 = 活张量 + 池中空闲块。"""
+        """命中 / 未命中 / 当前占用 / 池峰值。占用 = 活张量 + 池中空闲块。
+
+        峰值是**自上次 `reset_peak()` 起**的累积值（默认进程开始）。
+        """
         hits = int(self._pool_hits)
         misses = int(self._pool_misses)
         total = hits + misses

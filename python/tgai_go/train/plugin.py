@@ -581,8 +581,41 @@ def resolve_arch(name):
 
 
 def resolve_optimizer(name):
+    """按名字取优化器类：**先插件登记表，再核心内置表**。
+
+    ★ 2026-11-20 修复：原来只查插件表，于是 `resolve_optimizer("Muon")` 对**核心内置**
+      优化器也返回 `None`。这会让"先探测再调用"的写法踩坑：
+
+          cls = T.plugin.resolve_optimizer("Muon")
+          opt = cls(params)          # TypeError: 'NoneType' object is not callable
+
+      社区插件作者实测踩到过（忘写 `import polaris` 时报这个错，很难定位）。
+      现在内置优化器也能被解析到；插件仍优先（同名时插件可覆盖内置，便于实验）。
+    """
     info = _OPTIMIZERS.get(name)
-    return None if info is None else info["cls"]
+    if info is not None:
+        return info["cls"]
+    return _builtin_optimizer(name)
+
+
+def _builtin_optimizer(name):
+    """核心内置优化器（懒加载，避免 plugin.py 与 __init__.py 的循环 import）。
+
+    内置优化器分两处：`AdamW/LAMB/Muon` 写在 `_OptimModule` 类体里，
+    `SGD/Lion/Adafactor` 是类定义**之后**再挂上去的（`__init__.py` 末尾）。两者都
+    不在 `_OPTIMIZERS` 里，所以原来 `resolve_optimizer` 对它们一律返回 `None`。
+
+    这里直接读**类属性字典**（`type(inst).__dict__`），不会递归进 `__getattr__`；
+    再用白名单过滤，避免把 `Accumulator`、`lr_scheduler` 这类名字也当成优化器。
+    """
+    if name not in ("AdamW", "SGD", "Adafactor", "LAMB", "Lion", "Muon"):
+        return None
+    try:
+        from . import optim as _optim_inst
+    except Exception:                    # noqa: BLE001 - 导入期被调用就退回 None
+        return None
+    cls = type(_optim_inst).__dict__.get(name)
+    return cls if isinstance(cls, type) else None
 
 
 def registered():
