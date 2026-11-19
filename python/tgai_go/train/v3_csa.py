@@ -334,7 +334,16 @@ def _chunk_layout(seg, c):
         has = cnt > 0
         first = np.minimum(offs, max(vpos.size - 1, 0))
         first_tok = vpos[first]
-        slot_doc = np.where(has, doc_ord.reshape(-1)[first_tok], -1)
+        # ★ 2026-11-20 严重修复：这里原来存的是 `doc_ord`（**窗口内序号，1 起**），
+        #   而 `_mask_global_seg` / `_mask_local_seg` 拿它跟 `seg`（**数据里的文档号**）
+        #   比较：`cseg[b,k] == seg[b,i]`。两个不同的量一比，只要文档号不等于序号
+        #   （几乎总是如此，例如 seg 全 0 或文档号为 5/9），掩码就全部变成 NEG_BIG
+        #   ⇒ **CSA 层注意力恒 0、梯度恒 0**，但 12 次 GEMM/层照跑（白付算力）。
+        #   参考实现 `model_v3.py:908-911` 的做法是 `cseg_ext.scatter_(0, take_ok, seg)`
+        #   —— 即存 **seg 的原始值**，本文件的 L274 注释也写着"该 chunk 的文档标签"。
+        #   实测证据（修复前，step 2）：mask_g 中 <-1e29 的比例 = 1.0000、row_g 全 0、
+        #   p@v absmax = 0、dS_csa absmax = 0。
+        slot_doc = np.where(has, seg.reshape(-1)[first_tok], -1)
         # 文档内序号 p = 当前 chunk 与该文档首个 chunk 之差
         new_doc = np.zeros(B * Tc, bool)
         new_doc[0] = True
