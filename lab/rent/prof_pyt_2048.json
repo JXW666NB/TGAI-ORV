@@ -1,0 +1,498 @@
+{
+ "impl": "pytorch",
+ "cfg": {
+  "seq": 2048,
+  "d": 1024,
+  "layers": 12,
+  "d_ff": 3328,
+  "E": 4,
+  "top_k": 2,
+  "vocab": 96000,
+  "amp": 1,
+  "ckpt": 0
+ },
+ "n_params": 740769289,
+ "steps": 20,
+ "warmup": 2,
+ "prof_steps": 20,
+ "wall_median_s": 0.39962179999565706,
+ "wall_min_s": 0.3949951000395231,
+ "wall_max_s": 0.4075925000361167,
+ "wall_all": [
+  0.39671699999598786,
+  0.3964276999467984,
+  0.39694810000946745,
+  0.39669189997948706,
+  0.3965574000030756,
+  0.39718640001956373,
+  0.3992902999743819,
+  0.39694609999423847,
+  0.3999533000169322,
+  0.400599799992051,
+  0.4037671000114642,
+  0.40225289994850755,
+  0.4075925000361167,
+  0.4020285999868065,
+  0.40427489997819066,
+  0.4034642999758944,
+  0.3949951000395231,
+  0.40412319998722523,
+  0.39653899997938424,
+  0.4004105000058189
+ ],
+ "losses": [
+  11.675275802612305,
+  11.69479751586914,
+  11.68135929107666,
+  11.659566879272461,
+  11.67232894897461,
+  11.656963348388672,
+  11.662955284118652,
+  11.661398887634277,
+  11.652742385864258,
+  11.663570404052734,
+  11.681904792785645,
+  11.65454387664795,
+  11.69227409362793,
+  11.662444114685059,
+  11.662802696228027,
+  11.663116455078125,
+  11.672813415527344,
+  11.6542387008667,
+  11.671855926513672,
+  11.662009239196777
+ ],
+ "phase_ms": {
+  "forward": 107.51391983032227,
+  "backward": 206.1992950439453,
+  "optimizer": 85.89311981201172
+ },
+ "cuda_ms_per_step": 353.31425000000013,
+ "cuda_over_wall": 0.8841215619464199,
+ "cpu_ops_per_step": 51615.0,
+ "sum_all_events_us": 657253.55,
+ "prof_wall_s": 21.777634500002023,
+ "kernels_per_step": 25064.5,
+ "kernels": [
+  {
+   "name": "aten::mm",
+   "count": 14862,
+   "us_total": 1833788.0,
+   "us_per_step": 91689.4,
+   "cpu_us_per_step": 18306.18999999909
+  },
+  {
+   "name": "aten::copy_",
+   "count": 50738,
+   "us_total": 1125628.0,
+   "us_per_step": 56281.4,
+   "cpu_us_per_step": 22475.75999999964
+  },
+  {
+   "name": "aten::mul",
+   "count": 48092,
+   "us_total": 1085040.0,
+   "us_per_step": 54252.0,
+   "cpu_us_per_step": 24661.995000010746
+  },
+  {
+   "name": "aten::add_",
+   "count": 21286,
+   "us_total": 418288.0,
+   "us_per_step": 20914.4,
+   "cpu_us_per_step": 5519.495000002886
+  },
+  {
+   "name": "aten::as_strided",
+   "count": 99647,
+   "us_total": 247535.0,
+   "us_per_step": 12376.75,
+   "cpu_us_per_step": 3680.224999989188
+  },
+  {
+   "name": "aten::div",
+   "count": 11652,
+   "us_total": 237078.0,
+   "us_per_step": 11853.9,
+   "cpu_us_per_step": 6603.9650000022275
+  },
+  {
+   "name": "aten::_foreach_lerp_",
+   "count": 20,
+   "us_total": 218536.0,
+   "us_per_step": 10926.8,
+   "cpu_us_per_step": 211.20500000005705
+  },
+  {
+   "name": "aten::fill_",
+   "count": 15483,
+   "us_total": 208251.0,
+   "us_per_step": 10412.55,
+   "cpu_us_per_step": 4944.95999999724
+  },
+  {
+   "name": "aten::sum",
+   "count": 7389,
+   "us_total": 162912.0,
+   "us_per_step": 8145.6,
+   "cpu_us_per_step": 4541.199999998271
+  },
+  {
+   "name": "aten::_amp_foreach_non_finite_check_and_unscale_",
+   "count": 20,
+   "us_total": 151856.0,
+   "us_per_step": 7592.8,
+   "cpu_us_per_step": 166.50999999986962
+  },
+  {
+   "name": "aten::result_type",
+   "count": 46404,
+   "us_total": 137898.0,
+   "us_per_step": 6894.9,
+   "cpu_us_per_step": 178.11000000580097
+  },
+  {
+   "name": "aten::empty_strided",
+   "count": 41750,
+   "us_total": 132298.0,
+   "us_per_step": 6614.9,
+   "cpu_us_per_step": 5461.645000005455
+  },
+  {
+   "name": "aten::add",
+   "count": 5637,
+   "us_total": 104859.0,
+   "us_per_step": 5242.95,
+   "cpu_us_per_step": 3154.620000000389
+  },
+  {
+   "name": "aten::cat",
+   "count": 1677,
+   "us_total": 104110.0,
+   "us_per_step": 5205.5,
+   "cpu_us_per_step": 1190.6849999995297
+  },
+  {
+   "name": "aten::empty",
+   "count": 31312,
+   "us_total": 102915.0,
+   "us_per_step": 5145.75,
+   "cpu_us_per_step": 3801.3600000035485
+  },
+  {
+   "name": "aten::tanh_backward",
+   "count": 2316,
+   "us_total": 90189.0,
+   "us_per_step": 4509.45,
+   "cpu_us_per_step": 1053.625000000588
+  },
+  {
+   "name": "aten::tanh",
+   "count": 2316,
+   "us_total": 67383.0,
+   "us_per_step": 3369.15,
+   "cpu_us_per_step": 1181.5600000003474
+  },
+  {
+   "name": "aten::view",
+   "count": 19679,
+   "us_total": 55586.0,
+   "us_per_step": 2779.3,
+   "cpu_us_per_step": 2154.324999998576
+  },
+  {
+   "name": "aten::_local_scalar_dense",
+   "count": 14908,
+   "us_total": 50751.0,
+   "us_per_step": 2537.55,
+   "cpu_us_per_step": 28400.054999999305
+  },
+  {
+   "name": "aten::bmm",
+   "count": 1360,
+   "us_total": 46364.0,
+   "us_per_step": 2318.2,
+   "cpu_us_per_step": 1516.1450000022928
+  },
+  {
+   "name": "aten::sigmoid_backward",
+   "count": 1338,
+   "us_total": 46307.0,
+   "us_per_step": 2315.35,
+   "cpu_us_per_step": 637.4850000002058
+  },
+  {
+   "name": "aten::linalg_vector_norm",
+   "count": 2280,
+   "us_total": 43735.0,
+   "us_per_step": 2186.75,
+   "cpu_us_per_step": 2720.455000001123
+  },
+  {
+   "name": "aten::_log_softmax",
+   "count": 20,
+   "us_total": 39582.0,
+   "us_per_step": 1979.1,
+   "cpu_us_per_step": 16.284999999984574
+  },
+  {
+   "name": "aten::_log_softmax_backward_data",
+   "count": 20,
+   "us_total": 39346.0,
+   "us_per_step": 1967.3,
+   "cpu_us_per_step": 12.755000000080326
+  },
+  {
+   "name": "aten::sigmoid",
+   "count": 1338,
+   "us_total": 35904.0,
+   "us_per_step": 1795.2,
+   "cpu_us_per_step": 725.4949999998369
+  },
+  {
+   "name": "aten::resize_",
+   "count": 8428,
+   "us_total": 27642.0,
+   "us_per_step": 1382.1,
+   "cpu_us_per_step": 830.2199999970908
+  },
+  {
+   "name": "aten::to",
+   "count": 10316,
+   "us_total": 23836.0,
+   "us_per_step": 1191.8,
+   "cpu_us_per_step": 151.1650000002576
+  },
+  {
+   "name": "aten::rsqrt",
+   "count": 2280,
+   "us_total": 23353.0,
+   "us_per_step": 1167.65,
+   "cpu_us_per_step": 1934.975000000351
+  },
+  {
+   "name": "aten::neg",
+   "count": 1680,
+   "us_total": 22693.0,
+   "us_per_step": 1134.65,
+   "cpu_us_per_step": 942.6049999988587
+  },
+  {
+   "name": "aten::eq",
+   "count": 3438,
+   "us_total": 22198.0,
+   "us_per_step": 1109.9,
+   "cpu_us_per_step": 1851.0550000022608
+  },
+  {
+   "name": "detach",
+   "count": 7574,
+   "us_total": 19128.0,
+   "us_per_step": 956.4,
+   "cpu_us_per_step": 648.9100000029371
+  },
+  {
+   "name": "aten::ge",
+   "count": 2280,
+   "us_total": 18230.0,
+   "us_per_step": 911.5,
+   "cpu_us_per_step": 1283.7300000013158
+  },
+  {
+   "name": "aten::clamp_min",
+   "count": 2280,
+   "us_total": 14959.0,
+   "us_per_step": 747.95,
+   "cpu_us_per_step": 1309.9850000010902
+  },
+  {
+   "name": "aten::remainder",
+   "count": 918,
+   "us_total": 13353.0,
+   "us_per_step": 667.65,
+   "cpu_us_per_step": 842.2699999994423
+  },
+  {
+   "name": "aten::set_",
+   "count": 4350,
+   "us_total": 12933.0,
+   "us_per_step": 646.65,
+   "cpu_us_per_step": 1438.879999995504
+  },
+  {
+   "name": "aten::div_",
+   "count": 918,
+   "us_total": 10694.0,
+   "us_per_step": 534.7,
+   "cpu_us_per_step": 684.7700000008554
+  },
+  {
+   "name": "aten::topk",
+   "count": 240,
+   "us_total": 9434.0,
+   "us_per_step": 471.7,
+   "cpu_us_per_step": 277.27000000013186
+  },
+  {
+   "name": "AddBackward0",
+   "count": 4020,
+   "us_total": 9013.0,
+   "us_per_step": 450.65,
+   "cpu_us_per_step": 108.72000000039262
+  },
+  {
+   "name": "aten::_reshape_alias",
+   "count": 3060,
+   "us_total": 8477.0,
+   "us_per_step": 423.85,
+   "cpu_us_per_step": 329.1550000011484
+  },
+  {
+   "name": "aten::_unsafe_view",
+   "count": 2300,
+   "us_total": 6050.0,
+   "us_per_step": 302.5,
+   "cpu_us_per_step": 239.93499999936398
+  },
+  {
+   "name": "aten::triu",
+   "count": 240,
+   "us_total": 5827.0,
+   "us_per_step": 291.35,
+   "cpu_us_per_step": 118.56500000028714
+  },
+  {
+   "name": "aten::_softmax",
+   "count": 580,
+   "us_total": 5527.0,
+   "us_per_step": 276.35,
+   "cpu_us_per_step": 380.05500000126216
+  },
+  {
+   "name": "CloneBackward0",
+   "count": 1975,
+   "us_total": 4586.0,
+   "us_per_step": 229.3,
+   "cpu_us_per_step": 32.37999999984167
+  },
+  {
+   "name": "aten::masked_fill_",
+   "count": 420,
+   "us_total": 4084.0,
+   "us_per_step": 204.2,
+   "cpu_us_per_step": 159.76000000166042
+  },
+  {
+   "name": "aten::le",
+   "count": 180,
+   "us_total": 3941.0,
+   "us_per_step": 197.05,
+   "cpu_us_per_step": 109.2200000000854
+  },
+  {
+   "name": "aten::cudnn_convolution",
+   "count": 180,
+   "us_total": 3000.0,
+   "us_per_step": 150.0,
+   "cpu_us_per_step": 220.394999999824
+  },
+  {
+   "name": "aten::bitwise_not",
+   "count": 180,
+   "us_total": 2666.0,
+   "us_per_step": 133.3,
+   "cpu_us_per_step": 100.35499999962443
+  },
+  {
+   "name": "aten::amax",
+   "count": 240,
+   "us_total": 2237.0,
+   "us_per_step": 111.85,
+   "cpu_us_per_step": 137.30500000006776
+  },
+  {
+   "name": "aten::sub",
+   "count": 240,
+   "us_total": 1423.0,
+   "us_per_step": 71.15,
+   "cpu_us_per_step": 109.1499999998241
+  },
+  {
+   "name": "aten::log_",
+   "count": 240,
+   "us_total": 1350.0,
+   "us_per_step": 67.5,
+   "cpu_us_per_step": 70.73500000016865
+  },
+  {
+   "name": "aten::exp_",
+   "count": 240,
+   "us_total": 1209.0,
+   "us_per_step": 60.45,
+   "cpu_us_per_step": 75.41500000025107
+  },
+  {
+   "name": "aten::resolve_conj",
+   "count": 240,
+   "us_total": 593.0,
+   "us_per_step": 29.65,
+   "cpu_us_per_step": 2.5950000000161255
+  },
+  {
+   "name": "aten::real",
+   "count": 240,
+   "us_total": 529.0,
+   "us_per_step": 26.45,
+   "cpu_us_per_step": 2.580000000155178
+  },
+  {
+   "name": "aten::resolve_neg",
+   "count": 240,
+   "us_total": 524.0,
+   "us_per_step": 26.2,
+   "cpu_us_per_step": 1.209999999973934
+  },
+  {
+   "name": "ExpandBackward0",
+   "count": 129,
+   "us_total": 308.0,
+   "us_per_step": 15.4,
+   "cpu_us_per_step": 4.365000000814325
+  },
+  {
+   "name": "aten::reciprocal",
+   "count": 20,
+   "us_total": 114.0,
+   "us_per_step": 5.7,
+   "cpu_us_per_step": 14.104999999993016
+  },
+  {
+   "name": "aten::_amp_update_scale_",
+   "count": 20,
+   "us_total": 101.0,
+   "us_per_step": 5.05,
+   "cpu_us_per_step": 13.015000000037253
+  },
+  {
+   "name": "detach_",
+   "count": 20,
+   "us_total": 49.0,
+   "us_per_step": 2.45,
+   "cpu_us_per_step": 0.8199999998731073
+  },
+  {
+   "name": "Optimizer.zero_grad#AdamW.zero_grad",
+   "count": 20,
+   "us_total": 45.0,
+   "us_per_step": 2.25,
+   "cpu_us_per_step": 617.6650000001216
+  },
+  {
+   "name": "aten::lift_fresh",
+   "count": 20,
+   "us_total": 40.0,
+   "us_per_step": 2.0,
+   "cpu_us_per_step": 0.18500000011408702
+  }
+ ]
+}

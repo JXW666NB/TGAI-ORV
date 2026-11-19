@@ -47,6 +47,12 @@ RT = T._cuda()
 SKIP = int(os.environ.get("PROF_SKIP", "3"))
 OUT = os.environ.get("PROF_OUT", r"D:\orv_bench\prof_kernels.json")
 TAG = os.environ.get("PROF_TAG", "")
+# PROF_LEAVES=0：只打四段（forward/backward/clip/optimizer）的 event，**不**逐 leaf 打点。
+#   为什么要这个模式：逐 leaf 打点每步要给 6700+ 个 leaf 各记 2 个 event，探针自身的
+#   CPU 开销（~10-20 µs/leaf）会把 step 墙钟抬高 ~80 ms，且这些 CPU 停顿会落进
+#   「段内空档」，让 phase 的 inclusive 时间被高估。四段模式每步只有 8 个 event，
+#   测出的 phase 时间是**干净的 inclusive 时间**（含真实停顿，不含探针开销）。
+LEAVES = os.environ.get("PROF_LEAVES", "1") not in ("0", "", "false", "False")
 
 _C_INT = ctypes.c_int
 _U64 = ctypes.c_uint64
@@ -210,7 +216,7 @@ _orig_launch = RT.launch
 
 
 def _launch(name, grid, block, args, shared=0, module=None):
-    if not _rec[0]:
+    if not _rec[0] or not LEAVES:
         return _orig_launch(name, grid, block, args, shared, module)
     t0 = time.perf_counter()
     ints = []
@@ -436,7 +442,8 @@ def _forward_loss(*a, **kw):
     if not _rec[0]:
         _rec[0] = True
         _init_fast()
-        _install_leaf_wrappers()
+        if LEAVES:
+            _install_leaf_wrappers()
     _pool_delta("other")
     _pool_delta(None)
     e0 = _mark()

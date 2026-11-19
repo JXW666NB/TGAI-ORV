@@ -4169,8 +4169,17 @@ class CudaRuntime:
                     total = None
         if not total or total <= 0:
             return
-        cap = int(total * 0.6)
-        self._pool_cap = max(8 << 30, min(cap, 20 << 30))
+        # ★ 2026-11-19 深夜（子代理实测后修正）：原来是 0.6×总量，在 32 GiB 卡上给 19.1 GiB，
+        #   而**峰值 live 就有 23.7 GiB** ⇒ cap 低于 live，池每步都 trim 再重申请
+        #   （实测 1225 次 alloc + 1333 次 free + 138 次 trim/步，GPU 空转 130 ms）。
+        #   实测 A/B（seq2048，预热+3 次中位数）：
+        #       19.1 GiB → 0.489 s   24 → 0.400 s   26 → 0.398 s   28 → 0.398 s（饱和）
+        #   所以正确规则是"**用满剩余显存**"：cap = 总量 − 预留。
+        #   预留取 max(4 GiB, 15% 总量)：32 GiB 卡 → 27.2 GiB；24 GiB 卡 → 20.4 GiB；
+        #   16 GiB 卡 → 13.6 GiB。留固定余量给驱动/其它进程，避免把缓存变成 OOM 陷阱。
+        reserve = max(4 << 30, int(total * 0.15))
+        cap = total - reserve
+        self._pool_cap = max(8 << 30, min(cap, total - (1 << 30)))
         self._pool_cap_adapted = True            # 成功才置位
         # 便于排查：只在 TG_POOL_DEBUG 下打印，避免污染正常日志
         if os.environ.get("TG_POOL_DEBUG"):
