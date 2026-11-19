@@ -19,6 +19,7 @@
 """
 import numpy as np
 
+
 from . import _Optim, _invalidate_fp16_after_step, _bf16_step_boundary, _cuda, _f32
 
 __all__ = ["SGD", "Lion", "Adafactor", "Accumulator", "scale_grads"]
@@ -61,6 +62,29 @@ def _read_grad(p):
     return np.array(g.data if hasattr(g, "data") else g, dtype=np.float32, copy=True)
 
 
+
+def _warn_host_path(opt_name, params):
+    """在 CUDA 参数上使用"主机路径"优化器时给一次明确告警。
+
+    2026-11-20 实测：`SGD` / `Adafactor` 是 numpy 实现 —— 每个参数都要
+    D2H(梯度) + D2H(参数) + numpy 更新 + H2D(写回)，状态也在主机。
+    9.4M 参数下 `Adafactor` 的 `opt.step` **160.8 ms**（占整步 93%），
+    而同一模型的融合版 `AdamW` 只要 0.34 ms。它不报错，只是慢 470 倍 ——
+    所以必须显式告警，否则用户会在 CUDA 上默默付这个代价。
+
+    （`Lion` 已在 2026-11-20 改为单 kernel 设备端路径；`Muon` 的 NS 始终在设备端。）
+    """
+    try:
+        is_cuda = any(getattr(q, "device", "cpu") == "cuda" for q in params)
+    except TypeError:
+        return
+    if is_cuda:
+        import warnings
+        warnings.warn(
+            "%s 在 CUDA 参数上走**主机路径**（每个参数 D2H/H2D），实测 9.4M 参数下 "
+            "opt.step 慢约两个数量级。修法：CUDA 上改用 AdamW / Int8AdamWGpu / "
+            "Fp16MomAdamW / Lion（都已是单 kernel 设备端）。"
+            % opt_name, RuntimeWarning, stacklevel=3)
 class SGD(_Optim):
     """与 torch.optim.SGD 语义一致（momentum / dampening / nesterov / weight_decay）。"""
 
@@ -82,11 +106,43 @@ class SGD(_Optim):
         # torch 的 SGD 在**第一步直接把 grad 存进 momentum buffer**（不做 dampening），
         # 从第二步起才乘 (1-dampening)。这一点 torch 文档没强调，但实测如此。
         self._started = [False] * len(self.params)
+        # ★ 2026-11-20：CUDA 上走**单 kernel**（`sgd_multi_flat`），动量留在显存。
+        #   原来每参数 D2H(梯度)+D2H(参数)+numpy+H2D(参数)，与 Adafactor 同病。
+        self._rt = None
+        self._dev = bool(self.params) and all(
+            getattr(p, "device", "cpu") == "cuda" for p in self.params)
+        if self._dev:
+            self._rt = _cuda()
+            if self.momentum > 0:
+                self.buf = [self._rt.zeros(tuple(p.shape)) for p in self.params]
 
     @_invalidate_fp16_after_step
     def step(self):
         _bf16_step_boundary()
         lr = float(self.lr)
+        if self._dev:
+            if self.momentum > 0:
+                entries = []
+                for i, p in enumerate(self.params):
+                    g = getattr(p, "grad", None)
+                    if g is None:
+                        continue
+                    entries.append((p._gpu, g._gpu, self.buf[i]))
+                started = [1 if s else 0 for s in self._started]
+            else:
+                entries = []
+                for p in self.params:
+                    g = getattr(p, "grad", None)
+                    if g is None:
+                        continue
+                    entries.append((p._gpu, g._gpu, p._gpu))   # buf 不会被读
+                started = None
+            if entries:
+                self._rt.sgd_multi(entries, lr, self.wd, self.momentum,
+                                   self.dampening, self.nesterov, started)
+                if self.momentum > 0:
+                    self._started = [True] * len(self.params)
+            return
         for i, p in enumerate(self.params):
             g = _read_grad(p)
             if g is None:
@@ -252,6 +308,7 @@ class Adafactor(_Optim):
     def __init__(self, params, lr=1e-2, eps1=1e-30, eps2=1e-3, clip_threshold=1.0,
                  decay_rate=-0.8, beta1=None, weight_decay=0.0, scale_parameter=False):
         super().__init__(params, lr)
+        _warn_host_path("Adafactor", self.params)
         if lr is None:
             raise ValueError("Adafactor 需要显式 lr（本实现不内置 transformers 的相对步长调度）。"
                              "修法：传 lr，例如 Adafactor(params, lr=1e-3)")

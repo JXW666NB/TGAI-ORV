@@ -2294,6 +2294,47 @@ extern "C" __global__ void lion_multi_flat(
 }
 
 
+/* SGD 单 kernel 更新（2026-11-20）。与 `lion_multi_flat` 同一套定位方式。
+
+   背景：`opt_extra.SGD` 原来是 numpy 实现（每参数 D2H/H2D），与 `Adafactor` 同病。
+   语义严格对齐 torch.optim.SGD 与 `opt_extra.SGD` 的 numpy 版：
+     * `wd` 是**耦合** L2（`g += wd*p`），不是 AdamW 那种解耦衰减
+     * momentum>0 时**首步 buf = g**（不做 dampening），从第二步起
+       `buf = momentum*buf + (1-dampening)*g`（torch 文档没强调，但实测如此）
+     * nesterov: `g = g + momentum*buf`；否则 `g = buf`
+   `started` 是**每个张量**的"是否已开始"标志，由**主机**维护后传入 ——
+   不能在内核里边读边写，否则同一批线程会看到彼此刚写的值（竞态）。 */
+extern "C" __global__ void sgd_multi_flat(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* bs, const int* sizes, const long long* eoffs,
+    const int* started, int n_tensors, float lr, float wd, float mom,
+    float damp, int nesterov, int has_mom, float grad_scale) {
+    long long gid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+    int lo = 0, hi = n_tensors - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (gid < eoffs[mid + 1]) hi = mid; else lo = mid + 1;
+    }
+    long long i = gid - eoffs[lo];
+    long long n = (long long)sizes[lo];
+    if (i < 0 || i >= n) return;
+    float* p = (float*)ps[lo];
+    const float* g = (const float*)gs[lo];
+    float gi = g[i] * grad_scale;
+    if (wd != 0.f) gi += wd * p[i];
+    if (has_mom) {
+        float* b = (float*)bs[lo];
+        if (started[lo] == 0) {
+            b[i] = gi;
+        } else {
+            b[i] = mom * b[i] + (1.f - damp) * gi;
+        }
+        gi = nesterov ? (gi + mom * b[i]) : b[i];
+    }
+    p[i] = p[i] - lr * gi;
+}
+
+
 extern "C" __global__ void adamw_multi_int8(
     const unsigned long long* ps, const unsigned long long* gs,
     const unsigned long long* mqs, const unsigned long long* vqs,
@@ -8257,6 +8298,62 @@ class CudaRuntime:
             (float(eps), ctypes.c_float),
             (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
             (1 if do_wd else 0, ctypes.c_int),
+        ])
+
+    def sgd_multi(self, entries, lr, wd=0.0, momentum=0.0, dampening=0.0,
+                  nesterov=False, started=None, block=256, grad_scale=1.0):
+        """SGD：**一次发射**更新全部参数，动量留在显存。
+
+        `entries` 每项 `(p, g, buf)`；无动量时 `buf` 传任意同长度缓冲（不会被读）。
+        `started`：与 entries 等长的 0/1 列表，表示"该参数是否已开始动量"
+        （torch 的 SGD 首步直接把 grad 存进 buf，不做 dampening）。
+        由主机维护 —— 内核里不能边读边写同一个标志（竞态）。
+        """
+        if not entries:
+            return
+        block = int(block)
+        mom = float(momentum)
+        has_mom = 1 if mom > 0.0 else 0
+        for ent in entries:
+            for buf in ent:
+                self._split_forget_ptr(buf)
+        key = (tuple(id(x) for ent in entries for x in ent), block, has_mom)
+        tb = getattr(self, "_sgd_table", None)
+        if tb is None or tb[0] != key:
+            def _ptrs(idx):
+                return self.h2d(np.array([int(ent[idx].ptr) for ent in entries],
+                                         np.uint64), dtype=np.uint64)
+
+            ps, gs, bs = _ptrs(0), _ptrs(1), _ptrs(2)
+            sizes = [int(ent[0].n) for ent in entries]
+            for i, n in enumerate(sizes):
+                if int(entries[i][1].n) != n:
+                    raise CudaError(
+                        "SGD 第 %d 项 梯度长度 ≠ 参数长度（%d vs %d）" % (i, entries[i][1].n, n)
+                        + "。修法：检查该参数的梯度是否被裁剪/重置成了别的形状")
+            szs = self.h2d(np.array(sizes, np.int32), dtype=np.int32)
+            eoff = [0]
+            for n in sizes:
+                eoff.append(eoff[-1] + n)
+            eos = self.h2d(np.array(eoff, np.int64), dtype=np.int64)
+            tb = (key, ps, gs, bs, szs, eos, len(sizes), int(eoff[-1]))
+            self._sgd_table = tb
+        _, ps, gs, bs, szs, eos, n_par, total = tb
+        if started is None:
+            started = [0] * n_par
+        sta = self.h2d(np.array(started, np.int32), dtype=np.int32)
+        grid = ((total + block - 1) // block, 1, 1)
+        self.launch("sgd_multi_flat", grid, (block, 1, 1), [
+            (int(ps.ptr), ctypes.c_void_p), (int(gs.ptr), ctypes.c_void_p),
+            (int(bs.ptr), ctypes.c_void_p),
+            (int(szs.ptr), ctypes.c_void_p), (int(eos.ptr), ctypes.c_void_p),
+            (int(sta.ptr), ctypes.c_void_p),
+            (int(n_par), ctypes.c_int),
+            (float(lr), ctypes.c_float), (float(wd), ctypes.c_float),
+            (float(mom), ctypes.c_float), (float(dampening), ctypes.c_float),
+            (1 if nesterov else 0, ctypes.c_int),
+            (int(has_mom), ctypes.c_int),
+            (float(grad_scale), ctypes.c_float),
         ])
 
     def lion_multi(self, entries, b1, omb1, b2, omb2, lr, wd, grad_scale=1.0,
