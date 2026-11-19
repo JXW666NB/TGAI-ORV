@@ -2211,7 +2211,8 @@ extern "C" __global__ void adamw_multi_int8(
     const unsigned long long* mss, const unsigned long long* vss,
     const int* sizes, int n_tensors, int block,
     float b1, float omb1, float b2, float omb2,
-    float lr, float wd_lr, float eps, float bc1, float bc2) {
+    float lr, float wd_lr, float eps, float bc1, float bc2,
+    float grad_scale) {
   int gw = ((int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x) >> 5;
   int lane = (int)threadIdx.x & 31;
   int per = block / 32;                     /* 每线程负责几个元素 */
@@ -2248,7 +2249,10 @@ extern "C" __global__ void adamw_multi_int8(
     float m = 0.f;
     float v = 0.f;
     if (i < n) {
-      float gi = g[i];
+      /* ★ 梯度裁剪的缩放**融合在这里**（grad_scale 由调用方给 1.0 时逐位不变）。
+         物理上先 scale 再读 g[i] 与本式**同为一次 mul.rn**，故逐位等价；
+         省掉裁剪那一趟 读+写 6.8 GB。 */
+      float gi = g[i] * grad_scale;
       m = (float)mq[i] * sm;
       v = (float)vq[i] * sv;
       m = b1 * m + omb1 * gi;
@@ -2302,7 +2306,8 @@ extern "C" __global__ void adamw_multi_m8v16(
     const unsigned long long* vbs,
     const int* sizes, const int* boffs, int n_tensors, int block,
     float b1, float omb1, float b2, float omb2,
-    float lr, float wd_lr, float eps, float bc1, float bc2) {
+    float lr, float wd_lr, float eps, float bc1, float bc2,
+    float grad_scale) {
   int gw = ((int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x) >> 5;
   int lane = (int)threadIdx.x & 31;
   int per = block / 32;
@@ -2335,7 +2340,10 @@ extern "C" __global__ void adamw_multi_m8v16(
     long i = i0 + lane + k * 32;
     float m = 0.f;
     if (i < n) {
-      float gi = g[i];
+      /* ★ 与 `adamw_multi_int8` 同一处融合：读入即乘 grad_scale。
+         `gi` 的全部下游用途（omb1*gi、omb2*gi*gi）自动继承缩放后的值，
+         内核里没有第二处 `g[...]` 读取。 */
+      float gi = g[i] * grad_scale;
       m = (float)mq[i] * sm;
       float v = __uint_as_float((unsigned int)vb[i] << 16);
       m = b1 * m + omb1 * gi;
@@ -8071,13 +8079,16 @@ class CudaRuntime:
         ])
 
     def adamw_multi_int8(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps,
-                         bc1, bc2, block=64):
+                         bc1, bc2, block=64, grad_scale=1.0):
         """一次发射更新全部参数，动量是 **int8 + 每 block 一个 fp32 scale**。
 
         `entries` 里每项是 `(p, g, mq, vq, ms, vs)`；`mq/vq` 是 int8 缓冲，
         `ms/vs` 是每 block 一个 fp32 的 scale（块数 = ceil(n/block)）。
         显存占用 = 2 字节/参数 + 8/block 字节，BLOCK=64 时 **2.125 B/参数**
         （fp32 是 8 B、bf16 是 4 B）。
+
+        `grad_scale`：读梯度时乘的系数（梯度裁剪的缩放融合进来）。默认 1.0
+        ⇒ 与旧行为**逐位相同**（乘 1.0 是精确恒等）；`g` 本身不再被原地缩放。
 
         为什么要有这个：`int8_adamw.py` 是**主机侧 numpy** 实现，
         1.5B 上每步要把约 12 GiB 搬过 PCIe，实际不可用。
@@ -8135,14 +8146,18 @@ class CudaRuntime:
             (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
             (float(eps), ctypes.c_float),
             (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+            (float(grad_scale), ctypes.c_float),
         ])
 
     def adamw_multi_m8v16(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps,
-                          bc1, bc2, block=64):
+                          bc1, bc2, block=64, grad_scale=1.0):
         """一次发射更新全部参数：`m` 是 int8 分块、`v` 是 bf16。
 
         `entries` 每项 `(p, g, mq, ms, vb)`：`mq` int8、`ms` 每 block 一个 fp32、`vb` uint16(bf16)。
         ≈3.06 字节/参数。为什么不全 int8 见内核注释（v 会下溢 ⇒ 实测发散）。
+
+        `grad_scale`：读梯度时乘的系数（梯度裁剪的缩放融合进来）。默认 1.0
+        ⇒ 与旧行为**逐位相同**（乘 1.0 是精确恒等）；`g` 本身不再被原地缩放。
         """
         if not entries:
             return
@@ -8199,6 +8214,7 @@ class CudaRuntime:
             (float(lr), ctypes.c_float), (float(wd_lr), ctypes.c_float),
             (float(eps), ctypes.c_float),
             (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
+            (float(grad_scale), ctypes.c_float),
         ])
 
     def adamw(self, p, g, m, v, b1, omb1, b2, omb2, lr, wd_lr, eps, bc1, bc2, do_wd):

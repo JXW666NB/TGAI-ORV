@@ -77,12 +77,18 @@ class Int8AdamWGpu(object):
         for p in self.params:
             p.grad = None
 
-    def step(self):
-        """一步更新：一次内核发射覆盖所有带梯度的参数。"""
+    def step(self, grad_scale=1.0):
+        """一步更新：一次内核发射覆盖所有带梯度的参数。
+
+        `grad_scale`：梯度裁剪的缩放系数，**由内核在读梯度时乘上去**（默认 1.0，
+        与旧行为逐位相同）。这样调用方不必先对 6.8 GB 梯度做一趟原地缩放；
+        物理缩放与内核内乘同一个数**同为一次 IEEE 乘**，结果逐位等价。
+        """
         self.t += 1
         rt = _rt()
         bc1 = 1.0 - self.b1 ** self.t
         bc2 = 1.0 - self.b2 ** self.t
+        gs = float(grad_scale)
         ents = []
         for i, p in enumerate(self.params):
             if p.grad is None or not getattr(p, "requires_grad", True):
@@ -101,11 +107,11 @@ class Int8AdamWGpu(object):
             rt.adamw_multi_m8v16(ents, self.b1, 1.0 - self.b1,
                                  self.b2, 1.0 - self.b2, self.lr,
                                  self.lr * self.wd, self.eps, bc1, bc2,
-                                 self.block)
+                                 self.block, grad_scale=gs)
         else:
             rt.adamw_multi_int8(ents, self.b1, 1.0 - self.b1, self.b2,
                                 1.0 - self.b2, self.lr, self.lr * self.wd,
-                                self.eps, bc1, bc2, self.block)
+                                self.eps, bc1, bc2, self.block, grad_scale=gs)
         # 参数变了 ⇒ fp16 权重影子作废（同 Fp16MomAdamW 的处理）
         try:
             rt.f16_cache_clear()

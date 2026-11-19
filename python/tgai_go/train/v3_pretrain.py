@@ -1172,6 +1172,10 @@ def main(argv=None):
     else:
         raise SystemExit("未知的 --opt=%r。修法：用 adamw / fp16mom / adafactor / int8"
                          % (a.opt,))
+    # ★ 梯度裁剪的缩放**融合进优化器内核**（只有 int8gpu 的 Int8AdamWGpu 支持）：
+    #   defer 模式不物理缩放 6.8 GB 梯度，只返回 (norm, scale)，由内核读梯度时乘。
+    #   其它优化器一律保持旧的物理缩放路径（拿到的仍是 float，行为不变）。
+    _defer_clip = (a.opt == "int8gpu")
     # checkpoint 的优化器状态目前只实现了 AdamW 的 (t, m/v) 落盘。
     # 别的优化器不是"存不下"，而是存了也不能正确续训 —— 必须明确拒绝，不能静默错。
     if a.opt not in ("adamw", "fp16mom") and (a.ckpt_every > 0 or a.resume):
@@ -1320,12 +1324,25 @@ def main(argv=None):
                           % (_dt_r, _nred, _bytes / float(1 << 30),
                              (_bytes / float(1 << 30)) / _dt_r if _dt_r > 0 else 0.0),
                           flush=True)
-            gnorm = float(T.clip_grad_norm_(params, float(a.grad_clip))) \
-                if float(a.grad_clip) > 0 else 0.0
+            gscale = 1.0
+            if float(a.grad_clip) > 0:
+                if _defer_clip:
+                    # 不物理缩放；scale 交给 opt.step 在内核里乘（省一趟 读+写）。
+                    gnorm, gscale = T.clip_grad_norm_(
+                        params, float(a.grad_clip), defer_scale=True)
+                    gnorm = float(gnorm)
+                    gscale = float(gscale)
+                else:
+                    gnorm = float(T.clip_grad_norm_(params, float(a.grad_clip)))
+            else:
+                gnorm = 0.0
             if not _is_finite(gnorm):
                 aborted = ("grad_norm", gnorm, step, ids, labels, seg)
                 break
-            opt.step()
+            if _defer_clip:
+                opt.step(grad_scale=gscale)
+            else:
+                opt.step()
             # ★ 权重已更新 ⇒ 必须让 fp16 权重影子失效，否则下一步会用上一步的 fp16 权重。
             #   `cuda.py` 写明"缓存失效责任在调用方"；只 amp_on 不失效是静默错误。
             if _AMP["gemm"]:

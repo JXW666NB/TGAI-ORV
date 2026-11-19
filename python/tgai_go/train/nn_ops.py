@@ -179,8 +179,15 @@ def where(cond, a, b):
     return a * m + b * (_ones_like(m) - m)
 
 
-def clip_grad_norm_(params, max_norm):
+def clip_grad_norm_(params, max_norm, defer_scale=False):
     """梯度 L2 范数裁剪（与 torch.nn.utils.clip_grad_norm_ 一致），返回裁剪前总范数。
+
+    `defer_scale=True`（**可选的新契约**）：当所有梯度都在 CUDA 上时**不做物理缩放**，
+    返回 `(norm, scale)` —— 由优化器内核在读梯度时乘 `scale`。目的：省掉裁剪那一趟
+    对 6.8 GB 梯度的 读+写。`defer_scale=False`（默认）保持旧行为：物理缩放、返回 float，
+    老调用方不受影响。
+    注意：一旦无法 defer（有 CPU 梯度 / 没有可用的设备端路径），本函数仍会**物理缩放**，
+    此时返回 `(norm, 1.0)`，调用方按 1.0 传给优化器才不会重复缩放。
 
     性能要点（踩过）：最初对每个参数都 `g.to_numpy()` 求范数 —— CUDA 上等于
     **291 次 D2H + 全同步**，实测把 0.3 s/step 拖到 **7.8 s/step（25×）**。
@@ -216,7 +223,8 @@ def clip_grad_norm_(params, max_norm):
                 continue
             gpu = getattr(g, "_gpu", None)
             if gpu is None:
-                return _clip_grad_norm_host(params, max_norm)
+                n = _clip_grad_norm_host(params, max_norm)
+                return (n, 1.0) if defer_scale else n
             bufs.append(gpu)
         if bufs:
             # ★ 2026-11-19 晚 紧急回退（子代理实测发现）：
@@ -248,9 +256,13 @@ def clip_grad_norm_(params, max_norm):
                     total = float(rt.read_scalar(acc))
                     use_dev = True
     if not use_dev:
-        return _clip_grad_norm_host(params, max_norm)
+        n = _clip_grad_norm_host(params, max_norm)
+        return (n, 1.0) if defer_scale else n
 
     norm = float(np.sqrt(max(total, 0.0)))
+    if defer_scale and max_norm is not None and max_norm > 0 and norm > max_norm:
+        # ★ 只算 scale，不做物理缩放：缩放交给优化器内核（读梯度时一次乘）。
+        return norm, float(max_norm / (norm + 1e-6))
     if max_norm is not None and max_norm > 0 and norm > max_norm:
         scale = max_norm / (norm + 1e-6)
         # ★ 同一次改动：裁剪时的 n 次 `scale_inplace` 合成一次 `scale_multi`
@@ -281,7 +293,7 @@ def clip_grad_norm_(params, max_norm):
                     rt.scale_inplace(gpu, float(scale))
         for p, g in cpu_ps:
             p.grad = g * scale
-    return norm
+    return (norm, 1.0) if defer_scale else norm
 
 
 def _clip_grad_norm_host(params, max_norm):
