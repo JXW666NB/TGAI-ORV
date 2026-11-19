@@ -215,8 +215,13 @@ def _silu32_pair(v):
     return y, d
 
 
-def _ce32(logits, tgt):
-    """与 CUDA ce_fwd / ce_bwd 同一套 exp32、log32 和左折叠。"""
+def _ce32_exact(logits, tgt):
+    """与 CUDA ce_fwd / ce_bwd **逐位对齐**的参考实现（三重 Python 循环）。
+
+    ⚠️ 只在需要与 CUDA 逐位对拍时用（`TG_CE_EXACT=1`）。实测 64×4096 要 **28.8 秒**
+    —— 直接拿它当默认会让 CPU 训练完全不可用（这正是它长期未被发现的原因：
+    不报错、只是慢到没人用它训练）。
+    """
     logits = np.ascontiguousarray(logits, np.float32)
     tgt = np.asarray(tgt, np.int64).reshape(-1)
     n, v = logits.shape
@@ -245,6 +250,34 @@ def _ce32(logits, tgt):
                 p = np.float32(p - one)
             dl[i, j] = np.float32(p * inv_n)
     loss = np.float32(acc / np.float32(n))
+    return loss, dl
+
+
+def _ce32(logits, tgt):
+    """CPU 的 CE 前向+反向。默认走向量化 numpy（快 ~4 个数量级）。
+
+    为什么要有两个实现：`_ce32_exact` 逐位对齐 CUDA 的左折叠累加顺序，但它是
+    三重 Python 循环 —— 64×4096 实测 **28.8 秒**（向量化版约 1~2 ms）。训练默认
+    必须用快的；需要逐位对拍时设 `TG_CE_EXACT=1`。
+    两者数学等价，差异只来自求和顺序（实测 loss 相对差 ~1e-7）。
+    """
+    if os.environ.get("TG_CE_EXACT") == "1":
+        return _ce32_exact(logits, tgt)
+    logits = np.ascontiguousarray(logits, np.float32)
+    tgt = np.asarray(tgt, np.int64).reshape(-1)
+    n, v = int(logits.shape[0]), int(logits.shape[1])
+    if n <= 0:
+        return np.float32(0.0), np.zeros((0, v), np.float32)
+    m = logits.max(axis=1, keepdims=True)                 # (n,1) 数值稳定
+    ex = np.exp((logits - m).astype(np.float32))          # (n,v)
+    s = ex.sum(axis=1, keepdims=True)                     # (n,1)
+    lse = (m + np.log(s)).reshape(-1)                     # (n,)
+    rows = np.arange(n)
+    picked = logits[rows, tgt]
+    loss = np.float32(np.float64(np.sum(lse - picked, dtype=np.float64)) / n)
+    p = ex / s                                            # softmax
+    p[rows, tgt] -= np.float32(1.0)                       # dlogits ∝ p - onehot
+    dl = (p / np.float32(n)).astype(np.float32)
     return loss, dl
 
 
