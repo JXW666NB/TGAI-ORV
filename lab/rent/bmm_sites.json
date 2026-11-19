@@ -1,0 +1,1006 @@
+{
+ "steps": [
+  2,
+  3
+ ],
+ "per_step": {
+  "2": {
+   "matmul_general | mmgen lead=1 M=2048 N=256 K=1024": 9,
+   "matmul_general | mmgen lead=1 M=2048 N=1024 K=1024": 60,
+   "matmul_general | mmgen lead=1 M=512 N=1024 K=256": 18,
+   "matmul_general | mmgen lead=1x16 M=2048 N=64 K=64": 36,
+   "matmul_general | mmgen lead=1x16 M=512 N=64 K=64": 18,
+   "matmul_general | mmgen lead=1x16 M=2048 N=512 K=64": 9,
+   "matmul_general | mmgen lead=1x16 M=2048 N=64 K=512": 9,
+   "matmul_general | mmgen lead=1x16 M=32 N=64 K=64": 18,
+   "matmul_general | mmgen lead=1x16 M=2048 N=32 K=64": 9,
+   "matmul_general | mmgen lead=1x16 M=2048 N=64 K=32": 9,
+   "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=2048 K=64": 3,
+   "bmm | bmm b=16 M=2048 N=64 K=2048": 6,
+   "sgemm_tn_strided_batched | ssbTN b=1 M=1024 N=1024 K=2048": 30,
+   "bmm | bmm b=16 M=2048 N=2048 K=64": 3,
+   "sgemm_strided_batched | ssb b=16 M=2048 N=64 K=2048": 3,
+   "sgemm_tn_strided_batched | ssbTN b=16 M=2048 N=64 K=2048": 3,
+   "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=512 K=64": 9,
+   "sgemm_tn_strided_batched | ssbTN b=16 M=512 N=64 K=2048": 9,
+   "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=64 K=512": 9,
+   "sgemm_tn_strided_batched | ssbTN b=16 M=64 N=512 K=2048": 9,
+   "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=32 K=64": 9,
+   "sgemm_tn_strided_batched | ssbTN b=16 M=32 N=64 K=2048": 9,
+   "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=64 K=32": 9,
+   "sgemm_tn_strided_batched | ssbTN b=16 M=64 N=32 K=2048": 9,
+   "matmul_general | mmgen lead=1 M=512 N=256 K=1024": 18,
+   "sgemm_tn_strided_batched | ssbTN b=1 M=256 N=1024 K=512": 18,
+   "matmul_general | mmgen lead=1 M=2048 N=1024 K=256": 9,
+   "sgemm_tn_strided_batched | ssbTN b=1 M=1024 N=256 K=2048": 9
+  },
+  "3": {
+   "matmul_general | mmgen lead=1 M=2048 N=256 K=1024": 9,
+   "matmul_general | mmgen lead=1 M=2048 N=1024 K=1024": 60,
+   "matmul_general | mmgen lead=1 M=512 N=1024 K=256": 18,
+   "matmul_general | mmgen lead=1x16 M=2048 N=64 K=64": 36,
+   "matmul_general | mmgen lead=1x16 M=512 N=64 K=64": 18,
+   "matmul_general | mmgen lead=1x16 M=2048 N=512 K=64": 9,
+   "matmul_general | mmgen lead=1x16 M=2048 N=64 K=512": 9,
+   "matmul_general | mmgen lead=1x16 M=32 N=64 K=64": 18,
+   "matmul_general | mmgen lead=1x16 M=2048 N=32 K=64": 9,
+   "matmul_general | mmgen lead=1x16 M=2048 N=64 K=32": 9,
+   "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=2048 K=64": 3,
+   "bmm | bmm b=16 M=2048 N=64 K=2048": 6,
+   "sgemm_tn_strided_batched | ssbTN b=1 M=1024 N=1024 K=2048": 30,
+   "bmm | bmm b=16 M=2048 N=2048 K=64": 3,
+   "sgemm_strided_batched | ssb b=16 M=2048 N=64 K=2048": 3,
+   "sgemm_tn_strided_batched | ssbTN b=16 M=2048 N=64 K=2048": 3,
+   "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=512 K=64": 9,
+   "sgemm_tn_strided_batched | ssbTN b=16 M=512 N=64 K=2048": 9,
+   "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=64 K=512": 9,
+   "sgemm_tn_strided_batched | ssbTN b=16 M=64 N=512 K=2048": 9,
+   "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=32 K=64": 9,
+   "sgemm_tn_strided_batched | ssbTN b=16 M=32 N=64 K=2048": 9,
+   "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=64 K=32": 9,
+   "sgemm_tn_strided_batched | ssbTN b=16 M=64 N=32 K=2048": 9,
+   "matmul_general | mmgen lead=1 M=512 N=256 K=1024": 18,
+   "sgemm_tn_strided_batched | ssbTN b=1 M=256 N=1024 K=512": 18,
+   "matmul_general | mmgen lead=1 M=2048 N=1024 K=256": 9,
+   "sgemm_tn_strided_batched | ssbTN b=1 M=1024 N=256 K=2048": 9
+  }
+ },
+ "rows": [
+  {
+   "entry": "matmul_general",
+   "geom": "mmgen lead=1 M=2048 N=1024 K=1024",
+   "calls_total": 180,
+   "flops_total": 773094113280,
+   "stack": [
+    "v3_pretrain.py:781:_layer",
+    "v3_csa.py:940:csa_forward",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ]
+  },
+  {
+   "entry": "sgemm_tn_strided_batched",
+   "geom": "ssbTN b=1 M=1024 N=1024 K=2048",
+   "calls_total": 90,
+   "flops_total": 386547056640,
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1272:bw",
+    "__init__.py:1254:_tn"
+   ]
+  },
+  {
+   "entry": "bmm",
+   "geom": "bmm b=16 M=2048 N=64 K=2048",
+   "calls_total": 18,
+   "flops_total": 154618822656,
+   "stack": [
+    "v3_ops.py:417:attention_orv",
+    "__init__.py:3081:scaled_dot_product_attention",
+    "__init__.py:3106:_sdpa_impl",
+    "__init__.py:3488:_sdpa_materialized",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1010:_matmul_cuda"
+   ]
+  },
+  {
+   "entry": "sgemm_nt_strided_batched",
+   "geom": "ssbNT b=16 M=2048 N=2048 K=64",
+   "calls_total": 9,
+   "flops_total": 77309411328,
+   "stack": [
+    "v3_ops.py:417:attention_orv",
+    "__init__.py:3081:scaled_dot_product_attention",
+    "__init__.py:3106:_sdpa_impl",
+    "__init__.py:3463:_sdpa_materialized",
+    "__init__.py:3389:_attn_scores",
+    "probe_bmm_sites.py:182:_nt"
+   ]
+  },
+  {
+   "entry": "bmm",
+   "geom": "bmm b=16 M=2048 N=2048 K=64",
+   "calls_total": 9,
+   "flops_total": 77309411328,
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1017:bw"
+   ]
+  },
+  {
+   "entry": "sgemm_strided_batched",
+   "geom": "ssb b=16 M=2048 N=64 K=2048",
+   "calls_total": 9,
+   "flops_total": 77309411328,
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:3396:bw",
+    "probe_bmm_sites.py:190:_ssb"
+   ]
+  },
+  {
+   "entry": "sgemm_tn_strided_batched",
+   "geom": "ssbTN b=16 M=2048 N=64 K=2048",
+   "calls_total": 9,
+   "flops_total": 77309411328,
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:3397:bw"
+   ]
+  },
+  {
+   "entry": "matmul_general",
+   "geom": "mmgen lead=1x16 M=2048 N=512 K=64",
+   "calls_total": 27,
+   "flops_total": 57982058496,
+   "stack": [
+    "v3_csa.py:815:_attn_chunked",
+    "v3_csa.py:890:_attn",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ]
+  },
+  {
+   "entry": "matmul_general",
+   "geom": "mmgen lead=1x16 M=2048 N=64 K=512",
+   "calls_total": 27,
+   "flops_total": 57982058496,
+   "stack": [
+    "v3_csa.py:815:_attn_chunked",
+    "v3_csa.py:893:_attn",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ]
+  },
+  {
+   "entry": "sgemm_nt_strided_batched",
+   "geom": "ssbNT b=16 M=2048 N=512 K=64",
+   "calls_total": 27,
+   "flops_total": 57982058496,
+   "stack": [
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1265:bw",
+    "__init__.py:1234:_nt",
+    "probe_bmm_sites.py:182:_nt"
+   ]
+  },
+  {
+   "entry": "sgemm_tn_strided_batched",
+   "geom": "ssbTN b=16 M=512 N=64 K=2048",
+   "calls_total": 27,
+   "flops_total": 57982058496,
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1272:bw",
+    "__init__.py:1254:_tn"
+   ]
+  },
+  {
+   "entry": "sgemm_nt_strided_batched",
+   "geom": "ssbNT b=16 M=2048 N=64 K=512",
+   "calls_total": 27,
+   "flops_total": 57982058496,
+   "stack": [
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1265:bw",
+    "__init__.py:1234:_nt",
+    "probe_bmm_sites.py:182:_nt"
+   ]
+  },
+  {
+   "entry": "sgemm_tn_strided_batched",
+   "geom": "ssbTN b=16 M=64 N=512 K=2048",
+   "calls_total": 27,
+   "flops_total": 57982058496,
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1272:bw",
+    "__init__.py:1254:_tn"
+   ]
+  },
+  {
+   "entry": "matmul_general",
+   "geom": "mmgen lead=1 M=2048 N=256 K=1024",
+   "calls_total": 27,
+   "flops_total": 28991029248,
+   "stack": [
+    "v3_pretrain.py:781:_layer",
+    "v3_csa.py:921:csa_forward",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ]
+  },
+  {
+   "entry": "matmul_general",
+   "geom": "mmgen lead=1x16 M=2048 N=64 K=64",
+   "calls_total": 108,
+   "flops_total": 28991029248,
+   "stack": [
+    "v3_csa.py:949:csa_forward",
+    "v3_csa.py:232:_rope",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ]
+  },
+  {
+   "entry": "matmul_general",
+   "geom": "mmgen lead=1 M=2048 N=1024 K=256",
+   "calls_total": 27,
+   "flops_total": 28991029248,
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1267:bw",
+    "probe_bmm_sites.py:205:_mm"
+   ]
+  },
+  {
+   "entry": "sgemm_tn_strided_batched",
+   "geom": "ssbTN b=1 M=1024 N=256 K=2048",
+   "calls_total": 27,
+   "flops_total": 28991029248,
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1272:bw",
+    "__init__.py:1254:_tn"
+   ]
+  },
+  {
+   "entry": "matmul_general",
+   "geom": "mmgen lead=1 M=512 N=1024 K=256",
+   "calls_total": 54,
+   "flops_total": 14495514624,
+   "stack": [
+    "v3_pretrain.py:781:_layer",
+    "v3_csa.py:941:csa_forward",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ]
+  },
+  {
+   "entry": "matmul_general",
+   "geom": "mmgen lead=1 M=512 N=256 K=1024",
+   "calls_total": 54,
+   "flops_total": 14495514624,
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1267:bw",
+    "probe_bmm_sites.py:205:_mm"
+   ]
+  },
+  {
+   "entry": "sgemm_tn_strided_batched",
+   "geom": "ssbTN b=1 M=256 N=1024 K=512",
+   "calls_total": 54,
+   "flops_total": 14495514624,
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1272:bw",
+    "__init__.py:1254:_tn"
+   ]
+  },
+  {
+   "entry": "matmul_general",
+   "geom": "mmgen lead=1x16 M=512 N=64 K=64",
+   "calls_total": 54,
+   "flops_total": 3623878656,
+   "stack": [
+    "v3_csa.py:950:csa_forward",
+    "v3_csa.py:232:_rope",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ]
+  },
+  {
+   "entry": "matmul_general",
+   "geom": "mmgen lead=1x16 M=2048 N=32 K=64",
+   "calls_total": 27,
+   "flops_total": 3623878656,
+   "stack": [
+    "v3_csa.py:974:csa_forward",
+    "v3_csa.py:890:_attn",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ]
+  },
+  {
+   "entry": "matmul_general",
+   "geom": "mmgen lead=1x16 M=2048 N=64 K=32",
+   "calls_total": 27,
+   "flops_total": 3623878656,
+   "stack": [
+    "v3_csa.py:974:csa_forward",
+    "v3_csa.py:893:_attn",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ]
+  },
+  {
+   "entry": "sgemm_nt_strided_batched",
+   "geom": "ssbNT b=16 M=2048 N=32 K=64",
+   "calls_total": 27,
+   "flops_total": 3623878656,
+   "stack": [
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1265:bw",
+    "__init__.py:1234:_nt",
+    "probe_bmm_sites.py:182:_nt"
+   ]
+  },
+  {
+   "entry": "sgemm_tn_strided_batched",
+   "geom": "ssbTN b=16 M=32 N=64 K=2048",
+   "calls_total": 27,
+   "flops_total": 3623878656,
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1272:bw",
+    "__init__.py:1254:_tn"
+   ]
+  },
+  {
+   "entry": "sgemm_nt_strided_batched",
+   "geom": "ssbNT b=16 M=2048 N=64 K=32",
+   "calls_total": 27,
+   "flops_total": 3623878656,
+   "stack": [
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1265:bw",
+    "__init__.py:1234:_nt",
+    "probe_bmm_sites.py:182:_nt"
+   ]
+  },
+  {
+   "entry": "sgemm_tn_strided_batched",
+   "geom": "ssbTN b=16 M=64 N=32 K=2048",
+   "calls_total": 27,
+   "flops_total": 3623878656,
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1272:bw",
+    "__init__.py:1254:_tn"
+   ]
+  },
+  {
+   "entry": "matmul_general",
+   "geom": "mmgen lead=1x16 M=32 N=64 K=64",
+   "calls_total": 54,
+   "flops_total": 226492416,
+   "stack": [
+    "v3_csa.py:969:csa_forward",
+    "v3_csa.py:232:_rope",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ]
+  }
+ ],
+ "samples": {
+  "matmul_general | mmgen lead=1 M=2048 N=256 K=1024": {
+   "stack": [
+    "v3_pretrain.py:781:_layer",
+    "v3_csa.py:921:csa_forward",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ],
+   "bufs": [
+    {
+     "n": 2097152,
+     "min": -4.990103721618652,
+     "max": 5.09489631652832,
+     "absmax": 5.09489631652832,
+     "std": 0.998752385353076,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 262144,
+     "min": -0.08525769412517548,
+     "max": 0.09749319404363632,
+     "absmax": 0.09749319404363632,
+     "std": 0.019982337721436393,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "matmul_general | mmgen lead=1 M=2048 N=1024 K=1024": {
+   "stack": [
+    "v3_pretrain.py:781:_layer",
+    "v3_csa.py:940:csa_forward",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ],
+   "bufs": [
+    {
+     "n": 2097152,
+     "min": -4.990103721618652,
+     "max": 5.09489631652832,
+     "absmax": 5.09489631652832,
+     "std": 0.998752385353076,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 1048576,
+     "min": -0.09520348161458969,
+     "max": 0.09807001054286957,
+     "absmax": 0.09807001054286957,
+     "std": 0.0199826670442447,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "matmul_general | mmgen lead=1 M=512 N=1024 K=256": {
+   "stack": [
+    "v3_pretrain.py:781:_layer",
+    "v3_csa.py:941:csa_forward",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ],
+   "bufs": [
+    {
+     "n": 131072,
+     "min": -10.141334533691406,
+     "max": 8.44106388092041,
+     "absmax": 10.141334533691406,
+     "std": 0.9962791469763573,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 262144,
+     "min": -0.09122506529092789,
+     "max": 0.09988199174404144,
+     "absmax": 0.09988199174404144,
+     "std": 0.01992347043932821,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "matmul_general | mmgen lead=1x16 M=2048 N=64 K=64": {
+   "stack": [
+    "v3_csa.py:949:csa_forward",
+    "v3_csa.py:232:_rope",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ],
+   "bufs": [
+    {
+     "n": 2097152,
+     "min": -4.460824489593506,
+     "max": 4.443161487579346,
+     "absmax": 4.460824489593506,
+     "std": 0.9999987193755062,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 4096,
+     "min": -1.0,
+     "max": 1.0,
+     "absmax": 1.0,
+     "std": 0.125,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "matmul_general | mmgen lead=1x16 M=512 N=64 K=64": {
+   "stack": [
+    "v3_csa.py:950:csa_forward",
+    "v3_csa.py:232:_rope",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ],
+   "bufs": [
+    {
+     "n": 524288,
+     "min": -4.582095146179199,
+     "max": 4.65332555770874,
+     "absmax": 4.65332555770874,
+     "std": 0.9999947941483797,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 4096,
+     "min": -1.0,
+     "max": 1.0,
+     "absmax": 1.0,
+     "std": 0.125,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "matmul_general | mmgen lead=1x16 M=2048 N=512 K=64": {
+   "stack": [
+    "v3_csa.py:815:_attn_chunked",
+    "v3_csa.py:890:_attn",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ],
+   "bufs": [
+    {
+     "n": 2097152,
+     "min": -4.445372581481934,
+     "max": 4.405710697174072,
+     "absmax": 4.445372581481934,
+     "std": 0.9999986766894382,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 524288,
+     "min": -4.581975936889648,
+     "max": 4.212669372558594,
+     "absmax": 4.581975936889648,
+     "std": 0.9999915199829474,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "matmul_general | mmgen lead=1x16 M=2048 N=64 K=512": {
+   "stack": [
+    "v3_csa.py:815:_attn_chunked",
+    "v3_csa.py:893:_attn",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ],
+   "bufs": [
+    {
+     "n": 16777216,
+     "min": 0.001953125,
+     "max": 0.001953125,
+     "absmax": 0.001953125,
+     "std": 0.0,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 524288,
+     "min": -1.4440772533416748,
+     "max": 1.464665174484253,
+     "absmax": 1.464665174484253,
+     "std": 0.3185641593374348,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "matmul_general | mmgen lead=1x16 M=32 N=64 K=64": {
+   "stack": [
+    "v3_csa.py:969:csa_forward",
+    "v3_csa.py:232:_rope",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ],
+   "bufs": [
+    {
+     "n": 32768,
+     "min": -3.9325075149536133,
+     "max": 4.123226165771484,
+     "absmax": 4.123226165771484,
+     "std": 0.9999923583791104,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 4096,
+     "min": -1.0,
+     "max": 1.0,
+     "absmax": 1.0,
+     "std": 0.125,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "matmul_general | mmgen lead=1x16 M=2048 N=32 K=64": {
+   "stack": [
+    "v3_csa.py:974:csa_forward",
+    "v3_csa.py:890:_attn",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ],
+   "bufs": [
+    {
+     "n": 2097152,
+     "min": -4.445372581481934,
+     "max": 4.405710697174072,
+     "absmax": 4.445372581481934,
+     "std": 0.9999986766894382,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 32768,
+     "min": -3.977116346359253,
+     "max": 3.9860763549804688,
+     "absmax": 3.9860763549804688,
+     "std": 0.9999692596948471,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "matmul_general | mmgen lead=1x16 M=2048 N=64 K=32": {
+   "stack": [
+    "v3_csa.py:974:csa_forward",
+    "v3_csa.py:893:_attn",
+    "__init__.py:961:__matmul__",
+    "__init__.py:1099:_matmul_cuda",
+    "__init__.py:1204:_matmul_cuda_nd",
+    "probe_bmm_sites.py:205:_mm"
+   ],
+   "bufs": [
+    {
+     "n": 1048576,
+     "min": 0.03125,
+     "max": 0.03125,
+     "absmax": 0.03125,
+     "std": 0.0,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 32768,
+     "min": -1.2263914346694946,
+     "max": 1.2953726053237915,
+     "absmax": 1.2953726053237915,
+     "std": 0.319829644573158,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=2048 K=64": {
+   "stack": [
+    "v3_ops.py:417:attention_orv",
+    "__init__.py:3081:scaled_dot_product_attention",
+    "__init__.py:3106:_sdpa_impl",
+    "__init__.py:3463:_sdpa_materialized",
+    "__init__.py:3389:_attn_scores",
+    "probe_bmm_sites.py:182:_nt"
+   ],
+   "bufs": [
+    {
+     "n": 2097152,
+     "min": -3.1613495349884033,
+     "max": 3.14229154586792,
+     "absmax": 3.1613495349884033,
+     "std": 0.6411854627820069,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 2097152,
+     "min": -3.243767023086548,
+     "max": 3.5315327644348145,
+     "absmax": 3.5315327644348145,
+     "std": 0.639238338507699,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "sgemm_strided_batched | ssb b=16 M=2048 N=64 K=2048": {
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:3396:bw",
+    "probe_bmm_sites.py:190:_ssb"
+   ],
+   "bufs": [
+    {
+     "n": 67108864,
+     "min": -2.649877205840312e-05,
+     "max": 2.4959364964161068e-05,
+     "absmax": 2.649877205840312e-05,
+     "std": 4.498744599847282e-08,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 2097152,
+     "min": -3.1909666061401367,
+     "max": 3.3192405700683594,
+     "absmax": 3.3192405700683594,
+     "std": 0.6393361657052005,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=512 K=64": {
+   "stack": [
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1265:bw",
+    "__init__.py:1234:_nt",
+    "probe_bmm_sites.py:182:_nt"
+   ],
+   "bufs": [
+    {
+     "n": 2097152,
+     "min": 0.0,
+     "max": 0.0,
+     "absmax": 0.0,
+     "std": 0.0,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 524288,
+     "min": -1.6082768440246582,
+     "max": 1.6970449686050415,
+     "absmax": 1.6970449686050415,
+     "std": 0.31908438297359054,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=64 K=512": {
+   "stack": [
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1265:bw",
+    "__init__.py:1234:_nt",
+    "probe_bmm_sites.py:182:_nt"
+   ],
+   "bufs": [
+    {
+     "n": 16777216,
+     "min": 0.0,
+     "max": 0.0,
+     "absmax": 0.0,
+     "std": 0.0,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 524288,
+     "min": -4.439028739929199,
+     "max": 4.370433807373047,
+     "absmax": 4.439028739929199,
+     "std": 0.9999944235708731,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=32 K=64": {
+   "stack": [
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1265:bw",
+    "__init__.py:1234:_nt",
+    "probe_bmm_sites.py:182:_nt"
+   ],
+   "bufs": [
+    {
+     "n": 2097152,
+     "min": 0.0,
+     "max": 0.0,
+     "absmax": 0.0,
+     "std": 0.0,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 32768,
+     "min": -1.3747164011001587,
+     "max": 1.3732151985168457,
+     "absmax": 1.3747164011001587,
+     "std": 0.31962835319986627,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "sgemm_nt_strided_batched | ssbNT b=16 M=2048 N=64 K=32": {
+   "stack": [
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1265:bw",
+    "__init__.py:1234:_nt",
+    "probe_bmm_sites.py:182:_nt"
+   ],
+   "bufs": [
+    {
+     "n": 1048576,
+     "min": 0.0,
+     "max": 0.0,
+     "absmax": 0.0,
+     "std": 0.0,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 32768,
+     "min": -3.5848965644836426,
+     "max": 3.8261585235595703,
+     "absmax": 3.8261585235595703,
+     "std": 0.9999911110026313,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "matmul_general | mmgen lead=1 M=512 N=256 K=1024": {
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1267:bw",
+    "probe_bmm_sites.py:205:_mm"
+   ],
+   "bufs": [
+    {
+     "n": 524288,
+     "min": 0.0,
+     "max": 0.0,
+     "absmax": 0.0,
+     "std": 0.0,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 262144,
+     "min": -0.09752338379621506,
+     "max": 0.08791869878768921,
+     "absmax": 0.09752338379621506,
+     "std": 0.01998916637570618,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  },
+  "matmul_general | mmgen lead=1 M=2048 N=1024 K=256": {
+   "stack": [
+    "probe_bmm_sites.py:255:<module>",
+    "v3_pretrain.py:1307:main",
+    "__init__.py:774:backward",
+    "__init__.py:1346:_backward_cuda",
+    "__init__.py:1267:bw",
+    "probe_bmm_sites.py:205:_mm"
+   ],
+   "bufs": [
+    {
+     "n": 524288,
+     "min": 0.0,
+     "max": 0.0,
+     "absmax": 0.0,
+     "std": 0.0,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    },
+    {
+     "n": 262144,
+     "min": -0.09265521168708801,
+     "max": 0.09486375749111176,
+     "absmax": 0.09486375749111176,
+     "std": 0.019984010958992975,
+     "frac_gt_1e3": 0.0,
+     "frac_gt_1e4": 0.0
+    }
+   ]
+  }
+ },
+ "totals": {
+  "calls_total": 1107,
+  "flops_total": 2156434292736
+ }
+}

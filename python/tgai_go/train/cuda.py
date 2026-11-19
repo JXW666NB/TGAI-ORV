@@ -5666,6 +5666,17 @@ class CudaRuntime:
         #   cuBLAS 的 strided-batched 允许把 stride 传 0 —— 语义就是"所有 batch 复用
         #   同一块矩阵"，正好是广播。这里直接按元素步长调 `_bmm_op`
         #   （与 `sgemm_nt/tn_strided_batched` 同一套步长约定）。
+        # ★ 2026-11-19：**batch==1 的批量路径是纯浪费** —— 它让 `x[1,T,d] @ W` 这种
+        #   前导维为 (1,) 的调用绕过下面 `if not a_lead and not b_lead: return self.sgemm(A,B)`
+        #   的 2-D 分支，于是永远吃不到 AMP 的 fp16 路径（cuBLAS 走 fp32 strided-batched，
+        #   实测 9.9 TFLOPS，而 fp16 分支是 64.9）。
+        #   实测（seq2048 / 12 层 MoE / 端到端 A/B）：**−15.0 ms/步**，显存 +0.00 GiB。
+        #   仅在 fp16 打开时生效 ⇒ `--amp off` 的行为与数值**逐位不变**。
+        #   逃生门：TG_AMP_BMM=0。
+        if (batch == 1 and int(A.n) == M * K and int(B.n) == K * N
+                and self._fp16_state()["on"] and os.environ.get("TG_AMP_BMM") != "0"):
+            C2 = self.sgemm(self.reshape(A, (M, K)), self.reshape(B, (K, N)))
+            return self.reshape(C2, out_lead + (M, N))
         C3 = self.empty((batch, M, N), dtype=np.float32)
         if batch == 0 or M == 0 or N == 0:
             return self.reshape(C3, out_lead + (M, N))
