@@ -213,7 +213,16 @@ def clip_grad_norm_(params, max_norm):
             if gpu is None:
                 return _clip_grad_norm_host(params, max_norm)
             ss = rt.sumsq_parallel(gpu)
-            acc = ss if acc is None else rt.add(acc, ss)
+            # ★ 2026-11-19：原地累加（`add_`），省掉每参数一次临时缓冲分配。
+            #   原来 `rt.add(acc, ss)` 每步新建 320 个缓冲 —— 池健康时开销不大，
+            #   但长序列下池一抖动就会被放大。语义完全一致（都只求和）。
+            if acc is None:
+                acc = ss
+            else:
+                try:
+                    rt.add_(acc, ss)
+                except Exception:                # noqa: BLE001 - 后端无 add_ 时退回旧路径
+                    acc = rt.add(acc, ss)
         if acc is not None:
             total = float(rt.read_scalar(acc))
             use_dev = True
