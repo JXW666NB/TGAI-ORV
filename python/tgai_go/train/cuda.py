@@ -4107,7 +4107,11 @@ class CudaRuntime:
         显式设了 `TG_POOL_GB` 时**不覆盖用户的选择**。
         拿不到设备总量时保持默认值（行为与之前一致，不会更差）。
         """
+        # 只做一次成功：拿到总量并设好 cap 后置位。拿不到（上下文未就绪）就下次再试。
+        if getattr(self, "_pool_cap_adapted", False):
+            return
         if os.environ.get("TG_POOL_GB"):
+            self._pool_cap_adapted = True        # 用户显式指定，不再自动改
             return
         total = None
         for nm in ("_device_total_bytes", "device_total_bytes", "total_device_bytes",
@@ -4123,6 +4127,11 @@ class CudaRuntime:
             return
         cap = int(total * 0.6)
         self._pool_cap = max(8 << 30, min(cap, 20 << 30))
+        self._pool_cap_adapted = True            # 成功才置位
+        # 便于排查：只在 TG_POOL_DEBUG 下打印，避免污染正常日志
+        if os.environ.get("TG_POOL_DEBUG"):
+            print("[pool] 自适应池上限 %.1f GiB（设备总量 %.1f GiB）"
+                  % (self._pool_cap / (1024 ** 3), total / (1024 ** 3)), flush=True)
 
     def _pool_release(self, ptr, token):
         if ptr <= 0:
@@ -4439,7 +4448,11 @@ class CudaRuntime:
                     val = int(total_b.value)
             except Exception:
                 val = 0
-        self._dev_total_bytes = val
+        # ★ 2026-11-19：**不要把 0 缓存下来**。首次调用可能发生在 CUDA 上下文就绪之前，
+        #   cuMemGetInfo 失败返回 0，一旦缓存就永远是 0（V100 上实测到 0.0 就是这么来的），
+        #   按显存自适应的池上限因此变成空操作。失败就下次再问。
+        if val > 0:
+            self._dev_total_bytes = val
         return val
 
     def free_device_bytes(self):
@@ -4543,6 +4556,13 @@ class CudaRuntime:
 
     def _alloc(self, nbytes):
         nbytes = int(nbytes)
+        # ★ 2026-11-19：池上限自适应必须在**上下文就绪之后**做（构造期查不到设备总量）。
+        #   首次分配是最早能保证就绪的点；失败不抛、下次再试。
+        if not getattr(self, "_pool_cap_adapted", False):
+            try:
+                self._adapt_pool_cap()
+            except Exception:                    # noqa: BLE001 - 自适应失败不能影响分配
+                pass
         if nbytes <= 0:
             raise CudaError("cuMemAlloc 拒绝 0 字节" + "。修法：调小 batch/seq，或开梯度检查点（cfg[GRAD_CKPT]=True）；也可设 TG_POOL_GB 限制池上限")
         bucket = self._bucket.get(nbytes)
