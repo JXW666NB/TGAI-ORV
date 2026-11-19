@@ -1,3 +1,104 @@
+## [1.0.7] - 2026-11-20
+
+这一版是**地基修复**：三个"不报错、只是算错或慢到不能用"的问题，加一类优化器的主机路径。
+
+### 正确性（最重要）
+
+**CSA 掩码：9/12 层的注意力其实是死的**（`v3_csa.py:337`）
+`slot_doc` 存的是**窗口内序号**（1 起），而 `_mask_global_seg` / `_mask_local_seg`
+拿它跟**数据里的文档号** `seg` 比较（`cseg == seg`）。两个不同的量一比，只要文档号
+不等于序号（几乎总是如此：bench 数据没有 `seg_id` ⇒ `seg` 全 0），掩码就全部变成
+`NEG_BIG` ⇒ **9 个 CSA 层的注意力输出恒 0、梯度恒 0，但每层 12 次 GEMM 照跑**。
+参考实现 `model_v3.py:908-911` 是 `cseg_ext.scatter_(0, take_ok, seg)` —— 存 seg 的原始值，
+本文件注释也写着"该 chunk 的文档标签"。
+
+* 修复：`slot_doc = seg[...]`（原位一行）
+* 实测：`loss_first` 11.659786 → **11.669556**；`gnorm` 5.429 → **6.898**（+27%，注意力真的在贡献梯度了）
+* **新增 2 个回归测试**，并验证过"回退修复后这两个测试会失败"：
+  `test_chunk_layout_slot_doc_stores_seg_values_not_ordinals`、
+  `test_global_seg_mask_not_dead_for_single_document_window`
+* ⚠️ 影响：此前所有**训练质量**相关的结论（loss、收敛、与 PyTorch 的 loss 对比）作废，需重测；
+  **速度**结论不受影响（那 12 次 GEMM 本来就付了算力，只是结果被掩成 0）
+
+### 新增 `TG_DETERMINISTIC=1`：让训练"逐位可复现"
+
+同一命令跑两次，**step-1 就分叉**（只有 step-0 恒等）。根因是**两处** `atomicAdd`：
+
+| 位置 | 机制 |
+| --- | --- |
+| `cuda.py::emb_gather_bwd` | embedding 反向，重复 token id 撞同一行 |
+| `cuda.py::rmsnorm_bwd` | **RMSNorm 的 dw 跨行累加**；`v3_pretrain` 走 `v3_ops.rmsnorm_orv_fused` **绕过**了 `nn.RMSNorm` 里的确定性分支 |
+
+只修第一处会给出**假的安全感**：实测旧包在 `TG_DETERMINISTIC=1` 下仍有 **25/321 个参数**
+（全是 `ln1/ln2/ln_f`）在漂，量级 1e-9~1e-10；把分派放进 `rt.rmsnorm_bwd` 咽喉点后 **0/321**。
+
+* 验收：4 个配置（seq2048/amp gemm、seq2048/amp off、seq2048/adamw、seq512）× **两个独立进程** × 20 步，
+  loss 与 gnorm 数组**逐位相同**；反证：旧包配同一开关仍分叉（rel 7.85e-06）
+* 关闭时行为不变（三条可判定证据：40 个内核的发射序列逐位相同、step-0 前向逐位相同、源码只多一个 if）
+* 代价：算子级 embedding 散射 +0.61 ms、MoE gather 反向 +1.24 ms、RMSNorm 反向 +0.30 ms；
+  端到端在这张卡上**低于噪声底**（同二进制同时段漂 0.219→0.277 s），如实记录不做结论
+* 全清单与判据见新文档 `docs/DETERMINISM.md`（含未覆盖项：`moe_permute` 的 CUDA Graph 路径仍不确定）
+* 默认**关**（非确定），文档里所有"逐位一致"的说法都加了限定
+
+### 性能：三处"逐元素 Python 循环"根除（100~8000 倍）
+
+| 位置 | 修前 | 修后 | 加速 |
+| --- | --- | --- | --- |
+| `_ce32`（CPU cross_entropy 前向+反向）| 64×4096 = **28.8 s** | **3.5 ms** | **8161×** |
+| `_sumsq32`（Muon 的 Newton-Schulz 范数）| 256×1024 = 663 ms | **22.5 ms** | **30×** |
+| `Lion.step`（CUDA）| **149 ms** | **0.286 ms** | **521×** |
+| `SGD.step`（CUDA）| 66.48 ms | **0.32 ms** | **208×** |
+| `Adafactor.step`（CUDA）| 143~161 ms | **0.69 ms** | **207×** |
+
+前两处是"为逐位对拍而写"的参考实现（文档字符串写明"与 GPU 同一套舍入"），
+不报错、只是慢 —— 于是 CPU 训练路径**名义可用、实际不可用**。
+保留逐位版并用开关切回：`TG_CE_EXACT=1`、`TG_SUMSQ_EXACT=1`。
+⚠️ 默认走快路径后 **CPU 与 GPU 不再逐位相同**（CE 差 ~1e-7；NS 输出差 ~4e-5 相对，
+因为 1 ulp 的范数差会被 5 轮迭代放大）。CPU/GPU 对拍的脚本必须显式设这两个变量。
+
+后三处是同一类病：**优化器在 CUDA 上仍是 numpy 实现** —— 每个参数
+`D2H(梯度) + D2H(参数) + numpy 更新 + H2D(写回)`，状态也存在主机。
+改为单/多内核、状态留在显存、**每步 0 次标量回读**。
+* Lion/SGD：扁平网格 + 累积元素偏移二分，一次发射覆盖全部参数
+* Adafactor：6 条内核（rowstats / colstats / mc / update / finalize / apply），
+  `clip` 与 `scale_parameter` 的标量**全在设备上算**（退回主机读标量最贵可到 9.8 ms/次）
+* 数值对拍：Lion `max|Δp|=1.5e-08`；SGD 4 组配置全 `1.49e-08`（含 momentum/nesterov/dampening）；
+  Adafactor 11 组 × 3 步 `max|Δp|=2.38e-07`（判据 1e-5，42× 余量），11/11 可复现
+* 无 `atomicAdd`（确定性契约）
+
+### 接口修复
+
+* `plugin.resolve_optimizer`：原来**只查插件表**，对核心内置的 `AdamW/LAMB/Muon`（类属性）
+  以及 `SGD/Lion/Adafactor`（类定义后挂上去的）一律返回 `None` ⇒ "先探测再调用"的写法报
+  `'NoneType' object is not callable`。现在 6 个内置全部能解析，插件仍优先（可覆盖同名）。
+* 新增 `rt.reset_peak()`：`pool_stats()["peak_live_bytes"]` 原来是**进程级累积**峰值，
+  于是"同一模型换优化器测显存"读到同一个数（实测 6 个优化器都是 0.2671 GiB）。
+  现在可归零到当前值，分阶段/分优化器测量才有意义。
+* `ops_cpu.find_compiler`：`TGAI_CC` 指向 `zig.exe` 时被当成 `"unix"`，于是调用
+  `zig.exe -shared ...`（**缺 `cc` 子命令**）失败 —— 而 zig 正是文档推荐的零配置路径。
+
+### CI（Windows 两条腿长期红，两个独立原因）
+
+| 层 | 报错 | 根因 | 修法 |
+| --- | --- | --- | --- |
+| 1 | `clang: unsupported option '-fPIC' for target 'x86_64-pc-windows-msvc'` | 通用分支**无条件**加 `-fPIC`，还插了 MinGW 专有的 `--out-implib` | 按平台分派 + 失败回退；PE/DLL 不需要 `-fPIC` |
+| 2 | `找不到符号 'tgop_dbl_fwd'` | **Windows 的 DLL 默认没有导出表**（clang→MSVC 目标）；Linux 默认全导出，所以只有 Windows 红 | `find_compiler` 在 Windows 上若有 ziglang 就避开 clang；CI 里 best-effort 设 `TGAI_CC`（不因它失败）|
+
+新增 3 个回归测试钉住编译器选择（含"显式 `TGAI_CC` 永远优先"）。
+
+### 同口径性能（1.0.7 实测，V100，预热 1 次 + 3 次中位数，极差 ≤0.8%）
+
+配置：vocab 96000、12 层 MoE（d=1024 / d_ff=3328 / E=4+1 / top_k=2 / n_q=16 / csa=4）、
+两侧都关梯度检查点、都开 AMP、batch=1、20 步、`--opt int8gpu`。
+
+| seq | ORV | PyTorch | 结论 | 显存（ORV / PyT）|
+| --- | --- | --- | --- | --- |
+| 512 | **0.220 s** | 0.312 s | **ORV 快 1.42×** | **12.6** / 16.5 GiB |
+| 2048 | **0.380 s** | 0.411 s | **ORV 快 1.08×** | 23.7 / **22.9** GiB |
+
+测试：**829 passed, 59 skipped**（新增 5 个回归测试）。
+
+
 ## [未发布] - 2026-11-20（CPU 地基修复）
 
 ### 性能：CPU 的两处"逐元素 Python 循环"（不报错，只是慢到不可用）
