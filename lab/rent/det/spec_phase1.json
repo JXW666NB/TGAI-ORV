@@ -1,0 +1,12 @@
+{
+ "seq": 2048,
+ "steps": 8,
+ "amp": "gemm",
+ "opt": "int8gpu",
+ "layers": 12,
+ "runs": 2,
+ "configs": [
+  {"tag": "orig_off", "pkg": "D:\\orv_det_work\\orig_pkg", "env": []},
+  {"tag": "orig_on", "pkg": "D:\\orv_det_work\\orig_pkg", "env": ["TG_DETERMINISTIC=1"]}
+ ]
+}

@@ -1,3 +1,57 @@
+## [未发布] - 2026-11-20
+
+### 修复 · `TG_DETERMINISTIC=1` 现在真的能逐位复现（默认关闭，默认行为逐位不变）
+
+**默认是非确定的**：同一条命令、同一 seed、同一数据跑两次，step-0（纯前向）恒等，
+**step-1 起 loss 就会在最末几位分叉**（实测 rel 1.3e-06）。根因是反向里的跨 block
+浮点累加：`atomicAdd` 的加法顺序由 warp 调度决定，浮点加法不结合。
+
+**旧开关只挡了一半**。用"同进程两次 forward+backward、逐参数比梯度"的探针量：
+旧包在 `TG_DETERMINISTIC=1` 下 **321 个参数里仍有 25 个在变**，全是 `ln1/ln2/ln_f`
+（RMSNorm 权重），量级 1e-9~1e-10。原因是 `v3_pretrain` 的 RMSNorm 走
+`v3_ops.rmsnorm_orv_fused` → 直接调 `rt.rmsnorm_bwd`（dw 用 atomicAdd 跨 2048 行累加），
+**绕过了** `nn.RMSNorm` 里那个确定性分支 ⇒ 开关名义上开着、结果仍不可复现。
+这条单独就足以给出**假的安全感**，是本次最重要的发现。
+
+改动（全部在 `python/tgai_go/train/`）：
+
+| 位置 | 改动 |
+| --- | --- |
+| `cuda.py` `_deterministic_from_env()` | 解析 `TG_DETERMINISTIC`（1/0、true/false、on/off、yes/no）；**非法值明确报错**，不再静默当关 |
+| `cuda.py` `scatter_rows_owned` / `scatter_flat_owned` | 新增确定性散射内核：目标行按 `dst % grid` **独占**给一个 block，块内按**源行号升序**串行累加，无原子 |
+| `cuda.py` `CudaRuntime.scatter_add_rows` / `scatter_add_flat` | 开关打开时改走上面的内核（`P["emb"][ids]`、MoE 的 `index_select` 反向都从这里进） |
+| `cuda.py` `CudaRuntime.rmsnorm_bwd` | 开关打开时改走 `rms_rstd + rmsnorm_bwd_dx + rms_dw_det`（dw 按列独占、行号升序）。**这是咽喉点**：`nn.RMSNorm` 与 `v3_ops` 都从这里进 |
+| `cuda.py` `CudaRuntime.emb_bwd` | 去掉"仅 `vocab>=2 且 d>=128` 才走确定性"的门槛（小词表/窄模型此前仍走原子版） |
+| `apilist.py` | 两个新内核登记中英文说明，`T.help(tag="内核")` 可见 |
+
+**验收（V100-32G，`v3_pretrain`，d=1024/L=12/E=4/top_k=2/csa=4，data2048_v96000）**
+
+| 项 | 结果 |
+| --- | --- |
+| 开：seq2048 `amp gemm` `opt int8gpu`，**两个独立进程 × 20 步** | loss 与 gnorm 数组**逐位相同** |
+| 开：seq2048 `amp off` / seq2048 `opt adamw` / seq512（各两个独立进程 × 20 步） | 全部**逐位相同** |
+| 关（冻结原包）同命令两个独立进程 | 仍在变（step-1 起分叉）——**默认未被改动** |
+| 开/关同一步梯度 | 前向 loss **逐位相同**；梯度全局相对误差 **9.24e-09**，仅 25/321 参数（= RMSNorm dw，求和顺序变了）不同 |
+| 20 步 loss 轨迹 | 不发散（11.6696 → 11.6728，与关闭时同量级） |
+
+**代价（CUDA event，真实规模，`det_perf_kernel.py`）**
+
+| 算子（真实形状） | 关 | 开 | Δ |
+| --- | --- | --- | --- |
+| embedding 散射 (96000×1024, 2048 token) | 0.478 ms | 1.092 ms | **+0.61 ms** |
+| MoE gather 反向 (4096×1024 → 2048 行) | 0.059 ms | 1.298 ms | **+1.24 ms** |
+| RMSNorm 反向 (2048×1024) | 0.067 ms | 0.365 ms | **+0.30 ms** |
+
+端到端（`bench_stable.py`，1 预热 + 3 次中位数）：两次独立会话给出 **+21.3%**（seq2048）
+与 **−3.2%**（交替 A/B，seq2048），**符号相反** —— 同一二进制在同一张卡上不同时段的
+整体步时漂移就有 0.219→0.277 s（+26%），所以端到端代价**低于这张卡的噪声底**，
+无法可靠分辨。可复现的结论只有算子级那三行；开关仍是**默认关、按需开**。
+
+覆盖不到的地方（见 `docs/DETERMINISM.md` 全清单）：`moe_permute`/`moe_permute_bwd`
+（CUDA Graph 的 MoE 路径，v3_pretrain 不走）、`index_scatter_add8` 的 `divs>1`（`repeat_interleave`
+在开关打开时已被路由到 `repeat_reduce`）、以及 cuBLAS 的算法选择（实测 6 个形状 fp32/fp16
+逐位可重复，但不等于全局保证）。
+
 ## [1.0.6] - 2026-11-19
 
 ### 性能：`batch==1` 的 3-D GEMM 不再绕开 AMP 的 fp16 路径（seq2048 −16 ms）
@@ -4025,8 +4079,13 @@ ORV 自比噪声底（双进程）3.20e-07；真实语料 15 步曲线最差 1.0
 - 三处 `atomicAdd` 全部换成确定性归约：rmsnorm 的 dw（按列升序）、
   词嵌入反向（按 id 独占一行）、`repeat_interleave` 反向（按 j 升序，新内核 `repeat_reduce`）。
 - **实测：同一配置两次训练，参数最大绝对差 0.000e+00（逐位一致）**；默认模式 7.63e-06。
+  ⚠️ **限定条件（2026-11-20 补）**：这条只在 Qwen2.5-0.5B 形状（`qwen` 路径、稠密 FFN、无 MoE/CSA）
+  上成立。`v3_pretrain` 的 MoE+CSA 路径当时另有**两处**没被覆盖（`scatter_add_rows` 的
+  行散射、以及 `v3_ops.rmsnorm_orv_fused` 绕过 `nn.RMSNorm` 直接调 `rt.rmsnorm_bwd`），
+  所以那条路径上开关**名义开着、结果仍不可复现**（25/321 参数每次都变）。2026-11-20 已修，
+  见本文件顶部与 `docs/DETERMINISM.md`。
 - 代价约 1%（717.3 → 724.3 ms/step，V100 / Qwen2.5-0.5B 形状 / B=4·S=512）。
-- 与 fp16 加速**可同时开启**：492.9 ms/step 且参数逐位一致。
+- 与 fp16 加速**可同时开启**：492.9 ms/step 且参数逐位一致（同样限上面这条路径）。
 
 ### 新增 · fp16 Tensor Core GEMM（`rt.fp16_gemm = True`，默认关）
 - 零转换入口 `gemm_f16_nt_raw` / `gemm_f16_tn_raw` / `gemm_f16_nn_raw`

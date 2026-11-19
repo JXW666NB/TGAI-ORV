@@ -1,0 +1,14 @@
+{
+ "seq": 2048,
+ "steps": 20,
+ "amp": "gemm",
+ "opt": "int8gpu",
+ "layers": 12,
+ "runs": 2,
+ "configs": [
+  {"tag": "orig_off", "pkg": "D:\\orv_det_work\\orig_pkg", "env": []},
+  {"tag": "new_off", "pkg": "D:\\orv_det_work\\new_pkg_x", "env": []},
+  {"tag": "new_on", "pkg": "D:\\orv_det_work\\new_pkg_x", "env": ["TG_DETERMINISTIC=1"]}
+ ],
+ "ab": [["orig_off", "new_off"]]
+}

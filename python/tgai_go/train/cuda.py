@@ -2060,6 +2060,55 @@ extern "C" __global__ void scatter_add_flat(
     if (i >= n) return;
     atomicAdd(out + idx[i], g[i]);
 }
+
+/* ---- 确定性散射（TG_DETERMINISTIC=1 时替代上面两条 atomicAdd 版本）----
+ *
+ * 为什么需要：`scatter_add_rows` / `scatter_add_flat` / `scatter_add_rows` 的
+ * atomicAdd 在**下标重复**时，同一个输出元素会被多个 block 抢着加。
+ * 浮点加法不结合，warp 调度一变，结果的末几位就变 ⇒ 同一条命令跑两次，
+ * step-1 的 loss 就会分叉（实测 rel 1.3e-6）。这是 v3_pretrain 里
+ * `P["emb"][ids]`（embedding 查表）反向的路径，也是主缺陷所在。
+ *
+ * 做法与 `emb_bwd_owned` 同族：**目标行按 (dst % gridDim.x) 独占给一个 block**，
+ * 块内按**源行号升序**串行累加。既没有原子、也没有跨 block 的同一地址写
+ * ⇒ 输出与运行次数无关。累加方向与 CPU 的 `np.add.at` 一致。
+ * 代价：每个 block 都要扫一遍全部 n_rows（原子版的并行度被换成顺序），
+ * 所以只在确定性模式下用；调用方必须保证 out 已经清零。
+ */
+extern "C" __global__ void scatter_rows_owned(const float* __restrict__ g,
+                                               const int* __restrict__ idx,
+                                               float* __restrict__ out,
+                                               int n_rows, int row_size, int n_dst) {
+    const int blocks = (int)gridDim.x;
+    const int mine = (int)blockIdx.x;
+    const int stride = (int)blockDim.x;
+    for (int r = 0; r < n_rows; ++r) {
+        const int dst = idx[r];
+        if (dst < 0 || dst >= n_dst) continue;
+        if ((dst % blocks) != mine) continue;
+        const float* grow = g + (long long)r * row_size;
+        float* orow = out + (long long)dst * row_size;
+        for (int j = (int)threadIdx.x; j < row_size; j += stride)
+            orow[j] += grow[j];
+    }
+}
+
+extern "C" __global__ void scatter_flat_owned(const float* __restrict__ g,
+                                              const int* __restrict__ idx,
+                                              float* __restrict__ out,
+                                              int n, int n_dst) {
+    /* 1-D 没有第二维可以分给线程，所以每个 block 只让 0 号线程顺序累加；
+       按 dst % gridDim.x 分块，保证同一 dst 只属于一个 block。 */
+    if (threadIdx.x != 0) return;
+    const int blocks = (int)gridDim.x;
+    const int mine = (int)blockIdx.x;
+    for (int r = 0; r < n; ++r) {
+        const int dst = idx[r];
+        if (dst < 0 || dst >= n_dst) continue;
+        if ((dst % blocks) != mine) continue;
+        out[dst] += g[r];
+    }
+}
 """
 
 
@@ -3281,6 +3330,31 @@ def _pool_cap_from_env(default_bytes=12 * (1024 ** 3)):
     return int(gb * (1024 ** 3))
 
 
+def _deterministic_from_env():
+    """`TG_DETERMINISTIC` 解析（默认关）。
+
+    关 = 现状：反向的散射/归约走 atomicAdd / 原子累加，快，但**浮点加法的
+    顺序由硬件调度决定** ⇒ 同一条命令跑两次，step-1 起 loss 就会在最末几位分叉。
+    开 = 反向改走无原子内核（`scatter_rows_owned` / `scatter_flat_owned` /
+    `emb_bwd_owned` / `rms_dw_det` / `repeat_reduce`），顺序固定为「源行号升序」
+    ⇒ 同一条命令换进程重跑，loss / gnorm 逐位相同。
+
+    非法值**明确报错**（不静默当关）：这里报错的代价是一次启动失败，
+    而静默降级会让"我明明开了 TG_DETERMINISTIC"变成一个查不出来的假象。
+    """
+    v = os.environ.get("TG_DETERMINISTIC")
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    if s in ("", "0", "false", "off", "no"):
+        return False
+    if s in ("1", "true", "on", "yes"):
+        return True
+    raise CudaError("TG_DETERMINISTIC 只接受 1/0（或 true/false、on/off、yes/no），"
+                    "收到 %r" % (v,)
+                    + "。修法：逐位可复现设 TG_DETERMINISTIC=1，要默认速度就留空或设 0")
+
+
 _POOL_CAP_BYTES = _pool_cap_from_env()
 # d2h 已经同步过默认流。这时如果池里堆了超过 2 GiB 的空闲块，
 # 就从最小的开始释放到只留 256 MiB，避免下一步把上一步的尺寸全堆在活张量上。
@@ -3336,8 +3410,9 @@ class CudaRuntime:
         self._blas_stream_set = False
         self._dto_async_ready = False
         self._capturing = False
-        # 确定性模式：TG_DETERMINISTIC=1 时反向走无原子内核（慢约 1%，可逐位复现）
-        self.deterministic = str(os.environ.get("TG_DETERMINISTIC", "")).strip().lower() in ("1", "true", "on", "yes")
+        # 确定性模式：TG_DETERMINISTIC=1 时反向走无原子内核（可逐位复现）。
+        # 覆盖范围见 `_deterministic_from_env` 的 docstring 与 docs/DETERMINISM.md。
+        self.deterministic = _deterministic_from_env()
         # CUDA Graph 捕获期的预留 arena（bump 分配）
         self._arena_base = 0
         self._arena_size = 0
@@ -5435,7 +5510,12 @@ class CudaRuntime:
             (int(d), ctypes.c_int), (int(k), ctypes.c_int), (int(EC), ctypes.c_int)])
 
     def scatter_add_rows(self, g, idx, n_src_rows, row_size, n_rows):
-        """行 gather 的反向：先清零 [n_src_rows, row_size]，再把 g 的行按 idx atomicAdd 回去。"""
+        """行 gather 的反向：先清零 [n_src_rows, row_size]，再把 g 的行按 idx 散回去。
+
+        默认走 `scatter_add_rows`（atomicAdd，快）。
+        `rt.deterministic` 为真时走 `scatter_rows_owned`：目标行按 `dst % grid`
+        独占给一个 block，块内按源行号升序串行累加 —— 无原子 ⇒ 两次运行逐位相同。
+        """
         n_rows = int(n_rows)
         row_size = int(row_size)
         out = self.zeros((int(n_src_rows), row_size), dtype=np.float32)
@@ -5443,10 +5523,16 @@ class CudaRuntime:
         if total:
             if total > 2147483647:
                 raise CudaError("scatter_add_rows 元素数 %d 超过 int32" % total + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
-            grid, block = self._ewise_grid(total)
-            self.launch("scatter_add_rows", grid, block, [
-                self._ptr(g), self._ptr(idx), self._ptr(out),
-                (n_rows, ctypes.c_int), (row_size, ctypes.c_int)])
+            if getattr(self, "deterministic", False):
+                self.launch("scatter_rows_owned", (256, 1, 1), (256, 1, 1), [
+                    self._ptr(g), self._ptr(idx), self._ptr(out),
+                    (n_rows, ctypes.c_int), (row_size, ctypes.c_int),
+                    (int(n_src_rows), ctypes.c_int)])
+            else:
+                grid, block = self._ewise_grid(total)
+                self.launch("scatter_add_rows", grid, block, [
+                    self._ptr(g), self._ptr(idx), self._ptr(out),
+                    (n_rows, ctypes.c_int), (row_size, ctypes.c_int)])
         return out
 
     def gather_flat(self, src, idx, n):
@@ -5462,15 +5548,24 @@ class CudaRuntime:
         return out
 
     def scatter_add_flat(self, g, idx, n_src, n):
-        """逐元素 gather 的反向：zeros(n_src) 后按 idx atomicAdd。"""
+        """逐元素 gather 的反向：zeros(n_src) 后按 idx 散回去。
+
+        默认 atomicAdd；`rt.deterministic` 为真时走 `scatter_flat_owned`
+        （dst 按 `dst % grid` 独占给一个 block、块内按下标升序）⇒ 逐位可复现。
+        """
         n = int(n)
         out = self.zeros((int(n_src),), dtype=np.float32)
         if n:
             if n > 2147483647:
                 raise CudaError("scatter_add_flat 元素数 %d 超过 int32" % n + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
-            grid, block = self._ewise_grid(n)
-            self.launch("scatter_add_flat", grid, block, [
-                self._ptr(g), self._ptr(idx), self._ptr(out), (n, ctypes.c_int)])
+            if getattr(self, "deterministic", False):
+                self.launch("scatter_flat_owned", (256, 1, 1), (32, 1, 1), [
+                    self._ptr(g), self._ptr(idx), self._ptr(out),
+                    (n, ctypes.c_int), (int(n_src), ctypes.c_int)])
+            else:
+                grid, block = self._ewise_grid(n)
+                self.launch("scatter_add_flat", grid, block, [
+                    self._ptr(g), self._ptr(idx), self._ptr(out), (n, ctypes.c_int)])
         return out
 
     def _cat_geom(self, shape, axis):
@@ -7640,6 +7735,24 @@ class CudaRuntime:
         return buf
 
     def rmsnorm_bwd(self, dy, x, w, seq, d, eps):
+        """RMSNorm 反向，返回 (dx, dw)。
+
+        默认走融合 `rmsnorm_bwd`（dw 用 atomicAdd 跨行累加 —— 行数一多，
+        同一列的加法顺序就随调度变，末几位不可复现）。
+        `rt.deterministic` 为真时改走三条无原子内核（`rms_rstd` +
+        `rmsnorm_bwd_dx` + `rms_dw_det`，dw 按**列**独占、按行号升序串行累加）
+        ⇒ 两次运行逐位相同。**这里是唯一的咽喉点**：`nn.RMSNorm` 与
+        `v3_ops.rmsnorm_orv_fused` 都从这条进，所以只改这里不会漏。
+        """
+        if getattr(self, "deterministic", False):
+            dw = self.zeros(w.shape, dtype=np.float32)
+            dx = self.rmsnorm_bwd_det(dy, x, w, seq, d, eps, dw)
+            # rmsnorm_bwd_det 按 (seq, d) 分配；本次调用的 x 可能是 (B,T,d) 之类的同元素数
+            # 形状。GpuBuf.shape 是普通槽位，改元数据即可（数据布局不变）。
+            want = tuple(int(v) for v in x.shape)
+            if tuple(int(v) for v in dx.shape) != want:
+                dx.shape = want
+            return dx, dw
         dx = self.empty(x.shape, dtype=np.float32)
         dw = self.zeros(w.shape, dtype=np.float32)
         if seq and d:
@@ -7921,7 +8034,10 @@ class CudaRuntime:
         # 独占版只留给"超长序列 + 小词表"（原来那条注释针对的 8192 场景）。
         # 确定性模式：强制走"按 id 独占一行、块内按 token 顺序累加"的 emb_bwd_owned，
         # 它没有 atomicAdd，所以同一输入两次运行结果逐位相同（代价是每块扫全部 seq）。
-        if getattr(self, "deterministic", False) and vocab >= 2 and d >= 128:
+        # ★ 2026-11-20：**不再按 vocab/d 加门槛**。原来只在 vocab>=2 且 d>=128 时生效，
+        #   于是小模型 / 小词表（含 vocab=1 这种全部 token 撞同一行的最坏情况）在
+        #   "确定性模式"下仍走原子版 —— 开关名义上开着、结果仍不可复现。
+        if getattr(self, "deterministic", False):
             self.launch("emb_bwd_owned", (256, 1, 1), (256, 1, 1), [
                 self._ptr(grad), self._ptr(ids), self._ptr(dw),
                 (seq, ctypes.c_int), (d, ctypes.c_int), (vocab, ctypes.c_int),

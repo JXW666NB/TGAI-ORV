@@ -32,6 +32,11 @@ PyPI 包名 `tgai-orv`，import 路径 `tgai_go.train`。
 5. **插件可以更快，不可以"更准"或"更省事地不同"。** dtype 提升、累加顺序、边界行为（nan/inf/空张量）
    属于核心语义，插件不得改变。
 6. **改代码前先看 `docs/INDEX.md`。** 仓库有 70+ 篇文档，不先读会写出与既有结论冲突的东西。
+7. **默认非确定：同命令同 seed 跑两次，step-1 起 loss 就会在末几位分叉。** 两处原子累加：
+   embedding 反向的散射（`scatter_add_rows` / `emb_gather_bwd`）与 RMSNorm 的 dw
+   （`rmsnorm_bwd` 的 `atomicAdd`，且 `v3_ops.rmsnorm_orv_fused` **绕过** `nn.RMSNorm` 的确定性分支）。
+   **需要逐位可复现请设 `TG_DETERMINISTIC=1`**（默认关 = 现状；全清单与未覆盖项见 `docs/DETERMINISM.md`）。
+   写"逐位一致"时务必带限定：是**单步内**、**同进程**、还是**开开关后跨进程**。
 ### 2.2 先自省：`T.help()` —— 别再靠记忆猜库里有什么（0.9.97+）
 
 ORV 自带内省入口，**不需要 GPU**、不依赖 PyTorch 文档：
@@ -632,6 +637,7 @@ ckpt.list_checkpoints(...)        # 配合 rotate() 做滚动保留
 | 现代 MoE | `docs/MOE_MODERN_ARCH.md` |
 | 3B 性能实测 | `docs/ROADMAP_3B_PERF.md` |
 | 全部文档索引 | `docs/INDEX.md` |
+| **逐位可复现 / 非确定性全清单** | ★ `docs/DETERMINISM.md`（哪些地方会变、`TG_DETERMINISTIC` 覆盖到哪、代价实测、未覆盖项） |
 
 ---
 

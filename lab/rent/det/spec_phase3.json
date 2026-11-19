@@ -1,0 +1,15 @@
+{
+ "seq": 2048,
+ "steps": 20,
+ "amp": "gemm",
+ "opt": "int8gpu",
+ "layers": 12,
+ "runs": 2,
+ "configs": [
+  {"tag": "new_on_gemm", "pkg": "D:\\orv_det_work\\new_pkg_x", "env": ["TG_DETERMINISTIC=1"]},
+  {"tag": "new_on_ampoff", "pkg": "D:\\orv_det_work\\new_pkg_x", "env": ["TG_DETERMINISTIC=1"], "amp": "off"},
+  {"tag": "new_on_adamw", "pkg": "D:\\orv_det_work\\new_pkg_x", "env": ["TG_DETERMINISTIC=1"], "opt": "adamw"},
+  {"tag": "new_on_s512", "pkg": "D:\\orv_det_work\\new_pkg_x", "env": ["TG_DETERMINISTIC=1"], "seq": 512},
+  {"tag": "orig_on_gemm", "pkg": "D:\\orv_det_work\\orig_pkg", "env": ["TG_DETERMINISTIC=1"]}
+ ]
+}
