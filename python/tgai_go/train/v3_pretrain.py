@@ -936,7 +936,7 @@ def build_arg_parser():
                    help="优化器。状态显存（每参数）：adamw 8B / muon(fp16 动量) 2B / fp16mom 4B "
                         "/ adafactor 因子化 O(n+m) / int8 约 1-2B。"
                         "★ 注意：非 adamw 时 checkpoint 的优化器状态暂不支持续训（会明确拒绝）")
-    g.add_argument("--opt-state", dest="opt_state", default="fp16",
+    g.add_argument("--opt-state", dest="opt_state", default=None,
                    choices=["fp16", "bf16", "fp32"],
                    help="--opt fp16mom 的动量存储精度。实测 fp16 会让 Adam 的二阶动量 v"
                         "（常 1e-8 量级，fp16 最小正规数 6.1e-5）下溢成 0，"
@@ -1146,9 +1146,23 @@ def main(argv=None):
               % (st, opt.bytes_per_param()), flush=True)
     elif a.opt == "fp16mom":
         from tgai_go.train.opt_fp16mv import Fp16MomAdamW
+        # ★ 2026-11-19 修「默认值陷阱」：`fp16` 存二阶动量必然下溢 ——
+        #   v 常为 1e-8 量级，而 fp16 最小正规数 6.1e-5，开根后 denom≈eps，
+        #   步长被放大几个数量级（实测第 3 步 loss 11.6→94.6，末值 275）。
+        #   bf16 与 fp32 同指数范围、同样 2 字节，不会下溢 ⇒ 默认改用 bf16。
+        #   要强制 fp16 必须显式传 --opt-state fp16，并会打印警告。
+        st_ff = str(getattr(a, "opt_state", None) or "")
+        if not st_ff:
+            st_ff = "bf16"
+        if st_ff == "fp16":
+            print("[fp16mom] 警告：--opt-state fp16 会让二阶动量下溢，"
+                  "历史上这条路会让 loss 发散。建议 bf16（同样 2 字节）或 fp32。",
+                  flush=True)
         opt = Fp16MomAdamW(params, lr=float(a.lr), betas=(float(a.beta1), float(a.beta2)),
                            eps=float(a.eps), weight_decay=float(a.wd),
-                           state=str(getattr(a, "opt_state", "fp16")))
+                           state=st_ff)
+        print("[fp16mom] state=%s，动量 %.1f 字节/参数" % (st_ff, opt.bytes_per_param()),
+              flush=True)
     elif a.opt == "adafactor":
         opt = T.optim.Adafactor(params, lr=float(a.lr), weight_decay=float(a.wd))
     elif a.opt == "int8":

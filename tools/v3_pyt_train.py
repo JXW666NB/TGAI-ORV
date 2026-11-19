@@ -81,13 +81,16 @@ def main():
     rng = np.random.default_rng(0)
     ids_all = rng.integers(0, 4096, (a.steps, a.seq)).astype(np.int64)
     times, losses = [], []
+    seg_f, seg_b, seg_o = [], [], []
     for step in range(a.steps):
         ids = torch.from_numpy(ids_all[step]).cuda()[None, :]
         tgt = ids[:, 1:].contiguous()
         t0 = time.time()
         # 模型内部自己平移 targets（传等长 ids），与 train_v3.py 的用法一致
+        torch.cuda.synchronize(); _tf0 = time.perf_counter()
         with torch.amp.autocast("cuda", dtype=torch.float16, enabled=bool(a.amp)):
             out = model(ids, targets=ids)
+        torch.cuda.synchronize(); _tf1 = time.perf_counter()
         if isinstance(out, (tuple, list)):
             logits, loss = out[0], out[1]
         else:
@@ -96,11 +99,19 @@ def main():
                 logits[:, :-1, :].reshape(-1, logits.shape[-1]).float(),
                 tgt.reshape(-1))
         opt.zero_grad()
+        torch.cuda.synchronize(); _tb0 = time.perf_counter()
         if scaler is not None:
-            scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+            scaler.scale(loss).backward()
+            torch.cuda.synchronize(); _tb1 = time.perf_counter()
+            scaler.step(opt); scaler.update()
         else:
-            loss.backward(); opt.step()
-        torch.cuda.synchronize()
+            loss.backward()
+            torch.cuda.synchronize(); _tb1 = time.perf_counter()
+            opt.step()
+        torch.cuda.synchronize(); _to1 = time.perf_counter()
+        if step >= 1:
+            seg_f.append(_tf1 - _tf0); seg_b.append(_tb1 - _tb0)
+            seg_o.append(_to1 - _tb1)
         times.append(time.time() - t0); losses.append(float(loss.item()))
         print("step %d loss=%.4f %.2fs" % (step, losses[-1], times[-1]), flush=True)
 
@@ -111,6 +122,9 @@ def main():
                step_s=float(np.mean(times)), tok_s=a.seq / float(np.mean(times)),
                peak_mib=prof.get("peak"), base_mib=base,
                torch_peak_mib=int(torch.cuda.max_memory_allocated() // 1024 // 1024))
+    if seg_f:
+        med = lambda xs: float(np.median(xs))
+        res["fwd_s"], res["bwd_s"], res["opt_s"] = med(seg_f), med(seg_b), med(seg_o)
     print("RESULT", json.dumps({k: v for k, v in res.items() if k != "losses"}, ensure_ascii=False))
     print("losses", losses)
     if a.out:
