@@ -2254,6 +2254,46 @@ extern "C" __global__ void add_bcast8(
  * 块内 absmax 用 warp shuffle 归约 —— 不需要 shared memory，也不需要额外一趟。
  * 数学序列与 fp32 AdamW 逐条相同，只有 m/v 的存储是 int8。
  */
+/* Lion 单 kernel 更新（2026-11-20）。
+   背景：`opt_extra.Lion` 原来是 **numpy 实现** —— 每个参数 `g.to_numpy()`(D2H) +
+   `p.to_numpy()`(D2H) + numpy 更新 + 写回(H2D)，而且动量状态存在主机 numpy 里。
+   实测 9.4M 参数 **149 ms/步**（融合版 AdamW 只要 0.34 ms）。
+   这里把整个更新留在显存：**一次发射**处理所有参数。
+
+   定位方式：扁平网格 + 按"累积元素偏移"二分（不用 per-warp 分块表，逻辑更简单）。
+   Lion 公式（与 torch 无官方实现，按论文）：
+       u = b1*m + (1-b1)*g
+       p = p - lr*(sign(u) + wd*p)
+       m = b2*m + (1-b2)*g
+   `grad_scale` 与 adamw 版同语义（读梯度时乘，供梯度裁剪融合）。 */
+extern "C" __global__ void lion_multi_flat(
+    const unsigned long long* ps, const unsigned long long* gs,
+    const unsigned long long* ms, const int* sizes, const long long* eoffs,
+    int n_tensors, float b1, float omb1, float b2, float omb2,
+    float lr, float wd, float grad_scale) {
+    long long gid = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+    // 二分定位张量：eoffs 是累积元素偏移（长度 n_tensors+1）
+    int lo = 0, hi = n_tensors - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (gid < eoffs[mid + 1]) hi = mid; else lo = mid + 1;
+    }
+    long long i = gid - eoffs[lo];
+    long long n = (long long)sizes[lo];
+    if (i < 0 || i >= n) return;
+    float* p = (float*)ps[lo];
+    const float* g = (const float*)gs[lo];
+    float* m = (float*)ms[lo];
+    float gi = g[i] * grad_scale;
+    float mi = m[i];
+    float u = b1 * mi + omb1 * gi;
+    float s = (u > 0.f) ? 1.f : ((u < 0.f) ? -1.f : 0.f);
+    if (wd != 0.f) s += wd * p[i];
+    p[i] = p[i] - lr * s;
+    m[i] = b2 * mi + omb2 * gi;
+}
+
+
 extern "C" __global__ void adamw_multi_int8(
     const unsigned long long* ps, const unsigned long long* gs,
     const unsigned long long* mqs, const unsigned long long* vqs,
@@ -8217,6 +8257,62 @@ class CudaRuntime:
             (float(eps), ctypes.c_float),
             (float(bc1), ctypes.c_float), (float(bc2), ctypes.c_float),
             (1 if do_wd else 0, ctypes.c_int),
+        ])
+
+    def lion_multi(self, entries, b1, omb1, b2, omb2, lr, wd, grad_scale=1.0,
+                   block=256):
+        """Lion：**一次发射**更新全部参数，fp32 动量留在显存。
+
+        `entries` 每项 `(p, g, m)`，三者同长度，且都是设备缓冲。
+
+        为什么需要这个内核：`opt_extra.Lion` 原来是 **numpy 实现** —— 每个参数
+        `g.to_numpy()`(D2H) + `p.to_numpy()`(D2H) + numpy 更新 + 写回(H2D)，
+        动量也存在主机。实测 9.4M 参数 **149 ms/步**（融合版 AdamW 只要 0.34 ms）。
+
+        `grad_scale` 与 adamw 版同语义（读梯度时乘，供梯度裁剪融合）。
+
+        定位方式：扁平网格 + 按累积元素偏移二分（`eoffs`），一次 launch 覆盖全部张量；
+        比 per-tensor 循环少 300+ 次发射。
+        """
+        if not entries:
+            return
+        block = int(block)
+        for ent in entries:
+            for buf in ent:
+                self._split_forget_ptr(buf)
+        key = (tuple(id(x) for ent in entries for x in ent), block)
+        tb = getattr(self, "_lion_table", None)
+        if tb is None or tb[0] != key:
+            def _ptrs(idx):
+                return self.h2d(np.array([int(ent[idx].ptr) for ent in entries],
+                                         np.uint64), dtype=np.uint64)
+
+            ps, gs, ms = _ptrs(0), _ptrs(1), _ptrs(2)
+            sizes = [int(ent[0].n) for ent in entries]
+            for i, n in enumerate(sizes):
+                if int(entries[i][1].n) != n or int(entries[i][2].n) != n:
+                    raise CudaError(
+                        "Lion 第 %d 项 梯度/动量长度 ≠ 参数长度（%d/%d vs %d）"
+                        % (i, entries[i][1].n, entries[i][2].n, n)
+                        + "。修法：重建优化器状态（动量必须与参数同形状）")
+            szs = self.h2d(np.array(sizes, np.int32), dtype=np.int32)
+            eoff = [0]
+            for n in sizes:
+                eoff.append(eoff[-1] + n)
+            eos = self.h2d(np.array(eoff, np.int64), dtype=np.int64)
+            tb = (key, ps, gs, ms, szs, eos, len(sizes), int(eoff[-1]))
+            self._lion_table = tb
+        _, ps, gs, ms, szs, eos, n_par, total = tb
+        grid = ((total + block - 1) // block, 1, 1)
+        self.launch("lion_multi_flat", grid, (block, 1, 1), [
+            (int(ps.ptr), ctypes.c_void_p), (int(gs.ptr), ctypes.c_void_p),
+            (int(ms.ptr), ctypes.c_void_p),
+            (int(szs.ptr), ctypes.c_void_p), (int(eos.ptr), ctypes.c_void_p),
+            (int(n_par), ctypes.c_int),
+            (float(b1), ctypes.c_float), (float(omb1), ctypes.c_float),
+            (float(b2), ctypes.c_float), (float(omb2), ctypes.c_float),
+            (float(lr), ctypes.c_float), (float(wd), ctypes.c_float),
+            (float(grad_scale), ctypes.c_float),
         ])
 
     def adamw_multi_int8(self, entries, b1, omb1, b2, omb2, lr, wd_lr, eps,

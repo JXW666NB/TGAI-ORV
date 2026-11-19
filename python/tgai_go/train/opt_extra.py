@@ -120,11 +120,31 @@ class Lion(_Optim):
         self.b1, self.b2 = b1, b2
         self.wd = float(weight_decay)
         self.m = [np.zeros(p.shape, np.float32) for p in self.params]
+        # ★ 2026-11-20：CUDA 上走**单 kernel**，动量留在显存。
+        #   原来是 numpy 实现 —— 每个参数 D2H(梯度)+D2H(参数)+H2D(参数)，
+        #   实测 9.4M 参数 **149 ms/步**（融合版 AdamW 0.34 ms）。这是纯浪费。
+        self._rt = None
+        self._dev = bool(self.params) and all(
+            getattr(p, "device", "cpu") == "cuda" for p in self.params)
+        if self._dev:
+            self._rt = _cuda()
+            self.m = [self._rt.zeros(tuple(p.shape)) for p in self.params]
 
     @_invalidate_fp16_after_step
     def step(self):
         _bf16_step_boundary()
         lr = float(self.lr)
+        if self._dev:
+            entries = []
+            for i, p in enumerate(self.params):
+                g = getattr(p, "grad", None)
+                if g is None:
+                    continue
+                entries.append((p._gpu, g._gpu, self.m[i]))
+            if entries:
+                self._rt.lion_multi(entries, self.b1, 1.0 - self.b1,
+                                    self.b2, 1.0 - self.b2, lr, self.wd)
+            return
         for i, p in enumerate(self.params):
             g = _read_grad(p)
             if g is None:
