@@ -36,6 +36,11 @@ cuda = [
 dev = [
     "pytest>=7",
     "safetensors>=0.4",
+    # Windows 上 CPU 插件需要一个"默认导出符号"的 C 编译器：
+    # GitHub Actions 的 windows 镜像里 `cc` 是 clang → MSVC 目标，默认**不导出**任何符号，
+    # 于是 ctypes 找不到插件函数（Linux 默认全导出，所以只有 Windows 腿会红）。
+    # ziglang 是零配置的官方推荐路径（`pip install ziglang` 即可）。
+    "ziglang>=0.13; sys_platform == 'win32'",
 ]
 
 [project.urls]

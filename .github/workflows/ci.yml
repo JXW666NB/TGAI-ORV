@@ -22,5 +22,15 @@ jobs:
         run: |
           python -m pip install -U pip
           python -m pip install -e ".[dev]"
+      # Windows 的 `cc` 是 clang -> MSVC 目标：既不吃 -fPIC，产物也**没有导出表**，
+      # 于是 CPU 插件用例必挂（Linux 腿不受影响，所以只有 Windows 一直红）。
+      # 这里显式钉到一个"默认导出符号"的工具链（ziglang，dev extra 已按平台安装）。
+      - name: pin a symbol-exporting C toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $z = python -c "import os,ziglang; print(os.path.join(os.path.dirname(ziglang.__file__), 'zig.exe'))"
+          Write-Host "TGAI_CC=$z"
+          "TGAI_CC=$z" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: "test (no GPU; CUDA 用例会被 skipif 跳过)"
         run: python -m pytest tests -q

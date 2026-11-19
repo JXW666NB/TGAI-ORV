@@ -42,7 +42,12 @@ def find_compiler():
     if env:
         p = shutil.which(env) or (env if os.path.isfile(env) else None)
         if p:
-            return p, ("tcc" if "tcc" in os.path.basename(p).lower() else "unix")
+            # ★ 2026-11-20：TGAI_CC 指向 zig 时必须走 zig 分支。
+            #   原来只认 tcc，其它一律当 "unix" ⇒ 会调用
+            #   `zig.exe -shared ...`（缺了 `cc` 子命令）而失败。
+            _b = os.path.basename(p).lower()
+            return p, ("tcc" if "tcc" in _b else
+                       "zig" if "zig" in _b else "unix")
     for name in _COMPILERS:
         p = shutil.which(name)
         if p:
@@ -92,7 +97,14 @@ def _compile(src_path, out_path, cc, kind):
     elif kind == "zig":
         cmds = [[cc, "cc", "-shared", "-O3", "-o", out_path, src_path]]
     elif sys.platform == "win32":
+        # Windows 上还有第二层坑：**默认不导出任何符号**（Linux 默认全导出）。
+        # 若工具链是 clang→MSVC 目标，产物是"没有导出表"的 DLL，ctypes 必然找不到函数。
+        # 所以依次尝试：普通 → 显式全导出（MinGW/clang-GNU 认这个）→ 加 -fPIC。
         cmds = [[cc, "-shared", "-O3", "-o", out_path, src_path],
+                [cc, "-shared", "-O3", "-Wl,--export-all-symbols",
+                 "-o", out_path, src_path],
+                [cc, "-shared", "-fPIC", "-O3", "-Wl,--export-all-symbols",
+                 "-o", out_path, src_path],
                 [cc, "-shared", "-fPIC", "-O3", "-o", out_path, src_path]]
     else:
         cmds = [[cc, "-shared", "-fPIC", "-O3", "-o", out_path, src_path]]
@@ -137,9 +149,21 @@ def _sym(handle, sym):
     try:
         s = getattr(handle["lib"], sym)
     except AttributeError:
+        _hint = ""
+        if sys.platform == "win32":
+            # Windows 的第二层坑：DLL 默认**没有导出表**（clang→MSVC 目标尤其如此），
+            # 编译成功但 ctypes 找不到函数。这一条要单独讲清楚，否则用户会去改 C 代码。
+            _hint = (
+                "\n  ⚠️ Windows 特有：编译成功了却找不到符号，通常是**编译器默认不导出符号**。"
+                "\n     修法（任一）："
+                "\n       1) 用 zig（零配置，推荐）：pip install ziglang，然后设 "
+                "TGAI_CC=<...>\\zig.exe"
+                "\n       2) 用 MinGW/gcc，或给函数加 __declspec(dllexport)"
+                "\n       3) 该工具链不支持全导出时，本模块会依次尝试 "
+                "-Wl,--export-all-symbols，仍失败就换编译器")
         raise RuntimeError(
             "CPU 插件里找不到符号 %r（%s）。修法：确认函数已定义且不是 static，"
-            "C++ 需 extern \"C\"" % (sym, os.path.basename(handle["path"])))
+            "C++ 需 extern \"C\"%s" % (sym, os.path.basename(handle["path"]), _hint))
     s.restype = None
     _CACHE[handle["path"]] = handle
     handle["syms"][sym] = s
