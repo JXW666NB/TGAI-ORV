@@ -1,3 +1,49 @@
+## [1.0.11] - 2026-11-21
+
+### 修掉 Muon 的病态默认值：21.70 s/步 → **1.02 s/步（21.3×）**
+
+**根因**：`Muon.__init__` 的 `ns_fast` 默认 `False`，于是每个 2D 张量的 Newton-Schulz
+都要走 `sumsq_sequential`（**单线程顺序归约 + 每个矩阵一次 `read_scalar` 同步**）
+和 `sgemm_mode`（朴素 GEMM，不走 cuBLAS）。代码注释里早就记着实测：
+
+> 单个 [1024,4096] 矩阵的 `sumsq_sequential` 要 **101 ms**，而 5 步 NS 的纯 GEMM 只要 **9.3 ms**
+> —— **91% 的时间花在归约上，不是算力问题**。
+
+848M 有 321 个 2D 张量，于是整步 21.7 s（同卡 AdamW 0.23 s）。
+而 `v3_pretrain` **从不传 `ns_fast`**，所以 `--opt muon` 永远走这条路。
+
+那条慢路径存在的唯一理由是**与 NumPy/OpenBLAS 逐位一致**（parity 测试用）—— 它被当成了生产默认。
+
+**修法**：默认走快路径（cuBLAS + 两趟并行归约），parity 变成显式选择：
+
+| 环境变量 | 行为 |
+| --- | --- |
+| （不设）| `fast=True`：cuBLAS + `sumsq_parallel` |
+| `TG_MUON_NS_PARITY=1` | `fast=False`：逐位对齐 numpy（给 parity 用）|
+| `TG_MUON_NS_FAST=0/1` | 显式指定，优先级最高 |
+
+代价：cuBLAS 单次约 3e-8 相对误差，五轮后与 numpy 差约 1e-7（fp32 正常范围）。
+
+**4090 实测（seq512 / 12 层 / 4 步 / `--amp off`）**：
+
+| 配置 | 单步 | 峰值 |
+| --- | --- | --- |
+| **`muon`（新默认）** | **1.0198 s** | **10.375 GiB** |
+| `muon` + `TG_MUON_NS_PARITY=1`（旧默认）| 21.6982 s | 10.375 GiB |
+| `adamw`（参照）| 0.2300 s | 15.144 GiB |
+
+⇒ **21.3× 提速**；仍比 AdamW 慢 4.43×（Newton-Schulz 是算法成本），
+但**少占 4.8 GiB** —— 这正是 Muon 对 MoE 的价值：一份动量而不是两份。
+
+新增 `tests/test_muon_ns_default.py`（13 条，CPU 可跑）：默认快路径、parity 开关、
+显式覆盖、`ns_fast=None` 被正确解析成布尔。全套 **844 passed / 61 skipped**。
+
+### 另一处文档失真
+
+`nn_ops.py` 的 docstring 说梯度裁剪走 `sumsq_sequential` —— **过时**。裁剪从 2026-11-19 起
+就走一次多张量内核（`sumsq_multi_sharded`）。已把该段改成"历史（别照抄成现状）"，
+并注明单线程版在 1.36 亿元素上要 7.6 s、fp32 累积误差达 60%。
+
 ## [1.0.10] - 2026-11-21
 
 **纯文档/基准版本**（代码与 1.0.9 完全相同），把 RTX 4090 上的完整实测数据放进 README，
