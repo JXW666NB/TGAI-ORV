@@ -1,3 +1,63 @@
+## [1.0.8] - 2026-11-20
+
+收尾版：把"HOPE V3 对齐"这件事从口头对齐变成**有实测、有边界、有文档**的状态。
+
+### 新增：MoE z-loss + 互补均衡 aux loss（可选，默认关）
+
+`v3_pretrain.forward_loss` 现在支持与 HOPE V3 一致的 MoE 辅助项，公式逐项对齐
+`model_v3.py:1079-1086 / 1126-1133`：
+
+```
+z   = (logsumexp(router_logits, -1) ** 2).mean()      × moe_router_z_loss (1e-4)
+f   = (E / (top_k*N)) * onehot.sum(0)                 （无梯度）
+P   = probs.mean(0)                                   （有梯度）
+aux = z + (f * P).sum() × moe_aux_alpha (1e-4)
+```
+
+* 开关：环境变量 `ORV_Z_LOSS` / `ORV_AUX_BAL`（默认 0）
+* **默认关闭时训练损失与 1.0.7 逐位相同**（实测 step0 `11.653159` 完全一致）
+* 实测（8 层 / E=8 / seq512）：step-0 loss 抬高 **+0.004955**；30 步末 10 均值 +0.006
+* 实现细节：用恒等式 `lse = mean_j(x_j − log_softmax_j)` 求 router 的 logsumexp，
+  不必新写归约内核（沿用 `nn.MoE._router_z_loss` 的技巧，但归一化改成参考实现的 `.mean()`）
+* 新增 2 个回归测试：系数默认/校验、以及上面那个恒等式（若被重构破坏，z-loss 会**静默算错**）
+
+### 实测决定：**暂不实现 QK-Clip**（有证据，不是偷懒）
+
+参照实现跑 5 步后 `model._qk_max.max() = 39.69`（逐头 31.7~39.7），而 `qk_clip_tau = 100`
+⇒ `γ = min(1, τ/S_max) = 1.0`，**一次都不会触发**。
+
+原因：两侧都开 `attn_qk_norm=True`（q/k 沿 head 维 RMSNorm），pre-softmax 分数天然有界。
+现在实现它 = 写一段永不执行的代码。**方案已完整记录在 `docs/V3_HOPE_PARITY.md` §7.2**，
+将来关掉 qk_norm 或训练规模上去时再启用。
+
+### 文档：`docs/V3_HOPE_PARITY.md`（新增）
+
+* 配置对齐表：参数量 **746,938,118 vs 746,979,334（差 0.006%）**
+* 30 步 loss 曲线（同数据、同顺序、同 lr、同裁剪）
+* **定量归因**：那 0.10 的 loss 差逐项排除 —— aux 只解释 0.006、GradScaler 无跳步、
+  lr 调度方向相反、初始权重噪声只有 0.009~0.012
+* 明确写出**已知上限**：两侧是否看到完全相同的 token 尚未验证
+  （ORV 的 `PackedCorpus._window` 自己切窗，与 harness 的 `[:seq]` 可能不同）
+* ⚠️ 因此**不要把 ORV 与 HOPE V3 的 loss 数值直接相比**，该表只用于说明"同量级、同方向"
+
+### CI：四条腿已绿
+
+GitHub API 对本机 IP 长期 403，改用 shields.io 徽章通道确认：
+`img.shields.io/github/actions/workflow/status/JXW666NB/TGAI-ORV/ci.yml?branch=main` → **build: passing**。
+
+（前两轮修的是两个**独立**的 Windows 专属原因：`-fPIC` 不被 clang→MSVC 接受；
+DLL 默认无导出表导致 ctypes 找不到插件符号。详见 1.0.7 的条目。）
+
+### 性能（最终值，aux 默认关）
+
+| seq | ORV | PyTorch | 结论 |
+| --- | --- | --- | --- |
+| 512 | **0.220 s** | 0.312 s | ORV 快 **1.42×** |
+| 2048 | **0.380 s** | 0.411 s | ORV 快 **1.08×** |
+
+测试：**831 passed, 59 skipped**。
+
+
 ## [1.0.7] - 2026-11-20
 
 这一版是**地基修复**：三个"不报错、只是算错或慢到不能用"的问题，加一类优化器的主机路径。
