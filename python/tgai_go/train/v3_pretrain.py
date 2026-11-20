@@ -112,6 +112,31 @@ NPY_MAGIC = b"\x93NUMPY"
 IGNORE_INDEX = -100            # 与 data_v3 / model_v3 的忽略值一致
 
 
+def _aux_coefs():
+    """读 MoE 辅助项系数：`(z_loss 系数, aux_bal 系数)`，默认都是 0。
+
+    对齐 HOPE V3 的 `moe_router_z_loss` / `moe_aux_alpha`（各 1e-4）。
+    默认 0 ⇒ `forward_loss` 里那段**完全跳过**，训练损失与 1.0.7 逐位相同。
+    非法值抛 ValueError（不静默当 0，免得"以为开了其实没开"）。
+    """
+    out = []
+    for nm in ("ORV_Z_LOSS", "ORV_AUX_BAL"):
+        raw = os.environ.get(nm, "")
+        if raw == "":
+            out.append(0.0)
+            continue
+        try:
+            v = float(raw)
+        except ValueError:
+            raise ValueError(
+                "%s=%r 不是数字。修法：传浮点数（如 0.0001），或删掉该环境变量"
+                % (nm, raw))
+        if v < 0:
+            raise ValueError("%s 不能为负（实际 %r）。修法：传 >=0 的浮点数" % (nm, v))
+        out.append(v)
+    return tuple(out)
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # 小工具
 # ═════════════════════════════════════════════════════════════════════════
@@ -751,6 +776,15 @@ def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
       ② CSA 层把 `seg` 传给 `make_plan`（按文档边界池化）；
       ③ `CE(logits[:, :-1], labels[:, 1:], ignore_index=-100)`。
     """
+    # ★ 2026-11-20：MoE 辅助项（对齐 HOPE V3 的 `model_v3.py::aux_loss()`）。
+    #   参考公式（`model_v3.py:1079-1086` 与 `1126-1133`）：
+    #       z   = (logsumexp(router_logits, -1) ** 2).mean()
+    #       f   = (E / (top_k*N)) * onehot.sum(0)      # 每专家被选比例（无梯度）
+    #       P   = probs.mean(0)                        # 平均路由概率（有梯度）
+    #       aux = z * moe_router_z_loss + (f*P).sum() * moe_aux_alpha
+    #   系数默认 0 ⇒ **行为与以前逐位相同**；用 ORV_Z_LOSS / ORV_AUX_BAL 打开。
+    _aux_z, _aux_a = _aux_coefs()
+    aux_terms = []
     B, Tlen = int(ids.shape[0]), int(ids.shape[1])
     d = int(cfg["d"])
     n_q = int(cfg["n_q"])
@@ -793,6 +827,22 @@ def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
                 mo = MOE.moe_topk_orv(hn, eids, gates, L["W1"], L["W2"], L["W3"])
             if shared:
                 mo = mo + V.situ_glu_orv(hn, L["S1"], L["S2"], L["S3"])
+            # ★ MoE 辅助项（系数为 0 时这段完全跳过 ⇒ 与以前逐位相同）
+            if _aux_z or _aux_a:
+                _E = int(L["router"].shape[0])
+                _N = int(hn.shape[0])
+                if _aux_z:
+                    _lg = hn @ L["router"].transpose(0, 1)
+                    # `x_j - log_softmax_j == lse`（对每列成立），见 nn.MoE._router_z_loss
+                    _lp = T.functional.log_softmax(_lg, axis=-1)
+                    _lse = (_lg - _lp).sum(axis=-1) / float(_E)
+                    aux_terms.append((_lse * _lse).mean() * _aux_z)
+                if _aux_a:
+                    _cnt = np.bincount(np.asarray(eids).reshape(-1), minlength=_E)
+                    _f = T.tensor((_E / float(int(top_k) * _N))
+                                  * _cnt.astype(np.float32))
+                    _P = _s.sum(axis=0) * (1.0 / float(_N))
+                    aux_terms.append((_f * _P).sum() * _aux_a)
             return h + mo.reshape(B, Tlen, d)
 
         x = CLI._checkpoint_layer(_layer, x) if use_ckpt else _layer(x)
@@ -801,7 +851,18 @@ def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
     logits = xh @ P["head"].transpose(0, 1)
     target = np.ascontiguousarray(labels[:, 1:]).reshape(-1)
     loss = T.functional.cross_entropy(logits, target, ignore_index=IGNORE_INDEX)
+    _aux_val = 0.0
+    if aux_terms:                      # 只有系数非 0 时才会有内容
+        _acc = aux_terms[0]
+        for _t in aux_terms[1:]:
+            _acc = _acc + _t
+        loss = loss + _acc
+        try:
+            _aux_val = float(_acc.read() if hasattr(_acc, "read") else _acc.data)
+        except Exception:              # noqa: BLE001 - 纯日志用，取不到就留 0
+            _aux_val = float("nan")
     meta = {"counts": counts, "n_csa": n_csa, "n_global": len(kinds) - n_csa,
+            "aux": _aux_val,
             "n_valid": int((target != IGNORE_INDEX).sum())}
     return loss, meta
 

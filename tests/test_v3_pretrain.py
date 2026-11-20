@@ -361,3 +361,47 @@ def test_scheduler_state_roundtrip_matches():
     s2.load_state_dict({"n": 6, "lr": seq[5], "base_lr": 3e-4})
     tail = [s2.step() for _ in range(9)]
     assert np.allclose(tail, seq[6:]), "调度器状态恢复后 lr 序列必须一致"
+
+
+# ---------------------------------------------------------------------------
+# MoE 辅助项（2026-11-20：对齐 HOPE V3 的 aux_loss）
+# ---------------------------------------------------------------------------
+
+def test_aux_coefs_default_zero_and_validation(monkeypatch):
+    """系数默认 0 ⇒ 训练损失与 1.0.7 逐位相同；非法值要显式报错，不能静默当 0。"""
+    from tgai_go.train import v3_pretrain as VP
+
+    monkeypatch.delenv("ORV_Z_LOSS", raising=False)
+    monkeypatch.delenv("ORV_AUX_BAL", raising=False)
+    assert VP._aux_coefs() == (0.0, 0.0)
+
+    monkeypatch.setenv("ORV_Z_LOSS", "0.0001")
+    monkeypatch.setenv("ORV_AUX_BAL", "0.0002")
+    assert VP._aux_coefs() == (0.0001, 0.0002)
+
+    monkeypatch.setenv("ORV_Z_LOSS", "banana")
+    with pytest.raises(ValueError):
+        VP._aux_coefs()
+
+    monkeypatch.setenv("ORV_Z_LOSS", "-1")
+    with pytest.raises(ValueError):
+        VP._aux_coefs()
+
+
+def test_router_lse_identity():
+    """z-loss 依赖的恒等式：`mean_j(x_j - log_softmax_j) == logsumexp(x)`。
+
+    `forward_loss` 用它来算 router 的 lse（不必新写 logsumexp 内核）。
+    若这个恒等式在某次重构后不成立，z-loss 会**静默算错**，所以钉住。
+    """
+    import tgai_go.train as T
+
+    rng = np.random.default_rng(0)
+    for shape in ((8, 16), (32, 8), (5, 33)):
+        x = rng.normal(size=shape).astype(np.float32)
+        lg = T.tensor(x.copy())
+        lp = T.functional.log_softmax(lg, axis=-1)
+        d = (np.asarray(lg.data, np.float64) - np.asarray(lp.data, np.float64))
+        lse = d.sum(axis=-1) / float(shape[1])
+        ref = np.log(np.exp(x.astype(np.float64)).sum(axis=-1))
+        assert np.allclose(lse, ref, atol=1e-3), (shape, np.abs(lse - ref).max())
