@@ -91,7 +91,7 @@ python examples/exam2_chat10m_tgai.py --device cuda --steps 600 --batch 64 --out
 | `TG_NO_FUSED=1` | 关掉融合内核（RoPE/GLU），回退组合实现 |
 | `TG_NO_VEC4=1` | 关掉 float4 向量化 |
 | `TG_LAUNCH_FAST=0` | 关掉 launch 参数模板缓存 |
-| `TG_CUDA_GRAPH=1` | 开 CUDA Graph 重放（**只在固定 batch 时可用**，与 `--batch` 互斥） |
+| `TG_CUDA_GRAPH=1` | ⚠️ **当前无效**：没有任何代码读取这个变量（2026-11-20 实测 grep 0 处）。运行时有 `graph_arm()` 图捕获机制，但 `v3_pretrain` 从不调用它；且与"步内 D2H 裁剪"和"MoE top-k 数据相关路由"结构性冲突。详见 `docs/DISPATCH_BOUND.md` |
 | `TG_FP16=1` | fp16 GEMM（实验性：精度达标时几乎没有速度收益） |
 
 ---
