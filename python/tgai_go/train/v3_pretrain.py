@@ -778,8 +778,87 @@ def _attention_mask(seg):
     return T.tensor(MK.seg_additive(MK.make_seg_mask(seg)))
 
 
+def _ce_chunk_rows(cli_value=0):
+    """`--ce-chunk` / `TG_CE_CHUNK` 解析（环境变量优先，便于 A/B 不改命令行）。
+
+    返回**每块的 token 行数**；0 / 负数 / 解析失败 ⇒ 0（= 不分块，走原来的整块
+    `logits = xh @ head.T` 路径，行为与引入本开关之前**逐位一致**）。
+    """
+    v = os.environ.get("TG_CE_CHUNK", "")
+    if str(v).strip() not in ("", "0"):
+        try:
+            return max(0, int(str(v).strip()))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(0, int(cli_value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _chunked_ce(xh, target, head, chunk):
+    """把 head + CE 切成 `chunk` 行一块，**按有效 token 数加权**合并。
+
+    ## 为什么必须配梯度重算
+
+    只切 matmul 不重算的话，autograd 会把**每块**的 logits 留到反向（`ce_bwd` 需要
+    logits 算 dlogits），峰值等于没省。所以每块都过 `CLI._checkpoint_layer`：
+    前向不建图（中间量立刻释放），反向用保存的那一小块输入重跑。仓库里已验证
+    重算的梯度**逐位等价**（`lab/prof/ckpt_proto.py`，max_abs = 0.000e+00）。
+
+    ## 为什么不能"各块 mean 再平均"
+
+    不分块的语义是 `sum(有效行) / N`（`ignore_index=-100` 的行被排除）。
+    `mean_c` 的分母是**本块有效行数** `n_c`，不是块大小；先还原 `sum_c = mean_c × n_c`
+    再按 `n_c / N` 加权，才等于原来的 `sum/N`。
+    （仓库里记过同类坑：无效行若计入均值，loss 会偏大 —— 实测 8.09 vs 4.69。）
+    """
+    rows = int(xh.shape[0])
+    chunk = int(chunk)
+    nvalid = int((target != IGNORE_INDEX).sum())
+    if chunk <= 0 or chunk >= rows or nvalid <= 0:
+        logits = xh @ head.transpose(0, 1)
+        return T.functional.cross_entropy(logits, target, ignore_index=IGNORE_INDEX)
+    inv = 1.0 / float(nvalid)
+    loss = None
+    for s in range(0, rows, chunk):
+        e = min(rows, s + chunk)
+        tc = target[s:e]
+        nc = int((tc != IGNORE_INDEX).sum())
+        if nc == 0:                        # 整块被 mask 掉：对 loss 与梯度都无贡献
+            continue
+        xc = xh[s:e]
+
+        # ★ `head.transpose(0, 1)` 必须**在块内**、且每块各自一份：
+        #   放到块外共用同一个转置视图节点时，两个块的反向会共用同一条
+        #   (headT → head) 边 —— 实测第 2 个块的反向把第 1 个块的 head 梯度**覆盖**掉，
+        #   gnorm 变成 15.3866 → 10.759（≈ 15.3866/√2，正好是"少一半"的特征）。
+        def _one(xin, tc=tc):
+            return T.functional.cross_entropy(
+                xin @ head.transpose(0, 1), tc, ignore_index=IGNORE_INDEX)
+
+        # ★★ 2026-11-21 实测结论（已定位，未解决）：**这里不能放 `_checkpoint_layer`**。
+        #   分块数学本身是精确的：
+        #       chunk=128（4 块，不重算）gnorm 与不分块 **逐位相同**（d=0.000e+00）
+        #       chunk=256（2 块，不重算）gnorm d=1.49e-06、loss d=6.7e-06
+        #   但只要套上 `CLI._checkpoint_layer`，gnorm 就变成 base/√k 量级：
+        #       2 块 15.3866 → 10.7590（=base/√2）  4 块 → 7.28  8 块 → 5.12
+        #   即 **k 个块只有 1 个块的梯度活下来** —— `_checkpoint_layer` 的
+        #   `sub.backward(g)` 是"嵌套整图反传"，在一次前向里被调用 k>1 次时会把前一块
+        #   已经累加的参数梯度清掉。它原本的用法是"每层一次、串成一条链"，那条路径
+        #   已验证逐位等价；**多处并列调用不成立**。
+        #   后果：**本开关目前不省显存**（梯度重算不可用 ⇒ 各块 logits 仍要留到反向）。
+        #   要省显存必须先修 `_checkpoint_layer` 的多次并列调用（引擎改动，单独立项）。
+        part = _one(xc) * (float(nc) * inv)
+        loss = part if loss is None else loss + part
+    if loss is None:                       # 理论上到不了（nvalid>0 已判过）
+        logits = xh @ head.transpose(0, 1)
+        return T.functional.cross_entropy(logits, target, ignore_index=IGNORE_INDEX)
+    return loss
+
+
 def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
-                 top_k=2, shared=True, use_seg=True):
+                 top_k=2, shared=True, use_seg=True, ce_chunk=0):
     """一次前向 + shift 后的 CE。返回 `(loss, meta)`，`loss` 是 0 维张量。
 
     与参考实现（`model_v3.py:1368-1515`）对齐的三点：
@@ -859,9 +938,15 @@ def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
         x = CLI._checkpoint_layer(_layer, x) if use_ckpt else _layer(x)
 
     xh = V.rmsnorm_orv(x, P["ln_f"])[:, :Tlen - 1, :].reshape(B * (Tlen - 1), d)
-    logits = xh @ P["head"].transpose(0, 1)
     target = np.ascontiguousarray(labels[:, 1:]).reshape(-1)
-    loss = T.functional.cross_entropy(logits, target, ignore_index=IGNORE_INDEX)
+    # ★ 2026-11-21：head+CE 可选分块（`--ce-chunk` / `TG_CE_CHUNK`）。
+    #   默认 0 ⇒ 走下面这两行**原样不动**，与引入开关之前逐位一致。
+    _cc = _ce_chunk_rows(ce_chunk)
+    if _cc and _cc < int(xh.shape[0]):
+        loss = _chunked_ce(xh, target, P["head"], _cc)
+    else:
+        logits = xh @ P["head"].transpose(0, 1)
+        loss = T.functional.cross_entropy(logits, target, ignore_index=IGNORE_INDEX)
     _aux_val = 0.0
     if aux_terms:                      # 只有系数非 0 时才会有内容
         _acc = aux_terms[0]
@@ -1033,6 +1118,14 @@ def build_arg_parser():
     g.add_argument("--beta2", type=float, default=0.999)
     g.add_argument("--eps", type=float, default=1e-8)
     g.add_argument("--grad-clip", type=float, default=1.0, help="<=0 关闭裁剪")
+    g.add_argument("--ce-chunk", type=int, default=0, dest="ce_chunk",
+                   help="head+CE 分块的行数（0 = 不分块，与以前逐位一致）。"
+                        "**注意：当前版本【不省显存】** —— 分块数学已验证精确"
+                        "（chunk=128 时 gnorm 逐位相同），但梯度重算不可用："
+                        "`_checkpoint_layer` 在一次前向里并列调用 k 次会丢掉 k-1 份梯度"
+                        "（实测 gnorm = base/√k），所以各块 logits 仍留到反向。"
+                        "要拿到显存收益必须先修 `_checkpoint_layer` 的多次并列调用。"
+                        "也认环境变量 TG_CE_CHUNK。")
     g.add_argument("--seed", type=int, default=None,
                    help="不给则 42；续训时自动沿用 checkpoint 里的 seed")
     g.add_argument("--policy", default=None,
@@ -1391,7 +1484,9 @@ def main(argv=None):
             opt.zero_grad()
             loss, fmeta = forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
                                        top_k=int(a.top_k), shared=(not a.no_shared),
-                                       use_seg=(not a.no_seg))
+                                       use_seg=(not a.no_seg),
+                                       ce_chunk=_ce_chunk_rows(
+                                           getattr(a, "ce_chunk", 0)))
             lv = _scalar(loss)
             if not _is_finite(lv):
                 aborted = ("loss", lv, step, ids, labels, seg)
