@@ -6256,6 +6256,39 @@ class CudaRuntime:
         cache[key] = tail
         return tail
 
+    def _bcast_box(self, a_shape, b_shape, out_shape):
+        """`mul_bcast`/`add_bcast` 的 28 元素启动参数表，**按形状缓存且可原地改写**。
+
+        为什么要有它（2026-11-20 实测，4090 / seq512）：这两个算子一步要发 576 + 57 次，
+        原来的写法每次都要 `tuple(int(s) for s in …)` ×3、24 个 `(int, ctypes.c_int)`、
+        再把 4 元素 list 与 24 元素 list 拼成一个 28 元素 list —— 纯记账约 3.5 µs/次。
+        这里改成一份 list-of-list：形状部分一次建好，每次只改前 4 格的**数值**，不再产生
+        任何新对象。`launch()` 的快路径本来就是按位置改写 `holders[i].value`，
+        所以传可变 list 与传 tuple 完全等价（`_make_tmpl` 只做 `(val, typ)` 解包）。
+
+        前三格用 `c_uint64`（跟 `_ptr()` 一致），第四格 `c_int`（元素数）。
+        数值由调用方填 —— 缓存里只存类型与形状常量。
+        """
+        cache = getattr(self, "_bcast_box_cache", None)
+        if cache is None:
+            cache = self._bcast_box_cache = {}
+        ka = a_shape if type(a_shape) is tuple else tuple(a_shape)
+        kb = b_shape if type(b_shape) is tuple else tuple(b_shape)
+        key = (ka, kb, out_shape)
+        box = cache.get(key)
+        if box is not None:
+            return box
+        tail = self._bcast_tail(tuple(int(s) for s in ka),
+                                tuple(int(s) for s in kb),
+                                tuple(int(s) for s in out_shape))
+        box = [[0, ctypes.c_uint64], [0, ctypes.c_uint64],
+               [0, ctypes.c_uint64], [0, ctypes.c_int]]
+        box += [list(t) for t in tail]
+        if len(cache) > 4096:                 # 只防病态用法下无界增长
+            cache.clear()
+        cache[key] = box
+        return box
+
     def mul_bcast(self, a, b, a_shape, b_shape, out_shape):
         """带广播的逐元素乘：**一次内核**，不物化任何广播副本。
 
@@ -6264,40 +6297,52 @@ class CudaRuntime:
         这里把索引映射放进内核，结果与"先物化再乘"**逐位等价**
         （同一个乘法、同一对元素，只是不再经过中间缓冲）。
         """
-        out_shape = tuple(int(s) for s in out_shape)
+        if type(out_shape) is not tuple:
+            out_shape = tuple(int(s) for s in out_shape)
         out = self.empty(out_shape, dtype=np.float32)
         n = int(out.n)
         if n:
             if n > 2147483647:
                 raise CudaError("mul_bcast 元素个数超过 int32"
                                 + "。修法：把张量分块相乘；或改用非广播路径")
-            grid, block = self._ewise_grid(n)
+            block = 256
+            grid = ((n + 255) // 256, 1, 1)
             self._activate()
-            self.launch("mul_bcast8", grid, block,
-                        [self._ptr(a), self._ptr(b), self._ptr(out),
-                         (n, ctypes.c_int)]
-                        + self._bcast_tail(tuple(int(s) for s in a_shape),
-                                           tuple(int(s) for s in b_shape),
-                                           out_shape))
+            box = self._bcast_box(a_shape, b_shape, out_shape)
+            box[0][0] = int(a.ptr)
+            box[1][0] = int(b.ptr)
+            box[2][0] = int(out.ptr)
+            box[3][0] = n
+            # `_ptr()` 的副作用必须保留：把参与本步的缓冲记进"已提交"集合，
+            # fp16 拆分缓存靠它判断能否复用（原先由 3 次 `_ptr()` 完成）。
+            self._mark_submitted(a.ptr)
+            self._mark_submitted(b.ptr)
+            self._mark_submitted(out.ptr)
+            self.launch("mul_bcast8", grid, (block, 1, 1), box)
         return out
 
     def add_bcast(self, a, b, a_shape, b_shape, out_shape):
         """带广播的逐元素加：一次内核，不物化广播副本（与 `mul_bcast` 同构）。"""
-        out_shape = tuple(int(s) for s in out_shape)
+        if type(out_shape) is not tuple:
+            out_shape = tuple(int(s) for s in out_shape)
         out = self.empty(out_shape, dtype=np.float32)
         n = int(out.n)
         if n:
             if n > 2147483647:
                 raise CudaError("add_bcast 元素个数超过 int32"
                                 + "。修法：把张量分块相加；或改用非广播路径")
-            grid, block = self._ewise_grid(n)
+            block = 256
+            grid = ((n + 255) // 256, 1, 1)
             self._activate()
-            self.launch("add_bcast8", grid, block,
-                        [self._ptr(a), self._ptr(b), self._ptr(out),
-                         (n, ctypes.c_int)]
-                        + self._bcast_tail(tuple(int(s) for s in a_shape),
-                                           tuple(int(s) for s in b_shape),
-                                           out_shape))
+            box = self._bcast_box(a_shape, b_shape, out_shape)
+            box[0][0] = int(a.ptr)
+            box[1][0] = int(b.ptr)
+            box[2][0] = int(out.ptr)
+            box[3][0] = n
+            self._mark_submitted(a.ptr)
+            self._mark_submitted(b.ptr)
+            self._mark_submitted(out.ptr)
+            self.launch("add_bcast8", grid, (block, 1, 1), box)
         return out
 
     def _broadcast_lead(self, sa, sb):
