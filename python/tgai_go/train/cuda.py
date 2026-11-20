@@ -3518,10 +3518,12 @@ class GpuBuf:
         self.ptr = int(ptr)
         self._token = None
         self._base = None
-        self.nbytes = int(nbytes)
-        self.shape = tuple(shape)
-        self.n = int(n)
-        self.dtype = np.dtype(dtype)
+        self.nbytes = nbytes if type(nbytes) is int else int(nbytes)
+        # ★ 2026-11-20：`empty()` 传进来的已经是 tuple / np.dtype / int，
+        #   再归一化一次是纯浪费（这类构造一步 4500+ 次）。只在真不是的时候归一。
+        self.shape = shape if type(shape) is tuple else tuple(shape)
+        self.n = n if type(n) is int else int(n)
+        self.dtype = dtype if type(dtype) is np.dtype else np.dtype(dtype)
         # 主机已经知道的标量（例如 backward() 填的 1）。读它不必再同步设备。
         self.known_scalar = None
         # 异步 H2D 期间主机缓冲必须活着。
@@ -3940,6 +3942,11 @@ class CudaRuntime:
         self._attn_nop_path = None
         # 缓存分配器。热路径只在 CPU 侧交接指针，不调用 cuMemAlloc/cuMemFree。
         self._pool_cap = _POOL_CAP_BYTES
+        # ★ 2026-11-20：这两个标志在**热路径**（`_alloc` 每次分配都读）里用属性直读，
+        #   原来写成 `getattr(self, "...", False)`。必须是"在任何可能读它的代码之前"
+        #   就有值，所以放在这里（`_adapt_pool_cap()` 之前）。
+        self._pool_cap_adapted = False
+        self._alloc_retry = False
         self._adapt_pool_cap()
         self._pool_free = {}
         self._pool_live = {}
@@ -4700,8 +4707,14 @@ class CudaRuntime:
             raise CudaError("分配器把仍在使用的块交了出去: 0x%x" % int(ptr) + "。修法：调小 batch/seq，或开梯度检查点（cfg[GRAD_CKPT]=True）；也可设 TG_POOL_GB 限制池上限")
         self._pool_seq += 1
         self._pool_live[int(ptr)] = (int(size), self._pool_seq, self._submit_stamp)
-        self._pool_live_bytes += int(size)
-        self._pool_note()
+        live = self._pool_live_bytes + int(size)
+        self._pool_live_bytes = live
+        # `_pool_note()` 内联（一步 4500+ 次；省一次方法调用 + 一次属性读）。
+        if live > self._pool_peak_live:
+            self._pool_peak_live = live
+        occupied = live + self._pool_cached_bytes
+        if occupied > self._pool_peak:
+            self._pool_peak = occupied
 
     def _pool_token_of(self, ptr):
         rec = self._pool_live.get(int(ptr))
@@ -5214,7 +5227,8 @@ class CudaRuntime:
         nbytes = int(nbytes)
         # ★ 2026-11-19：池上限自适应必须在**上下文就绪之后**做（构造期查不到设备总量）。
         #   首次分配是最早能保证就绪的点；失败不抛、下次再试。
-        if not getattr(self, "_pool_cap_adapted", False):
+        # ★ 2026-11-20：标志位改**属性直读**（每次分配都走这里，一步 4500+ 次）。
+        if not self._pool_cap_adapted:
             try:
                 self._adapt_pool_cap()
             except Exception:                    # noqa: BLE001 - 自适应失败不能影响分配
@@ -5230,12 +5244,12 @@ class CudaRuntime:
         # 捕获期：**只从 arena 分配**，绝不碰池。
         # 理由（实测）：图节点会引用分配到的缓冲；若来自池，后续捕获/复用/empty_cache 会让
         # 前一张图的缓冲被改写或释放，表现为"第二张图重放结果不对"或 rc=700 非法访存。
-        if getattr(self, "_capturing", False) and getattr(self, "_arena_base", 0):
+        if self._capturing and self._arena_base:
             ap = self._arena_alloc(bucket)
             if ap:
                 return ap
         ptr = self._pool_take(bucket)
-        if not ptr and not getattr(self, "_alloc_retry", False) and not self._capturing:
+        if not ptr and not self._alloc_retry and not self._capturing:
             # ★ 这里原来的判据是**硬编码 12.2 GiB**：一旦 live+cached 超过它就
             #   cuCtxSynchronize() + 释放缓存。工作集本来就 13 GiB 左右，于是**每次未命中
             #   都整设备同步一次**（实测 1190 次/步，1.1 s 里很大一块）。
@@ -5334,14 +5348,33 @@ class CudaRuntime:
         raise CudaError(msg)
 
     def empty(self, shape, dtype=np.float32):
-        shape = tuple(shape)
-        # _alloc 的池命中路径不再设上下文，这里少一次 np.dtype() 归一化
-        dt = _F32 if dtype is np.float32 else np.dtype(dtype)
-        n = 1
-        for s in shape:
-            n *= int(s)
-        # cuMemAlloc(0) 会返回 INVALID_VALUE，空张量也留 1 个元素的垫片，n 仍记 0。
-        nbytes = max(n, 1) * int(dt.itemsize)
+        """分配一块设备内存（池命中时**只做主机侧指针交接**）。
+
+        热路径优化（2026-11-20，实测 6.69 µs → 见 `_alloc`/`GpuBuf` 的同类注释）：
+        一步会调用 4500+ 次，所以这里避免任何可省的归一化：
+          * `dtype` 常态就是 `np.float32`（`_F32` 已就绪）或已是 `np.dtype`；
+          * `shape` 常态已经是 tuple；
+          * rank-2 直接乘，不走 `for` 循环（绝大多数张量是 2D/展平后的 2D）。
+        语义与原来完全一致：`n` 仍是"各维相乘（可为 0）"，`nbytes` 仍用 `max(n,1)`。
+        """
+        if dtype is np.float32:
+            dt = _F32
+        elif type(dtype) is np.dtype:
+            dt = dtype
+        else:
+            dt = np.dtype(dtype)
+        if type(shape) is not tuple:
+            shape = tuple(shape)
+        nd = len(shape)
+        if nd == 2:
+            n = int(shape[0]) * int(shape[1])
+        elif nd == 0:
+            n = 1
+        else:
+            n = 1
+            for s in shape:
+                n *= int(s)
+        nbytes = (n if n > 0 else 1) * dt.itemsize
         ptr = self._alloc(nbytes)
         return GpuBuf(self, ptr, nbytes, shape, n, dt)
 
