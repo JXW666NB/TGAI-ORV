@@ -5352,11 +5352,19 @@ def _newton_schulz5_gpu(rt, x, steps=5, eps=1e-7, fast=False):
         # cuBLAS 路径：同样的 5 步迭代，只是矩阵乘换成 cuBLAS（运行时只有 gemm_nt）。
         # 利用对称性：s = x x^T 与 ss = s s 都是对称矩阵，所以 s@s == s@s^T；
         # y@x 则用 gemm_nt(y, x^T) —— 多一次 transpose 拷贝，远小于 GEMM 本身。
-        for _ in range(int(steps)):
-            s = rt.gemm_nt(x, x)                     # x @ x^T（对称）
-            ss = rt.gemm_nt(s, s)                    # s @ s^T == s @ s（对称）
-            y = rt.add(rt.scale(s, b), rt.scale(ss, c))
-            x = rt.add(rt.scale(x, a), rt.gemm_nt(y, rt.transpose2d(x)))
+        # ★ 2026-11-21：`TG_MUON_NS_GEMM=tf32` 时临时切 cuBLAS 到 TF32 张量核，
+        #   4090 上把 NS 的 GEMM 从 ~19 TFLOPS 拉到接近峰值（代价 ~1e-3 相对误差）。
+        #   默认 fp32（PEDANTIC，逐位稳定）—— 只有显式开启才切，且 finally 一定复位。
+        _tf32 = (_muon_ns_gemm_mode() == "tf32") and rt.ns_math_mode_begin()
+        try:
+            for _ in range(int(steps)):
+                s = rt.gemm_nt(x, x)                 # x @ x^T（对称）
+                ss = rt.gemm_nt(s, s)                # s @ s^T == s @ s（对称）
+                y = rt.add(rt.scale(s, b), rt.scale(ss, c))
+                x = rt.add(rt.scale(x, a), rt.gemm_nt(y, rt.transpose2d(x)))
+        finally:
+            if _tf32:
+                rt.ns_math_mode_end()
     else:
         for _ in range(int(steps)):
             # X @ X.T：先把 X 转成连续的 X.T，再做顺序 FMA 的普通乘。
@@ -5396,6 +5404,22 @@ def _muon_default_ns_fast():
     if p in ("1", "true", "yes", "on"):
         return False
     return True
+
+
+def _muon_ns_gemm_mode():
+    """Newton-Schulz 的 GEMM 用哪种数学模式。
+
+    * `"fp32"`（**默认**）：cuBLAS PEDANTIC，真 fp32、逐位稳定，但 4090 上实测只有 ~19 TFLOPS。
+    * `"tf32"`：临时切 `CUBLAS_TF32_TENSOR_OP_MATH`，Ampere+ 走张量核（4090 峰值 80 TFLOPS），
+      代价是约 1e-3 量级的相对误差。**只影响 Muon 的 NS**，训练主路径仍是 PEDANTIC fp32。
+
+    NS 本身是近似（5 步、eps=1e-7），官方 Muon 实现直接用 bf16 跑它，
+    所以这里放开精度是合理的 —— 但**默认不开**，要显式设 `TG_MUON_NS_GEMM=tf32`。
+    """
+    v = os.environ.get("TG_MUON_NS_GEMM", "").strip().lower()
+    if v in ("tf32", "1", "true", "yes", "on"):
+        return "tf32"
+    return "fp32"
 
 
 class Muon(_Optim):

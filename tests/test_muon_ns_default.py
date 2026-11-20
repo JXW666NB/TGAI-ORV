@@ -10,8 +10,29 @@ import tgai_go.train as T
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    for k in ("TG_MUON_NS_FAST", "TG_MUON_NS_PARITY"):
+    for k in ("TG_MUON_NS_FAST", "TG_MUON_NS_PARITY", "TG_MUON_NS_GEMM"):
         monkeypatch.delenv(k, raising=False)
+
+
+def test_ns_gemm_defaults_to_fp32():
+    """NS 的 GEMM 默认走 PEDANTIC fp32（逐位稳定）；TF32 必须显式开启。
+
+    NS 是近似算法（5 步、eps=1e-7），官方 Muon 实现甚至用 bf16 跑它 ——
+    但"默认不变"是这里的硬约束：精度相关的东西不能悄悄改。
+    """
+    assert T._muon_ns_gemm_mode() == "fp32"
+
+
+@pytest.mark.parametrize("val", ["tf32", "1", "true", "YES", "on"])
+def test_ns_gemm_tf32_opt_in(monkeypatch, val):
+    monkeypatch.setenv("TG_MUON_NS_GEMM", val)
+    assert T._muon_ns_gemm_mode() == "tf32"
+
+
+@pytest.mark.parametrize("val", ["", "fp32", "乱写", "off"])
+def test_ns_gemm_falls_back_to_fp32(monkeypatch, val):
+    monkeypatch.setenv("TG_MUON_NS_GEMM", val)
+    assert T._muon_ns_gemm_mode() == "fp32"
 
 
 def test_default_is_fast():

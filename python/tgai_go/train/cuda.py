@@ -30,6 +30,10 @@ CUDA_OP_T = 1
 # 注释写明：cublas<T> 例程因此改用对应的 _PEDANTIC compute type。
 CUBLAS_PEDANTIC_MATH = 2
 CUBLAS_DEFAULT_MATH = 0
+# cublas_api.h: CUBLAS_TF32_TENSOR_OP_MATH = 1 —— Ampere+ 上让 fp32 GEMM 走 TF32 张量核。
+# 引擎默认 PEDANTIC（见构造期注释：避免 TF32 把 fp32 拉到 ~1e-3），只有 Muon 的
+# Newton-Schulz 会在显式开启时临时切到它（`ns_math_mode_begin/end`）。
+CUBLAS_TF32_TENSOR_OP_MATH = 1
 CUBLAS_POINTER_MODE_HOST = 0
 # cuStreamBeginCapture 的 mode。先 RELAXED，不行再 THREAD_LOCAL。
 CU_STREAM_CAPTURE_MODE_THREAD_LOCAL = 1
@@ -7342,6 +7346,38 @@ class CudaRuntime:
         for buf in c.values():
             total += int(getattr(buf, "nbytes", 0) or 0)
         return {"entries": len(c), "bytes": total, "on": bool(getattr(self, "_f16_cache_on", False))}
+
+    def ns_math_mode_begin(self):
+        """Muon 专用：把 cuBLAS 临时切到 TF32（Ampere+ 的 fp32 GEMM 走张量核）。
+
+        返回 True 表示切成功，调用方**必须**在 finally 里调 `ns_math_mode_end()`。
+        为什么只有 Muon 用：Newton-Schulz 本身就是近似（5 步、eps=1e-7），
+        官方 Muon 实现直接用 bf16 跑它；而训练主路径需要 fp32 的逐位稳定性，
+        所以才有了"全局 PEDANTIC + NS 临时 TF32"这种分工。
+
+        失败（老驱动没有该 math mode）一律返回 False，调用方回落 fp32 —— 绝不抛。
+        """
+        if self.cublas is None or self.cu is None:
+            return False
+        try:
+            self._activate()
+            self._chk_blas(self.cublas.cublasSetMathMode(
+                self.handle, CUBLAS_TF32_TENSOR_OP_MATH),
+                "cublasSetMathMode(TF32)")
+            return True
+        except Exception:                                # noqa: BLE001
+            return False
+
+    def ns_math_mode_end(self):
+        """把 cuBLAS 复位回 PEDANTIC（构造期设定的全局策略）。"""
+        if self.cublas is None or self.cu is None:
+            return
+        try:
+            self._chk_blas(self.cublas.cublasSetMathMode(
+                self.handle, CUBLAS_PEDANTIC_MATH),
+                "cublasSetMathMode(PEDANTIC)")
+        except Exception:                                # noqa: BLE001
+            pass
 
     def _sgemm_f16(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
         """列主序调用和 _sgemm 完全一致，只是 A/B 先转 fp16、按 fp32 累加。
