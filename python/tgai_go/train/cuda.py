@@ -1668,6 +1668,109 @@ extern "C" __global__ void sumsq_multi_slots(const float* raw_ptrs,
     if (threadIdx.x == 0) slots[t] = sm[0];
 }
 
+/* ===========================================================================
+   多张量平方和 / 缩放的**分片**版本（2026-11-20）。
+
+   为什么需要：上面的 `sumsq_multi_slots` / `scale_multi` 的 grid 是 (张量数,1,1)，
+   **每个张量只有 1 个 block(256 线程)**。对 98.3M 元素的大梯度（vocab 96000 的
+   emb/head）一个 block 要独自扫 393 MB ⇒ 实测 **4.2 GB/s**（同形状 1024 block 时
+   900 GB/s），所以 `clip_grad_norm_` 里不得不加 `big <= (1<<20)` 的门槛，
+   退回"逐张量 sumsq_parallel(2 次发射) + add_(1 次发射)" = **962 次发射/步**。
+
+   这里改成按分片给 block：每个张量切 nb_t 个 block，全局 grid = Σ nb_t。
+   块 → 张量 的映射由 `raw_offsets`（n+1 个 int32 的累计分片下标）二分得到。
+
+   **与旧路径逐位一致**（不是"近似一致"）：
+     * kernel A 里每个分片复刻 `sumsq_partial` 的 grid-stride 循环
+       （步长 = blockDim * 该张量的 nb_t），所以 `part[t][s]` 与旧路径同值；
+     * kernel B 里对每个张量复刻 `sumsq_final` 的"tid 起步 + 树归约"，
+       再按张量下标顺序做 fp32 累加 —— 与旧路径 `acc = ss_0` 之后顺序
+       `add_(acc, ss_i)` 完全同序（0.0 + x == x，fp32 精确）。
+   因此范数的二进制结果不变，`TG_DETERMINISTIC` 不受影响，也没有任何 atomicAdd。
+   =========================================================================== */
+
+/* 由累计分片表二分出全局块号 b 属于哪个张量。 */
+__device__ __forceinline__ int tg_slot_of(const int* off, int n, int b) {
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (off[mid] <= b) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
+extern "C" __global__ void sumsq_multi_shard(const float* raw_ptrs,
+                                             const float* raw_sizes,
+                                             const float* raw_offsets,
+                                             int n, float* part) {
+    int b = blockIdx.x;
+    const int* off = (const int*)raw_offsets;
+    int t = tg_slot_of(off, n, b);
+    int s = b - off[t];
+    int nb = off[t + 1] - off[t];
+    const unsigned long long* pp = (const unsigned long long*)raw_ptrs;
+    const int* sz = (const int*)raw_sizes;
+    const float* a = (const float*)pp[t];
+    int m = sz[t];
+    float acc = 0.f;
+    /* 与 sumsq_partial 同一条循环：blockDim 固定 256，gridDim 在该张量上是 nb。 */
+    for (int i = s * 256 + threadIdx.x; i < m; i += 256 * nb) {
+        float v = a[i];
+        acc = __fadd_rn(acc, __fmul_rn(v, v));
+    }
+    __shared__ float sm[256];
+    sm[threadIdx.x] = acc;
+    __syncthreads();
+    for (int o = 128; o > 0; o >>= 1) {
+        if (threadIdx.x < o)
+            sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + o]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) part[b] = sm[0];
+}
+
+/* 单 block：对每个张量做一次 sumsq_final 的树归约，再按下标顺序累加。 */
+extern "C" __global__ void sumsq_multi_final(const float* part,
+                                             const float* raw_offsets,
+                                             int n, float* out) {
+    const int* off = (const int*)raw_offsets;
+    __shared__ float sm[256];
+    float total = 0.f;
+    for (int t = 0; t < n; ++t) {
+        int i0 = off[t], i1 = off[t + 1];
+        float s = 0.f;
+        for (int i = i0 + threadIdx.x; i < i1; i += blockDim.x)
+            s = __fadd_rn(s, part[i]);
+        sm[threadIdx.x] = s;
+        __syncthreads();
+        for (int o = 128; o > 0; o >>= 1) {
+            if (threadIdx.x < o)
+                sm[threadIdx.x] = __fadd_rn(sm[threadIdx.x], sm[threadIdx.x + o]);
+            __syncthreads();
+        }
+        total = __fadd_rn(total, sm[0]);   /* 与旧路径顺序 add_ 同序 */
+    }
+    if (threadIdx.x == 0) out[0] = total;
+}
+
+/* 分片版原地缩放：每个元素各乘一次，**与分片方式无关**（无归约）⇒ 逐位等价。 */
+extern "C" __global__ void scale_multi_shard(const float* raw_ptrs,
+                                             const float* raw_sizes,
+                                             const float* raw_offsets,
+                                             int n, float s) {
+    int b = blockIdx.x;
+    const int* off = (const int*)raw_offsets;
+    int t = tg_slot_of(off, n, b);
+    int sh = b - off[t];
+    int nb = off[t + 1] - off[t];
+    const unsigned long long* pp = (const unsigned long long*)raw_ptrs;
+    const int* sz = (const int*)raw_sizes;
+    float* a = (float*)pp[t];
+    int m = sz[t];
+    for (int i = sh * 256 + threadIdx.x; i < m; i += 256 * nb)
+        a[i] = __fmul_rn(a[i], s);
+}
+
 /* 多张量原地缩放：一个 block 处理一个张量，无归约 ⇒ 天然确定性。
    用途：梯度裁剪时一次缩完所有参数（原来 321 次 scale_inplace）。 */
 extern "C" __global__ void scale_multi(const float* raw_ptrs, const float* raw_sizes,
@@ -3827,6 +3930,9 @@ class CudaRuntime:
         self._blas_count = 0
         # nbytes -> 池桶大小（同一个尺寸每步反复申请，省掉一次取整计算）
         self._bucket = {}
+        # (a_shape, b_shape, out_shape) -> mul_bcast/add_bcast 的 24 个广播/形状参数。
+        # 纯形状函数，与数值无关；见 `_bcast_tail` 的说明（实测省 6~9 ms/步）。
+        self._bcast_tail_cache = {}
         # 低显存 attention 是第二份 NVRTC 模块。默认路径不编译它。
         self._attn_mod = None
         self._attn_fns = {}
@@ -6087,6 +6193,36 @@ class CudaRuntime:
                 strides.append(int(raw[i - base]))
         return strides
 
+    def _bcast_tail(self, a_shape, b_shape, out_shape):
+        """`mul_bcast` / `add_bcast` 的 24 个（形状, stride）启动参数，按形状三元组缓存。
+
+        为什么要有它（2026-11-20 实测，4090 / seq512 / 12 层）：
+          `_bcast_strides` ×2（3.4+3.2 µs）+ `_row_strides` ×2（2.5 µs）
+          + `_left_pad8` ×3（3.2 µs）+ 24 个 `ctypes.c_int` 构造 ≈ 15 µs，
+          而 `mul_bcast` 一步要发 **576 次**、`add_bcast` 57 次 ⇒ 纯主机侧约 9 ms/步
+          （步时 238 ms 的 3.8%）。这一整段是**形状的纯函数**，与张量取值无关，
+          所以缓存不改变任何数值语义；缓存键是形状元组，条目数由模型结构决定（极少）。
+        """
+        key = (a_shape, b_shape, out_shape)
+        cache = getattr(self, "_bcast_tail_cache", None)
+        if cache is None:
+            cache = self._bcast_tail_cache = {}
+        tail = cache.get(key)
+        if tail is not None:
+            return tail
+        _ci = ctypes.c_int
+        tail = ([(int(s), _ci) for s in self._left_pad8(out_shape, 1)]
+                + [(int(s), _ci)
+                   for s in self._left_pad8(
+                       self._bcast_strides(a_shape, out_shape), 0)]
+                + [(int(s), _ci)
+                   for s in self._left_pad8(
+                       self._bcast_strides(b_shape, out_shape), 0)])
+        if len(cache) > 4096:                 # 只防病态用法下无界增长
+            cache.clear()
+        cache[key] = tail
+        return tail
+
     def mul_bcast(self, a, b, a_shape, b_shape, out_shape):
         """带广播的逐元素乘：**一次内核**，不物化任何广播副本。
 
@@ -6104,15 +6240,12 @@ class CudaRuntime:
                                 + "。修法：把张量分块相乘；或改用非广播路径")
             grid, block = self._ewise_grid(n)
             self._activate()
-            self.launch("mul_bcast8", grid, block, [
-                self._ptr(a), self._ptr(b), self._ptr(out), (n, ctypes.c_int),
-            ] + [(int(s), ctypes.c_int) for s in self._left_pad8(out_shape, 1)]
-              + [(int(s), ctypes.c_int)
-                 for s in self._left_pad8(
-                     self._bcast_strides(a_shape, out_shape), 0)]
-              + [(int(s), ctypes.c_int)
-                 for s in self._left_pad8(
-                     self._bcast_strides(b_shape, out_shape), 0)])
+            self.launch("mul_bcast8", grid, block,
+                        [self._ptr(a), self._ptr(b), self._ptr(out),
+                         (n, ctypes.c_int)]
+                        + self._bcast_tail(tuple(int(s) for s in a_shape),
+                                           tuple(int(s) for s in b_shape),
+                                           out_shape))
         return out
 
     def add_bcast(self, a, b, a_shape, b_shape, out_shape):
@@ -6126,15 +6259,12 @@ class CudaRuntime:
                                 + "。修法：把张量分块相加；或改用非广播路径")
             grid, block = self._ewise_grid(n)
             self._activate()
-            self.launch("add_bcast8", grid, block, [
-                self._ptr(a), self._ptr(b), self._ptr(out), (n, ctypes.c_int),
-            ] + [(int(s), ctypes.c_int) for s in self._left_pad8(out_shape, 1)]
-              + [(int(s), ctypes.c_int)
-                 for s in self._left_pad8(
-                     self._bcast_strides(a_shape, out_shape), 0)]
-              + [(int(s), ctypes.c_int)
-                 for s in self._left_pad8(
-                     self._bcast_strides(b_shape, out_shape), 0)])
+            self.launch("add_bcast8", grid, block,
+                        [self._ptr(a), self._ptr(b), self._ptr(out),
+                         (n, ctypes.c_int)]
+                        + self._bcast_tail(tuple(int(s) for s in a_shape),
+                                           tuple(int(s) for s in b_shape),
+                                           out_shape))
         return out
 
     def _broadcast_lead(self, sa, sb):
@@ -9200,6 +9330,9 @@ class CudaRuntime:
             调度变化，重跑会差 1e-7 量级，破坏逐位可复现）。
           * kernel B `sumsq_final`：对 slots 做固定顺序的树归约（与原来同一套算法）。
         张量之间的求和顺序由 slot 下标固定，因此结果与张量个数、调度无关。
+
+        注意：grid=(n,1,1) ⇒ **每张量只有 1 个 block**。大张量（>1M 元素）请用
+        `sumsq_multi_total_sharded`，否则带宽只有 ~4 GB/s。
         """
         bufs = [b for b in bufs if b is not None and int(b.n) > 0]
         n = len(bufs)
@@ -9217,8 +9350,54 @@ class CudaRuntime:
         out.keepalive = (slots, ptrs, sizes)  # 防缓冲被池提前回收
         return float(self.read_scalar(out))
 
+    def _shard_offsets(self, bufs):
+        """每个张量的分片块数 nb_t = min(1024, ceil(m/256))，以及累计下标表。
+
+        nb_t 的取法与 `sumsq_parallel` / `scale_inplace` 的 grid 完全一致，
+        这是"分片版本与逐张量路径逐位相同"的前提。
+        """
+        nb = np.empty(len(bufs), dtype=np.int64)
+        for i, b in enumerate(bufs):
+            m = int(b.n)
+            nb[i] = max(1, min(1024, (m + 255) // 256))
+        off = np.zeros(len(bufs) + 1, dtype=np.int32)
+        off[1:] = np.cumsum(nb)
+        return nb, off
+
+    def sumsq_multi_total_sharded(self, bufs):
+        """所有张量平方和（**确定性 + 与逐张量路径逐位一致**），**2 次发射**。
+
+        与 `sumsq_multi_total` 的区别：grid 按分片给 block（Σ nb_t 个），
+        因此大张量也能跑满带宽（98.3M 元素实测 900 GB/s vs 4.2 GB/s）。
+        大张量不再需要退回"逐张量 2 次发射"的老路。
+        """
+        bufs = [b for b in bufs if b is not None and int(b.n) > 0]
+        n = len(bufs)
+        if n == 0:
+            return 0.0
+        if n == 1:                           # 单张量：与 sumsq_parallel 逐位同值
+            return float(self.read_scalar(self.sumsq_parallel(bufs[0])))
+        _nb, off = self._shard_offsets(bufs)
+        total_blocks = int(off[-1])
+        ptrs, sizes = self._ptrs_and_sizes(bufs)
+        # int32 → float32 是按位重解释（h2d 只吃 float32/uint16），内核里强转回 int。
+        offs = self.h2d(np.ascontiguousarray(off).view(np.float32))
+        part = self.empty((total_blocks,), dtype=np.float32)
+        self.launch("sumsq_multi_shard", (total_blocks, 1, 1), (256, 1, 1), [
+            self._ptr(ptrs), self._ptr(sizes), self._ptr(offs),
+            (n, ctypes.c_int), self._ptr(part)])
+        out = self.empty((), dtype=np.float32)
+        self.launch("sumsq_multi_final", (1, 1, 1), (256, 1, 1), [
+            self._ptr(part), self._ptr(offs), (n, ctypes.c_int),
+            self._ptr(out)])
+        out.keepalive = (part, ptrs, sizes, offs)   # 防缓冲被池提前回收
+        return float(self.read_scalar(out))
+
     def scale_multi(self, bufs, scalar):
-        """所有张量原地乘同一标量（**确定性**，无归约）。1 次发射取代 n 次。"""
+        """所有张量原地乘同一标量（**确定性**，无归约）。1 次发射取代 n 次。
+
+        注意：grid=(n,1,1) ⇒ 每张量 1 个 block。大张量请用 `scale_multi_sharded`。
+        """
         bufs = [b for b in bufs if b is not None and int(b.n) > 0]
         n = len(bufs)
         if n == 0:
@@ -9231,6 +9410,35 @@ class CudaRuntime:
         self.launch("scale_multi", (n, 1, 1), (256, 1, 1), [
             self._ptr(ptrs), self._ptr(sizes), (n, ctypes.c_int),
             (s, ctypes.c_float)])
+
+    def scale_multi_sharded(self, bufs, scalar):
+        """所有张量原地乘同一标量，按分片给 block（**1 次发射**，逐位等价）。
+
+        乘法是纯逐元素的、没有归约 ⇒ 分片方式不影响任何元素的取值，
+        与逐张量 `scale_inplace` **逐位相同**。`scalar == 1.0` 时与
+        `scale_inplace` 一样**什么都不做**；n==1 的 `known_scalar` 也在主机侧同步，
+        避免"设备上没改、主机上的已知标量却过期"。
+        """
+        bufs = [b for b in bufs if b is not None and int(b.n) > 0]
+        n = len(bufs)
+        if n == 0:
+            return
+        s = float(scalar)
+        if n == 1:
+            self.scale_inplace(bufs[0], s)
+            return
+        if s != 1.0:
+            _nb, off = self._shard_offsets(bufs)
+            total_blocks = int(off[-1])
+            ptrs, sizes = self._ptrs_and_sizes(bufs)
+            offs = self.h2d(np.ascontiguousarray(off).view(np.float32))
+            self.launch("scale_multi_shard", (total_blocks, 1, 1), (256, 1, 1), [
+                self._ptr(ptrs), self._ptr(sizes), self._ptr(offs),
+                (n, ctypes.c_int), (s, ctypes.c_float)])
+            self._scale_shard_keep = (ptrs, sizes, offs)   # 防 h2d 缓冲被提前回收
+        for b in bufs:                       # 与 scale_inplace 的 known_scalar 语义对齐
+            if int(b.n) == 1 and b.known_scalar is not None:
+                b.known_scalar = float(b.known_scalar) * s
 
     def sumsq_sequential(self, buf):
         """一个标量：按地址顺序的 sum(x*x)。调用方只把这个标量降回主机。"""

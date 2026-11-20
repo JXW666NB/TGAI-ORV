@@ -90,7 +90,7 @@ def main():
         seg = z["seg_id"][wi, :a.seq] if "seg_id" in z.files else np.zeros_like(ids)
         return ids, lab, seg
 
-    ces, auxs, tms = [], [], []
+    ces, auxs, tms, scales = [], [], [], []
     for step in range(a.steps):
         si, wi = order[step % len(order)]
         ids, lab, seg = win(si, wi)
@@ -111,6 +111,7 @@ def main():
         torch.cuda.synchronize()
         tms.append((time.perf_counter() - t0) * 1e3)
         ces.append(float(loss.item()))
+        scales.append(float(scaler.get_scale()))
         auxs.append(float(aux.item()))
 
     print("[hope_q] " + json.dumps({
@@ -123,6 +124,7 @@ def main():
         "ce_min": round(float(min(ces)), 6),
         "step_ms": round(float(np.median(tms)), 1),
         "first_win": [int(order[0][0]), int(order[0][1])],
+        "scale_first": scales[0], "scale_last": scales[-1], "scale_dropped": bool(scales[-1] < scales[0]),
         "qk_max_max": float(model._qk_max.max().item()),
         "qk_max_per_head_max": [round(float(x), 3) for x in model._qk_max.max(dim=0).values],
     }))

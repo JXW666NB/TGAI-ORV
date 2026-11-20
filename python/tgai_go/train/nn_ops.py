@@ -227,21 +227,24 @@ def clip_grad_norm_(params, max_norm, defer_scale=False):
                 return (n, 1.0) if defer_scale else n
             bufs.append(gpu)
         if bufs:
-            # ★ 2026-11-19 晚 紧急回退（子代理实测发现）：
-            #   多张量内核 `sumsq_multi_slots` 的 grid 是 (张量数,1,1)，**每个张量只有
-            #   1 个 block(256 线程)**。对 98.3M 元素的大梯度（vocab 96000 的 emb/head），
-            #   一个 block 要独自扫 393 MB ⇒ 实测只有 **26 GB/s**（同形状 1024 block 时
-            #   706 GB/s）。结果 clip 从 11.7 ms 涨到 **285.9 ms（占 seq512 步时 58%）**。
-            #   在我把内核改成"按分片给 block"之前，**大张量一律走旧的逐张量路径**。
-            big = max((int(b.n) for b in bufs), default=0)
-            use_multi = big <= (1 << 20)        # ≤1M 元素时多张量内核才有净收益
-            if use_multi:
-                try:
-                    total = float(rt.sumsq_multi_total(bufs))
-                    use_dev = True
-                except Exception:                # noqa: BLE001 - 老后端没有多张量核
-                    use_multi = False
-            if not use_multi:
+            # ★ 2026-11-20：改为**分片版多张量内核**（grid = Σ min(1024, ceil(m/256))）。
+            #   历史：先是"逐张量 sumsq_parallel(2 次发射) + add_(1 次发射)" —— 321 个
+            #   参数约 962 次发射，实测占步时 6%（fp32）/ 8.6%（amp=gemm）；
+            #   后来改成"每张量 1 个 block"的多张量内核，但大张量只有 4.2 GB/s，
+            #   只能加 `big <= 1<<20` 门槛退回老路（等于没修）。
+            #   现在分片版对 98.3M 元素实测 900 GB/s，且**与老路逐位同值**，
+            #   所以不再需要门槛：全部参数 2 次发射（+ 裁剪时 1 次缩放）。
+            try:
+                total = float(rt.sumsq_multi_total_sharded(bufs))
+                use_dev = True
+            except Exception:                    # noqa: BLE001 - 老后端没有分片内核
+                if hasattr(rt, "sumsq_multi_total"):
+                    try:
+                        total = float(rt.sumsq_multi_total(bufs))
+                        use_dev = True
+                    except Exception:            # noqa: BLE001
+                        use_dev = False
+            if not use_dev:
                 acc = None
                 for gpu in bufs:
                     ss = rt.sumsq_parallel(gpu)
@@ -279,16 +282,12 @@ def clip_grad_norm_(params, max_norm, defer_scale=False):
             else:
                 gbufs.append(gpu)
         if gbufs:
-            # ★ 同上的紧急回退：`scale_multi` 也是 grid=(张量数,1,1)，98.3M 的梯度实测
-            #   要 150 ms（48 GB/s），而逐张量 `scale_inplace` 只要 2.5 ms。
-            big_g = max((int(b.n) for b in gbufs), default=0)
-            if big_g <= (1 << 20):
-                try:
-                    rt.scale_multi(gbufs, float(scale))
-                except Exception:                # noqa: BLE001 - 回退到逐张量
-                    for gpu in gbufs:
-                        rt.scale_inplace(gpu, float(scale))
-            else:
+            # ★ 2026-11-20：同样改成分片版（1 次发射，逐位等价 —— 乘法无归约）。
+            #   旧的两个分支都要么 321 次 `scale_inplace`、要么"每张量 1 个 block"
+            #   的 `scale_multi`（98.3M 元素实测 48 GB/s，反而更慢）。
+            try:
+                rt.scale_multi_sharded(gbufs, float(scale))
+            except Exception:                    # noqa: BLE001 - 老后端
                 for gpu in gbufs:
                     rt.scale_inplace(gpu, float(scale))
         for p, g in cpu_ps:

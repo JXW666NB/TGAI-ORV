@@ -145,6 +145,17 @@ def _now():
     return time.perf_counter()
 
 
+def _bf16_requested():
+    """用户是否显式要求 bf16 GEMM（`TG_BF16=1`，与 `cuda.py` 的判定同一套取值）。
+
+    抽出来只为一件事：本文件的 AMP 分支固定 fp16，`TG_BF16=1` 会被
+    `amp_api._set()` 主动关掉 —— 那是个**静默**失效，实测没有任何日志。
+    这个函数让调用点能把"被忽略"写进日志（见 main() 的 --amp 分支）。
+    """
+    return str(os.environ.get("TG_BF16", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _scalar(t):
     """0 维张量 → float（CUDA 上 `to_numpy()` 返回 0 维数组）。"""
     v = t.to_numpy() if hasattr(t, "to_numpy") else t
@@ -1253,6 +1264,22 @@ def main(argv=None):
     # both: 两者都开
     _AMP = {"gemm": a.amp in ("gemm", "both"), "mlp": a.amp in ("mlp", "both")}
     if _AMP["gemm"]:
+        # ★ 2026-11-20：这里**刻意**写死 fp16，并显式告诉用户 TG_BF16=1 被忽略了。
+        #   为什么不是 bug 修一修就能开：`amp_api._set()` 对 fp16 分支会主动把
+        #   `_bf16_state()["on"]` 置 False，所以 TG_BF16=1 在这条路径上**必然无效**
+        #   （实测 amp_state() 一直是 {'fp16': True, 'bf16': False}）。
+        #   而 bf16 GEMM 的权重影子缓存失效由 `_bf16_epoch_bump()` 负责，它只挂在
+        #   `_Optim` 家族（`T.optim.AdamW` / opt_extra）的 step 上 ——
+        #   `Int8AdamWGpu.step()`（--opt int8gpu，本基准/生产真用的那个）**没有调用它**
+        #   ⇒ 直接放开 bf16 会用到上一步的 bf16 权重，梯度静默错掉（与 fp16 那次
+        #   `grad_norm 12.49 → 145775` 是同一类事故）。
+        #   所以在把 `_bf16_step_boundary()` 接进 Int8AdamWGpu 并做过数值对拍之前，
+        #   这里只做"不再静默"：行为不变，但把原因写进日志。
+        if _bf16_requested():
+            print("[amp] 注意：TG_BF16=1 已被显式忽略 —— 本路径固定 fp16 GEMM；"
+                  "bf16 需要先给 Int8AdamWGpu.step 接上 _bf16_step_boundary()"
+                  "（否则影子权重会跨步变旧，梯度静默错）。state 会显示 fp16=True/bf16=False。",
+                  flush=True)
         T.amp_on(dtype="fp16", weight_cache=not bool(a.amp_no_cache))
         # ★ 只把**参数**地址登记给 fp16 影子缓存：参数整步不变，缓存安全；
         #   激活/中间量不登记 ⇒ 每次现 cast，不可能读到池子复用留下的旧影子。
