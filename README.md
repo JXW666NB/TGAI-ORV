@@ -195,6 +195,21 @@ ORV 用 `--opt int8gpu`（m8v16，默认档），PyTorch 用 fp32 AdamW。
   用 `int8gpu` 与 `fp32 adamw` **都 OOM**；V100-32GB 上 ORV+int8gpu 可跑（0.578 s/步）而 PyTorch OOM。
   不要在 24 GB 卡上宣称能训 1.7B。
 
+### 显存：两个口径都要看（4090 / 20 步 / 2 轮取大者）
+
+| 配置 | ORV 分配器 | PyTorch 分配器 | ORV 整进程（smi）| PyTorch 整进程（smi）|
+| --- | --- | --- | --- | --- |
+| seq512 | **11.22 GiB** | 14.79 GiB | **15.02 GiB** | 16.67 GiB |
+| seq1024 | **14.15 GiB** | 17.74 GiB | 19.67 GiB | **19.05 GiB** |
+| seq2048（同开检查点）| **10.75 GiB** | 15.57 GiB | 20.11 GiB | **18.90 GiB** |
+
+* **分配器口径 ORV 一直省 3.6~4.8 GiB** —— 来源是 `int8gpu` 的分块动量为 **3.06 B/参数**，
+  而 fp32 AdamW 的 `exp_avg + exp_avg_sq` 是 **8 B/参数**。
+* ⚠️ **整进程口径在 1024/2048 上 ORV 反而多 0.6~1.2 GiB**：ORV 的池会**缓存**空闲块供下一步复用
+  （这是有意的性能取舍，见 `docs/DISPATCH_BOUND.md` 关于池 churn 的实测）。
+  看"这个配置能不能跑"要用**分配器口径**；看"卡上还剩多少给别人"要用**整进程口径**。
+* 两个口径的差异也提醒：**别用 nvidia-smi 的数字去评判分配器的好坏**。
+
 口径：同数据（vocab 96000）、同 ckpt（该关的关、该开的两侧同开）、**两侧各取自身最优设置**、
 batch=1、20 步、**交替 3 轮取中位数并给极差**（区间互不重叠）。
 脚本：`lab/rent/bench_4090_final.py`、`bench_4090_matrix.py`、`run_opts_big.sh`。
