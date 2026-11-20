@@ -191,8 +191,13 @@ def clip_grad_norm_(params, max_norm, defer_scale=False):
 
     性能要点（踩过）：最初对每个参数都 `g.to_numpy()` 求范数 —— CUDA 上等于
     **291 次 D2H + 全同步**，实测把 0.3 s/step 拖到 **7.8 s/step（25×）**。
-    现在 CUDA 张量走 `sumsq_sequential` 在**设备端**累加平方和，最后只读一个标量；
-    缩放用 `scale_inplace` 原地做。CPU 张量（numpy 梯度）走原来的路径。
+    现在 CUDA 张量走**一次多张量内核**（`sumsq_multi_sharded`，2026-11-19/20 两轮优化）
+    在设备端累加平方和，最后只读一个标量；缩放用 `scale_inplace` 原地做。
+    CPU 张量（numpy 梯度）走原来的路径。
+
+    ⚠️ 历史（别照抄成现状）：更早用过逐张量的 `sumsq_sequential` —— 那是**单线程**归约，
+    1.36 亿元素的嵌入梯度实测要 7.6 s，且 fp32 累积误差高达 60%。这条路径现在**不再**用于裁剪，
+    只保留给"与 numpy 逐位对齐"的 parity 场合。
 
     走 `sumsq_parallel`（两段并行归约）：1.36 亿元素的嵌入梯度实测 **2.7 ms**，
     而单线程版要 **7.6 s**（2850×），且单线程版在 float32 下累积误差高达 60%。

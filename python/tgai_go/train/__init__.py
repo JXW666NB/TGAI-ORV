@@ -5369,6 +5369,35 @@ def _newton_schulz5_gpu(rt, x, steps=5, eps=1e-7, fast=False):
     return x
 
 
+def _muon_default_ns_fast():
+    """Newton-Schulz 默认走哪条路。
+
+    ★ 2026-11-21 修正（**这是 Muon 21.7 s/步的主因**）：
+      原来 `ns_fast` 默认 False ⇒ 走 `sumsq_sequential`（单线程顺序归约，**每个矩阵一次
+      `read_scalar` 同步**）+ `sgemm_mode` 朴素 GEMM。代码里自己记着实测：单个
+      [1024,4096] 矩阵就要 **101 ms**，而 5 步 NS 的纯 GEMM 只要 9.3 ms ⇒ **91% 时间在归约上**。
+      848M 有 321 个 2D 张量，于是整步 21.7 s（AdamW 只要 0.23 s）。
+
+      那条慢路径存在的唯一理由是**与 NumPy/OpenBLAS 逐位一致**（parity 测试用），
+      不该是生产默认。现在默认改成快路径：
+
+        * 默认（无环境变量）→ `fast=True`（cuBLAS + 两趟并行归约）
+        * `TG_MUON_NS_PARITY=1` → `fast=False`（逐位对齐 numpy，给 parity 用）
+        * `TG_MUON_NS_FAST=0/1` → 显式指定，优先级最高
+
+      代价：cuBLAS 单次约 3e-8 相对误差，五轮后与 numpy 差约 1e-7 —— fp32 正常范围。
+    """
+    v = os.environ.get("TG_MUON_NS_FAST", "").strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    p = os.environ.get("TG_MUON_NS_PARITY", "").strip().lower()
+    if p in ("1", "true", "yes", "on"):
+        return False
+    return True
+
+
 class Muon(_Optim):
     """Muon：动量 + Newton-Schulz 正交化；2D 走 Muon，其余回退 AdamW 式更新。
 
@@ -5389,19 +5418,23 @@ class Muon(_Optim):
     """
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, weight_decay=0.0,
-                 fp16_mom=False, ns_fast=False, ns_steps=5):
+                 fp16_mom=False, ns_fast=None, ns_steps=5):
         _Optim.__init__(self, params, lr)
-        #: Newton-Schulz 是否用 cuBLAS（`ns_fast=True`）。
-        #: 默认 False = 顺序 FMA 内核，与 OpenBLAS 逐位一致但**很慢**
-        #: （3B 有 2550 个张量要逐个正交化，实测 62.9 秒/步）。
-        #: 大模型可设 ns_fast=True：实测 62.9 → 35.0 s/步（1.8×），代价是约 1e-7 量级差异。
+        #: Newton-Schulz 走哪条路。**默认 None = 按策略解析**（见 `_muon_default_ns_fast`）：
+        #: CUDA 上默认 True（cuBLAS + 并行归约），`TG_MUON_NS_PARITY=1` 才回到逐位对齐 numpy 的慢路径。
         #:
-        #: ★ 2026-11-11 实测结论：**Muon 在 3B 规模不可用**，与本开关无关。
+        #: ★ 2026-11-21 修正：原来默认 False ⇒ 每步每矩阵一次 `sumsq_sequential`（单线程 + read_scalar
+        #:   同步），实测单个 [1024,4096] 要 101 ms 而 5 步 NS 的 GEMM 只要 9.3 ms（91% 在归约上）。
+        #:   848M 的 321 个 2D 张量因此整步 **21.7 s**（AdamW 0.23 s）。那条慢路径只为 parity 存在。
+        #:
+        #: ★ 2026-11-11 实测结论：**就算走快路径，Muon 在 3B 规模仍不可用**（NS 是 FLOP 密集型，
+        #:   3B 理论下限约 1.4 s/步，实测 35 s）。要训 3B 请用 AdamW；Muon 适合小模型实验。
         #: Newton-Schulz 本身是 FLOP 密集型 —— 每个 [1024,4096] 矩阵 5 步 × 3 GEMM ≈ 96 GFLOP，
         #: 224 个这样的矩阵合计约 21.6 TFLOP/步；V100 fp32 峰值 15.7 TFLOP/s，
         #: 理论下限已约 1.4 秒，实测 35 秒（受带宽限制）。这是**算法固有代价**，不是实现缺陷。
         #: 同卡上 AdamW 只要 0.709 s/步。要训 3B 请用 AdamW。
-        self.ns_fast = bool(ns_fast)
+        # None = 用 `_muon_default_ns_fast()` 的策略（CUDA 上默认快路径）。
+        self.ns_fast = bool(_muon_default_ns_fast() if ns_fast is None else ns_fast)
         self.ns_steps = int(ns_steps)
         self.mom = momentum
         self.nesterov = nesterov
