@@ -742,6 +742,24 @@ def _checkpoint_layer(fn, x):
     所以这里会多一份层输入（seq512 下约 2 MB/层），这是重算的必要代价。
 
     只在 `cfg["grad_ckpt"]` 打开时使用；默认路径完全不走这里。
+
+    ## ★ 2026-11-21 修：一次前向里**并列调用 k 次**会丢 k−1 份上游梯度
+
+    最小复现（`lab/rent/gt_ck.py`，GPU）：
+        W(叶子) --matmul--> x --切 k 块--> 每块 `_checkpoint_layer(fn)` --> 相加 --> backward
+    修之前 `|dW|` **恒定**（k=1/2/4/8 都是 510.40946），不随 k 增长 ——
+    即只有第 1 个块的梯度到达了 x 上游的参数；不包 ckpt 的基准是 510 → 752 → 1195（k=4 起封顶）。
+    在 v3 训练里的表现：`--ce-chunk` k 块时 `gnorm ≈ base/√k`（2 块 15.3866→10.7590）。
+
+    根因：`sub.backward(g)` 是**整图反向**，它会顺着 `x._parents` 一路走到 embedding，
+    而 `Tensor._backward_cuda` 在遍历时会把沿途每个节点的 `_parents/_backward` 拆掉
+    （见 `__init__.py` 里"反向消费完就拆图引用"的那段注释）。于是第 1 个块的嵌套反传
+    把 x 之上的整条链拆空了，第 2..k 个块的梯度走到 x 就断掉。
+
+    修法：嵌套反传**在 x 处切断**（临时把 x 当叶子），只算"本段自己的参数 + `x.grad`"，
+    再由**外层**遍历沿恢复后的 `_parents` 继续往上走。这样 k 次调用各自只负责自己那一段，
+    梯度按外层遍历正常累加。数值上与原来一致（同一批算子、同一顺序的累加链），
+    `--grad-ckpt` 的 12 层链式路径仍然逐位对齐非 ckpt 基准（见 `tests/test_ckpt_multi.py`）。
     """
     Tn = T.Tensor
     if not isinstance(x, Tn) or not x.requires_grad:
@@ -751,8 +769,17 @@ def _checkpoint_layer(fn, x):
 
     def bw(g, grads):
         sub = fn(x)                          # 用原始输入重跑，建图
+        # ★ 在 x 处切断：临时把 x 变成叶子，嵌套反传只算到 x 为止，
+        #   绝不越过 x 去拆外层图（否则并列调用时后 k−1 个块的梯度全丢）。
+        saved_parents, saved_backward = x._parents, x._backward
+        x._parents = ()
+        x._backward = None
         x.grad = None
-        sub.backward(g)                      # 子图反传（写自己那些参数的 .grad）
+        try:
+            sub.backward(g)                  # 子图反传（写本段自己的参数 + x.grad）
+        finally:
+            # 必须恢复：外层遍历还要靠它把梯度继续传给 x 的上游。
+            x._parents, x._backward = saved_parents, saved_backward
         if x.grad is not None:
             from . import _acc as _acc_fn
             _acc_fn(grads, x, x.grad._gpu)

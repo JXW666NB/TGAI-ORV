@@ -837,19 +837,14 @@ def _chunked_ce(xh, target, head, chunk):
             return T.functional.cross_entropy(
                 xin @ head.transpose(0, 1), tc, ignore_index=IGNORE_INDEX)
 
-        # ★★ 2026-11-21 实测结论（已定位，未解决）：**这里不能放 `_checkpoint_layer`**。
-        #   分块数学本身是精确的：
-        #       chunk=128（4 块，不重算）gnorm 与不分块 **逐位相同**（d=0.000e+00）
-        #       chunk=256（2 块，不重算）gnorm d=1.49e-06、loss d=6.7e-06
-        #   但只要套上 `CLI._checkpoint_layer`，gnorm 就变成 base/√k 量级：
-        #       2 块 15.3866 → 10.7590（=base/√2）  4 块 → 7.28  8 块 → 5.12
-        #   即 **k 个块只有 1 个块的梯度活下来** —— `_checkpoint_layer` 的
-        #   `sub.backward(g)` 是"嵌套整图反传"，在一次前向里被调用 k>1 次时会把前一块
-        #   已经累加的参数梯度清掉。它原本的用法是"每层一次、串成一条链"，那条路径
-        #   已验证逐位等价；**多处并列调用不成立**。
-        #   后果：**本开关目前不省显存**（梯度重算不可用 ⇒ 各块 logits 仍要留到反向）。
-        #   要省显存必须先修 `_checkpoint_layer` 的多次并列调用（引擎改动，单独立项）。
-        part = _one(xc) * (float(nc) * inv)
+        # ★★ 2026-11-21：这里**可以**用 `_checkpoint_layer` —— 但前提是那个多次并列调用的
+        #   梯度 bug 已修（见 `v3_train_cli._checkpoint_layer` 的 2026-11-21 段）。
+        #   修之前的实测（留档，别再踩）：
+        #       chunk=128（4 块，不重算）gnorm 逐位相同；chunk=256 d=1.49e-06
+        #       套上 `_checkpoint_layer` 就变 gnorm ≈ base/√k（2 块 15.3866→10.7590，
+        #       4 块 →7.28，8 块 →5.12）= k 个块只有 1 个的梯度活下来。
+        #   修好后（同一套测量）：chunk=64/128/256 的 gnorm d ≤ 5.7e-06、loss d ≤ 6.7e-06。
+        part = CLI._checkpoint_layer(_one, xc) * (float(nc) * inv)
         loss = part if loss is None else loss + part
     if loss is None:                       # 理论上到不了（nvalid>0 已判过）
         logits = xh @ head.transpose(0, 1)
@@ -1120,11 +1115,11 @@ def build_arg_parser():
     g.add_argument("--grad-clip", type=float, default=1.0, help="<=0 关闭裁剪")
     g.add_argument("--ce-chunk", type=int, default=0, dest="ce_chunk",
                    help="head+CE 分块的行数（0 = 不分块，与以前逐位一致）。"
-                        "**注意：当前版本【不省显存】** —— 分块数学已验证精确"
-                        "（chunk=128 时 gnorm 逐位相同），但梯度重算不可用："
-                        "`_checkpoint_layer` 在一次前向里并列调用 k 次会丢掉 k-1 份梯度"
-                        "（实测 gnorm = base/√k），所以各块 logits 仍留到反向。"
-                        "要拿到显存收益必须先修 `_checkpoint_layer` 的多次并列调用。"
+                        "每块过 `_checkpoint_layer` ⇒ 峰值只留 1 块的 logits"
+                        "（seq2048 整块是 2047x96000x4B ≈ 786 MB）。"
+                        "数值已验证：chunk=64/128/256 的 gnorm d ≤ 5.7e-06、loss d ≤ 6.7e-06。"
+                        "注意：`_checkpoint_layer` 的多次并列调用 bug 修好后才可用"
+                        "（2026-11-21 修复；修之前它会丢 k-1 份梯度）。"
                         "也认环境变量 TG_CE_CHUNK。")
     g.add_argument("--seed", type=int, default=None,
                    help="不给则 42；续训时自动沿用 checkpoint 里的 seed")
