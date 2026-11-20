@@ -123,6 +123,8 @@ def main():
         "ce_min": round(float(min(ces)), 6),
         "step_ms": round(float(np.median(tms)), 1),
         "first_win": [int(order[0][0]), int(order[0][1])],
+        "qk_max_max": float(model._qk_max.max().item()),
+        "qk_max_per_head_max": [round(float(x), 3) for x in model._qk_max.max(dim=0).values],
     }))
 
 

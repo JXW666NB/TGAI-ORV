@@ -69,3 +69,43 @@ D:\orv_pip_0962\Scripts\python.exe D:\orv_bench\tie_main.py `
 ```
 
 脚本：`lab/rent/q_hope_pyt.py`（参照侧 harness，含同款取窗顺序）、`lab/rent/tie_main.py`（tie 注入壳）。
+
+---
+
+## 7. 2026-11-20 更新：两项"未对齐"的处置
+
+### 7.1 MoE z-loss + aux loss —— **已实现**（`a762af3`）
+
+接进 `v3_pretrain.forward_loss`，公式与 `model_v3.py:1079-1086 / 1126-1133` 逐项对齐：
+
+```
+z   = (logsumexp(router_logits, -1) ** 2).mean()      × moe_router_z_loss (1e-4)
+f   = (E / (top_k*N)) * onehot.sum(0)                 （无梯度）
+P   = probs.mean(0)                                   （有梯度）
+aux = z + (f * P).sum() × moe_aux_alpha (1e-4)
+```
+
+* 开关：`ORV_Z_LOSS` / `ORV_AUX_BAL`（默认 0 ⇒ **训练损失与 1.0.7 逐位相同**）
+* 实现技巧：`lse = mean_j(x_j − log_softmax_j)`，不必新写 logsumexp 内核
+* 实测（8 层 / E=8 / seq512）：step-0 loss 抬高 **+0.004955**（参照侧 12 层/E=4 是 0.0074，量级一致）
+* 回归测试：`tests/test_v3_pretrain.py::test_aux_coefs_default_zero_and_validation` +
+  `test_router_lse_identity`（恒等式若被重构破坏，z-loss 会静默算错）
+
+### 7.2 QK-Clip —— **实测为 no-op，暂不实现**（有证据）
+
+**实测**：参照实现跑 5 步后 `model._qk_max.max() = 39.69`，逐头 31.7~39.7，而 `qk_clip_tau = 100`。
+⇒ `γ = min(1, τ / S_max) = 1.0`，**QK-Clip 一次都不会触发**。
+
+原因：两侧都开 `attn_qk_norm = True`（q/k 沿 head 维做 RMSNorm），pre-softmax 分数天然有界
+（≈ d_head·cosθ ≈ 64 量级），达不到 τ=100。
+
+**结论**：现在实现它 = 写一段永不执行的代码。**不做**，但把方案记录下来，将来遇到以下情形再启用：
+* 关掉 `attn_qk_norm`
+* 训练规模远大于当前（K2 的动机是 1T token 级别的 logit 爆炸）
+* 实测 `max(q·k)` 逼近 τ
+
+**将来实现时的精确方案**（照 `optim_v3.py::apply_qk_clip`）：
+1. 前向记录 per-(layer, head) 的 pre-softmax 最大分数（ORV 目前**没有**这个遥测，需要改注意力路径）
+2. **优化器更新之后**执行：`γ_h = min(1, τ / S_max^h)`；`Wq ← γ^α · Wq`、`Wk ← γ^(1−α) · Wk`（α=0.5）
+3. CSA 层的 K 走 `k_down`，需缩放 **k_down 的输出行**（等效于缩放 K）
+4. 判据：开启后 `max(q·k)` 应被压到 ≤ τ，且 loss 曲线无 spike
