@@ -3785,6 +3785,34 @@ def _alias_driver_symbol(cu, name, require_v2=True):
      + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
 
 
+def _arch_candidates(arch):
+    """从设备 arch 往下降的编译候选（含自身，降序）。
+
+    为什么需要这个：NVRTC 只认到某个 compute_XX，而设备比它新（典型：RTX 5090 是
+    sm_120，而机器上装的是 CUDA 12.4 的 NVRTC → `nvrtc: error: invalid value for
+    --gpu-architecture (-arch)`）。PTX **向前兼容**：用 compute_90 编出的 PTX 能由
+    驱动 JIT 到 sm_120 上跑，功能一致，只有首次加载多一次 JIT。
+
+    所以策略是"先试精确 arch，失败就逐个降级"，而不是直接报错让用户自己去装 CUDA。
+    """
+    a = str(arch or "")
+    if not a.startswith("compute_"):
+        return [arch]
+    try:
+        num = int(a.split("_", 1)[1])
+    except Exception:                                    # noqa: BLE001
+        return [arch]
+    # 已知代际（Volta 70 / Turing 75 / Ampere 80、86 / Hopper 90 / Blackwell 100、120）
+    known = (120, 100, 90, 86, 80, 75, 70)
+    out = [a]
+    for k in known:
+        if k < num:
+            cand = "compute_%d" % k
+            if cand not in out:
+                out.append(cand)
+    return out
+
+
 def _pool_bucket(nbytes):
     """请求向上取整到复用桶。小块 512B 对齐；更大则用不超过 nbytes/16 的 2 的幂对齐。
 
@@ -4307,7 +4335,30 @@ class CudaRuntime:
                 self.module_kind = "cubin"
                 return
             cubin_err = CudaError("cubin 加载失败 rc=%d" % rc)
-        ptx = self._compile(arch)
+        # ★ 2026-11-21：arch 降级链。设备比 NVRTC 新时（RTX 5090=sm_120 + CUDA 12.4 的
+        #   NVRTC）精确拱形会被拒（`invalid value for --gpu-architecture`），而 PTX 向前兼容 ——
+        #   用 compute_90 编出的 PTX 由驱动 JIT 到 sm_120，功能一致。所以逐个降级试，
+        #   而不是直接抛给用户去装 CUDA。
+        ptx = None
+        tried = []
+        arch_err = None
+        for cand in _arch_candidates(arch):
+            tried.append(cand)
+            try:
+                ptx = self._compile(cand)
+                if cand != arch:
+                    sys.stderr.write(
+                        "[arch] 设备架构是 %s，但当前 NVRTC 只认到 %s；已用 %s 编 PTX 交给"
+                        "驱动 JIT（功能一致，仅首次加载略慢）。要原生支持请装更新的"
+                        " nvidia-cuda-nvrtc-cu12（>=12.8）。\n" % (arch, cand, cand))
+                    sys.stderr.flush()
+                self._arch_used = cand
+                break
+            except Exception as ex:                       # noqa: BLE001
+                arch_err = ex
+        if ptx is None:
+            raise arch_err if arch_err is not None else CudaError(
+                "NVRTC 编译失败，试过 %r" % (tried,))
         mod = ctypes.c_void_p()
         buf = ctypes.create_string_buffer(ptx)
         try:
