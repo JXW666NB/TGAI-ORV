@@ -1,3 +1,59 @@
+## [1.0.13] - 2026-11-21
+
+### 新卡支持：arch 降级链，让 ORV 在比 NVRTC 新的 GPU 上也能起
+
+RTX 5090 是 **sm_120**，而镜像里常装的是 CUDA 12.4 的 NVRTC —— 它不认识 `compute_120`：
+
+```
+nvrtc: error: invalid value for --gpu-architecture (-arch)
+```
+
+ORV 直接起不来。而 **PTX 向前兼容**：用 `compute_90` 编出的 PTX 可以由驱动 JIT 到 sm_120 上跑，
+功能一致，只有首次加载多一次 JIT。
+
+**修法**：`_arch_candidates()` 给出降级链 `compute_120 → 100 → 90 → 86 → 80 → 75 → 70`，
+逐个试到成功为止，并打印一行提示（不静默）：
+
+```
+[arch] 设备架构是 compute_120，但当前 NVRTC 只认到 compute_90；已用 compute_90 编 PTX
+       交给驱动 JIT（功能一致，仅首次加载略慢）。要原生支持请装更新的
+       nvidia-cuda-nvrtc-cu12（>=12.8）。
+```
+
+**5090 实测（两套镜像，同一张卡）**：
+
+| 环境 | ORV 能否跑 | seq512 中位 |
+| --- | --- | --- |
+| NVRTC 12.4（只能降级到 compute_90 PTX + JIT）| 能（带提示）| 0.1660 s |
+| NVRTC 12.8（原生 cubin，sm_120）| 能（无提示）| **0.1372 s** |
+
+⇒ **降级可用，但比原生慢约 21%**。这条也写进了 README：新卡请装 12.8+ 的 NVRTC。
+
+### RTX 5090（Blackwell, 32 GB）首次跑通并与 PyTorch 对比
+
+| 配置 | 单步（seq512 / 12 层 / 848M / 20 步）| ORV 峰值 |
+| --- | --- | --- |
+| **ORV `--amp off`（最优）** | **0.1372 s** | 11.22 GiB |
+| ORV `--amp gemm` | 0.1703 s | 12.65 GiB |
+| PyTorch（torch 2.8.0+cu128）| 0.2180 s | — |
+| PyTorch `--amp` | 0.2572 s | — |
+
+⇒ **ORV 快 1.59×**（4090 上是 1.47×）。
+
+* ORV 4090→5090 快 **1.53×**，PyTorch 只快 1.39× —— ORV 的跨代标度略好。
+* **AMP 在两代卡、两个框架上都是负优化**（5090：ORV +24%、PyTorch +18%）。
+  原先我猜"5090 的 fp16 算力是 fp32 的 4 倍，AMP 可能第一次变正收益" —— **实测证伪**。
+  说明即使到 Blackwell，ORV 也不是 GEMM 受限。
+* 主机侧占比在这台机上降到 **28%**（49 ms / 172 ms；4090 修复前是 42%），
+  因为 clip 合批去掉 960 次发射、且这台是 Xeon 8470Q。
+
+### 其它
+
+* 新增 `tests/test_arch_fallback.py`（9 条）：降级链的顺序、无重复、垃圾输入原样返回。
+  全套 **863 passed / 61 skipped**。
+* 修正一处文档失真：`nn_ops.py` 的裁剪 docstring 说走 `sumsq_sequential`，实际从
+  2026-11-19 起走一次多张量内核；单线程版只保留给 parity。
+
 ## [1.0.12] - 2026-11-21
 
 ### CI 修复：Muon 的"分层等价"测试判据本身在病态区不可用
