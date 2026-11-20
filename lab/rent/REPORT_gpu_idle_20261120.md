@@ -713,3 +713,64 @@ seq2048+ckpt 交替 3 轮：chunk=0 中位 **0.5275 s**、chunk=512 中位 **0.5
 `TG_GRAD_CKPT` 未设时**代码路径根本不会调用 `_checkpoint_layer`**（结构上不可能有影响）。
 实测交替 3 轮：修前 0.2020 / 0.2082 / 0.2052（中位 0.2052），修后 0.1987 / 0.2083 / 0.2074（中位 0.2074）
 ⇒ **+1.1%**，两组区间大幅重叠，属噪声（同一段落里的 `fb3460b` 基准 0.2021 也在区间内）。
+---
+
+# 第六轮：B1（GpuBuf 对象池）的**门禁脚本已完成并全绿**；B1 本体今晚未落地
+
+## 31. 三条对拍路径的门禁：已写成脚本，当前代码（`ec8051e`）全部 PASS
+
+脚本：`lab/rent/verify_alloc_paths.py`（4090，`PYTHONPATH=<包> python verify_alloc_paths.py {pool|cache20|oom|graph|all}`）
+
+| # | 路径 | 实测 | 判定 |
+|---|---|---|---|
+| ①a | `empty_cache()` 前后 `pool_stats()` 逐字段 | `cached_bytes` 20.520 MiB → **0**；`hits/misses/trims/live_bytes/peak_*` 增量全 **0**；4 个活张量仍可读 | **PASS** |
+| ①b | 每步强制 `empty_cache()` vs 不插，20 步 loss | **20/20 逐位相同**，`max\|Δloss\| = 0.000e+00`（`TG_DETERMINISTIC=1`） | **PASS** |
+| ② | `TG_POOL_GB=4` 人为 OOM，10 步 | `rc=0` 跑完；`trims=3067`（真的走过"回收→重试"兜底）；loss 正常下降 | **PASS** |
+| ③ | `graph_arm()+graph_begin()` 捕获一步 + 重放 2 次 | 捕获 3 个 kernel、保留 1 张图；**两次重放逐位相同（max abs diff = 0）**；`trims` 0 → 0 | **PASS** |
+
+脚本里记了三个坑（下次别再踩）：`_pool_live` 是内部字典（只用 `pool_stats()`）；
+重放要自己调 `rt.cu.cuGraphLaunch(rt._graph_exec, rt._stream)`（没有公开 `graph_replay`）；
+捕获期必须先 `rt.reserve_capture_arena(bytes)`，且 `h2d_into` 的 `src` 必须是**带 `.value`
+的 ctypes 对象**（喂 ndarray 会 AttributeError）。
+
+**顺带一个图路径的既有问题（与对象池无关，仅提示）**：捕获**那一步**的执行结果与逐算子基线
+不一致（实测 `False`），但两次重放都**逐位等于**基线。怀疑捕获期 arena 分配与中间缓冲别名，
+属图路径本身的问题；本门禁没把它当阻塞项（改造前就是这样），但**图路径要上线前必须查清**。
+
+## 32. B1 本体为什么今晚没落地（带天花板数字）
+
+`rt.empty` 一次完整生命周期 **5.80 µs** 的分解（20000 次微基准）：
+
+| 组成 | µs | 能否在不改语义的前提下省掉 |
+|---|---|---|
+| 纯 dict 取/还地板 | 0.21 | 已到地板 |
+| `_alloc` + `free` 记账（`_pool_live` 3-tuple、seq/live/peak 三计数器、双所有权检查、`_split_forget_ptr`、`_f16_cache_drop_ptr`） | **3.89** | **不能** —— 这三职责正是 lead 要求保持的语义 |
+| `GpuBuf()` 构造 + `__del__` finalizer | 1.86 | 只能靠"壳复用"，而壳一旦复用、内存就必须留在池里 |
+| 其它 | ~0.0 | — |
+
+⇒ **要 ≤2.0 µs，只能让块不离开池**（memory-retaining 对象池）：块永不在 live↔free 之间移动，
+`_pool_live` 的更新在复用路径上变成 0 次。原型实测该路径 **0.278 µs/圈（22×）**，
+计入必要的字段清理与边界判断后估计 **1.2~2.0 µs**，端到端 ≈ **−8.5%**（3900 次 × 4.3 µs ≈ 17 ms）。
+
+但这条改动会**改变三条路径的前提**，必须逐条重验：
+* `live_bytes` 会被"池里持有的块"永久占用 ⇒ 需要给池另设上限，并与 `TG_POOL_GB=4` 的 OOM 行为重新对拍；
+* `empty_cache()` 必须**同时排空对象池**，否则真缺显存时回收不掉；
+* `_capturing`/`_graph_exec` 时必须**完全旁路**对象池（走原路径分配）。
+
+**在深夜赶这个改动、只跑一遍对拍就提交，风险远大于收益**（改坏的形态是"偶发非法访存 /
+OOM 兜底失效"，最难查的一类）。按纪律（稳定第一、宁要带三条对拍证明的干净版本）**今晚不落地**，
+只交门禁 + 分解 + 天花板。
+
+## 33. 明天的一次性做法（已想清，按此执行即可）
+
+1. 新增 `_gbuf_pool: dict[bucket] -> list[GpuBuf]`（上限：总字节 ≤ 64 MiB 且 ≤ 256 个壳，防 seq2048 的
+   几百种尺寸把池撑大）。
+2. `empty()`：`_alloc()` **之前**先看池里有没有可复用的壳（`_capturing`/`_graph_exec` 时跳过）；
+   命中就复用壳 → 重置 `ptr/nbytes/shape/n/dtype/keepalive/known_scalar/host_hold`，
+   `_token` 保持（块没动）。
+3. `GpuBuf.__del__`：**不再** `rt.free()`，而是把壳推回池（块继续归池持有）。
+   `_pool_live` 只在**首次**建壳时登记一次 ⇒ 三职责语义不变（只是块的"寿命"变长）。
+4. `empty_cache()` / `_pool_shed_ready(force=True)` / `_alloc` 的 rc≠0 兜底：**先排空 `_gbuf_pool`**
+   （对每个壳真正 `rt.free()`）再走原来的回收，保证"回收得掉"。
+5. 验收：本文件四条门禁全绿 + seq512(无 ckpt) 与 seq2048(ckpt) 各交替 3 轮 A/B + pytest ≥831/61 +
+   "同码两跑逐位相同"（`TG_DETERMINISTIC=1`，21 步）。
