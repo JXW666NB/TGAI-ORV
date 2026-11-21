@@ -135,12 +135,12 @@ def parse_place(spec, world):
                         raise ValueError("--place 的专家数看不懂：%r" % (item,) +
                                          "。修法：写成 `e=4`")
                     if "e" in slot:
-                        raise ValueError("rank %d 的专家数写了两次" % (rank,))
+                        raise ValueError("rank %d 的专家数写了两次" % (rank,) + "。修法：每张卡只写一次 `e=N`")
                     slot["e"] = n
                 elif item.startswith("layers"):
                     a, b = _range_after(item)
                     if "layers" in slot:
-                        raise ValueError("rank %d 的层区间写了两次" % (rank,))
+                        raise ValueError("rank %d 的层区间写了两次" % (rank,) + "。修法：每张卡只写一次 `layers=a-b`")
                     slot["layers"] = (a, b)
                 else:
                     raise ValueError("--place 不认识的规则 %r" % (item,) +
@@ -258,7 +258,7 @@ def estimate_comm(n_params, world=1, mode="dp", seq=512, hidden=1024,
         bus = 2.0 * 2.0 * per_layer * max(1, int(layers))
     else:
         raise ValueError("不认识的并行方式 %r" % (mode,) +
-                         "。可选：dp / zero1 / zero2 / zero3 / ep")
+                         "。可选：dp / zero1 / zero2 / zero3 / ep。修法：把 mode 改成上面任一档")
     gb = bus / 1e9
     return {"gb": gb, "ms": gb * 1e3 / gbps, "gbps": gbps, "mode": mode}
 
