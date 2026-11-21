@@ -155,10 +155,13 @@ def _dump_grad_norms(params, path):
             rows.append([i, int(p.numel()), None])
             continue
         try:
-            # ★ 用引擎文档里的写法（`T.help('op')` 明说：算子都是**张量方法**）：
-            #   `t.mul(x)` / `t.sum()`，而不是 `T.sum(t)`。
-            #   （我第一版写成 `T.sum(g*g)`，321 个参数全报 AttributeError，白烧一轮 GPU。）
-            v = float(_scalar(g.mul(g).sum()))
+            # ★ 实测核对过的写法（2026-11-21，别再凭记忆写）：
+            #   `Tensor` 有 `.sum()`，但**没有** `.mul()` / `.matmul()` 方法，顶层也没有 `T.mul`。
+            #   逐元素乘是运算符 `a * b`；矩阵乘是 `a @ b` 或顶层 `T.matmul(a, b)`。
+            #   （第一版我写 `g.mul(g).sum()`，看着像对的，实际每次都会抛
+            #     AttributeError 然后**静默**落到下面的 to_numpy 兜底 —— 结果对不对，
+            #     但慢了一个数量级，而且掩盖了"这个 API 不存在"这个事实。）
+            v = float(_scalar((g * g).sum()))
             rows.append([i, int(p.numel()), v])
         except Exception:                            # noqa: BLE001
             try:                                     # 兜底：拷回主机用 numpy

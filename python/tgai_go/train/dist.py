@@ -753,21 +753,52 @@ class DataParallel:
             self._slot.close()
         need = int(nbytes)
         name = self._slot_name(need)
+        # ★ 2026-11-21（CI ubuntu-3.12 实测）：**先创建、后发布**。
+        #   旧实现让 rank>0 直接去 attach 同一个名字，于是踩进 `SharedMemory(create=True)`
+        #   的经典竞态窗口：段文件已经存在但还没 `ftruncate` 到目标尺寸，
+        #   对端 attach 后 mmap 一个**空文件** ⇒ `ValueError: cannot mmap an empty file`，
+        #   然后 rank0 在 barrier 上白等（对端已死）。只在 3.12/某些调度下偶发。
+        #   现在 rank0 建好段并写好头之后落一个 marker 文件，对端**只等 marker**，
+        #   等到了再 attach；另外仍然保留空文件重试作为第二道保险。
+        # marker 名必须用**共享的** `_session_id`（rank0 的启动时刻，rank>0 从 ready 读到），
+        # 不能用 `_session_token()` —— 那个返回**本进程**启动时刻，两端名字不同 ⇒ 死等。
+        # （我今天在 barrier 上已经犯过一次同样的错，这是第二次。）
+        sid = getattr(self, "_session_id", None)
+        tok = int(round(float(sid if sid is not None else _PROC_START) * 1000.0))
+        marker = os.path.join(self.dir, "slot_%d_%d.ready" % (tok, need))
         if self.rank == 0:
             self._slot = shared_memory.SharedMemory(
                 name=name, create=True, size=need * self.world)
             self._slot.buf[:8] = need.to_bytes(8, "little")
             self._shm.append(self._slot)
+            try:                                     # 段已可用 ⇒ 才发布
+                with open(marker, "wb") as fh:
+                    fh.write(b"%d" % (need * self.world))
+            except OSError:
+                pass                                 # marker 写不了也不致命（对端有重试）
         else:
+            self._wait_for(marker, "共享内存就绪")
             t0 = time.time()
             while True:
+                slot = None
                 try:
-                    self._slot = shared_memory.SharedMemory(name=name, create=False)
-                    break
+                    slot = shared_memory.SharedMemory(name=name, create=False)
                 except FileNotFoundError:
-                    if time.time() - t0 > self.timeout:
-                        raise TimeoutError("共享内存 %s 未创建" % name + "。修法：确认 rank0 已完成共享内存创建（可能有 rank 提前退出）")
-                    time.sleep(0.002)
+                    slot = None
+                except ValueError as exc:
+                    if "empty file" not in str(exc):
+                        raise
+                    slot = None            # 空文件窗口：等价于"还没准备好"，重试
+                if slot is not None:
+                    if int(slot.size) >= need * self.world:
+                        self._slot = slot
+                        break
+                    slot.close()           # 尺寸没到位（或同名残留段）：关掉重来
+                if time.time() - t0 > self.timeout:
+                    raise TimeoutError(
+                        "共享内存 %s 未就绪" % name +
+                        "。修法：确认 rank0 已完成共享内存创建（可能有 rank 提前退出）")
+                time.sleep(0.002)
             self._shm.append(self._slot)
         self._bytes = need
 
