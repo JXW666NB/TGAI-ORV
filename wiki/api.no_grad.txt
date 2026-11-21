@@ -1,0 +1,75 @@
+[ID] api:no_grad
+[分类] compute
+[中文名] 关闭梯度记录
+[英文名] Disable gradient recording
+[作者] TGAI
+
+=== 中文 ===
+`T.no_grad()` —— 上下文管理器，块内运算**不记录反向闭包**（不建图）。签名是空的 `()`：
+不带参数，只能 `with T.no_grad():` 这样用，**不是装饰器**。
+
+行为：进入时把全局梯度开关关掉，退出时恢复**进入前**的状态（抛异常也会恢复，可嵌套）。
+
+参数：没有参数。要控制的范围就靠 `with` 块本身。
+
+⚠️ 坑 1（和 PyTorch 不一样，静默）：块里算出来的张量 `requires_grad` **仍然是 True**，
+丢掉的只是 `_backward` 闭包。所以在 no_grad 里建的输出上调用 `.backward()`
+**不会报错，直接是空操作**（实测：不抛异常，`x.grad` 保持 `None`）。
+靠 `if not y.requires_grad` 判断"没建图"是错的。
+
+⚠️ 坑 2（不能当装饰器）：`@T.no_grad()` 会在装饰时就抛 `TypeError: 'no_grad' object is not callable`
+（PyTorch 的 `@torch.no_grad()` 可以）。要包一个函数请自己写：
+`def f(x): with T.no_grad(): return ...`。
+
+⚠️ 坑 3（进程级开关，不是线程局部）：实现是一个模块级全局标志（源码里的 `_GRAD_ENABLED`），
+所以多线程里一个线程开 no_grad 会影响别的线程（⚠️ 未在多线程下实测；PyTorch 是线程局部的）。
+
+为什么用它：反向闭包会捕获输入张量，**只要你还留着输出，整条祖先链就被钉住**。
+源码注释记录：no_grad 下每保留一个 131 KB 的输出，实测 live 涨约 1.4 MB；flash 反向因此随
+序列长度二次增长（75 → 228 → 869 MiB）。所以推理/评估/采样一律包 `T.no_grad()`。
+
+=== English ===
+`T.no_grad()` is a context manager: operations inside the block record **no backward closure**
+(no graph). Its signature is empty `()` -- no arguments, context-manager use only, and it is
+**not a decorator**.
+
+Entering flips the global gradient switch off; exiting restores the **previous** state (also on
+exceptions, and nesting works).
+
+Parameters: none. Scope is controlled entirely by the `with` block.
+
+⚠️ Gotcha 1 (silent, unlike PyTorch): tensors computed inside the block still report
+`requires_grad` **True** -- only the `_backward` closure is dropped. Calling `.backward()` on such
+an output **raises nothing and does nothing** (verified: no exception, `x.grad` stays `None`).
+Testing `if not y.requires_grad` to detect "no graph" is therefore wrong.
+
+⚠️ Gotcha 2 (not a decorator): `@T.no_grad()` raises `TypeError: 'no_grad' object is not callable`
+at decoration time (PyTorch's `@torch.no_grad()` does work). Wrap manually instead:
+`def f(x): with T.no_grad(): return ...`.
+
+⚠️ Gotcha 3 (process-wide, not thread-local): the implementation is one module-level flag
+(`_GRAD_ENABLED` in the source), so in a multithreaded program one thread entering `no_grad`
+affects the others (⚠️ not measured with threads; PyTorch keeps it thread-local).
+
+Why use it: a backward closure captures its inputs, so **keeping an output pins the whole ancestor
+chain**. A source comment records that under `no_grad` each retained 131 KB output used to add
+~1.4 MB live, which made flash backward grow quadratically with sequence length
+(75 -> 228 -> 869 MiB). Inference, evaluation and sampling should always be wrapped in
+`T.no_grad()`.
+
+=== 示例 ===
+x = T.Tensor([1., 2.], requires_grad=True)
+with T.no_grad():                  # ✅ 推理：不建图
+    y = (x * 2).sum()
+print(y.requires_grad)             # True —— 和 PyTorch 不一样
+y.backward()                       # ⚠️ 空操作，不报错
+print(x.grad)                      # None —— 梯度根本没记
+# @T.no_grad()                     # ❌ TypeError：不是装饰器，只能用 with
+def infer(t):                      # ✅ 想包函数就这样写
+    with T.no_grad():
+        return (t * 2).sum()
+
+=== 见也 ===
+api:Tensor
+api:checkpoint
+api:amp_on
