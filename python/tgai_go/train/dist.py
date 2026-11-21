@@ -1853,9 +1853,19 @@ class DataParallel:
                     self._nccl, st, rt, sc, slots=dp_overlap.resolve_slots(),
                     grad_dtype=self.grad_dtype)
             else:
-                transport = dp_overlap.HostBucketTransport(
-                    self, rt, sc, slots=dp_overlap.resolve_slots(),
-                    grad_dtype=self.grad_dtype)
+                # ★ 2026-11-21 实测后**禁用** host 重叠传输：它的后台线程一个桶都不处理。
+                #   证据（2×4090, --dp 2, mode=host, 13 桶, 321 参数）：
+                #     [dp-ov] comm=0.00ms exposed=0.03ms pending_zeroed=True  ← 看起来健康
+                #     诊断 per_bucket_ms=None                                ← 线程没跑过
+                #     两 rank gnorm 相差 1e-2（相对），量级与"没归约的本地梯度"一致
+                #   即：梯度根本没被归约，数据并行静默退化成各卡各训。
+                #   宁可报不可用、退回不重叠路径（正确），也不许静默少做工作。
+                raise dp_overlap.OverlapUnavailable(
+                    "host 后端的重叠传输（HostBucketTransport）实测不工作："
+                    "后台线程一个桶都没处理（comm=0.00ms、per_bucket_ms=None），"
+                    "梯度不会被归约" +
+                    "。修法：设 TG_DP_BACKEND=nccl 再用重叠（NCCL 路径实测有真实通信时间），"
+                    "或设 TG_DP_OVERLAP=0 走不重叠路径（正确）")
         except dp_overlap.OverlapUnavailable as exc:
             print("[dp] WARN 重叠归约不可用（%s）⇒ 退回不重叠路径" % (exc,), flush=True)
             return None

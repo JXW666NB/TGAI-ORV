@@ -158,6 +158,15 @@ def _check_overlap_stats(st, world):
     except (TypeError, ValueError):
         comm = 0.0
     if comm <= 0.5:
+        # 先把诊断打全：每桶耗时 / 模式 / 参数数 / missing 计数，再炸。
+        try:
+            per = st.get("bucket_comm_ms")
+            print("[dp-ov] 诊断：mode=%s params=%s deduped=%s buckets=%s "
+                  "per_bucket_ms=%s"
+                  % (st.get("mode"), st.get("params"), st.get("deduped"),
+                     st.get("buckets"), per), flush=True)
+        except Exception:                            # noqa: BLE001
+            pass
         raise RuntimeError(
             "重叠归约没有真的发生（[dp-ov] comm=%.2fms，world=%d）" % (comm, int(world)) +
             "。这说明梯度没有被归约，数据并行会退化成各卡各训（loss 仍会下降，"
