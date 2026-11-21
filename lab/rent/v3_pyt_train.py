@@ -50,6 +50,10 @@ def main():
                     help="每专家中间维度。真实 V3 是 2816（model_v3.py:97）；0 = 4*d")
     ap.add_argument("--amp", action="store_true",
                     help="PyTorch autocast fp16 + GradScaler（与 ORV 的 --amp gemm 同口径对照用）")
+    ap.add_argument("--dtype", default="fp32", choices=["fp32", "bf16"],
+                    help="参数与优化器状态的数据类型。bf16 把每参数显存从 16B 降到 8B，"
+                         "让 1.8B 级别模型能在 32 GiB 单卡上训练"
+                         "（AdamW fp32 需约 58 GiB ⇒ 必然 OOM）")
     ap.add_argument("--ckpt", type=int, default=1,
                     help="1=开梯度检查点（省显存、多付重算）；0=关（公平对比用）")
     ap.add_argument("--vocab", type=int, default=4096,
@@ -63,6 +67,12 @@ def main():
                          n_experts=a.E, n_activated=a.top_k, n_shared_experts=1,
                          max_seq_len=a.seq, moe_balance="sign")
     model = M.TGAIV3Model(cfg).cuda()
+    # ★ 2026-11-21：`--dtype bf16` 让 PyTorch 也能在 32 GiB 单卡上训 1.8B。
+    #   AdamW + fp32 要 16 B/参数（param 4 + grad 4 + m 4 + v 4），1.82B ⇒ 29 GiB，
+    #   加激活必然 OOM；bf16 是 8 B/参数 ⇒ 14.6 GiB。这是业界常规做法，
+    #   不是给 PyT 放水也不是刁难 —— 两边都在"能装下"的前提下比速度。
+    if getattr(a, "dtype", "fp32") == "bf16":
+        model = model.to(torch.bfloat16)
     # ★ 与 ORV 侧同口径：PyTorch 也开梯度检查点
     #   参考实现里检查点只在 `gradient_checkpointing and training and targets is not None`
     #   时才生效 ⇒ 必须把 targets 传进 forward，否则等于没开（我上一版就是漏了这点）
@@ -117,7 +127,7 @@ def main():
 
     stop.set(); th.join(timeout=3)
     res = dict(impl="pytorch", cfg=dict(d=a.d, layers=a.layers, E=a.E, seq=a.seq,
-                                        vocab=4096, steps=a.steps),
+                                        vocab=int(a.vocab), steps=a.steps),
                n_params=int(n_par), losses=losses,
                step_s=float(np.mean(times)), tok_s=a.seq / float(np.mean(times)),
                peak_mib=prof.get("peak"), base_mib=base,

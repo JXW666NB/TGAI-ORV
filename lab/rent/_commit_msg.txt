@@ -1,0 +1,85 @@
+feat(dp): optional NCCL backend via ctypes libnccl + chunked host pack; wire --dp into v3_pretrain
+
+## What changed
+
+* **`python/tgai_go/train/dist_nccl.py` (new)** — pure-ctypes `libnccl` binding
+  (no torch, no C extension): `ncclGetUniqueId` / `ncclCommInitRank` / `ncclAllReduce`
+  / `ncclGroupStart|End` / `ncclCommDestroy` / `ncclCommCount` / `ncclCommUserRank`,
+  plus `ncclGetVersion` + `ncclGetErrorString`. Library discovery is ordered and
+  explicit (`TG_NCCL_LIB` → `find_library` → torch/nvidia pip dirs → LD_LIBRARY_PATH
+  → system dirs) and every failure raises with a `修法：` hint. After init we verify
+  `ncclCommCount`/`ncclCommUserRank` against the declared world/rank — a mismatch
+  is a hang-or-wrong-answer class of bug, so it fails loudly.
+  Rendezvous: rank0 writes the 128-byte unique id to `<job dir>/nccl_id` atomically
+  (tmp+`os.replace`), other ranks wait for it (no torn reads possible).
+
+* **`dist.py`** — `TG_DP_BACKEND=host|nccl|auto` (`DataParallel(backend=...)` too).
+  Default stays `host`; explicit `nccl` never silently falls back, only `auto` does
+  (and prints a WARN). Unknown values raise. NCCL uses its own stream with a
+  two-event bidirectional fence against `rt._stream`, and does **no packing**
+  (one grouped `ncclAllReduce` per gradient tensor = 321 calls, ~0 extra D2D).
+  Missing gradients join the collective from a zero buffer so every rank issues the
+  same sequence/counts.
+  Host path: the 3.16 GiB pack buffer is now **chunked** (`TG_DP_PACK_MB`, default 256)
+  — see the numbers below for why.
+  Also: `TGAI_DP_TIMEOUT`, `DataParallel.stats()` (measured backend/comm), and a
+  rendezvous fix — `ready` now carries rank0's pid and a rank>0 that sees a dead
+  owner treats it as stale and removes it. Without this, reusing `TGAI_DP_JOB`
+  after a crash could leave rank1 trusting a stale `ready`, write `bar_init_1.1`,
+  have rank0 delete it as residue, and both sides wait 600 s (reproduced twice).
+
+* **`v3_pretrain.py`** — `--dp N` (world; rank still from `TGAI_DP_RANK`) with
+  validation of rank/world, rank0-only checkpoint writes and `train_log.jsonl`
+  (other ranks write `train_log.r<N>.jsonl`), `comm_s` per step in the log and
+  comm median/min/max/frac in RESULT, and `nvidia-smi --id=<visible gpu>` for the
+  per-card peak (the old code always reported GPU0, so rank1's "peak" was rank0's).
+
+* **`tests/test_dist_backend.py` (new, 41 tests)** — backend selection (default host,
+  aliases, unknown value is loud), explicit-nccl failure vs auto-fallback,
+  lib/version/unique-id paths, `NcclComm` call protocol with a fake lib (group +
+  in-place reduce + count/rank/device mismatch + abort-on-exception), stale-ready
+  detection (dead/live/garbage) and the chunked pack/add offset math
+  (parametrized: elements must be covered exactly once).
+
+## Numbers (2x RTX 5090 31.4 GiB, SYS/PCIe, p2p=False; 848.6M params = 3.16 GiB fp32)
+
+Allreduce microbench (`_dp_arbench.py`, 848,645,257 elems, 5 iters after 2 warmup,
+median): **host 148.0 ms (22.9 GB/s one-way)**, **nccl 140.8 ms (24.1 GB/s)**,
+NCCL 2.27.3, 321 grouped calls. ⇒ NCCL is 1.05x, not 1.57x: `dist.py` already
+packs into one D2H/H2D, so the "220 ms host-staged" baseline does not apply to it.
+
+Training step, 20 steps, 3 alternating rounds, median [range] (int8gpu, B=1/rank):
+| seq | single | 2-rank host | 2-rank nccl |
+| --- | --- | --- | --- |
+| 512  | 0.1372 s | 0.3158 [0.3128-0.3183] | 0.3266 [0.3237-0.3381] |
+| 2048 | 0.2486 s | 0.4130 [0.4103-0.4204] | 0.4112 [0.4035-0.4117] |
+
+Chunked pack matters at long seq: with one 3.16 GiB pack, seq2048 host was
+**0.4971 s** (pool_peak_live 25.25 GiB, nvidia peak 31.99 GiB of 31.4 GiB) vs
+**0.4130 s** now (pool 22.25 GiB) — the 90 ms was allocator pressure at the VRAM
+ceiling, not transfer time (comm was 143 ms both ways). At seq512 chunking costs
+~2.5 ms of comm (single-block host measured 0.3065 s before the change).
+
+DP throughput vs one card (global batch 2): **seq512 0.87x host / 0.84x nccl (net
+loss)**, **seq2048 1.20x / 1.21x**. Break-even is when the single-card step equals
+comm (~145 ms) ≈ seq 620 for this model. The reason is structural: ORV's reduce is
+fully serialized after backward, so the whole 145 ms is exposed; PyTorch DDP hides
+most of it inside backward.
+
+PyTorch reference (same 12L/E4/d_ff3328/vocab96000, bf16, ckpt off, 740.8M params
+because its embedding is tied and some layers are CSA — not the same model):
+single 0.1979 s (seq512) / 0.2072 s (seq2048); 2-rank DDP 0.2051 / 0.2242 ⇒
+**1.93x / 1.85x** on the same two cards.
+
+Correctness (world=1 `--batch 2` vs world=2 `--batch 1`, same data/seed, adamw):
+step0 gnorm **bitwise identical** (rank0 == single), rank-to-rank gnorm
+≤ 2.5e-4 (2e-6 relative), loss difference 1.2e-5 at step0 growing to 1.2e-2
+(0.09%) by step19 (separate trajectories: batch-shape SGEMM rounding amplified by
+AdamW; the reduce itself is exact at step 0). host and nccl agree to all printed
+digits with each other.
+
+## pytest
+
+`pytest tests -q` → **914 passed, 64 skipped** (baseline was 873 passed / 64 skipped;
++41 new tests, 0 failures). Also fixed the error-message audit violations the new
+raises introduced (`test_error_messages.py`).
