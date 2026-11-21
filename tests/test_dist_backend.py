@@ -13,6 +13,7 @@ NCCL 通信器本身用**假库**测调用协议（group + 就地 all_reduce + c
 """
 import os
 import sys
+import time
 
 import numpy as np
 import pytest
@@ -144,37 +145,42 @@ def test_ready_missing_is_not_stale(tmp_path):
     assert D.DataParallel._ready_is_stale(str(tmp_path / "ready")) is False
 
 
-def test_ready_with_dead_owner_pid_is_stale(tmp_path, monkeypatch):
-    """上一轮 rank0 已退出 ⇒ 旧 ready 必须被判为残留。
+def test_ready_from_older_session_is_stale(tmp_path):
+    """身份判据是**写者的进程启动时刻**（第 3 字段），不是 pid 死没死。
 
-    这正是实测踩到的：两次实验复用同一个 TGAI_DP_JOB，rank1 相信旧 ready，
-    直接冲向 bar_init_1，而 rank0 把它当残留删掉 ⇒ 双方各等 600 s。
+    pid 会被系统复用，"pid 活着"证明不了"这是本轮"；而"写者比我更早启动"是确定的。
     """
-    monkeypatch.setattr(D.DataParallel, "_pid_alive",
-                        staticmethod(lambda pid: False))
     path = tmp_path / "ready"
-    path.write_bytes(b"4242 1.0")
+    path.write_bytes(b"4242 1.0 1.0")            # 写者启动于 1.0（远古）
     assert D.DataParallel._ready_is_stale(str(path)) is True
 
 
-def test_ready_with_live_owner_pid_is_not_stale(tmp_path, monkeypatch):
-    monkeypatch.setattr(D.DataParallel, "_pid_alive",
-                        staticmethod(lambda pid: True))
+def test_ready_from_same_era_is_not_stale_even_if_pid_is_foreign(tmp_path, monkeypatch):
+    """写者与本进程同时代 ⇒ 是同伴，哪怕 pid 不是自己的、哪怕那 pid 已死。"""
+    monkeypatch.setattr(D.DataParallel, "_pid_alive", staticmethod(lambda pid: False))
     path = tmp_path / "ready"
-    path.write_bytes(b"4242 1.0")
+    path.write_bytes(b"4242 %f %f" % (time.time(), D._PROC_START + 1.0))
     assert D.DataParallel._ready_is_stale(str(path)) is False
 
 
 def test_own_pid_is_never_stale(tmp_path):
     path = tmp_path / "ready"
-    path.write_bytes(b"%d 1.0" % os.getpid())
+    path.write_bytes(b"%d %f %f" % (os.getpid(), time.time(), D._PROC_START))
     assert D.DataParallel._ready_is_stale(str(path)) is False
 
 
-def test_ready_with_garbage_content_is_stale(tmp_path):
-    path = tmp_path / "ready"
-    path.write_bytes(b"1")                  # 旧格式：没有 pid 字段
-    assert D.DataParallel._ready_is_stale(str(path)) is True
+def test_old_format_content_falls_back_to_mtime(tmp_path):
+    """老格式（没有第 3 字段）退回 mtime 判断：文件很旧 ⇒ 残留；文件是新的 ⇒ 当同伴。"""
+    import os as _os
+
+    stale = tmp_path / "ready"
+    stale.write_bytes(b"1")                      # 旧格式
+    _os.utime(str(stale), (1.0, 1.0))            # 1970 年的文件
+    assert D.DataParallel._ready_is_stale(str(stale)) is True
+
+    fresh = tmp_path / "ready2"
+    fresh.write_bytes(b"1")
+    assert D.DataParallel._ready_is_stale(str(fresh)) is False   # 新文件不许当残留
 
 
 # ═════════════════════════════════════════════════════════════════════════

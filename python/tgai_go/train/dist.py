@@ -52,6 +52,10 @@ import time
 
 import numpy as np
 
+#: 本进程启动时刻（用于判定"上一轮遗留的文件"）。**必须在模块导入时取**：
+#: 位于 `ready` 之前写出的文件只可能来自别的会话，不可能来自本进程。
+_PROC_START = time.time()
+
 try:
     from multiprocessing import shared_memory
     _HAS_SHM = True
@@ -102,6 +106,17 @@ def _set_grad(p, val, orig):
     except Exception:                                    # noqa: BLE001
         pass
     p.grad = val
+
+
+def _zero_grad_of(p):
+    """给「本步没有梯度」的参数补一个**全 0 的梯度**（与不重叠路径逐位同一语义）。
+
+    为什么要补而不是跳过：各 rank 的条目数/字节数必须一致（否则共享内存名字不同
+    ⇒ 一边创建一边等不到，卡死）；而且不补的话优化器会跳过该参数，
+    与"梯度为 0 但仍走 weight decay"的历史行为不一致。
+    """
+    shape = tuple(int(s) for s in getattr(p, "shape", ()) or ())
+    _set_grad(p, np.zeros(shape, np.float32), None)
 
 
 def _env_int(name, default):
@@ -217,6 +232,15 @@ class DataParallel:
         #: 最近一次 all_reduce 的 NCCL-only 耗时（host 路径为 None）
         self.nccl_sec = None
         self._nccl_calls = 0
+        # ── 反向重叠归约（`begin_overlap` / `finish_overlap`）的状态 ──
+        #: 当前 step 的重叠会话（`dp_overlap.OverlapSession`）；没开就是 None
+        self._ov = None
+        #: 最近一次重叠归约的 stats（暴露时间/重叠时间/桶数/pending 校验结果）
+        self.overlap_stats = None
+        #: 重叠归约专用的**非阻塞**流（NCCL 用；host 后端自己建一条）
+        self._ov_stream = None
+        #: ZeRO 用的按用途名管理的辅助共享内存（`_aux_slot`）：key -> (slot, 容量字节)
+        self._aux = {}
         base = os.environ.get("TGAI_DP_DIR") or tempfile.gettempdir()
         self.dir = os.path.join(base, "tgai_dp_%s" % self.job)
         self._shm = []
@@ -260,14 +284,15 @@ class DataParallel:
                     except OSError:
                         pass
             with open(ready, "wb") as fh:
-                fh.write(b"%d %f" % (os.getpid(), time.time()))
+                # 三个字段：写者 pid / 写者当前时间 / **写者的进程启动时刻**。
+                # 第 3 个字段是身份判据：它比读者更早 ⇒ 这份 ready 来自别的会话。
+                fh.write(b"%d %f %f" % (os.getpid(), time.time(), _PROC_START))
         elif self._ready_is_stale(ready):
-            print("[dp] WARN 发现上一轮残留的 ready（owner pid 已退出），清掉后重新等"
-                  "：%s" % ready, flush=True)
-            try:
-                os.remove(ready)
-            except OSError:
-                pass
+            # ★ 只**报告**、绝不删除：删除会踩到"我刚读到旧的、对方正好写了新的"这个
+            #   read-then-delete 窗口（CI ubuntu-3.10 实测双死锁）。`_wait_for` 每轮
+            #   重新 stat，新的 `ready` 一出现就会被接受。
+            print("[dp] 注意：%s 上有一份上一轮遗留的 ready（比本进程启动更早），"
+                  "忽略它继续等本轮 rank0 的标记" % ready, flush=True)
         self._wait_for(ready, "rendezvous 就绪")
         self._barrier("init")
         self._started = True
@@ -307,26 +332,34 @@ class DataParallel:
 
     @staticmethod
     def _ready_is_stale(path):
-        """`ready` 是否是上一轮遗留：里面记着 rank0 的 pid，pid 不在了就是旧的。
+        """`ready` 是不是**上一轮**留下的。
 
-        格式是 ``"<pid> <时间戳>"``（两个字段）。只有一个字段的是**旧版本**写的，
-        无法证明它属于当前这轮 ⇒ 一律当残留。
+        判据：文件里记着写者的**进程启动时刻**（第 3 个字段）。它比本进程启动更早
+        ⇒ 必然来自别的会话，与本轮无关 ⇒ **忽略并继续等**，绝**不删除**。
+
+        为什么不用 pid（旧实现）以及为什么不删（2026-11-21，CI ubuntu-3.10 双死锁）：
+        旧实现是「读到 pid 已死 ⇒ `os.remove(ready)` 再等」。这是 read-then-delete 竞态：
+        rank1 读到旧的（pid 已死）决定删，在它读与删之间 rank0 写入了新的
+        ⇒ rank1 删掉了**新文件** ⇒ rank0 卡在 `bar_init_1`、rank1 卡在 `ready`，
+        各等 600 s。而且 pid 会被系统复用，"pid 活着"根本不能证明"这是本轮"。
+        换成"写者的启动时刻"后，身份判定与 pid 复用无关；再配合"只忽略不删除"，
+        任何一方都不会破坏对方的文件。
         """
         try:
             with open(path, "rb") as fh:
-                raw = fh.read(64)
+                raw = fh.read(96)
+            mtime = os.stat(path).st_mtime
         except OSError:
-            return False                     # 没有文件 ⇒ 不是"残留"，正常等
+            return False                 # 没有文件 ⇒ 不是"残留"，正常等
         parts = raw.split()
-        if len(parts) < 2:
-            return True
-        try:
-            pid = int(parts[0])
-        except (ValueError, IndexError):
-            return True
-        if pid == os.getpid():
-            return False
-        return not DataParallel._pid_alive(pid)
+        if len(parts) >= 3:
+            try:
+                return float(parts[2]) < float(_PROC_START) - 1.0
+            except ValueError:
+                pass
+        # 老格式（只有 pid [时间]）：退回"文件比本进程还老"来判断，
+        # 仍是只读不删 —— 宁可多等一轮，也不许删掉别人刚写的标记。
+        return float(mtime) < float(_PROC_START) - 1.0
 
     def _marker(self, name):
         return os.path.join(self.dir, "%s.%d" % (name, self.rank))
@@ -455,6 +488,14 @@ class DataParallel:
         """rendezvous → 建 comm。所有 rank 必须都走到这里（`_start()` 已同步过）。"""
         from . import dist_nccl as N
 
+        # ★ 通道数默认 8：同一台机、无 P2P（SYS/PCIe）时实测这组参数把
+        #   3.16 GiB fp32 all-reduce 从 134 ms 降到 86 ms（1.55×）。
+        #   为什么放在这里：NCCL 在 **ncclCommInitRank** 时读 NCCL_* 环境变量，
+        #   而 ORV 的 DP 通信器正是在这里建；用户显式设了就不覆盖（setdefault）。
+        #   ★ 这是「同机多卡走 PCIe」的实测最优，不是普适最优：换 NVLink/多机
+        #   拓扑时请显式设 NCCL_MIN_NCHANNELS / NCCL_MAX_NCHANNELS 覆盖。
+        os.environ.setdefault("NCCL_MIN_NCHANNELS", "8")
+        os.environ.setdefault("NCCL_MAX_NCHANNELS", "8")
         rt = _runtime()
         lib = N.find_libnccl()
         if self.rank == 0:
@@ -844,13 +885,164 @@ class DataParallel:
             else:
                 rt.add_(rt.sub_view(g._gpu, (seg,), s - a), src)
 
+    # ---------- ZeRO 用的三个集合通信（2026-11-21） ----------
+    #
+    # 这三个与 `all_reduce_grads` 的区别：它们**不认参数列表**，只搬「一段已经打好的
+    # 连续 fp32 缓冲」，因此与模型结构无关，可以在 CPU 上用假运行时跑 2 进程对拍
+    # （`tests/zero_worker.py` 就是靠这一点，不需要两张卡）。
+    #
+    # 共同契约：
+    #   * `count` 必须**每个 rank 完全相同**（NCCL 的 all_gather/reduce_scatter 要求
+    #     等长；host 路径用同一个数拼共享内存名字，不同就是一边创建一边死等）；
+    #   * `send` / `recv` 都是**设备缓冲**（有 `.ptr`）。`rt` 可注入，供 CPU 单测传假运行时。
+
+    def _nccl_rt(self, rt):
+        """取运行时：显式注入的优先（CPU 单测传假运行时），否则用全局单例。"""
+        return _runtime() if rt is None else rt
+
+    def _aux_slot(self, key, per_rank_bytes):
+        """按用途名分配一块共享内存（总大小 = ``per_rank_bytes * world``），跨步复用。
+
+        与 `_ensure_slot` 的区别：那个是 DP 梯度专用的单例（名字里带字节数），
+        ZeRO 需要**几块互不干扰的**缓冲，复用同一个会因为大小交替变化而反复重建。
+        这里每块按 ``key`` 独立管理，只在变大时重建。
+        """
+        w = int(self.world)
+        need = int(per_rank_bytes)
+        cache = getattr(self, "_aux", None)
+        if cache is None:
+            cache = self._aux = {}
+        ent = cache.get(key)
+        if ent is not None and ent[1] >= need:
+            return ent[0]
+        if ent is not None:
+            try:
+                ent[0].close()
+            except Exception:                            # noqa: BLE001
+                pass
+        name = "tgai_dp_%s_%s_%d" % (self.job, key, need)
+        if self.rank == 0:
+            slot = shared_memory.SharedMemory(name=name, create=True, size=need * w)
+        else:
+            t0 = time.time()
+            while True:
+                try:
+                    slot = shared_memory.SharedMemory(name=name, create=False)
+                    break
+                except FileNotFoundError:
+                    if time.time() - t0 > self.timeout:
+                        raise TimeoutError(
+                            "共享内存 %s 未创建（ZeRO 的 %s 缓冲）" % (name, key) +
+                            "。修法：确认所有 rank 都启动了、TGAI_DP_JOB 一致；"
+                            "若有 rank 提前退出，其余 rank 会在这里超时")
+                    time.sleep(0.002)
+        self._shm.append(slot)
+        cache[key] = (slot, need)
+        return slot
+
+    def all_gather_flat(self, send, recv, count, rt=None):
+        """``recv[r*count : (r+1)*count] = 第 r 个 rank 的 send``（fp32）。
+
+        ZeRO-1/2 更新完参数后，用它把每 rank 只更新过的那 1/w 收回来。
+        """
+        count = int(count)
+        if count <= 0:
+            return
+        self._start()
+        rtk = self._nccl_rt(rt)
+        w = int(self.world)
+        if self.backend == "nccl":
+            self._nccl_before(rtk)
+            self._nccl.all_gather_flat(int(send.ptr), int(recv.ptr), count)
+            self._nccl_after(rtk)
+            rtk.sync()
+            return
+        span = w * count
+        slot = self._aux_slot("allgather", count * 4)     # 总大小 = w*count*4
+        hp = rtk.host_pinned(span * 4, slot="zero_allgather")
+        arr = hp.array(np.float32, span)
+        shm = np.ndarray((span,), np.float32, buffer=slot.buf)
+        rtk.d2h_into(send, ctypes.c_void_p(hp.ptr.value), nbytes=count * 4)
+        lo = self.rank * count
+        shm[lo:lo + count] = arr[:count]                  # ★ 只写自己那一段
+        self._barrier("zg")
+        np.copyto(arr, shm)
+        rtk.h2d_into(recv, ctypes.c_void_p(hp.ptr.value), nbytes=span * 4)
+        # ★ 第二个 barrier 不能省：快的 rank 若先进入下一块的写入，
+        #   会把慢 rank 正在读的那一段覆盖掉（静默算错，不是卡死）。
+        self._barrier("zg2")
+
+    def reduce_scatter_flat(self, send, recv, count, scale=None, rt=None):
+        """``recv[i] = sum_r send[r*count + i] * scale``（fp32，默认乘 ``1/world``）。
+
+        ZeRO-2 的梯度归约：``send`` 是每 rank 打好的 ``world*count`` 元素，
+        第 ``r`` 段最终归第 ``r`` 个 rank 所有 ⇒ 每 rank 只**收** ``count`` 个，
+        所以通信量是同一批数据 all_reduce 的**一半**。
+        """
+        count = int(count)
+        if count <= 0:
+            return
+        self._start()
+        rtk = self._nccl_rt(rt)
+        w = int(self.world)
+        sc = float(scale) if scale is not None else 1.0 / float(w)
+        if self.backend == "nccl":
+            self._nccl_before(rtk)
+            self._nccl.reduce_scatter_flat(int(send.ptr), int(recv.ptr), count)
+            self._nccl_after(rtk)
+            rtk.sync()
+            rtk.scale_inplace(recv, sc)
+            return
+        # host：每个 rank 把**自己那 world 段**全部写进共享内存，
+        # 一次 barrier 之后各自按 (world, world*count) 视图沿 rank 轴求和。
+        span = w * count
+        slot = self._aux_slot("reduce_scatter", span * 4)   # 总大小 = w*span*4
+        hp = rtk.host_pinned(span * 4, slot="zero_rs")
+        arr = hp.array(np.float32, span)
+        shm = np.ndarray((w, span), np.float32, buffer=slot.buf)
+        rtk.d2h_into(send, ctypes.c_void_p(hp.ptr.value), nbytes=span * 4)
+        np.copyto(shm[self.rank], arr)                    # ★ 只写自己那一行
+        self._barrier("zr")
+        acc = np.empty(count, np.float32)
+        np.sum(shm[:, self.rank * count:(self.rank + 1) * count], axis=0, out=acc)
+        acc *= sc
+        np.copyto(arr[:count], acc)
+        rtk.h2d_into(recv, ctypes.c_void_p(hp.ptr.value), nbytes=count * 4)
+        self._barrier("zr2")
+
+    def all_reduce_array(self, arr, rt=None):
+        """把一个小 float32 主机数组在所有 rank 上**求和**，返回同形状数组。
+
+        只用于「控制/统计量」（ZeRO-2 的逐张量平方和，MB 级），**不要**拿它搬梯度。
+        求和顺序与 `_all_reduce_host` 完全一致（`np.sum(axis=0)` 沿 rank 轴），
+        因此同一组输入在所有 rank 上给出**逐位相同**的结果 ——
+        ZeRO-2 的 gnorm 能与不分片版本逐位一致，靠的就是这一条。
+        """
+        shape = np.shape(arr)
+        a = np.ascontiguousarray(np.asarray(arr, dtype=np.float32)).reshape(-1)
+        n = int(a.size)
+        if n <= 0 or self.world <= 1:
+            return a.reshape(shape)
+        self._start()
+        slot = self._aux_slot("array", n * 4)             # 总大小 = w*n*4
+        shm = np.ndarray((self.world, n), np.float32, buffer=slot.buf)
+        shm[self.rank] = a
+        self._barrier("za")
+        out = np.empty(n, np.float32)
+        np.sum(shm, axis=0, out=out)
+        self._barrier("za2")
+        return out.reshape(shape)
+
     def stats(self):
+
         """给日志/RESULT 用的后端信息（**实测值，不是配置值**）。"""
         out = {"backend_requested": self.backend_requested,
                "backend": self.backend,
                "world": int(self.world), "rank": int(self.rank),
                "comm_sec": self.comm_sec, "nccl_sec": self.nccl_sec,
                "nccl_calls": int(self._nccl_calls)}
+        if self.overlap_stats is not None:
+            out["overlap"] = self.overlap_stats
         if self._nccl_lib is not None:
             out["nccl_lib"] = self._nccl_lib.path
             out["nccl_version"] = self._nccl_lib.version_str()
@@ -862,7 +1054,8 @@ class DataParallel:
         #   否则一个「造出来只为取 world 的单卡对象」在 close() 里也会去 _cuda()，
         #   在无卡机器上是没必要的副作用（单测 test_world_one_is_noop 守着）。
         if (self._nccl is None and self._nccl_events is None
-                and not self._nccl_own_stream and self._nccl_stream is None):
+                and not self._nccl_own_stream and self._nccl_stream is None
+                and self._ov_stream is None):
             return
         if self._nccl is not None:
             try:
@@ -895,9 +1088,169 @@ class DataParallel:
                             destroy_st(self._nccl_stream)
                     except Exception:                    # noqa: BLE001
                         pass
+                # 重叠归约自己的非阻塞流（可能只被重叠路径创建过）
+                if self._ov_stream is not None:
+                    destroy_st2 = getattr(cu, "cuStreamDestroy_v2", None) \
+                        or getattr(cu, "cuStreamDestroy", None)
+                    try:
+                        if destroy_st2 is not None:
+                            destroy_st2(self._ov_stream)
+                    except Exception:                    # noqa: BLE001
+                        pass
         self._nccl_events = None
         self._nccl_stream = None
         self._nccl_own_stream = False
+        self._ov_stream = None
+
+    # ---------- 反向重叠归约（可选；world<=1 / TG_DP_OVERLAP=0 时是快速空操作） ----------
+
+    def _make_overlap_stream(self, rt):
+        """给重叠归约开一条**非阻塞**流（与计算流靠 event 互相同步）。
+
+        必须 `CU_STREAM_NON_BLOCKING`：ORV 的计算流是 legacy NULL 流，默认（blocking）
+        流会与它**隐式互相同步**，重叠直接归零 —— 在真机上的表现就是"开了重叠但
+        时间一点没变"，而且不报任何错。这是本功能最容易静默失效的一处。
+        """
+        from . import dp_overlap
+
+        if self._ov_stream is not None:
+            return self._ov_stream
+        cu = getattr(rt, "cu", None)
+        if cu is None:
+            raise dp_overlap.OverlapUnavailable("运行时没有 CUDA 符号表" +
+                                           "。修法：重叠归约只支持 CUDA；CPU 后端请设 TG_DP_OVERLAP=0")
+        try:
+            pvoid = ctypes.POINTER(ctypes.c_void_p)
+            create = rt._bind_sym("cuStreamCreate", [pvoid, ctypes.c_uint])
+            if create is None:
+                raise dp_overlap.OverlapUnavailable("驱动缺少 cuStreamCreate" +
+                                           "。修法：升级显卡驱动；或设 TG_DP_OVERLAP=0 用不重叠路径")
+            st = ctypes.c_void_p()
+            rc = int(create(ctypes.byref(st), 1))          # 1 = NON_BLOCKING
+            if rc != 0 or not st.value:
+                raise dp_overlap.OverlapUnavailable(
+                "cuStreamCreate(非阻塞) rc=%d" % rc +
+                "。修法：按 rc 查 CUDA 错误；急着训练就设 TG_DP_OVERLAP=0")
+        except dp_overlap.OverlapUnavailable:
+            raise
+        except Exception as exc:                           # noqa: BLE001
+            raise dp_overlap.OverlapUnavailable(
+                "建重叠流失败 %r" % (exc,) +
+                "。修法：按上面的原始异常排查；或设 TG_DP_OVERLAP=0 退回不重叠路径")
+        self._ov_stream = st
+        return st
+
+    def begin_overlap(self, params, order=None, scale=None):
+        """开始「反向即归约」，返回会话（`world<=1`、开关关闭或不可用时返回 **None**）。
+
+        调用方契约（`v3_pretrain` 已按此实现）::
+
+            ov = dp.begin_overlap(params)      # 必须在 loss.backward() **之前**
+            loss.backward()
+            st = dp.finish_overlap()           # None ⇒ 请退回 dp.all_reduce_grads(params)
+
+        `order`：参数的就绪顺序（下标排列）。不给就用默认倒序；知道结构的一方
+        （`v3_pretrain`）可以给「head 最前、emb 最后」，见 `dp_overlap.build_plan`。
+        `scale`：默认 1/world（取平均，与 `all_reduce_grads` 一致）。
+
+        ★ 会话**不一定**真的重叠：图里有梯度检查点、已有 `.grad`（梯度累积）、
+          传输初始化失败……都会让它在反向开始时退回不重叠路径。届时
+          `finish_overlap()` 返回 None，调用方照常跑 `all_reduce_grads`，
+          `dp.overlap_stats["reason"]` 里写着为什么。
+        """
+        from . import dp_overlap
+
+        if self.world <= 1:
+            return None                        # ★ 单卡零行为变化
+        if not dp_overlap.overlap_enabled():
+            return None
+        if self._ov is not None:
+            raise RuntimeError(
+                "上一个重叠会话还没 finish_overlap()/abort_overlap()" +
+                "。修法：每步成对调用；异常路径要 abort_overlap()")
+        if not params:
+            return None
+        self._start()
+        try:
+            rt = _runtime()
+        except Exception:                                  # noqa: BLE001
+            return None
+        if getattr(rt, "_capturing", False):
+            # CUDA Graph 捕获期间不允许集合通信（dist_nccl 的已有约定）
+            return None
+        # ① 按 id 去重：tied 权重会被 parameters() 列两次；重复会让同一份梯度被归约两次
+        seen, uniq, deduped = set(), [], 0
+        for p in params:
+            if id(p) in seen:
+                deduped += 1
+                continue
+            seen.add(id(p))
+            uniq.append(p)
+        # ② 静态布局（各 rank 必须逐字节相同 ⇒ 只依赖 params 的顺序与大小）
+        elems = [int(p.numel()) for p in uniq]
+        try:
+            plan = dp_overlap.build_plan(elems, order=order)
+        except Exception as exc:                           # noqa: BLE001
+            print("[dp] WARN 重叠归约的桶布局失败（%r）⇒ 退回不重叠路径" % (exc,),
+                  flush=True)
+            return None
+        sc = (1.0 / float(self.world)) if scale is None else float(scale)
+        # ③ 传输
+        try:
+            if self.backend == "nccl":
+                st = self._make_overlap_stream(rt)
+                transport = dp_overlap.NcclBucketTransport(
+                    self._nccl, st, rt, sc, slots=dp_overlap.resolve_slots())
+            else:
+                transport = dp_overlap.HostBucketTransport(
+                    self, rt, sc, slots=dp_overlap.resolve_slots())
+        except dp_overlap.OverlapUnavailable as exc:
+            print("[dp] WARN 重叠归约不可用（%s）⇒ 退回不重叠路径" % (exc,), flush=True)
+            return None
+        except Exception as exc:                           # noqa: BLE001
+            print("[dp] WARN 重叠归约初始化异常（%r）⇒ 退回不重叠路径" % (exc,),
+                  flush=True)
+            return None
+        sess = dp_overlap.OverlapSession(
+            uniq, plan, transport, world=self.world, scale=sc,
+            zero_grad=_zero_grad_of, deduped=deduped, tag=str(self.job))
+        self.overlap_stats = {"active": False, "reason": "in_flight",
+                              "mode": transport.kind,
+                              "buckets": plan.nbuckets,
+                              "max_bucket_mb": plan.summary()["max_bucket_mb"]}
+        self._ov = sess
+        import tgai_go.train as T
+        T._set_bwd_overlap(sess)
+        return sess
+
+    def finish_overlap(self):
+        """结束重叠归约。返回 stats；**返回 None 表示请调用方跑老路径**。"""
+        sess = self._ov
+        if sess is None:
+            return None
+        self._ov = None
+        import tgai_go.train as T
+        T._set_bwd_overlap(None)
+        try:
+            st = sess.finish()
+        finally:
+            sess.abort()                    # 幂等：关流/事件/桶缓冲
+        self.overlap_stats = st
+        if not st.get("active"):
+            # 会话在反向开始时退回了不重叠路径（检查点/梯度累积/传输失败……）
+            return None
+        self.comm_sec = st.get("exposed_sec")      # 表里的 comm 列 = **暴露**时间
+        self.nccl_sec = st.get("comm_sec")         # 真实通信忙时
+        return st
+
+    def abort_overlap(self):
+        """异常路径：卸下钩子、关传输（不归约）。"""
+        sess, self._ov = self._ov, None
+        if sess is None:
+            return
+        import tgai_go.train as T
+        T._set_bwd_overlap(None)
+        sess.abort()
 
     def close(self):
         """释放共享内存与 NCCL 通信器。
