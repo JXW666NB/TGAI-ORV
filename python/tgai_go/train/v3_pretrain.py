@@ -260,6 +260,45 @@ def _gib(nbytes):
     return float(nbytes) / float(1 << 30)
 
 
+def warn_no_tensor_core(caps=None, rt=None):
+    """cc < 7.0（Pascal 及更早，如 P100）时打印一次警告：ORV 的加速路径不成立。
+
+    为什么要在启动时明说：ORV 相对 PyTorch 的加速主要来自 **fp16/bf16 tensor-core
+    GEMM 与融合内核**。P100 没有 Tensor Core，这些路径全部失效，剩下的是"每算子多次
+    launch"的相对劣势 —— 实测（`docs/P100_MEASURED_2026-11-21.md`）：
+    B=2 快 18% 但显存 +26%，B=4 打平而显存 +37%，综合不如 PyTorch。
+    用户不知道这一点时，会以为"引擎慢"，而不是"这张卡不适用"。
+
+    参数（都为测试留口）：
+      caps : 直接传 `rt.device_caps()` 的返回（不给就自己探）
+      rt   : 运行时对象（不给用 `T._cuda()`）
+    返回 caps 或 None；**任何探测失败都静默**（不能因为提示而让训练起不来）。
+    """
+    if os.environ.get("TG_NO_GPU_WARN", "").strip().lower() not in ("", "0", "false", "no", "off"):
+        return caps
+    if caps is None:
+        try:
+            rt = rt or T._cuda()
+            caps = rt.device_caps()
+        except Exception:                        # noqa: BLE001  探测失败不阻断训练
+            return None
+    if not isinstance(caps, dict) or caps.get("fp16_arith"):
+        return caps
+    cc = caps.get("cc") or (0, 0)
+    try:
+        ccs = "%d.%d" % (int(cc[0]), int(cc[1]))
+    except Exception:                            # noqa: BLE001
+        ccs = str(cc)
+    print("[orv] WARN 这张 GPU 的计算能力是 cc=%s，**没有 Tensor Core**。"
+          "ORV 的加速来自 fp16/bf16 tensor-core GEMM 与融合内核，在此类卡上不成立；"
+          "实测 P100：B=2 快 18%% 但显存 +26%%，B=4 打平而显存 +37%%。"
+          "修法：训练请用 PyTorch，或改用 V100/A100/4090/5090 及以上；"
+          "若仍要在此卡跑，加 --grad-ckpt（或 --grad-ckpt-layers N）降显存，"
+          "并设 TG_NO_GPU_WARN=1 关闭本提示。"
+          "详见 docs/P100_MEASURED_2026-11-21.md" % ccs, flush=True)
+    return caps
+
+
 def _is_finite(x):
     """NaN / Inf 判定（`x` 可以是 float、numpy 标量或 None）。"""
     if x is None:
@@ -1000,6 +1039,9 @@ def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
     #   重算开关必须在**这里**生效，否则等于没开（实测内核数 6898 完全不变）。
     use_ckpt = (os.environ.get("TG_GRAD_CKPT", "") not in ("", "0", "false", "False")
                 or bool((cfg or {}).get("grad_ckpt")))
+    # ★ 2026-11-21：可调档位。`--grad-ckpt-layers N`（N>0）⇒ 只重算**前 N 层**，
+    #   其余层照常建图。显存不够时全开、显存够时调小换速度，是"算力/显存"的连续旋钮。
+    _ckpt_lim = int((cfg or {}).get("grad_ckpt_layers") or 0)
     for Li, L in enumerate(P["layers"]):
         kind = kinds[Li]
         # 计数放在循环里做一次（重算会再跑一遍层体，不能在里面计数，否则翻倍）
@@ -1041,7 +1083,8 @@ def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
                     aux_terms.append((_f * _P).sum() * _aux_a)
             return h + mo.reshape(B, Tlen, d)
 
-        x = CLI._checkpoint_layer(_layer, x) if use_ckpt else _layer(x)
+        _do_ckpt = use_ckpt and (_ckpt_lim <= 0 or Li < _ckpt_lim)
+        x = CLI._checkpoint_layer(_layer, x) if _do_ckpt else _layer(x)
 
     xh = V.rmsnorm_orv(x, P["ln_f"])[:, :Tlen - 1, :].reshape(B * (Tlen - 1), d)
     target = np.ascontiguousarray(labels[:, 1:]).reshape(-1)
@@ -1266,6 +1309,19 @@ def build_arg_parser():
     g.add_argument("--no-final-save", action="store_true", help="结束时不再存（大模型省盘）")
     g.add_argument("--grad-ckpt", dest="grad_ckpt", action="store_true",
                    help="梯度重算：每层前向不建图、反向重跑（省激活显存，多花约一层的前向时间）")
+    g.add_argument("--grad-ckpt-layers", dest="grad_ckpt_layers", type=int, default=0,
+                   metavar="N",
+                   help="只对**前 N 层**做梯度重算（0 或负数 = 全部层，配合 --grad-ckpt）。"
+                        "档位含义：N 越小越省算力、省显存越少；显存还够就把它调小换速度")
+    g.add_argument("--bf16-act", dest="bf16_act", action="store_true",
+                   help="把**大激活**存成 bf16（省约一半激活显存），反向时临时升回 fp32。"
+                        "⚠ 数值代价：往返相对误差上界 2^-9≈1.95e-3（实测末步 loss 偏差 -0.027%%）。"
+                        "⚠ 全有或全无：若消费方在前向就抓住 fp32 缓冲，内存反而可能涨 —— "
+                        "务必用 pool_stats()/pool_dump_live() 确认峰值真的降了再采用")
+    g.add_argument("--bf16-act-min", dest="bf16_act_min", type=int, default=262144,
+                   metavar="ELEMS",
+                   help="启用 --bf16-act 的元素数下限（默认 262144 = 1 MiB fp32），"
+                        "太小的张量多一次转换内核反而亏")
     g.add_argument("--reschedule", action="store_true",
                    help="允许续训时改 LR 计划（默认严格校验一致）")
     # ---- 其它 ----
@@ -1348,6 +1404,10 @@ def _expand_cfg(a):
         # 梯度重算：用算力换显存（每层前向不建图，反向重跑）。
         # 原型实测梯度逐位等价；默认关闭，只有显式 --grad-ckpt 才开。
         cfg["grad_ckpt"] = True
+        _nk = int(getattr(a, "grad_ckpt_layers", 0) or 0)
+        if _nk > 0:
+            # 只重算前 N 层：显存换速度的中间档（N>=层数 等价于全开）
+            cfg["grad_ckpt_layers"] = _nk
     if int(a.csa) > 0:
         cfg.update(csa=int(a.csa), n_kv_attn=a.n_q, rope_theta=500000.0,
                    csa_compress=4, csa_conv_kernel=3, csa_local_window=0)
@@ -1407,6 +1467,11 @@ def main(argv=None):
         T._cuda().fp16_gemm = True
         print("[dev] rt.fp16_gemm=True (V100: slower + 3GB, reproduce only)", flush=True)
     rt = T._cuda()
+    warn_no_tensor_core(rt=rt)      # cc<7.0（如 P100）上说清「本卡不适用」
+    if getattr(a, "bf16_act", False):
+        _st = T.bf16_act_store(True, int(getattr(a, "bf16_act_min", 262144)))
+        print("[dev] bf16 激活存储已开（min_elems=%d）：激活按 bf16 存、计算仍在 fp32/fp16，"
+              "省约一半激活显存；数值代价见 --bf16-act 的帮助" % _st["min_elems"], flush=True)      # cc<7.0（如 P100）上说清「本卡不适用」
     base_mib = _nvidia_used_mib()
 
     # ---- 模型 ----
