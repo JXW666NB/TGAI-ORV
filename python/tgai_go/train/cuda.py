@@ -7480,13 +7480,21 @@ class CudaRuntime:
             return False
 
     def ns_math_mode_end(self):
-        """把 cuBLAS 复位回 PEDANTIC（构造期设定的全局策略）。"""
+        """把 cuBLAS 复位回**当前全局策略**：TF32（若 `tf32_enable(True)` 开着）否则 PEDANTIC。
+
+        ★ 2026-11-21 修：原来无条件复位成 PEDANTIC。而 `tf32_enable()` 复用的就是本方法 ——
+        所以 `--amp tf32` + `TG_MUON_NS_GEMM=tf32` + Muon 的组合下，NS 的一次 begin/end
+        会把全局 TF32 **静默关掉**，而 `_tf32["on"]` 仍是 True ⇒ 之后所有 GEMM 退回
+        PEDANTIC，用户完全看不出来。复位必须按"引擎当前认为的模式"来。
+        """
         if self.cublas is None or self.cu is None:
             return
+        st = getattr(self, "_tf32", None)
+        mode = (CUBLAS_TF32_TENSOR_OP_MATH
+                if (st is not None and st.get("on")) else CUBLAS_PEDANTIC_MATH)
         try:
-            self._chk_blas(self.cublas.cublasSetMathMode(
-                self.handle, CUBLAS_PEDANTIC_MATH),
-                "cublasSetMathMode(PEDANTIC)")
+            self._chk_blas(self.cublas.cublasSetMathMode(self.handle, mode),
+                           "cublasSetMathMode(restore)")
         except Exception:                                # noqa: BLE001
             pass
 
@@ -7516,8 +7524,10 @@ class CudaRuntime:
             st["ok"] = bool(ok)
             st["on"] = bool(ok)
             return bool(ok)
-        self.ns_math_mode_end()
+        # ★ 顺序要紧：先把状态置 False，再复位。
+        #   否则 `ns_math_mode_end()` 读到 `_tf32["on"]` 还是 True，会"复位"回 TF32 ⇒ 关不掉。
         st["on"] = False
+        self.ns_math_mode_end()
         return True
 
     def tf32_state(self):
