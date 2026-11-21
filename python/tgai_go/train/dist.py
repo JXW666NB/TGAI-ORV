@@ -455,6 +455,8 @@ class DataParallel:
         self._zero1 = None
         self._host16 = None
         self._ef_ov_warned = False
+        #: 低精度 + 反向重叠的组合被实测判为**数值未通过**，只警告一次（见 begin_overlap）
+        self._lowp_ov_warned = False
         # ── 反向重叠归约（`begin_overlap` / `finish_overlap`）的状态 ──
         #: 当前 step 的重叠会话（`dp_overlap.OverlapSession`）；没开就是 None
         self._ov = None
@@ -1794,6 +1796,23 @@ class DataParallel:
                 self._ef_ov_warned = True
                 print("[dp] WARN TG_DP_GRAD_EF=1 需要不重叠路径（残差在打包缓冲里结算）"
                       "⇒ 本步及后续都走 all_reduce_grads", flush=True)
+            return None
+        if self.grad_dtype != "fp32":
+            # ★ 2026-11-21 GPU 实测（2×4090）：低精度 + 反向重叠这条组合**数值不对**。
+            #   隔离实验（seq512/3 步/同一份数据）：
+            #     overlap=0 bf16  gnorm = 10.741 / 9.809 / 9.228   （= 逐位对拍的正确答案）
+            #     overlap=1 bf16  gnorm = 49.387 / 46.842 / 45.398  （×4.6，两个 rank 仍然相同）
+            #   非重叠低精度路径在 GPU 上**逐位**对拍通过（maxdiff=0.0，
+            #   nccl bf16 / host bf16 / nccl fp32 三组全过），所以这里退回它，
+            #   不要用一个"loss 看起来正常"的错误路径（Adam 近似尺度不变，gnorm 错了
+            #   loss 也照样降 —— 这正是最危险的一类 bug）。
+            #   修好之前**不允许**静默启用；要复现实验可显式 TG_DP_GRAD_DTYPE=fp32。
+            if not getattr(self, "_lowp_ov_warned", False):
+                self._lowp_ov_warned = True
+                print("[dp] WARN TG_DP_GRAD_DTYPE=%s 与反向重叠组合的数值验证未通过"
+                      "（GPU 实测 gnorm 偏大 4.6×）⇒ 低精度一律走不重叠路径"
+                      "（该路径已在 GPU 上逐位对拍通过）" % (self.grad_dtype,),
+                      flush=True)
             return None
         if self._ov is not None:
             raise RuntimeError(
