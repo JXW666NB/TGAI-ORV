@@ -134,6 +134,20 @@ CSA 的全局分支改成「query 分块 + 反向重算」后，显存从 O(seq�
 默认 `cq=2048`：**seq ≤ 2048 自动走原路径、逐位不变**；要完全回退设 `TG_CSA_ATTN_CQ=0`。
 数学：前向与物化路径 **max_abs = 0.000e+00（逐位一致）**；4 层/seq512 的 loss 与基线精确相同。
 
+### 反例：Tesla P100 16GB 上没有优势（实测，2026-11-21 由使用者复测）
+
+诚实记录一个不利结果：在 **P100（Pascal / sm_60 / 无 Tensor Core）**、S=2048、fp32、
+`LOWMEM=1` 的同一骨架下，与同机 PyTorch 对比：
+
+| 批次 | PyTorch | ORV 1.0.18 | 对比 |
+| ---: | --- | --- | --- |
+| B=2 | 2.68 s/step，1526 tok/s，6.69 GB | 2.27 s/step，1805 tok/s，8.43 GB | 快 18%，**显存 +26%** |
+| B=4 | 4.57 s/step，1793 tok/s，7.41 GB | 4.58 s/step，1788 tok/s，10.14 GB | 打平，**显存 +37%** |
+
+结论：**P100 上不推荐用 ORV 训练** —— 能开的 batch 反而更小，综合不划算；训练请用 PyTorch。
+ORV 的加速依赖 Tensor Core（fp16/bf16 GEMM 与融合内核），P100 上这些路径全部失效。
+显存超支随 batch 线性增长（每样本约 +0.65~0.87 GB），已定位为"反向中间量/注意力物化/
+MoE dispatch 缓冲"待归因项，详见 [`docs/P100_MEASURED_2026-11-21.md`](docs/P100_MEASURED_2026-11-21.md)。
 ## 基准测试：ORV vs PyTorch（RTX 3090 24GB 单卡）
 
 > **⚠️ 本节及下文所有"ORV 快 N×"的旧数字（含 `speed`/`extreme` 档位描述里的 2.1×、0.93×）
