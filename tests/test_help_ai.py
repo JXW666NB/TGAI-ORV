@@ -25,7 +25,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LAZY_MODULES = ("tgai_go.train.help_web", "tgai_go.train.help_wiki",
                 "tgai_go.train.help_l0")
 
-#: JSON 契约（改字段名 = 破坏契约，必须同步改 docs/AI_HELP_PROTOCOL.md）
+#: JSON 契约（改字段名 = 破坏契约，必须同步改 `apilist.help` 的 docstring 与本测试）
 TOP_KEYS = {"schema", "query", "kind", "count", "items", "hint",
             "wiki_version", "coverage", "errors", "warnings"}
 ITEM_KEYS = {"id", "kind", "name", "title_zh", "title_en", "zh", "en",

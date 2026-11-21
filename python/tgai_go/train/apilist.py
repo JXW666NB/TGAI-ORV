@@ -20,18 +20,26 @@
 给 AI / 自动化脚本 / for AI & scripts
 --------------------------------------
 * `format="json"`：**纯 JSON**（stdout 里除 JSON 外没有任何东西、无 ANSI 颜色、
-  不分页），schema 稳定为 `tgai-help/1`：
+  不分页），schema 稳定为 `tgai-help/2`（字段名是契约）：
 
-      顶层：schema / query / kind / count / items / hint（字段名是契约）
-      item：kind / name / zh / en / usage / namespace
+      顶层：schema / query / kind / count / items / hint / wiki_version /
+            coverage / errors / warnings
+      item：id / kind / name / title_zh / title_en / zh / en / usage /
+            namespace / category / documented / module / wiki_example /
+            see_also / author / reachable / form / form_kind /
+            reach_evidence / unreachable
 
-  同名条目可能出现在不同 kind（例如 `abs` 既是运行时 API 又是张量算子），
-  用 item 里的 `kind` 区分；`namespace` 给出调用入口（`rt.abs(...)` / `t.abs(...)`）。
+  `namespace` 是引擎按真实签名机械生成的调用示例（`x.sum()` / `a * b` /
+  `T.matmul(a, b)` / `rt.launch(...)` / `python -m ... --flag` / `TG_X=1`）；
+  **不可调用的条目 `reachable=false`、`namespace` 为空**，`unreachable` 给出原因，
+  绝不给你一个照抄就报错的假示例。同名条目可能出现在不同 kind（例如 `abs` 既是
+  运行时 API 又是张量算子），用 item 里的 `kind` 区分。
   未命中时 `count=0`、`hint` 给出可执行的下一步，**不会静默空输出**。
 * `open="web"`：把当前（可带关键词过滤的）条目渲染成**一个自包含 HTML**，
   写进 `tempfile` 临时目录，尝试用默认浏览器打开，并把文件路径打印到 stdout。
   无头/CI 下浏览器打不开不算失败；路径照常打印并返回。渲染模块 `help_web`
-  **只在此时才 import**，默认路径的导入开销为零。
+  **只在此时才 import**，默认路径的导入开销为零。页面黑白极简、零外链，
+  顶栏 `EN | 中文` 全局语言开关（默认英文；`?lang=zh` 可指定）。
 
 tag 认中英文 / tag accepts CN & EN
 -----------------------------------
