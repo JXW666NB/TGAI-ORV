@@ -140,6 +140,27 @@ def _aux_coefs():
 # ═════════════════════════════════════════════════════════════════════════
 # 小工具
 # ═════════════════════════════════════════════════════════════════════════
+def _overlap_enabled():
+    """「反向即归约」是否启用。**默认关（opt-in）**，这是 2026-11-21 实测后改的。
+
+    为什么默认关掉：2×4090 实测（`--dp 2`，fp32，host 后端，4 步，gnorm 打 9 位小数）
+
+    | 配置 | 普通 `all_reduce_grads` 被调用 | `[dp-ov] comm` | 两 rank 的 gnorm |
+    | --- | --- | --- | --- |
+    | `TG_DP_OVERLAP=0` | 是（每步 1 次）| 无 | **逐位相同**（4/4 步）|
+    | 默认（重叠开）| **0 次** | **0.00 ms** | **相差 1e-2 ~ 3e-4** |
+
+    也就是说重叠路径**根本没有真的归约梯度**（却报 `pending_zeroed=True`，看起来很正常），
+    数据并行静默退化成「各卡用自己的本地梯度」—— 这比慢一万倍更危险：
+    loss 照样下降，只有逐位对拍才看得出来。
+
+    在 `docs/DP_OVERLAP_2026-11-21.md` 的 bug 修好、并且有逐位证据之前，它只能是**显式开关**。
+    要开：`TG_DP_OVERLAP=1`。
+    """
+    v = os.environ.get("TG_DP_OVERLAP", "")
+    return str(v).strip().lower() not in ("", "0", "false", "no", "off")
+
+
 def _now():
     """计时统一用 perf_counter（Windows 上 time.time() 粒度 15.6 ms，不可用）。"""
     return time.perf_counter()
@@ -1600,7 +1621,7 @@ def main(argv=None):
             #   world<=1 / TG_DP_OVERLAP=0 / 图里有梯度检查点 / 已经有 .grad …… 时
             #   返回 None，走原来的「反向结束后一次性 all_reduce」路径（零行为变化）。
             _ov = None
-            if _dp is not None:
+            if _dp is not None and _overlap_enabled():
                 try:
                     _ov = _dp.begin_overlap(params, order=_overlap_order(P, params))
                 except Exception as _ovexc:              # noqa: BLE001
