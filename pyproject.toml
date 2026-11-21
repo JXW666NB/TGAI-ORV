@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # 若被占名，改这一行即可（import 名始终是 tgai_go，不受影响）。
 [project]
 name = "tgai-orv"
-version = "1.0.16"
+version = "1.0.17"
 description = "PyTorch-free LLM engine: train and infer with one codebase. 训推一体，不依赖 PyTorch。"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -67,5 +67,5 @@ include = ["tgai_go*"]
 # 现在至少把文件打进包里，且加载失败时给的是可执行的指引而不是裸异常。
 [tool.setuptools.package-data]
 "tgai_go.train" = ["kernels/*.cu", "kernels/*.cuh"]
-"tgai_go" = ["_native/*.dll", "_native/*.so", "_native/*.dylib"]
+"tgai_go" = ["_native/*.dll", "_native/*.so", "_native/*.dylib", "wiki/*.txt"]
 

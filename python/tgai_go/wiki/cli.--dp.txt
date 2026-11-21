@@ -1,0 +1,37 @@
+[ID] cli:--dp
+[分类] distributed
+[中文名] 数据并行 world 大小
+[英文名] Data-parallel world size
+[作者] TGAI
+
+=== 中文 ===
+`python -m tgai_go.train.v3_pretrain --dp N` 指定数据并行的 world 大小。
+默认 `--dp 0` 表示读 `TGAI_DP_WORLD`；world=1 时这个开关**没有任何影响**。
+
+rank 仍由 `TGAI_DP_RANK` 指定；**每个进程必须只看见一张卡**
+（`CUDA_VISIBLE_DEVICES=0` / `=1`），否则两个进程会挤在同一张卡上 OOM（实测踩过）。
+
+- 归约后端：`TG_DP_BACKEND=host|nccl|auto`（默认 host，不需要 NCCL/MPI）
+- 归约在梯度裁剪**之前**执行，默认取**平均**（与 PyTorch DDP 一致）
+- 正确性判据：各 rank 的 gnorm **逐位相同**（数据不同、loss 不同，但归约后的梯度必须一致）
+
+=== English ===
+`python -m tgai_go.train.v3_pretrain --dp N` sets the data-parallel world size.
+`--dp 0` (the default) means "read `TGAI_DP_WORLD`"; with world=1 this flag has **no effect**.
+
+The rank still comes from `TGAI_DP_RANK`, and **each process must see exactly one GPU**
+(`CUDA_VISIBLE_DEVICES=0` / `=1`), otherwise both processes land on the same card and OOM
+(measured the hard way).
+
+- Reduction backend: `TG_DP_BACKEND=host|nccl|auto` (default `host`, no NCCL/MPI needed)
+- Reduction runs **before** gradient clipping and averages by default (same as PyTorch DDP)
+- Correctness check: each rank's gnorm must be **bitwise identical** (different data and
+  loss, but the reduced gradient must agree)
+
+=== 示例 ===
+CUDA_VISIBLE_DEVICES=0 TGAI_DP_WORLD=2 TGAI_DP_RANK=0 python -m tgai_go.train.v3_pretrain --data corpus.txt --dp 2
+CUDA_VISIBLE_DEVICES=1 TGAI_DP_WORLD=2 TGAI_DP_RANK=1 python -m tgai_go.train.v3_pretrain --data corpus.txt --dp 2
+
+=== 见也 ===
+env:TG_DP_OVERLAP
+api:DUO

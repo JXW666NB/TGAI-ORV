@@ -1,0 +1,32 @@
+# 示范词条 1/3：一个张量算子。
+# 注意：真正的调用示例由引擎按签名自动生成，这里写的是"人能看懂的说明 + 坑"。
+[ID] op:mul
+[分类] compute
+[中文名] 逐元素相乘
+[英文名] Element-wise multiply
+[作者] TGAI
+
+=== 中文 ===
+逐元素相乘。写 `a * b` —— Tensor **没有** `.mul()` 方法，顶层也没有 `T.mul`，
+所以照 PyTorch 写成 `a.mul(b)` 会直接 AttributeError。支持 numpy 式广播。
+
+⚠️ 最常见的坑：ORV 里 `*` 是**逐元素**乘法，不是矩阵乘。矩阵乘要用 `a @ b`
+（或 `T.matmul(a, b)`）。两者写错不会报错，只会静默算出不一样的形状或数值 —— 这是新人第一个踩的坑。
+
+=== English ===
+Element-wise multiply. Write `a * b` -- Tensor has **no** `.mul()` method and there is no
+top-level `T.mul`, so the PyTorch-style `a.mul(b)` raises AttributeError.
+Numpy-style broadcasting is supported.
+
+⚠️ The most common trap: in ORV `*` is element-wise, NOT a matrix product.
+Use `a @ b` (or `T.matmul(a, b)`) for that. Writing the wrong one does not raise -- it
+silently produces a different shape or different numbers.
+
+=== 示例 ===
+y = a * b             # 逐元素 / element-wise
+z = a @ b             # 矩阵乘，别和上面混 / matrix product
+s = a.sum()           # 求和是张量方法，不是 T.sum(a)
+
+=== 见也 ===
+op:matmul
+op:sum

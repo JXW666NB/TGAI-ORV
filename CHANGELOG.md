@@ -1,3 +1,65 @@
+## [1.0.17] - 2026-11-21
+
+### 新增：`T.help` 内置离线 Wiki（词条是**数据**，可热更新）
+
+* **TXT 词条协议**：一条词条 = 一个 `.txt`（`[ID]` 为唯一必填字段，
+  `=== 中文 === / === English === / === 示例 === / === 见也 ===` 四个区块）。
+  规范见 `wiki/README_词条规范.txt`，写作 skill 见 `skills/orv-wiki-author/SKILL.md`。
+* **一一对应**：稳定 ID（`op:mul` / `api:DUO` / `kernel:…` / `cli:--dp` / `env:…` /
+  `plugin:<pkg>:<item>`），与引擎自省清单对号入座；未知 ID / 未知字段 / 未知区块 / 死链
+  **一律报错**并给候选，不静默忽略。
+* **热更新**：改文件即生效（缓存键是 `(路径, mtime, size)`），覆盖顺序
+  包内 → 仓库根 → `$TG_WIKI_PATH` → `~/.tgai/wiki`；`T.help.refresh()` 强制重载。
+* **缺词条绝不空白**：没有词条的条目仍显示 **名字 + 引擎按真实签名生成的调用示例** +
+  `未编写` 徽标 + `T.help.contrib('<ID>')` 提示。覆盖率在网页页脚可见。
+* **可达性自证**：L0 对每条记录 `reachable / form / reach_kind / reach_evidence`。
+  当前 **436 条里 433 条可达**；不可调用的条目**不摆假示例**，直接给原因与依据。
+* **离线网页**：`T.help(open='web')` 生成单文件自包含 HTML（**零外链/零 CDN/零字体请求**），
+  `file://` 直接打开；左栏按分类分组、kind 过滤、中英双语搜索、`未编写` 徽标、
+  自适应窄屏与打印，支持 `prefers-color-scheme: dark`。
+* **全局语言切换**：顶栏 `EN | 中文`，**默认英文**（面向国际化），
+  优先级 `?lang=` > `localStorage` > 默认 `en`；界面文案全部走词表（zh/en 各 46 key，
+  有测试保证两边 key 集合相同）；词条正文 tab 跟随全局语言，缺该语言时回退并提示；
+  **搜索始终中英双语**。
+* **`format="json"`**：纯 JSON（`schema=tgai-help/2`），无 ANSI、无分页噪声，供 AI 工具解析。
+* **`wiki` 随包发布**：`scripts/sync_wiki_package.py` 把仓库根 `wiki/` 同步进
+  `python/tgai_go/wiki/`，并由测试防止漂移 —— 否则从 PyPI 安装的用户拿不到词条。
+
+### 修复：三个"幽灵环境变量"（文案教用户设，代码从不读）
+
+| 变量 | 之前 | 现在 |
+| --- | --- | --- |
+| `TG_DEBUG` | **192 处**错误文案说"加 `TG_DEBUG=1` 可出更多日志"，**0 处**读取 | **真的实现了**：`CudaError` 会附加平台/进程/相关环境变量快照（诊断失败绝不掩盖原始错误）|
+| `TGAI_ATTN_FLASH` | 3 处文案让人设它回退到物化注意力，没人读 | 改成真正被读取的 **`TG_NO_FUSED=1`** |
+| `TG_CUDA_GRAPH` | 注释与建议里暗示它是开关，没人读 | 改成事实：图捕获由代码 `graph_arm()` 触发，**没有环境变量开关** |
+
+`T.help` 现在把这几个变量标成"可达/不可调用"，并新增"清单里不许有不可达 env"的回归测试。
+
+### 修复：数据并行的共享内存创建竞态
+
+`SharedMemory(create=True)` 建好文件名后尚未 `ftruncate` 到目标尺寸的窗口里，
+对端 attach 会 `ValueError: cannot mmap an empty file`（CI ubuntu-3.12 偶发）。
+现在 rank0 **创建完成后才写 marker**，对端等 marker 再 attach，并保留尺寸校验与空文件重试。
+（附带修掉我自己两处错误：marker 名误用"本进程启动时刻"导致两端死等；
+以及把 `ValueError` 当控制流哨兵，违反"错误消息必须带修法"的仓库规则。）
+
+### 测试与工程
+
+* 新增 `scripts/ci_test.py`：跑测试并把**失败用例名**写进 GitHub Job Summary
+  （公开仓库的 actions logs API 返回 403，以前只能靠截图猜哪条红）。
+* 新增 `scripts/wiki_check.py`：词条静态校验器（编码/字段/区块/分类/交叉引用），
+  无需引擎加载器即可用，作者写词条当场能验。
+* `tests/test_muon.py` 把 1-D 参数（AdamW 回退）与 2-D（Muon 主线）分开判：
+  前者在 `|g|≈eps` 处把相对误差放大 ~1e6 倍，用 1% 严判等于考核浮点运气。
+* 全套：**1178 passed / 64 skipped**。
+
+### 已知未完成
+
+* 重叠归约（`TG_DP_OVERLAP`）NCCL 路径的 gnorm 与不重叠路径差 10.3%，
+  **等价性未证明** ⇒ 继续默认关闭（详见 `docs/OPEN_DP_GNORM_MISMATCH.md`）。
+* ZeRO 在 2×4090 上的"装得下"可达 **seq512**，不是 2048。
+* 词条覆盖率 **14/436 = 3.2%** —— 欢迎按 `skills/orv-wiki-author` 补。
+
 ## [1.0.16] - 2026-11-21
 
 ### 正确性（这一版最重要的部分）

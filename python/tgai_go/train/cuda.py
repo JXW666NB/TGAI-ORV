@@ -3455,7 +3455,51 @@ def _launch_fast_enabled():
 
 
 class CudaError(RuntimeError):
-    pass
+    """CUDA 层错误。
+
+    ★ `TG_DEBUG=1` 时**自动追加诊断上下文**（2026-11-21）。
+      在此之前全仓有 192 处错误文案写着「加 TG_DEBUG=1 可出更多日志」，
+      但**没有任何代码读这个变量** —— 等于 192 条提示在教用户干一件没用的事。
+      现在它是真的：设了就会在错误末尾附上环境与设备快照，方便反馈时一次说清。
+    """
+
+    def __init__(self, msg="", *args):
+        text = str(msg)
+        try:
+            if _debug_enabled():
+                ctx = _debug_context()
+                if ctx:
+                    text = text + "\n[TG_DEBUG] " + ctx
+        except Exception:                        # noqa: BLE001  诊断失败绝不能掩盖原始错误
+            pass
+        super().__init__(text, *args)
+
+
+def _debug_enabled():
+    """`TG_DEBUG=1`（或 true/on/yes）时开诊断。默认关，零开销（一次 env 读）。"""
+    try:
+        v = os.environ.get("TG_DEBUG", "")
+    except Exception:                            # noqa: BLE001
+        return False
+    return str(v).strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _debug_context():
+    """给错误附加的一段诊断：平台 / 进程 / 相关环境变量。"""
+    import platform
+    bits = ["platform=%s" % (platform.platform(),),
+            "python=%s" % (platform.python_version(),),
+            "pid=%d" % (os.getpid(),)]
+    try:
+        keys = sorted(k for k in os.environ if k.startswith(("TG", "TGAI", "CUDA")))
+        if keys:
+            bits.append("env=" + ", ".join("%s=%s" % (k, os.environ.get(k, ""))
+                                           for k in keys[:24]))
+        else:
+            bits.append("env=(无 TG*/TGAI*/CUDA* 变量)")
+    except Exception:                            # noqa: BLE001
+        pass
+    return " | ".join(bits)
 
 
 # 已验收内核，不内嵌进主模块，避免宏/符号和现有源码撞车，也避免改默认编译结果。
@@ -3944,7 +3988,7 @@ class CudaRuntime:
         # _lfast 为 None 表示还没读过开关；False 表示已关闭或曾因异常退回。
         self._ltmpl = {}
         self._lfast = None
-        # 默认是 legacy NULL 流（值 0）。只有 TG_CUDA_GRAPH=1 调了 graph_arm()
+        # 默认是 legacy NULL 流（值 0）。只有代码显式调用 graph_arm() 才走捕获流（没有环境变量开关）
         # 才会换成一条可捕获的非默认流。不调用时和改动前逐调用相同。
         self._stream = ctypes.c_void_p(0)
         self._stream_ready = False
@@ -5412,7 +5456,7 @@ class CudaRuntime:
                 "  怎么办：\n"
                 "   1) 调小 --batch —— 显存只与 batch 有关，与语料大小无关；\n"
                 "   2) 调小 CFG 里的 MAXLEN(S) 或层数 L；\n"
-                "   3) 关掉 TG_CUDA_GRAPH（图捕获会额外占一份显存）；\n"
+                "   3) 不要调用 graph_arm()（图捕获会额外占一份显存）；\n"
                 "   4) 用 nvidia-smi 确认没有别的进程占卡；\n"
                 "   5) 若是池缓存挤占，调大池上限或调用 empty_cache()。" % int(rc))
         raise CudaError(msg)
@@ -10069,7 +10113,7 @@ class CudaRuntime:
         bad = getattr(self, "_attn_smem_rejected", None) or ()
         if (name, int(smem)) in bad:
             raise CudaError(self._smem_reject_msg(name, smem)
-                            + "。修法：设 TGAI_ATTN_FLASH=0 走物化注意力，或换 V100 及以上")
+                            + "。修法：设 TG_NO_FUSED=1 关掉融合反向、走物化注意力（这是真正会被读取的开关），或换 V100 及以上")
 
         # 8 = CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
         # 9 = CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT（百分数）
@@ -10078,7 +10122,7 @@ class CudaRuntime:
             self._attn_smem_rejected = tuple(bad) + ((name, int(smem)),)
             self._attn_flash_bwd_limited = (name, int(smem), int(rc))
             raise CudaError(self._smem_reject_msg(name, smem, rc=rc)
-                            + "。修法：设 TGAI_ATTN_FLASH=0 走物化注意力，或换 V100 及以上")
+                            + "。修法：设 TG_NO_FUSED=1 关掉融合反向、走物化注意力（这是真正会被读取的开关），或换 V100 及以上")
         self._chk(cu.cuFuncSetAttribute(fn, 9, 100),
                   "cuFuncSetAttribute(%s carveout)" % name)
 
@@ -10097,7 +10141,7 @@ class CudaRuntime:
             head
             + "；本设备申报上限 %d B（%d KB）。" % (lim, lim // 1024)
             + "修法（按代价从小到大）："
-              "① 关掉融合反向、走物化注意力 —— 设环境变量 TGAI_ATTN_FLASH=0，"
+              "① 关掉融合反向、走物化注意力 —— 设环境变量 TG_NO_FUSED=1，"
               "或调用时传 lowmem=False（多花显存但结果正确）；"
               "② 减小 batch/seq 让同一内核的内存需求降到上限内；"
               "③ 换 V100（sm_70）及以上，可 opt-in 到 96 KB。"
@@ -10406,7 +10450,7 @@ class CudaRuntime:
         if not self._graph_warned:
             self._graph_warned = True
             sys.stderr.write(
-                "[TG_CUDA_GRAPH] 捕获失败，已永久回退到逐步执行：%s\n" % (exc,)
+                "[cuda-graph] 捕获失败，已永久回退到逐步执行：%s\n" % (exc,)
             )
             sys.stderr.flush()
 

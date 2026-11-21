@@ -24,7 +24,7 @@ FAIL_RE = re.compile(r"^(FAILED|ERROR)\s+\S+")
 def main(argv):
     cmd = [sys.executable, "-X", "utf8", "-m", "pytest", "-q", "--tb=short", "-rf"]
     cmd += argv[1:] if len(argv) > 1 else ["tests"]
-    print("[ci] %s" % " ".join(cmd), flush=True)
+    # ★ 控制台输出必须 ASCII 安全：Windows 的 cp1252 控制台打中文会 UnicodeEncodeError，\n    #   直接让 CI 在执行到"打印结果"这一步时崩掉（2026-11-21 实测，两条 Windows 腿红）。\n    #   中文只写进 GITHUB_STEP_SUMMARY（那里是 UTF-8 文件）。\n    print("[ci] " + " ".join(cmd), flush=True)
 
     lines = []
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -67,10 +67,10 @@ def main(argv):
             pass
     # 本地跑时也打出来，省得再去翻日志文件
     if fails and not summary:
-        print("\n[ci] 失败用例：")
+        print("\n[ci] failed tests:")
         for f_ in fails[:20]:
             print("   %s" % f_)
-    print("[ci] 返回码 %d（日志：%s）" % (rc, LOG))
+    print("[ci] exit=%d log=%s" % (rc, LOG))
     return rc
 
 

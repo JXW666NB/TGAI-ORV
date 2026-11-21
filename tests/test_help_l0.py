@@ -221,11 +221,26 @@ def test_help_op_list_contains_only_real_tensor_methods():
 
 
 def test_json_exposes_reachability_and_flags_ghosts(capsys):
+    """`env:TG_DEBUG` 以前是"幽灵变量"（192 处文案让用户设它，却没人读）。
+
+    2026-11-21 把它**修实**了（`CudaError` 现在真的读它并附诊断），
+    所以判据从"必须报不可达"翻转为"必须报可达且给出真实形式"。
+    另外两个幽灵（`TGAI_ATTN_FLASH` / `TG_CUDA_GRAPH`）的**假名字已从源码删除**，
+    换成了真正会被读的 `TG_NO_FUSED` / "调用 graph_arm()" 的说明，因此它们不再出现。
+
+    这条测试的真正职责没变：**L0 里任何一条 env，都必须真的有读取点**。
+    """
     T.help("TG_DEBUG", format="json")
     payload = json.loads(capsys.readouterr().out)
-    ghost = [it for it in payload["items"] if it["id"] == "env:TG_DEBUG"]
-    assert ghost and ghost[0]["reachable"] is False
-    assert ghost[0]["unreachable"] and ghost[0]["namespace"] == ""
+    row = [it for it in payload["items"] if it["id"] == "env:TG_DEBUG"]
+    assert row, "env:TG_DEBUG 应该出现在清单里"
+    assert row[0]["reachable"] is True, "TG_DEBUG 现在有真实读取点，必须报可达"
+    assert row[0].get("form"), "可达条目必须给出真实使用形式"
+
+    # 全局不变量：清单里不许再有任何"不可达"的 env
+    bad = [it["id"] for it in payload["items"]
+           if it.get("kind") == "env" and it.get("reachable") is False]
+    assert bad == [], "env 里还有幽灵变量：%s" % (bad,)
 
 
 def test_reachability_summary_counts_are_sane():
@@ -238,4 +253,9 @@ def test_reachability_summary_counts_are_sane():
     assert summary["api"][1] == summary["api"][0]
     assert summary["kernel"][1] == summary["kernel"][0]
     assert summary["cli"][1] == summary["cli"][0]
-    assert summary["env"][1] == summary["env"][0] - 3
+    # 2026-11-21：三个幽灵 env 已修实/删名，env 现在应当 **100% 可达**。
+    # 保留"必须全可达"这条断言比"恰好有 3 个不可达"更有价值：
+    # 以后谁再往文案里写一个没人读的变量，这里会红。
+    assert summary["env"][1] == summary["env"][0], (
+        "env 里出现了不可达条目（文案提到但没人读）：%s"
+        % ([e["id"] for e in _by_kind("env") if not e["reachable"]],))

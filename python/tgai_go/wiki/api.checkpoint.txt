@@ -1,0 +1,93 @@
+[ID] api:checkpoint
+[分类] memory
+[中文名] 梯度检查点
+[英文名] Gradient checkpointing
+[作者] TGAI
+
+=== 中文 ===
+`T.checkpoint(fn, *inputs)` —— 用「重算」换显存：前向**不保留**中间激活，反向时把 `fn` 重跑一遍
+来拿梯度。数值与直接调用 `fn(*inputs)` **完全一致**（实测：同一输入下两条路径的梯度相同；`(x*x).sum()` 直算与检查点
+梯度逐位相同），所以这是拿时间换显存，不是近似。
+
+参数逐个说：
+
+- `fn`：可调用对象，把一段网络包起来（一层、几层都行）。**必须返回单个 Tensor**。
+- `*inputs`：传给 `fn` 的位置参数，数量/顺序原样透传；里面可以是 Tensor，也可以是别的对象。
+
+⚠️ 坑 1（静默不省显存）：只有 **`requires_grad=True` 的 Tensor 输入**才会被追踪。如果所有输入都是
+`requires_grad=False` 或纯 numpy，函数**直接等于 `fn(*inputs)`**，不建检查点、不报错、显存一点不省。
+排查"开了检查点还是 OOM"时先打印 `x.requires_grad`。
+
+⚠️ 坑 2（多输出直接报错，不静默）：`fn` 返回 tuple / list / numpy 会抛 `TypeError: fn 必须返回单个 Tensor`。
+多输出要么包成一个 Tensor 再拆，要么对每个输出分别 checkpoint。
+
+⚠️ 坑 3（`fn` 会被执行两次）：前向一次 + 反向重算一次，所以 `fn` 里**不能有副作用**
+（计数器、写全局、in-place 改外部状态），也必须**确定、可重复**（带随机性的插件算子不能用，否则重算出的
+梯度是错的，且不报错）。
+
+⚠️ 坑 4（CPU 上静默错）：`fn` 如果**直接返回某个输入张量**，CUDA 上会显式报错（ptr 相同），
+但 **CPU 上这个检查被跳过** —— 实测 `T.checkpoint(lambda a: a, x)` 原样返回 `x`，随后 `backward()`
+梯度为 `None`（静默丢梯度）。写 `lambda x: x` 这类恒等包装必踩。
+
+⚠️ 坑 5（时间/并行代价）：每段都要多跑一次前向，训练会变慢（具体倍数随模型与段数变化 ⚠️ 未验证）；
+源码注释还说走检查点的反向会让数据并行的「边反向边归约」退回非重叠路径（⚠️ 未验证，仅源码说明）。
+
+实测记录：20 层 / 606M / B=2 / S=2048 的反向峰值从 **31.29 GiB（OOM）降到 7.56 GiB**，16 GB 卡因此能跑，
+完整对照见 `docs/MEMORY_BACKWARD_PEAK_2026-11-12.md`。
+
+把一串层按段切：同名的 `T.checkpoint_sequential(functions, x, segments=None)`，`segments=None` 等价于 1 段
+（整串一个检查点），`segments=len(functions)` 是每层一个检查点。
+
+=== English ===
+`T.checkpoint(fn, *inputs)` trades memory for time: the forward pass keeps **no** intermediate
+activations, and backward re-runs `fn` to obtain the gradients. The numbers are **exactly** those of
+calling `fn(*inputs)` (verified: direct and checkpointed `(x*x).sum()` produce identical gradients),
+so this is recomputation, not an approximation.
+
+- `fn`: the callable to wrap (one layer or a whole block). It **must return a single Tensor**.
+- `*inputs`: positional arguments passed through unchanged; they may be Tensors or anything else.
+
+⚠️ Gotcha 1 (silent no-op): only Tensor inputs with **`requires_grad=True` are tracked**. If every
+input is `requires_grad=False` or plain numpy, the call simply **becomes `fn(*inputs)`** -- no
+checkpoint, no error, no memory saved. Print `x.requires_grad` first when checkpointing does not help.
+
+⚠️ Gotcha 2 (loud): returning a tuple / list / numpy from `fn` raises
+`TypeError: fn must return a single Tensor`. Pack multi-output into one Tensor, or checkpoint each
+output separately.
+
+⚠️ Gotcha 3 (`fn` runs twice): once in forward and once during recomputation, so `fn` must be free
+of side effects (counters, global mutation, in-place writes) and must be **deterministic**. A plugin
+op with randomness silently yields wrong gradients.
+
+⚠️ Gotcha 4 (silent on CPU): if `fn` **returns one of its inputs**, CUDA raises an explicit error
+(same ptr), but **the check is skipped on CPU** -- verified: `T.checkpoint(lambda a: a, x)` returns
+`x` itself and the following `backward()` leaves `.grad` as `None` (gradients silently lost).
+
+⚠️ Gotcha 5 (cost): every segment pays an extra forward pass, so training gets slower (exact factor
+depends on the model and segment count ⚠️ unverified). A source comment also says checkpointed
+backward forces data-parallel overlap back to the non-overlapped reduction path (⚠️ unverified,
+source-only note).
+
+Measured: backward peak for 20 layers / 606M / B=2 / S=2048 dropped from **31.29 GiB (OOM) to
+7.56 GiB**, which is what makes a 16 GB card work; full table in
+`docs/MEMORY_BACKWARD_PEAK_2026-11-12.md`.
+
+For a list of layers use `T.checkpoint_sequential(functions, x, segments=None)`; `segments=None`
+means one segment for the whole chain, `segments=len(functions)` means one checkpoint per layer.
+
+=== 示例 ===
+import numpy as np
+def block(h):                       # 真实里换成 layer(h)
+    return (h * 2).sum()
+x = T.Tensor([1., 2.], requires_grad=True)
+y = T.checkpoint(block, x)          # ✅ 数值与 block(x) 完全一致
+y.backward()
+print(np.asarray(x.grad))           # [2. 2.]
+# T.checkpoint(lambda h: (h, h), x) # ❌ TypeError：必须返回单个 Tensor
+z = T.Tensor([1., 2.])              # requires_grad=False
+T.checkpoint(block, z)              # ⚠️ 直接等于 block(z)，不省显存
+
+=== 见也 ===
+api:Tensor
+api:no_grad
+api:checkpoint_sequential
