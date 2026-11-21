@@ -402,11 +402,17 @@ def test_lowp_disables_overlap_path(monkeypatch):
 
     在修好之前低精度一律退回不重叠路径 —— 不能因为「loss 看起来正常」就放过去
     （Adam 近似尺度不变，梯度整体放大 4.6× 时 loss 曲线几乎不变，这是最危险的一类 bug）。
+
+    ★ 这里**必须把 `_start()` 打桩**：`begin_overlap()` 会先做 rendezvous，
+      而本用例只起 rank0（world=2），真做就是等 rank1 等到超时
+      （CI ubuntu 上 4 条腿全红就是这么来的，白等 10 分钟）。
+      我们要验的是" dtype 闸门"，与 rendezvous 无关 ⇒ 打桩后判据更纯、也更稳。
     """
     monkeypatch.delenv("TG_DP_GRAD_EF", raising=False)
     T = _import_tensor()
     dp = D.DataParallel(world=2, rank=0, job="pytest_lowp_ov",
                         grad_dtype="bf16")
+    monkeypatch.setattr(dp, "_start", lambda: None)     # 不做 rendezvous
     x = T.Tensor(np.ones((2,), np.float32), requires_grad=True)
     assert dp.begin_overlap([x]) is None, "低精度 + 重叠必须自动退回不重叠路径"
     dp.close()
