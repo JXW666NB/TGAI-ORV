@@ -15,6 +15,48 @@
 
 样例（step7）：`6.786449495799199`（rank0） vs `6.786491934594803`（rank1），相对差 **6.3e-6**。
 
+## 2026-11-21 15:00 追加：两次定案尝试，**都没定成**（如实记录）
+
+把 `gnorm=%9.3f` 临时改成 `%.9f`（只改远端 overlay，没进仓库），2 rank、4 步、seq512：
+
+**第 1 次**（只设 `TGAI_DP_WORLD/RANK/JOB`，**没传 `--dp`**）：
+`rc=2`（argparse 不认识 `--zero 0`，我误用了 zero2 文档里的 snippet）⇒ 无效实验。
+
+**第 2 次**（去掉 `--zero`，仍不传 `--dp`）：两 rank 都 rc=0，gnorm 相对差 **1e-2 ~ 3e-2**。
+但这次**根本没启用 DP** —— `v3_pretrain` 的接线靠 `--dp N`，env 变量只是 `DataParallel` 读身份。
+⇒ 各 rank 各训各的数据，差 1e-2 是**预期**的，**不能算 bug 证据**。
+
+**第 3 次**（加 `--dp 2`）：两 rank 都 rc=0，
+```
+rank0: 13.997000782  13.193862899  13.099180566  13.227820493
+rank1: 14.134153928  13.266683763  12.656350670  13.058478654
+step0 |Δ|=1.372e-01 相对 9.80e-03   ← 注意这是 step0
+```
+**step0 就已经差 1%**。而 step0 的权重是同一份（同 seed + `broadcast`），
+梯度归约之后两个 rank 拿到的是**同一个平均值** ⇒ gnorm 必须相同。
+差 1% 恰好是"**两个 rank 各自的本地梯度范数**"的量级 ⇒ **最可能是归约根本没发生**，
+而不是"归约之后不一致"。
+
+### 所以现在有两种互斥的可能，**必须二选一才能继续**
+
+| 可能 | 判据 |
+| --- | --- |
+| **A. `--dp 2` 没有真正启用 DP**（最可能）⇒ 没有 bug，只是我的实验方式错 | 打印 `dp.world` / `dp.rank` / 以及 `all_reduce_grads` 是否被调用（加一行 print 或计数器）；若 `world==1` 就实锤 |
+| **B. DP 启用了但归约没把两端算成同一个数** ⇒ 真 bug | 同上，若 `world==2` 且调用了，再看 host 打包路径的三条怀疑（见上） |
+
+### 下一步（10 分钟，有卡就能定案）
+
+1. 在 `v3_pretrain` 的优化器步之前加一行：
+   ```python
+   print("[dpdbg] world=%d rank=%d reduced=%s" % (_dp.world, _dp.rank, _reduced_flag))
+   ```
+   其中 `_reduced_flag` 在 `all_reduce_grads` 返回后置 True
+2. 重跑 4 步，看两 rank 是否都打印 `world=2 reduced=True`
+3. 若 `reduced=True` 而 gnorm 仍差 ⇒ **A 排除，进 B**，按上面三条怀疑逐个排（先试 d2h 前加同步）
+
+**在定案之前，不要在 README / CHANGELOG 里写"DP 各 rank 逐位一致"，
+也不要写"不一致是 bug"。** 现在两种可能都还开着。
+
 ## 为什么这算 bug
 
 `python/tgai_go/train/v3_pretrain.py:1625` 的注释写得很明确：
