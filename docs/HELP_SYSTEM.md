@@ -12,7 +12,7 @@
 | --- | --- | --- | --- | --- |
 | **L0 清单** | 引擎运行时自省（`dir()`/注册表/`inspect`）| 引擎自动 | 天然最新 | 有哪些 `op/api/kernel/cli/env/plugin`，名字、签名、所属模块 |
 | **L1 调用示例** | 由 L0 的签名**机械生成** | 引擎自动 | 天然最新 | `t.mul(x)`、`T.help('op')`、`T.DUO(devices=[0,1])` —— 参数怎么填 |
-| **L2 词条文案** | `*.md` 文件（front matter + Markdown）| 人（朋友/插件作者）| ✅ **文件改完即生效** | 中文/英文说明、注意事项、坑、示例代码、见也 |
+| **L2 词条文案** | `*.txt` 文件（TXT 协议，见 §4）| 人（朋友/插件作者）| ✅ **文件改完即生效** | 中文/英文说明、注意事项、坑、示例代码、见也 |
 | **L3 渲染** | 惰性导入的渲染器 | 引擎 | 不需要 | 终端 / JSON / 离线网页 |
 
 **关键**：L2 **绝不**存进 Python 常量、绝不 `import` 进 `__init__`。L1 永远由引擎现算，
@@ -36,7 +36,7 @@ plugin:<pkg>:<op>      # 插件提供的条目（防与他人重名）
 配套规则：
 
 * `aliases: [multiply, 乘法]` —— 改名前/别名都能命中，**报告里显示规范 ID**
-* 引擎侧提供 `id_of(obj) -> "op:mul"`，词条侧 front matter 必须写同一个 `id`
+* 引擎侧提供 `id_of(obj) -> "op:mul"`，词条侧 `[ID]` 必须写同一个规范 ID
 * 词条写了未知 ID ⇒ **加载时报错**（带文件名与最接近的 3 个候选），不许静默忽略
 * 引擎里有、词条里没有 ⇒ **不算错**，走第 3 节的降级渲染
 
@@ -59,49 +59,55 @@ plugin:<pkg>:<op>      # 插件提供的条目（防与他人重名）
 
 ---
 
-## 4. 词条文件格式（作者只需要写 Markdown）
+## 4. 词条文件格式（**TXT 协议** — 定稿，见 `wiki/README_词条规范.txt`）
 
-目录：
+> 2026-11-21 落地时改成 **TXT** 而不是 Markdown+front matter：
+> 写词条的人（含非程序员）用记事本就能写，且不需要理解 YAML。
+> 下面这段是**权威格式**；`wiki/README_词条规范.txt` 是给作者的详细说明。
 
-```
-wiki/
-  _meta.yaml                    # schema 版本、分类表、贡献者署名规则
-  op/mul.zh.md   op/mul.en.md   # 一条词条 = 一个语言一个文件（便于分头翻译）
-  api/DUO.zh.md  api/DUO.en.md
-  plugin/README.md              # 插件作者怎么带词条
-```
+一条词条 = 一个 `.txt`（建议命名 `类型.名字.txt`，如 `op.mul.txt`）：
 
-front matter（必填项越少越好，其余可缺省）：
+```txt
+[ID] op:mul
+[分类] compute
+[中文名] 逐元素相乘
+[英文名] Element-wise multiply
+[作者] 张三
 
-```markdown
----
-id: op:mul
-kind: op
-name: mul
-category: compute            # 见 §5 分类表
-since: 0.9.0                 # 该条目最早出现的版本
-aliases: [multiply, 乘法]
-authors: [朋友A]             # 署名（可选，显示在页面角落）
----
-## 中文
-逐元素相乘。`t.mul(x)` 等价于 `t * x`。
+=== 中文 ===
+正文（Markdown 风格的轻量标记：反引号、加粗、段落）
 
-⚠️ 坑：ORV 的 `*` 是逐元素，**矩阵乘**要用 `t.matmul`。
+=== English ===
+Body...
 
-## English
-Element-wise multiply...
+=== 示例 ===
+y = a * b
+
+=== 见也 ===
+op:matmul
 ```
 
-加载器规则：
+规则（加载器与 `scripts/wiki_check.py` 一致，两者互为交叉验证）：
 
-* `id` 与文件名不一致 ⇒ 报错（防止手滑）
-* 同一 `id` 的 `.zh.md` / `.en.md` 缺一边 ⇒ **允许**，回退到另一边并显示"暂无中文"
-* **未知字段**：报错（避免拼写错导致字段静默失效）
-* 正文允许 `<<T.help('op:matmul')>>` 这种**自动同步**的引用：渲染时替换为该条目的
-  当前签名与示例（避免文档里的签名过期）
+| 项 | 规则 |
+| --- | --- |
+| 头部字段 | 只允许 `ID / 分类 / 中文名 / 英文名 / 作者`；**必填只有 `ID`**；出现未知字段 ⇒ 报错 |
+| 区块 | 只允许 `=== 中文 ===` / `=== English ===` / `=== 示例 ===` / `=== 见也 ===`；未知区块 ⇒ 报错 |
+| 编码 | UTF-8 / UTF-8-BOM / **GB18030** 自动识别（Windows 记事本默认存 ANSI，必须兼容） |
+| 文件名 | 随意；建议 `类型.名字.txt`；与 `[ID]` 不一致只警告，以 `[ID]` 为准 |
+| 语言 | 中文/英文只写一个**合法**（页面显示"暂无英文/暂无中文"），两个都空 ⇒ 警告 |
+| 交叉引用 | `=== 见也 ===` 引用**还没有词条**的 ID ⇒ 记为"待写"，**不是错误** |
+| 分类 | 必须在 `wiki/_meta.txt` 里；不在 ⇒ 归 `other` 并在 `check()` 里列出 |
+| 特殊文件 | `_meta.txt`（分类表）与 `README*` 跳过不解析 |
+
+**引擎自动补全**：每条词条的**调用示例**由 L0 签名机械生成（见 §1 的 L1），
+`=== 示例 ===` 只是人写的补充用法；所以**词条缺失或写错签名都不会误导用户**。
+
+**可达性自证**（1.0.16 起）：L0 对每条目记录 `reachable / form / reach_kind / reach_evidence`，
+并在 `T.help('op')` 里说明真实调用形式（例如 `a * b`、`a @ b`、`T.matmul(a, b)`、`a.sum()`）。
+网页上不可调用的条目不显示假示例，直接给原因与依据；页脚显示 `可调用 N/M`。
 
 ---
-
 ## 5. 分类（两轴，够用且不臃肿）
 
 * **kind 轴**：`op / api / kernel / cli / env / plugin` —— 表示"这是什么"
@@ -142,13 +148,13 @@ categories:
 
 * `T.help.contrib("op:mul")`
   * 若已有词条 ⇒ 打印文件路径
-  * 若无 ⇒ **生成骨架文件**（front matter 已填好 id/kind/name/category/since/签名，
+  * 若无 ⇒ **生成骨架 TXT 文件**（`[ID]/[分类]/[中文名]/[英文名]` 与四个区块名都已填好，
     正文是待填的 `## 中文` / `## English`），并告诉用户该放哪个目录
   * 这是让"朋友一起写 Wiki"成本最低的关键：**不用先理解 schema**
 * `T.help.check()` → `{documented: N, missing: [...], percent: 87.4}`
   * CI 规则（本仓库）：`api:` 与 `plugin:` 必须 100%；`op:` 允许分批，但**每个 op 至少要有
     自动示例**（永远有）；缺词条的 ID 列进 PR 注释
-* 文案校验（CI）：front matter schema、中英缺边清单、死链（引用了不存在的 id）、
+* 文案校验（CI）：`scripts/wiki_check.py`（头部字段/区块白名单/重复 ID/分类归属/中英缺边/交叉引用）、
   未知字段、重复 id、`since` 大于当前版本（说明写的是未来版本）
 
 ---
@@ -159,7 +165,7 @@ categories:
 
 1. **零配置**：只写了 `@register_op("myop")` 之类的注册 ⇒ L0 自动发现 ⇒ Wiki 里出现
    `plugin:<pkg>:myop`，有名字 + 自动生成的示例，缺词条也能看
-2. **带词条目录**：插件包内放 `wiki/plugin/<pkg>/myop.zh.md`，并在入口点声明：
+2. **带词条目录**：插件包内放 `wiki/plugin/<pkg>/myop.txt`（同一套 TXT 协议），并在入口点声明：
    ```toml
    [project.entry-points."tgai_go.help"]
    myplugin = "myplugin.help:WIKI"        # 一个 dict 或目录路径
