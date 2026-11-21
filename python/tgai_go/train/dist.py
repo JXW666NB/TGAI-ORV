@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """数据并行（多卡）地基：参数广播 + 梯度全归约。
 
-设计目标：**先正确，再快**。第一版走「本机共享内存」做交换，
-不依赖 NCCL / MPI / torch.distributed —— 我们本来就是自研运行时。
+设计目标：**先正确，再快**。默认走「本机共享内存 + 文件屏障」做交换，
+**不依赖 NCCL / MPI / torch.distributed**（我们本来就是自研运行时）；
+需要更快时可显式切到 NCCL 后端（见下）。
 
 进程模型：每个 rank 一个进程（各自的 CUDA_VISIBLE_DEVICES），
 通过 `TGAI_DP_WORLD` / `TGAI_DP_RANK` 环境变量认领身份，
@@ -16,6 +17,18 @@
     opt.step()
 
 world=1 时所有操作都是**快速空操作**，所以单卡跑不会有任何行为变化。
+
+## 归约后端：`TG_DP_BACKEND=host|nccl|auto`（默认 host）
+
+| 值 | 行为 | 失败时 |
+| --- | --- | --- |
+| `host`（默认） | 打包 → D2H(pinned) → 共享内存 → H2D → GPU 就地加 | 不会失败（原有路径，行为逐位不变）|
+| `nccl` | ctypes 直连 `libnccl.so`，`ncclAllReduce(Sum/fp32)` + 乘 1/world | **明确报错**，不回退 |
+| `auto` | 先试 NCCL，不可用则回退 host | 打印 `[dp] WARN` 后回退 |
+
+`nccl` 后端的语义与 host 路径**一致**（都是求和后乘 `1/world`，缺失梯度按 0 补齐），
+差别只在数据走 PCIe 还是走「主机中转」。库位置可用 `TG_NCCL_LIB` 指定。
+NCCL 的 unique id 走同一个 rendezvous 目录（`<dir>/nccl_id`，rank0 原子写入）。
 
 ## 使用契约（2026-11-13 明确，之前只写在实现里）
 
@@ -98,6 +111,36 @@ def _env_int(name, default):
         return default
 
 
+def _env_float(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+#: 允许的归约后端。默认 host（与历史行为逐位一致）。
+BACKENDS = ("host", "nccl", "auto")
+
+
+def dp_backend_requested():
+    """读 `TG_DP_BACKEND` 并归一化。非法值**当场报错**，不静默当 host。
+
+    为什么不静默：写错一个字母（`TG_DP_BACKEND=ncl`）就退回慢 1.5 倍的路径，
+    而日志里看不出任何异常 —— 这种"悄悄降级"是性能实验最难查的一类错。
+    """
+    raw = os.environ.get("TG_DP_BACKEND", "")
+    v = str(raw).strip().lower()
+    if v in ("", "host", "none", "off", "0"):
+        return "host"
+    if v == "nccl":
+        return "nccl"
+    if v == "auto":
+        return "auto"
+    raise ValueError(
+        "TG_DP_BACKEND=%r 不认识（可选 %s）" % (raw, "/".join(BACKENDS)) +
+        "。修法：设成 host、nccl 或 auto；不想用 NCCL 就直接不设这个环境变量")
+
+
 def _get_data(p):
     """把参数数值取成 host 上的 float32 ndarray。
 
@@ -148,11 +191,32 @@ def _set_data(p, val):
 
 
 class DataParallel:
-    def __init__(self, world=None, rank=None, job=None, timeout=600.0):
+    def __init__(self, world=None, rank=None, job=None, timeout=None, backend=None):
         self.world = _env_int("TGAI_DP_WORLD", 1) if world is None else int(world)
         self.rank = _env_int("TGAI_DP_RANK", 0) if rank is None else int(rank)
         self.job = job or os.environ.get("TGAI_DP_JOB", "default")
-        self.timeout = float(timeout)
+        # 超时可配：对端崩了以后等 600 s 毫无意义（实验里就是白烧钱）。
+        # TGAI_DP_TIMEOUT 让失败快一点现形。
+        self.timeout = (float(timeout) if timeout is not None
+                        else _env_float("TGAI_DP_TIMEOUT", 600.0))
+        # 后端：显式参数 > 环境变量 > 默认 host
+        self.backend_requested = (str(backend).strip().lower() if backend is not None
+                                  else dp_backend_requested())
+        if self.backend_requested not in BACKENDS:
+            raise ValueError("backend=%r 不认识（可选 %s）"
+                             % (backend, "/".join(BACKENDS)) +
+                             "。修法：传 host、nccl 或 auto；默认 host")
+        self.backend = "host"                # 实际生效的后端（nccl 初始化失败时可能回退）
+        self._nccl = None
+        self._nccl_lib = None
+        self._nccl_stream = None
+        self._nccl_own_stream = False
+        self._nccl_events = None
+        #: 最近一次 all_reduce 的墙钟耗时（含通信+缩放；表里要单列的就是它）
+        self.comm_sec = None
+        #: 最近一次 all_reduce 的 NCCL-only 耗时（host 路径为 None）
+        self.nccl_sec = None
+        self._nccl_calls = 0
         base = os.environ.get("TGAI_DP_DIR") or tempfile.gettempdir()
         self.dir = os.path.join(base, "tgai_dp_%s" % self.job)
         self._shm = []
@@ -177,6 +241,13 @@ class DataParallel:
         为什么要清残留：generation 号每个进程都从 0 重数，若上一轮崩溃留下
         `bar_grads_1.<r>`，本轮同级 barrier 会因为"文件已存在"而**立即通过**
         ⇒ 少一次真实同步，读到别人半写的缓冲，梯度静默变错。
+
+        ★ 2026-11-21 修的第二个残留坑：`ready` 本身也会残留。
+          上一轮跑崩后 `/tmp/tgai_dp_<job>/ready` 还在，本轮 rank1 若比 rank0 的
+          清理更快，就会相信这个旧文件直接冲向 `bar_init_1`，而 rank0 随后把
+          `bar_init_1.1` 当残留删掉 ⇒ **双方各等 600 s**（实测复现两次）。
+          修法：`ready` 里写 rank0 的 pid，rank>0 看到 pid 已死就认定是旧文件、
+          自己删掉再等新的。rank0 依旧在清理阶段无条件删 `ready`。
         """
         if self.world <= 1 or getattr(self, "_started", False):
             return
@@ -189,10 +260,73 @@ class DataParallel:
                     except OSError:
                         pass
             with open(ready, "wb") as fh:
-                fh.write(b"1")
+                fh.write(b"%d %f" % (os.getpid(), time.time()))
+        elif self._ready_is_stale(ready):
+            print("[dp] WARN 发现上一轮残留的 ready（owner pid 已退出），清掉后重新等"
+                  "：%s" % ready, flush=True)
+            try:
+                os.remove(ready)
+            except OSError:
+                pass
         self._wait_for(ready, "rendezvous 就绪")
         self._barrier("init")
         self._started = True
+        self._ensure_backend()
+
+    @staticmethod
+    def _pid_alive(pid):
+        """进程是否还活着（跨平台；**不能用 `os.kill(pid, 0)` 了事**）。
+
+        ★ Windows 上 `os.kill(pid, 0)` 会走 `TerminateProcess`，不能拿来探测存活。
+          这里用 `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`：句柄为空时再看
+          `GetLastError` —— 5(拒绝访问)=活着，87(参数错)=pid 不存在。
+        """
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            try:
+                import ctypes
+                k32 = ctypes.windll.kernel32
+                h = k32.OpenProcess(0x1000, False, pid)
+                if h:
+                    k32.CloseHandle(h)
+                    return True
+                return int(k32.GetLastError()) == 5
+            except Exception:                        # noqa: BLE001
+                return True                          # 探测不了就不敢说它死了
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return True
+        return True
+
+    @staticmethod
+    def _ready_is_stale(path):
+        """`ready` 是否是上一轮遗留：里面记着 rank0 的 pid，pid 不在了就是旧的。
+
+        格式是 ``"<pid> <时间戳>"``（两个字段）。只有一个字段的是**旧版本**写的，
+        无法证明它属于当前这轮 ⇒ 一律当残留。
+        """
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read(64)
+        except OSError:
+            return False                     # 没有文件 ⇒ 不是"残留"，正常等
+        parts = raw.split()
+        if len(parts) < 2:
+            return True
+        try:
+            pid = int(parts[0])
+        except (ValueError, IndexError):
+            return True
+        if pid == os.getpid():
+            return False
+        return not DataParallel._pid_alive(pid)
 
     def _marker(self, name):
         return os.path.join(self.dir, "%s.%d" % (name, self.rank))
@@ -245,6 +379,172 @@ class DataParallel:
                     time.sleep(0.002)
             self._shm.append(self._slot)
         self._bytes = need
+
+    # ---------- NCCL 后端 ----------
+
+    def _ensure_backend(self):
+        """决定实际后端。**显式 nccl 失败 ⇒ 报错；auto 才回退**。
+
+        调用点：`_start()`（第一次真正通信时）。放在这里而不是构造时，是为了让
+        「造一个 world=2 的对象但从不通信」的单测不会去碰 GPU/NCCL。
+        """
+        if self.world <= 1:
+            self.backend = "host"
+            return
+        if self.backend_requested == "host":
+            self.backend = "host"
+            return
+        try:
+            self._init_nccl()
+            self.backend = "nccl"
+        except Exception as e:                           # noqa: BLE001
+            if self.backend_requested == "nccl":
+                raise RuntimeError(
+                    "TG_DP_BACKEND=nccl 但 NCCL 后端初始化失败：%s" % (e,) +
+                    "。修法：按上面的原因修（装 NCCL / 设 TG_NCCL_LIB / 对齐 world），"
+                    "或显式改用 TG_DP_BACKEND=host 走主机路径") from e
+            print("[dp] WARN TG_DP_BACKEND=auto：NCCL 不可用（%s）⇒ 回退 host 路径"
+                  % (e,), flush=True)
+            self.backend = "host"
+
+    def _make_nccl_stream(self, rt):
+        """给 NCCL 单独开一条流，并用 event 与计算流互相同步。
+
+        为什么要单独一条流（而不是直接用 `rt._stream`）：
+        `rt._stream` 默认是 **legacy NULL 流**。NCCL 对 NULL 流的处理依赖版本，
+        而"独立流 + event 双向栅栏"是 PyTorch/DeepSpeed 同样采用的、无歧义的做法：
+        计算流 --event0--> NCCL 流 --event1--> 计算流。
+
+        任何一步拿不到符号就退回 `rt._stream`（并打印一次原因）：这是**流的选择**，
+        不是后端失败；NCCL 本身仍然要求 `stream` 参数可用。
+        """
+        cu = getattr(rt, "cu", None)
+        if cu is None:
+            return rt._stream, False
+        try:
+            pvoid = ctypes.POINTER(ctypes.c_void_p)
+            create = rt._bind_sym("cuStreamCreate", [pvoid, ctypes.c_uint])
+            wait = rt._bind_sym("cuStreamWaitEvent",
+                                [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint])
+            ev_create = rt._bind_sym("cuEventCreate", [pvoid, ctypes.c_uint])
+            ev_rec = rt._bind_sym("cuEventRecord",
+                                  [ctypes.c_void_p, ctypes.c_void_p])
+            if not all((create, wait, ev_create, ev_rec)):
+                print("[dp] WARN 驱动缺少 stream/event 入口 ⇒ NCCL 直接用 rt._stream",
+                      flush=True)
+                return rt._stream, False
+            st = ctypes.c_void_p()
+            if int(create(ctypes.byref(st), 0)) != 0 or not st.value:
+                print("[dp] WARN cuStreamCreate 失败 ⇒ NCCL 直接用 rt._stream",
+                      flush=True)
+                return rt._stream, False
+            e0, e1 = ctypes.c_void_p(), ctypes.c_void_p()
+            if (int(ev_create(ctypes.byref(e0), 0)) != 0
+                    or int(ev_create(ctypes.byref(e1), 0)) != 0):
+                print("[dp] WARN cuEventCreate 失败 ⇒ NCCL 直接用 rt._stream",
+                      flush=True)
+                return rt._stream, False
+            self._nccl_events = (e0, e1)
+            return st, True
+        except Exception as e:                           # noqa: BLE001
+            print("[dp] WARN 建 NCCL 流失败（%r）⇒ 直接用 rt._stream" % (e,),
+                  flush=True)
+            return rt._stream, False
+
+    def _init_nccl(self):
+        """rendezvous → 建 comm。所有 rank 必须都走到这里（`_start()` 已同步过）。"""
+        from . import dist_nccl as N
+
+        rt = _runtime()
+        lib = N.find_libnccl()
+        if self.rank == 0:
+            uid = lib.get_unique_id()
+            raw = N.unique_id_to_bytes(uid)
+            N.write_unique_id(self.dir, raw)
+        else:
+            raw = N.wait_unique_id(self.dir, timeout=self.timeout)
+        stream, own = self._make_nccl_stream(rt)
+        comm = N.NcclComm(lib, self.world, self.rank, N.unique_id_from_bytes(raw),
+                          stream=stream)
+        self._nccl_lib = lib
+        self._nccl = comm
+        self._nccl_stream = stream
+        self._nccl_own_stream = bool(own)
+        print("[dp] nccl backend ready: lib=%s version=%s world=%d rank=%d device=%s "
+              "stream=%s events=%s"
+              % (lib.path, lib.version_str(), self.world, self.rank, comm.device,
+                 "own" if own else "rt._stream", "yes" if own else "no"), flush=True)
+
+    def _nccl_before(self, rt):
+        if self._nccl_own_stream and self._nccl_events is not None:
+            rt.cu.cuEventRecord(self._nccl_events[0], rt._stream)
+            rt.cu.cuStreamWaitEvent(self._nccl_stream, self._nccl_events[0], 0)
+
+    def _nccl_after(self, rt):
+        if self._nccl_own_stream and self._nccl_events is not None:
+            rt.cu.cuEventRecord(self._nccl_events[1], self._nccl_stream)
+            rt.cu.cuStreamWaitEvent(rt._stream, self._nccl_events[1], 0)
+
+    def _all_reduce_nccl(self, entries, total, scale):
+        """NCCL 路径：**不做打包**，每张量一次 `ncclAllReduce` 并 group 起来。
+
+        为什么不打包：打包要多付 2×3.16 GiB 的 D2D（~20 ms 各一遍），而 NCCL 对
+        10 MB 级的连续块效率已经很高；实测分组后的 321 次调用没有明显劣化。
+        """
+        rt = _runtime()
+        if self._nccl is None:
+            raise RuntimeError("NCCL 后端未初始化" + "。修法：先调用一次 broadcast()/_start()")
+        ptrs, counts = [], []
+        missing = []
+        missing_total = 0
+        for p, g, n in entries:
+            if g is None:
+                missing.append((p, n))
+                missing_total += int(n)
+            else:
+                if getattr(g, "_gpu", None) is None:
+                    raise RuntimeError(
+                        "NCCL 后端要求梯度在 GPU 上，但参数 %s 的梯度没有 _gpu 缓冲"
+                        % (tuple(getattr(p, "shape", ())),) +
+                        "。修法：TG_DP_BACKEND=nccl 只能用于 CUDA 训练；CPU 后端请用 host")
+            ptrs.append(0 if g is None else int(g._gpu.ptr))
+            counts.append(int(n))
+        zero_buf = None
+        if missing_total > 0:
+            # 缺梯度（MoE 没路由到该专家等）必须**以 0 参与集合通信**：
+            # 各 rank 的 params 列表相同、count 相同，谁也不能少发一次。
+            zero_buf = rt.empty((int(missing_total),), dtype=np.float32)
+            rt.copy_h2d_into(zero_buf, np.zeros(int(missing_total), np.float32))
+            off = 0
+            for i, (p, g, n) in enumerate(entries):
+                if g is None:
+                    ptrs[i] = int(zero_buf.ptr) + off * 4
+                    off += int(n)
+
+        calls = [(ptrs[i], counts[i]) for i in range(len(entries)) if counts[i] > 0]
+        _ph = {} if os.environ.get("TG_DP_TIMING") else None
+        t_all = time.perf_counter()
+        t0 = time.perf_counter()
+        self._nccl_before(rt)
+        self._nccl.all_reduce_group(calls)
+        self._nccl_after(rt)
+        rt.sync()
+        t1 = time.perf_counter()
+        self.nccl_sec = t1 - t0
+        self._nccl_calls = len(calls)
+
+        sc = float(scale) if scale is not None else 1.0 / float(self.world)
+        for p, g, n in entries:
+            if g is None:
+                _set_grad(p, np.zeros(tuple(getattr(p, "shape", (n,))), np.float32), None)
+            elif sc != 1.0:
+                rt.scale_inplace(g._gpu, sc)
+        self.comm_sec = time.perf_counter() - t_all
+        if _ph is not None:
+            print("[dp-phases] backend=nccl nccl=%.4fs scale+fill=%.4fs calls=%d "
+                  "zero_bytes=%d"
+                  % (self.nccl_sec, self.comm_sec - self.nccl_sec, len(calls),
+                     missing_total * 4), flush=True)
 
     # ---------- 对外接口 ----------
 
@@ -328,17 +628,20 @@ class DataParallel:
             _set_grad(p, val, g)
             off += n
 
-    def _buffers(self, total):
+    def _buffers(self, pack_elems, host_elems=None):
         """返回 (打包用设备缓冲, pinned 主机缓冲)，按需扩容并**跨步复用**。
 
         反复 new 会每步重付一次分配/锁定开销（3.16 GiB 的 pinned 分配很贵），
         所以缓存在实例上，只在变大时重建。
+
+        `pack_elems` 是**分块**大小（2026-11-21 起默认 256 MB）；主机缓冲仍按
+        总元素数 `host_elems` 分配 —— 那是 pinned 主机内存，不占显存。
         """
         rt = _runtime()
-        need = int(total) * 4
+        need = int(host_elems if host_elems is not None else pack_elems) * 4
         b = getattr(self, "_pack", None)
-        if b is None or int(b.n) < int(total):
-            b = rt.empty((int(total),), dtype=np.float32)
+        if b is None or int(b.n) < int(pack_elems):
+            b = rt.empty((int(pack_elems),), dtype=np.float32)
             self._pack = b
         h = getattr(self, "_host", None)
         if h is None or int(h.nbytes) < need:
@@ -386,6 +689,9 @@ class DataParallel:
         total = sum(e[2] for e in entries)
         if total <= 0:
             raise RuntimeError("梯度总长度为 0" + "。修法：确认反向已经跑过、params 非空")
+        if self.backend == "nccl":
+            self._all_reduce_nccl(entries, total, scale)
+            return
         self._ensure_slot(max(total * 4, 8))
 
         # ★ 2026-11-18 性能整改（第二版）：把 321 次逐张量同步拷贝换成
@@ -401,7 +707,17 @@ class DataParallel:
             rt = None
         if rt is None:
             return self._all_reduce_host(entries, total, scale)
-        pack, host = self._buffers(total)
+        # ★ 2026-11-21：打包缓冲改成**分块**（默认 256 MB，`TG_DP_PACK_MB` 可调，
+        #   0 = 退回"一整块"的旧行为）。
+        #   为什么：旧实现要一整块 3.16 GiB 的 pack，seq2048/848M 时把 5090 的
+        #   31.4 GiB 顶到只剩 168 MiB（pool_peak_live 25.25 GiB，而 NCCL 路径
+        #   只要 22.00 GiB），实测每步**多花约 90 ms**（0.497 s vs 0.409 s），
+        #   而两者的通信时间几乎相同（143 vs 145 ms）——多出来的是显存贴顶后
+        #   分配器的代价，不是搬运。分块只多占 `chunk`，字节数与语义不变。
+        pack_mb = _env_int("TG_DP_PACK_MB", 256)
+        chunk = (int(total) if pack_mb <= 0
+                 else max(1, min(int(total), (pack_mb << 20) // 4)))
+        pack, host = self._buffers(chunk, total)
         # ★ 把共享内存注册成页锁定 ⇒ d2h 可以直接写进去，省掉
         #   「pinned → shm」那一次 3.16 GiB 主机拷贝（实测约 0.3 s）。
         #   注册失败就退回老路（pinned + copyto），不影响正确性。
@@ -416,28 +732,26 @@ class DataParallel:
                 _ph[name] = now - _t[0]
                 _t[0] = now
 
-        # ① GPU 内打包（321 次 D2D，300+ GB/s，合计约 20 ms）
-        off = 0
-        for p, g, n in entries:
-            if g is not None:
-                rt.copy_d2d(pack, g._gpu, n * 4, dst_off=off * 4)
-            off += n
-
-        _mark("1_pack_d2d")
-        # ② 一次 d2h：优先**直接写进已注册的共享内存**
-        #   ★ 注意：d2h 和后面的 h2d 必须用**同一个地址**（acc_ptr），
-        #     否则回传的是另一块缓冲里的旧数据（我曾因此让梯度变成全 0，
-        #     是「各 rank gnorm 必须逐位相同」这条判据当场抓到的）。
+        # ① GPU 内打包 + ② 分块 d2h：优先**直接写进已注册的共享内存**
+        #   ★ d2h 与后面 h2d 必须落在**同一段地址**里（own_off / r*total*4），
+        #     否则回传的是另一块缓冲的旧数据（曾因此让梯度全 0，是
+        #     「各 rank gnorm 逐位相同」这条判据当场抓到的）。
+        lo = 0
+        while lo < int(total):
+            hi = min(int(total), lo + chunk)
+            self._pack_range(rt, entries, lo, hi, pack)
+            if shm_stage is not None:
+                dst = ctypes.c_void_p(shm_stage.ptr.value + own_off + lo * 4)
+            else:
+                dst = ctypes.c_void_p(host.ptr.value + lo * 4)
+            rt.d2h_into(pack, dst, nbytes=(hi - lo) * 4)
+            lo = hi
         if shm_stage is not None:
-            acc_ptr = ctypes.c_void_p(shm_stage.ptr.value + own_off)
-            rt.d2h_into(pack, acc_ptr)
             own_view = np.ndarray((total,), dtype=np.float32, buffer=self._slot.buf,
                                   offset=own_off)
         else:
-            acc_ptr = host.ptr
-            rt.d2h_into(pack, acc_ptr)
             own_view = host.array(np.float32, total)
-        _mark("2_d2h")
+        _mark("1_pack_d2h")
 
         # ③ 缺梯度的位置在**主机侧**清零（不占额外显存；这类位置很少）
         off = 0
@@ -456,31 +770,29 @@ class DataParallel:
         self._barrier("grads")
         _mark("4_barrier")
 
-        # ⑤ **GPU 侧求和**：把对端那段 h2d 上来，直接在各自的梯度缓冲上就地加、再乘均值。
+        # ⑤ **GPU 侧求和**：把对端那段分块 h2d 上来，直接在各自的梯度缓冲上就地加。
         #   ★ 为什么不在主机上求和：3.16 GiB 的 numpy 加法实测 0.46 s，而 GPU 就地加
         #     约 0.02 s。主机只负责搬运（d2h 0.28 + h2d 0.32）——无 P2P 时这是物理成本。
-        #   ★ 这样也不再需要"打包→求和→拆回"的整块搬运：梯度原地更新。
-        #   ★ 复用 `pack` 作为对端数据的落点：d2h 之后 pack 里的内容已经在共享内存里，
-        #     不再需要，可以覆盖。16 层时两块暂存各 4.2 GiB，不复用会直接顶到显存上限
-        #     （实测 16 层因此失败过一次）。
-        peer_gpu = pack
+        #   ★ 复用 `pack` 作为对端数据的落点（d2h 之后它的内容已经在共享内存里）。
         sc = float(scale) if scale is not None else 1.0 / float(self.world)
         for r in range(self.world):
             if r == self.rank:
                 continue
-            if shm_stage is not None:
-                src = ctypes.c_void_p(shm_stage.ptr.value + r * total * 4)
-            else:                       # 未注册成功：从 shm 的正常映射拷
-                seg = np.ndarray((total,), dtype=np.float32, buffer=self._slot.buf,
-                                 offset=r * total * 4)
-                src = ctypes.c_void_p(seg.ctypes.data)
-            rt.h2d_into(peer_gpu, src)
-            off = 0
-            for p, g, n in entries:
-                if g is not None:
-                    rt.add_(g._gpu, rt.sub_view(peer_gpu, (n,), off))
-                off += n
-        _mark("5_gpu_add")
+            lo = 0
+            while lo < int(total):
+                hi = min(int(total), lo + chunk)
+                if shm_stage is not None:
+                    src = ctypes.c_void_p(shm_stage.ptr.value
+                                          + r * total * 4 + lo * 4)
+                else:                   # 未注册成功：从 shm 的正常映射拷
+                    seg = np.ndarray((hi - lo,), dtype=np.float32,
+                                     buffer=self._slot.buf,
+                                     offset=(r * total + lo) * 4)
+                    src = ctypes.c_void_p(seg.ctypes.data)
+                rt.h2d_into(pack, src, nbytes=(hi - lo) * 4)
+                self._add_range(rt, entries, lo, hi, pack)
+                lo = hi
+        _mark("5_h2d_add")
 
         # ⑥ 就地乘均值；没有梯度的参数补 0（与原语义一致）
         for p, g, n in entries:
@@ -491,16 +803,111 @@ class DataParallel:
         _mark("6_scale")
         if _ph is not None:
             print("[dp-phases] " + "  ".join("%s=%.3fs" % (k, v) for k, v in
-                                             sorted(_ph.items())), flush=True)
+                                             sorted(_ph.items()))
+                  + "  chunk_mb=%d" % (chunk * 4 >> 20), flush=True)
+
+    @staticmethod
+    def _pack_range(rt, entries, lo, hi, pack):
+        """把 entries 在元素区间 ``[lo, hi)`` 的部分 D2D 拷进 pack（pack[0] ↔ lo）。
+
+        支持**跨块**的张量：按区间求交后按段拷贝，偏移都是元素单位。
+        """
+        off = 0
+        for p, g, n in entries:
+            a = off
+            off += n
+            b = off
+            if g is None or b <= lo or a >= hi:
+                continue
+            s = max(a, lo)
+            e = min(b, hi)
+            rt.copy_d2d(pack, g._gpu, (e - s) * 4,
+                        dst_off=(s - lo) * 4, src_off=(s - a) * 4)
+
+    @staticmethod
+    def _add_range(rt, entries, lo, hi, pack):
+        """把 pack 里区间 ``[lo, hi)`` 的数据就地加到对应梯度上（支持跨块张量）。"""
+        off = 0
+        for p, g, n in entries:
+            a = off
+            off += n
+            b = off
+            if g is None or b <= lo or a >= hi:
+                continue
+            s = max(a, lo)
+            e = min(b, hi)
+            seg = (e - s)
+            src = pack if (s - lo) == 0 and seg == int(pack.n) else \
+                rt.sub_view(pack, (seg,), s - lo)
+            if (s - a) == 0 and seg == n:
+                rt.add_(g._gpu, src)
+            else:
+                rt.add_(rt.sub_view(g._gpu, (seg,), s - a), src)
+
+    def stats(self):
+        """给日志/RESULT 用的后端信息（**实测值，不是配置值**）。"""
+        out = {"backend_requested": self.backend_requested,
+               "backend": self.backend,
+               "world": int(self.world), "rank": int(self.rank),
+               "comm_sec": self.comm_sec, "nccl_sec": self.nccl_sec,
+               "nccl_calls": int(self._nccl_calls)}
+        if self._nccl_lib is not None:
+            out["nccl_lib"] = self._nccl_lib.path
+            out["nccl_version"] = self._nccl_lib.version_str()
+            out["nccl_stream"] = "own" if self._nccl_own_stream else "rt._stream"
+        return out
+
+    def _close_nccl(self):
+        # ★ world=1 / host 后端 / NCCL 从未初始化时**必须完全不碰运行时**：
+        #   否则一个「造出来只为取 world 的单卡对象」在 close() 里也会去 _cuda()，
+        #   在无卡机器上是没必要的副作用（单测 test_world_one_is_noop 守着）。
+        if (self._nccl is None and self._nccl_events is None
+                and not self._nccl_own_stream and self._nccl_stream is None):
+            return
+        if self._nccl is not None:
+            try:
+                self._nccl.close()
+            except Exception:                            # noqa: BLE001
+                pass
+            self._nccl = None
+        rt = None
+        try:
+            rt = _runtime()
+        except Exception:                                # noqa: BLE001
+            pass
+        if rt is not None:
+            cu = getattr(rt, "cu", None)
+            if cu is not None:
+                if self._nccl_events is not None:
+                    destroy_ev = getattr(cu, "cuEventDestroy_v2", None) \
+                        or getattr(cu, "cuEventDestroy", None)
+                    for ev in self._nccl_events:
+                        try:
+                            if destroy_ev is not None:
+                                destroy_ev(ev)
+                        except Exception:                # noqa: BLE001
+                            pass
+                if self._nccl_own_stream and self._nccl_stream is not None:
+                    destroy_st = getattr(cu, "cuStreamDestroy_v2", None) \
+                        or getattr(cu, "cuStreamDestroy", None)
+                    try:
+                        if destroy_st is not None:
+                            destroy_st(self._nccl_stream)
+                    except Exception:                    # noqa: BLE001
+                        pass
+        self._nccl_events = None
+        self._nccl_stream = None
+        self._nccl_own_stream = False
 
     def close(self):
-        """释放共享内存。
+        """释放共享内存与 NCCL 通信器。
 
         ★ **不要删自己落下的 barrier 标记文件**（2026-11-13 修）。
           旧实现在这里 `os.remove("bar_*.%d")`，于是**跑得快的 rank 一收尾**就把标记删了，
           而慢的 rank 还在 `_wait_for` 等那个文件 ⇒ 永久卡死（实测 3 次里挂 1 次）。
           残留标记由下次启动时 rank0 在 `ready` 之前统一清理，所以留着是安全的。
         """
+        self._close_nccl()
         for s in self._shm:
             try:
                 s.close()

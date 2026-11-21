@@ -1133,6 +1133,11 @@ def build_arg_parser():
     g.add_argument("--fp16-gemm", action="store_true",
                    help="打开 fp16 GEMM（V100 实测慢 16.7%% 且多占 3GB，仅复现用）")
     g.add_argument("--log-every", type=int, default=10)
+    g.add_argument("--dp", type=int, default=0, metavar="N",
+                   help="数据并行 world 大小（0 = 读 TGAI_DP_WORLD，默认 1 = 单卡）。"
+                        "rank 仍由 TGAI_DP_RANK 指定，且每个进程必须只看见一张卡"
+                        "（CUDA_VISIBLE_DEVICES=0 / 1）。归约后端由 TG_DP_BACKEND="
+                        "host|nccl|auto 选（默认 host）。world=1 时本开关无任何影响")
     # ---- 存档 ----
     g = ap.add_argument_group("checkpoint")
     g.add_argument("--out", default=None,
@@ -1166,11 +1171,34 @@ def _sched_cfg(a, steps):
             "t_max": int(max(1, steps - warmup)), "horizon": steps}
 
 
-def _nvidia_used_mib():
+def _gpu_query_index():
+    """`_vram_peak` 该看哪张卡：CUDA_VISIBLE_DEVICES 的第一个。
+
+    ★ 为什么必须这么改（2026-11-21）：`nvidia-smi --query-gpu=memory.used` 会按
+    PCI 顺序列出**所有**卡，旧代码取 `splitlines()[0]` ⇒ 双卡时 rank1 一直在报
+    **rank0 那张卡**的显存。"每卡峰值显存"这一列会变成两次同一个数。
+    解析失败就返回 None（退回旧行为：第一张）。
+    """
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if not raw:
+        return None
+    first = raw.split(",")[0].strip()
+    if not first:
+        return None
     try:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used",
-                              "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True, timeout=5).stdout.strip()
+        return int(first)
+    except ValueError:
+        # CUDA_VISIBLE_DEVICES 允许写 GPU UUID；此时无法用序号查询，退回第一张
+        return None
+
+
+def _nvidia_used_mib():
+    idx = _gpu_query_index()
+    cmd = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
+    if idx is not None:
+        cmd.append("--id=%d" % int(idx))
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout.strip()
         return int(out.splitlines()[0])
     except Exception:
         return None
@@ -1179,11 +1207,14 @@ def _nvidia_used_mib():
 def _vram_peak(stop, base, out):
     """后台采样 nvidia-smi 的显存峰值（池高水位之外的独立证据）。"""
     peak = base if base is not None else 0
+    idx = _gpu_query_index()
+    cmd = ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"]
+    if idx is not None:
+        cmd.append("--id=%d" % int(idx))
     while not stop.is_set():
         try:
-            o = subprocess.run(["nvidia-smi", "--query-gpu=memory.used",
-                                "--format=csv,noheader,nounits"],
-                               capture_output=True, text=True, timeout=5).stdout.strip()
+            o = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=5).stdout.strip()
             peak = max(peak, int(o.splitlines()[0]))
         except Exception:
             pass
@@ -1452,35 +1483,63 @@ def main(argv=None):
         return 0
 
     # ---- 训练 ----
-    log_path = os.path.join(a.out, "train_log.jsonl") if a.out else None
-    log_f = open(log_path, "a", encoding="utf-8") if log_path else None
     stop_ev = threading.Event()
     prof = {}
     th = threading.Thread(target=_vram_peak, args=(stop_ev, base_mib, prof), daemon=True)
     th.start()
 
-    # ── 数据并行（可选）：TGAI_DP_WORLD>1 时启用 ──
+    # ── 数据并行（可选）：--dp N 或 TGAI_DP_WORLD>1 时启用 ──
     #   契约（见 dist.DataParallel 的 docstring）：
     #     * 建好模型后先 broadcast 一次，保证各 rank 权重逐位相同；
     #     * 每个 rank 吃**不同的**样本（这里用"跳过前 rank 个 batch"的简单做法，
     #       多读 world-1 份数据换取实现简单、不碰语料迭代器的内部状态）；
+    #       顺序上等价于「单卡 --batch world」按 rank 连续切分；
     #     * 反向之后、裁剪之前做 all_reduce（默认**取平均**）⇒ 与单卡语义一致；
     #       要让等效 batch 变大，按 world 放大 lr。
     _dp = None
     try:
-        _dpworld = int(os.environ.get("TGAI_DP_WORLD", "1"))
-    except Exception:
-        _dpworld = 1
+        _dp_env = int(os.environ.get("TGAI_DP_WORLD", "1"))
+    except Exception:                                    # noqa: BLE001
+        _dp_env = 1
+    _dpworld = int(a.dp) if int(a.dp) > 0 else _dp_env
     if _dpworld > 1:
+        _rank_env = os.environ.get("TGAI_DP_RANK")
+        if _rank_env is None or str(_rank_env).strip() == "":
+            raise SystemExit(
+                "数据并行需要每个 rank 显式给 TGAI_DP_RANK（当前 --dp %d）" % _dpworld +
+                "。修法：两个进程分别设 TGAI_DP_RANK=0 / TGAI_DP_RANK=1，并且"
+                " CUDA_VISIBLE_DEVICES 分别只暴露一张卡（0 / 1），"
+                "TGAI_DP_JOB 两边必须一致")
+        try:
+            _rank_v = int(_rank_env)
+        except (TypeError, ValueError):
+            raise SystemExit("TGAI_DP_RANK=%r 不是整数" % (_rank_env,) +
+                             "。修法：设成 0..%d" % (_dpworld - 1))
+        if not (0 <= _rank_v < _dpworld):
+            raise SystemExit("TGAI_DP_RANK=%d 越界（world=%d）" % (_rank_v, _dpworld) +
+                             "。修法：rank 必须落在 [0, world) 内")
         from . import dist as _dist_mod
-        _dp = _dist_mod.DataParallel()
-        _dp.broadcast(params)
+        _dp = _dist_mod.DataParallel(world=_dpworld)
+        _dp.broadcast(params)                # ← 失败（含 NCCL 不可用）在这里就报
         if _dp.rank == 0:
-            print("[dp] world=%d rank=%d job=%s dir=%s"
-                  % (_dp.world, _dp.rank, _dp.job, _dp.dir), flush=True)
+            print("[dp] world=%d rank=%d job=%s dir=%s backend=%s"
+                  % (_dp.world, _dp.rank, _dp.job, _dp.dir, _dp.backend), flush=True)
+    _is_main = (_dp is None) or (_dp.rank == 0)
+    _prefix = "" if _is_main else "[r%d] " % (_dp.rank,)
+    # ★ 只有 rank0 写 train_log.jsonl：两个进程同时 append 同一个文件会交错出
+    #   半行 JSON（实测按 8 KiB 缓冲写时更明显）。其余 rank 写**带后缀**的文件，
+    #   这样「world=2 的 loss 轨迹」可以取各 rank 的均值与单卡 batch=2 对拍。
+    if a.out and _is_main:
+        log_path = os.path.join(a.out, "train_log.jsonl")
+    elif a.out and _dp is not None:
+        log_path = os.path.join(a.out, "train_log.r%d.jsonl" % int(_dp.rank))
+    else:
+        log_path = None
+    log_f = open(log_path, "a", encoding="utf-8") if log_path else None
 
     hist_tail = []
     losses, secs = [], []
+    comm_hist = []                 # 每步 all_reduce 的墙钟（world=1 时全是 None）
     t_run0 = _now()
     step = start_step - 1
     aborted = None
@@ -1511,18 +1570,20 @@ def main(argv=None):
             del loss
             # ★ 必须在裁剪**之前**归约：否则 gnorm 只是本 rank 的范数，
             #   裁剪阈值在各 rank 上会不一致，梯度就不同步了。
+            _comm_s = None
             if _dp is not None:
                 _t_r = _now()
                 _nred = sum(1 for q in params if getattr(q, "grad", None) is not None)
                 _bytes = sum(int(q.grad._gpu.n) * 4 for q in params
                              if getattr(q, "grad", None) is not None)
                 _dp.all_reduce_grads(params)
+                _comm_s = _now() - _t_r
                 if os.environ.get("TG_DP_TIMING"):
-                    _dt_r = _now() - _t_r
-                    print("[dp] reduce %.3f s  grads=%d  bytes=%.2f GiB  => %.1f GiB/s"
-                          % (_dt_r, _nred, _bytes / float(1 << 30),
-                             (_bytes / float(1 << 30)) / _dt_r if _dt_r > 0 else 0.0),
-                          flush=True)
+                    print("[dp] reduce %.4f s  grads=%d  bytes=%.2f GiB  => %.1f GB/s"
+                          "[%s]"
+                          % (_comm_s, _nred, _bytes / float(1 << 30),
+                             (_bytes / _comm_s) / 1e9 if _comm_s > 0 else 0.0,
+                             _dp.backend), flush=True)
             gscale = 1.0
             if float(a.grad_clip) > 0:
                 if _defer_clip:
@@ -1560,12 +1621,14 @@ def main(argv=None):
             dt = _now() - t0
             losses.append(lv)
             secs.append(dt)
+            comm_hist.append(_comm_s)
             hist_tail.append([int(step), round(lv, 8)])
             if len(hist_tail) > 64:
                 del hist_tail[:-64]
             tok = int(a.batch) * int(cfg["seq"])
             rec = {"step": int(step), "loss": lv, "lr": float(lr), "gnorm": gnorm,
                    "sec": dt, "tok": tok, "tok_s": tok / dt if dt > 0 else 0.0,
+                   "comm_s": _comm_s,
                    "consumed": int(corpus.consumed),
                    "peak_live": int(rt.pool_stats()["peak_live_bytes"]),
                    "n_valid": fmeta["n_valid"]}
@@ -1575,12 +1638,15 @@ def main(argv=None):
             if int(a.log_every) > 0 and ((step - start_step) % int(a.log_every) == 0
                                         or step == stop_step - 1):
                 ps = rt.pool_stats()
-                print("step %6d/%d loss=%.6f lr=%.3e gnorm=%9.3f %.3fs tok/s=%8.1f "
-                      "peak_live=%.2fGiB consumed=%d"
-                      % (step, stop_step, lv, lr, gnorm, dt, rec["tok_s"],
-                         _gib(ps["peak_live_bytes"]), corpus.consumed), flush=True)
-            # ---- 周期性存档 ----
-            if a.out and int(a.ckpt_every) > 0 and (step + 1) % int(a.ckpt_every) == 0:
+                print("%sstep %6d/%d loss=%.6f lr=%.3e gnorm=%9.3f %.3fs tok/s=%8.1f "
+                      "peak_live=%.2fGiB consumed=%d%s"
+                      % (_prefix, step, stop_step, lv, lr, gnorm, dt, rec["tok_s"],
+                         _gib(ps["peak_live_bytes"]), corpus.consumed,
+                         "" if _comm_s is None else " comm=%.3fs" % _comm_s),
+                      flush=True)
+            # ---- 周期性存档（★ 只有 rank0 写盘）----
+            if (a.out and _is_main and int(a.ckpt_every) > 0
+                    and (step + 1) % int(a.ckpt_every) == 0):
                 d = save_run(a.out, step + 1, corpus, P, opt, sched,
                              state_extra={"seed": seed, "model": _jsonable(cfg),
                                           "schedule": dict(sc), "batch": int(a.batch),
@@ -1594,10 +1660,18 @@ def main(argv=None):
         if log_f is not None:
             log_f.close()
 
+    # ★ 通信器在**所有 rank 都跑完训练之后**统一关闭（ncclCommDestroy 内部会等齐）：
+    #   提前关会让还在最后一步 all_reduce 的 rank 挂住。
+    if _dp is not None:
+        _dp.close()
+
     # ---- NaN/Inf：停下 + 存现场（绝不静默继续）----
     if aborted is not None:
         kind, value, bad_step, ids, labels, seg = aborted
-        dump = os.path.join(a.out or ".", "nan", "nan_step_%06d" % int(bad_step))
+        # ★ 每个 rank 都有自己的现场；文件名带 rank 后缀，避免 rank1 覆盖 rank0
+        _nan_suf = "" if _is_main else "_r%d" % int(_dp.rank)
+        dump = os.path.join(a.out or ".", "nan",
+                            "nan_step_%06d%s" % (int(bad_step), _nan_suf))
         os.makedirs(dump, exist_ok=True)
         np.savez(os.path.join(dump, "batch.npz"), ids=ids, labels=labels, seg=seg)
         try:
@@ -1610,16 +1684,19 @@ def main(argv=None):
                            "bad": {"kind": kind, "value": value}}, f,
                           ensure_ascii=False, indent=1)
         except Exception as e:                    # pragma: no cover - 现场落盘失败
-            print("[nan] WARN 现场落盘失败：%s" % (e,), flush=True)
-        print("[nan] ABORT step=%d %s=%r dump=%s" % (bad_step, kind, value, dump), flush=True)
-        print("RESULT " + json.dumps({"status": "aborted", "kind": kind, "value": value,
-                                      "step": int(bad_step), "dump": dump},
-                                     ensure_ascii=False), flush=True)
+            print("%s[nan] WARN 现场落盘失败：%s" % (_prefix, e), flush=True)
+        print("%s[nan] ABORT step=%d %s=%r dump=%s"
+              % (_prefix, bad_step, kind, value, dump), flush=True)
+        if _is_main:
+            print("RESULT " + json.dumps({"status": "aborted", "kind": kind,
+                                          "value": value, "step": int(bad_step),
+                                          "dump": dump},
+                                         ensure_ascii=False), flush=True)
         return 2
 
-    # ---- 收尾存档 ----
+    # ---- 收尾存档（★ 只有 rank0 写盘）----
     final_dir = None
-    if a.out and not a.no_final_save:
+    if a.out and not a.no_final_save and _is_main:
         final_dir = save_run(a.out, step + 1, corpus, P, opt, sched,
                              state_extra={"seed": seed, "model": _jsonable(cfg),
                                           "schedule": dict(sc), "batch": int(a.batch),
@@ -1631,6 +1708,8 @@ def main(argv=None):
 
     ps = rt.pool_stats()
     steady = secs[2:] if len(secs) > 3 else (secs[1:] if len(secs) > 1 else secs)
+    _comm_vals = [float(x) for x in (rec_comm for rec_comm in comm_hist) if x is not None]
+    _world = 1 if _dp is None else int(_dp.world)
     res = {
         "status": "ok",
         "schema": SCHEMA,
@@ -1645,6 +1724,16 @@ def main(argv=None):
         "step_s_steady": float(np.mean(steady)) if steady else None,
         "tok_s_steady": (int(a.batch) * int(cfg["seq"]) / float(np.mean(steady))
                          if steady else None),
+        "batch": int(a.batch),
+        "world": _world,
+        "global_batch": int(a.batch) * _world,
+        "dp": (_dp.stats() if _dp is not None else None),
+        "comm_s_median": float(np.median(_comm_vals)) if _comm_vals else None,
+        "comm_s_min": float(np.min(_comm_vals)) if _comm_vals else None,
+        "comm_s_max": float(np.max(_comm_vals)) if _comm_vals else None,
+        "comm_frac": (float(np.median(_comm_vals)) / float(np.mean(steady))
+                      if _comm_vals and steady else None),
+        "gpu_index": _gpu_query_index(),
         "pool_peak_live_bytes": int(ps["peak_live_bytes"]),
         "pool_peak_bytes": int(ps["peak_bytes"]),
         "pool_peak_live_gib": round(_gib(ps["peak_live_bytes"]), 3),
@@ -1660,12 +1749,16 @@ def main(argv=None):
         "out": a.out,
         "final_ckpt": final_dir,
     }
-    print("RESULT " + json.dumps({k: v for k, v in res.items() if k != "losses"},
-                                 ensure_ascii=False), flush=True)
-    print("losses %r" % (res["losses"],), flush=True)
-    if a.json_out:
-        with open(a.json_out, "w", encoding="utf-8") as f:
-            json.dump(res, f, ensure_ascii=False, indent=1)
+    if _is_main:
+        print("RESULT " + json.dumps({k: v for k, v in res.items() if k != "losses"},
+                                     ensure_ascii=False), flush=True)
+        print("losses %r" % (res["losses"],), flush=True)
+        if a.json_out:
+            with open(a.json_out, "w", encoding="utf-8") as f:
+                json.dump(res, f, ensure_ascii=False, indent=1)
+    else:
+        print("%s[done] step=%d world=%d backend=%s"
+              % (_prefix, int(step) + 1, _world, _dp.backend), flush=True)
     return 0
 
 
