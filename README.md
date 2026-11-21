@@ -613,6 +613,38 @@ import tgai_go.train as T
 
 迁移检查清单见 [`docs/`](docs/)。
 
+## 训练完怎么用：同一个引擎直接推（推训一体）
+
+ORV 不是"只负责训练"的框架 —— **训练产物 `.TG` 就是推理输入**，中间不需要转 GGUF/ONNX。
+`tgai-orv` 这个 pip 包里同时包含训练侧（`tgai_go.train`）与推理侧（`tgai_go`，
+即 TGAI GO）。训练完立刻能跑：
+
+```bash
+python -m tgai_go info -m model.TG        # 这个模型是什么（不加载权重）
+python -m tgai_go meta -m model.TG        # 它声明的对话配置（同样不加载权重）
+python -m tgai_go chat -m model.TG        # 开始对话
+python -m tgai_go gen  -m model.TG "你好"  # 单次生成
+```
+
+```python
+import tgai_go
+
+e = tgai_go.TGEngine()
+m = tgai_go.load("model.TG")                 # 训练产物直接加载
+c = tgai_go.Chat(e, system="你是 TGAI")
+print(c.ask("你好"))
+```
+
+**`.TG` 是什么**：ORV 自定义的模型容器，magic `0x49414754`，128 字节固定头，权重按
+**权名 FNV-1a 64** 查表（不是按顺序），dtype 码 `6` 表示 **bf16**（当 fp16 读会静默出 NaN）。
+另有 `.TG4` 自描述分区容器，`read_tg` 按 magic 自动分派。
+
+**后端**：wheel 里只带 **CPU 引擎**（GPU 二进制有平台/驱动/架构依赖）；GPU 版由
+`tgai_go.gpu` 在目标机上检测 + 编译 + 安装，编不出来自动回退 CPU。
+
+- 完整上手指南：[`docs/INFERENCE_QUICKSTART.md`](docs/INFERENCE_QUICKSTART.md)
+- 终端自查：`T.help('load')` / `T.help(open='web')`；Wiki 里搜 `api:go:*`、`cli:go:*`、`fmt:TG`
+
 ## 查文档：`T.help` 与离线 Wiki（1.0.16+）
 
 **不要靠记忆猜 API** —— ORV 与 PyTorch 命名相近，但边界处有真实差异（例如没有

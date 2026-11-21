@@ -28,7 +28,7 @@ import os
 import re
 import sys
 
-KINDS = ("op", "api", "kernel", "cli", "env", "plugin", "meta")
+KINDS = ("op", "api", "kernel", "cli", "env", "plugin", "fmt", "meta")
 HEAD_KEYS = ("ID", "分类", "中文名", "英文名", "作者")
 BLOCKS = ("中文", "English", "示例", "见也")
 _DEFAULT_CATS = ("getting-started", "tensor", "model", "memory", "compute", "optim",

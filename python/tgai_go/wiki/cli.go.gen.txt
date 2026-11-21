@@ -1,0 +1,40 @@
+[ID] cli:go:gen
+[分类] inference
+[中文名] 命令行单次生成
+[英文名] CLI single generation
+[作者] TGAI
+
+=== 中文 ===
+问一句、拿一个答案、退出。适合脚本里调用或快速冒烟。
+
+```
+python -m tgai_go gen -m model.TG "用一句话解释 MoE"
+python -m tgai_go gen -m model.TG -t 0.2 -n 512 --stop "<|end|>" "写个冒泡排序"
+```
+
+注意事项：
+1. `--stop` 可以重复传多次，多个停止串都会生效；不传就用模型内嵌的停止串。
+2. 它**不带多轮上下文**（每次都是全新一轮）；要连续对话用 `chat` 或 `Chat`。
+3. 温度 `-t 0.2` 这种低值适合确定性任务，高值容易跑偏 —— 采样是概率的，别指望逐位可复现。
+
+=== English ===
+Ask once, get one answer, exit — handy for scripts and smoke tests.
+
+```
+python -m tgai_go gen -m model.TG "Explain MoE in one sentence"
+python -m tgai_go gen -m model.TG -t 0.2 -n 512 --stop "<|end|>" "Write bubble sort"
+```
+
+Notes:
+1. `--stop` is repeatable and every stop string applies; omit it to use the model's embedded stops.
+2. It carries **no multi-turn context** (each run is a fresh turn); use `chat` or `Chat` for conversation.
+3. Low `-t 0.2` suits deterministic tasks; sampling is probabilistic, so do not expect bitwise reproducibility.
+
+=== 示例 ===
+python -m tgai_go gen -m model.TG "1+1 等于几"
+python -m tgai_go gen -m model.TG -n 512 -t 0.2 --stop "<|end|>" "写个冒泡排序"
+
+=== 见也 ===
+cli:go:chat
+api:go:generate
+api:go:Params

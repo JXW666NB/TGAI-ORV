@@ -778,3 +778,93 @@ T.DUO(n_params=3e9, seq=512, optim="int8gpu")  # 给了参数量才能算显存�
 * **`TG_DP_OVERLAP` 默认关**（1.0.16 起）：重叠路径实测会静默不归约梯度
   （`comm=0.00ms` 却报 `pending_zeroed=True`），已有硬自检会当场 raise。详见
   `docs/OPEN_DP_GNORM_MISMATCH.md`
+
+
+---
+
+## 附录 B：推理侧（GO）与 `.TG` 容器 —— **ORV 是推训一体**
+
+> 2026-11-21 补。此前手册只讲训练，导致"训练完怎么用"在帮助系统里完全隐形
+> （用户指出后才发现：L0 清单里 0 条推理项、Wiki 里 0 条推理词条）。
+> 现状：L0 已有 21 条推理条目 + 2 条格式条目；Wiki 已有对应词条。
+
+### B.1 包结构与两套 API
+
+| 面 | import | 条目 ID 前缀 | 说明 |
+| --- | --- | --- | --- |
+| 训练侧 | `tgai_go.train as T` | `api:` / `op:` / `kernel:` | 写模型、训练、分布式 |
+| **推理侧（GO）** | **`import tgai_go`** | **`api:go:`** | 加载 `.TG`、对话、生成、服务 |
+| 命令行 | `python -m tgai_go` | `cli:go:` | 不写代码直接用 |
+| 文件格式 | `tgai_go.read_tg` | `fmt:` | `.TG` / `.TG4` 容器 |
+
+**为什么推理条目 ID 是三段式 `api:go:<名字>`**：`tgai_go` 与 `tgai_go.train` 有同名导出
+（`load` / `Model` / `Params`），不消歧就无法一一对应。
+
+### B.2 常用推理 API（全部有真实签名，`T.help('go:')` 可查）
+
+```python
+import tgai_go
+
+tgai_go.native_available()        # 原生引擎在不在（不在 = 纯 Python 回退）
+e = tgai_go.TGEngine()            # 引擎：持有原生库 + 设备上下文（一进程一个）
+m = tgai_go.load("model.TG",      # 加载训练产物；不需要任何格式转换
+                 extend_ctx=0,    # 扩上下文（NTK/YaRN），0 = 模型自带 max_seq
+                 threads=None,    # CPU 线程数
+                 preload=False)   # True = 预解码权重（首 token 不卡，更占内存）
+c = tgai_go.Chat(e, system="你是 TGAI")   # 多轮封装：连续 ask() 自动拼上下文
+c.ask("你好")
+c.ask("我叫小明")
+c.ask("我叫什么？")               # 它记得
+c.ask("天气如何", keep=False)      # 单次调用，不进历史
+tgai_go.chat_meta_of("model.TG")  # 只读对话配置（不加载权重）
+tgai_go.describe_params()         # 引擎注册了哪些采样参数
+tgai_go.Params()                  # 采样参数容器（**dict 子类**，传裸 dict 也合法）
+```
+
+**边界（写清免误会）**：
+- `Chat` 的 `max_turns` **默认只有 8**，超出的老轮次会被丢；但系统提示词始终保留
+  ⇒ 长对话的硬约束要写进 `system`。
+- 模型内嵌的采样默认值**优先于**代码默认值，"我设了温度却没变"通常是这个原因。
+- 采样是概率的：`temperature > 0` 时**不要指望逐位可复现**。
+
+### B.3 命令行
+
+```bash
+python -m tgai_go chat -m model.TG
+python -m tgai_go gen  -m model.TG -t 0.2 -n 512 --stop "<|end|>" "写个冒泡排序"
+python -m tgai_go info -m model.TG      # 结构（不加载权重）
+python -m tgai_go meta -m model.TG      # 对话配置（不加载权重）
+python -m tgai_go version               # 版本 + 原生库状态
+```
+
+`-n/--max-tokens` 默认 **256**（是默认值不是上限，被截断先看它）；`--stop` 可重复传。
+
+### B.4 `.TG` 容器（`fmt:TG` / `fmt:TG4`）
+
+| 项 | 值 |
+| --- | --- |
+| v3 magic | `0x49414754`（小端字节 `TGAI`） |
+| 头 | `struct <16I6Q4I`，固定 **128 字节** |
+| 头字段 | magic/version/weight_dtype/n_layers/d_model/n_heads/d_ff/vocab/max_seq/n_experts/n_act/rope_theta/pad/bos/eos/unk/tok_off/tok_len/wt_off/wt_cnt/wd_off/wd_len/arch/nkv/modflags/ext_off |
+| 权重表 | 每条 **52 字节**，含**权名 FNV-1a 64** ⇒ 按名字查表，不依赖顺序 |
+| dtype 码 | `0=fp32 1=fp16 2=int8 3=int32 4=q8_0 5=q4_0 6=bf16`（V2.7 实际存 6） |
+| `.TG4` | magic `0x00344754`，自描述分区 + NAM 名字表，与 v3 不是同一格式 |
+
+**真坑**：
+1. **dtype 6 是 bf16**：按 fp16 解释不会报错，直接出 NaN/乱码（都 2 字节）。
+2. `ext_off` 处**不一定是**对话 magic（真实 V2.7 文件就不是），解析器 assert 太严会误报文件损坏。
+3. 先 `info`/`meta`（不加载权重）再 `chat`，避免加载几十 GB 才发现配置不对。
+
+### B.5 后端事实（别写成假的）
+
+- **wheel 里只带 CPU 引擎**：GPU 二进制有平台/驱动/架构依赖，塞进 wheel 会体积暴涨且大概率不匹配。
+- **GPU 版由目标机自举**：`tgai_go.gpu` 负责检测 + 编译 + 安装（CUDA 按 `sm_75/sm_86/sm_89…` 编译，
+  Vulkan 需目标机环境），**编不出来自动回退 CPU**。
+- 自查：`native_available()` / `native_dir()` / `python -m tgai_go version`。
+
+### B.6 给 AI 助手的硬规则
+
+1. 写推理代码时 **`import tgai_go`**，不要写 `T.chat(...)` —— 训练侧没有这些名字。
+2. 条目 ID 是 `api:go:<名字>`；不要写成 `api:<名字>`（那是训练侧，会撞 `load`/`Model`/`Params`）。
+3. **不要替用户套对话模板**：模板与训练不一致是乱码/复读的头号原因，先 `meta` 看模型声明。
+4. 查到 `fmt:TG` 才允许解释文件结构；没查到就直说没有，不要编字段。

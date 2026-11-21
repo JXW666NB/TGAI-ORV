@@ -1,0 +1,35 @@
+[ID] cli:go:info
+[分类] inference
+[中文名] 命令行看模型信息
+[英文名] CLI model info
+[作者] TGAI
+
+=== 中文 ===
+只看模型信息，**不加载权重**，所以再大的模型也是瞬间返回。
+
+```
+python -m tgai_go info -m model.TG
+```
+
+注意事项：
+1. 它回答的是"这个文件声明了什么"（层数/专家/词表/上下文等），不是"这份权重训得好不好"。
+2. 拿到一个新模型时，建议先 `info` 再 `meta`，最后才 `chat` —— 避免直接加载几十 GB 才发现配置不对。
+
+=== English ===
+Shows model metadata **without loading weights**, so it returns instantly even for huge models.
+
+```
+python -m tgai_go info -m model.TG
+```
+
+Notes:
+1. It answers "what does this file declare" (layers, experts, vocab, context), not "how well was it trained".
+2. For a new model, run `info`, then `meta`, then `chat` — so you do not load tens of GB and only then discover a config mismatch.
+
+=== 示例 ===
+python -m tgai_go info -m model.TG
+python -m tgai_go version          # 版本 + 原生库是否就位
+
+=== 见也 ===
+cli:go:meta
+api:go:chat_meta_of

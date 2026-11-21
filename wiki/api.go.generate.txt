@@ -1,0 +1,38 @@
+[ID] api:go:generate
+[分类] inference
+[中文名] 底层自回归生成
+[英文名] Low-level autoregressive decode
+[作者] TGAI
+
+=== 中文 ===
+底层生成循环：你给 token id，它返回生成结果。日常用 `Chat` 就行，这里是为做自定义采样/评测/批处理的人准备的。
+
+签名：`generate(engine, input_ids, params, eos_id, eos_set=None, kv=None)`
+
+注意事项：
+1. `input_ids` 要**自己分词**后再传，引擎不做模板拼接 —— 用错模板会让输出质量明显变差（这是最常见的坑）。
+2. `kv` 可传入以复用已有 KV 缓存做多轮；不传则每次从零开始。
+3. 它是"引擎级"API：不处理历史、不加系统提示，全部由调用方负责。
+
+=== English ===
+The low-level decode loop: you supply token ids, it returns generations. Daily use should go through `Chat`; this exists for custom sampling, evaluation and batching.
+
+Signature: `generate(engine, input_ids, params, eos_id, eos_set=None, kv=None)`
+
+Notes:
+1. You tokenize and template `input_ids` yourself; the engine does no template stitching, and using the wrong template visibly degrades output (the most common pitfall).
+2. Pass `kv` to reuse an existing KV cache for multi-turn; omit it to start from scratch.
+3. This is an engine-level API: history, system prompt and stopping policy are the caller's responsibility.
+
+=== 示例 ===
+import tgai_go
+
+e = tgai_go.TGEngine()
+p = tgai_go.Params()
+ids = e.encode("你好")                 # 具体分词入口见 api:go:TGEngine
+out = tgai_go.generate(e, ids, p, eos_id=2)
+
+=== 见也 ===
+api:go:TGEngine
+api:go:Params
+api:go:ChatSession

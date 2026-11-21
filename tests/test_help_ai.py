@@ -195,7 +195,9 @@ def test_web_creates_self_contained_html(monkeypatch, capsys):
     path, html, out, opened = _render_web(monkeypatch, capsys)
     assert os.path.isfile(path)
     assert out.strip() == path                    # 无头环境必须能从 stdout 拿到路径
-    assert opened and opened[0].startswith("file://")
+    # ★ 2026-11-21（用户踩到）：默认**不再自动弹浏览器**。旧行为每调用一次就开一个窗口，
+    #   反复调用把用户前台抢走（实测留下 188 个临时目录）。要弹窗口必须显式 launch=True。
+    assert opened == [], "默认不许自动打开浏览器（会用窗口抢用户前台）"
     # 零外链 / 零 CDN / 零外部字体
     assert "http://" not in html and "https://" not in html
     assert "<link" not in html.lower()
@@ -212,9 +214,12 @@ def test_web_creates_self_contained_html(monkeypatch, capsys):
     assert "中文" in html and "English" in html
     assert "覆盖率" in html and "wiki" in html
     # 分类顺序来自 wiki/_meta.txt（order 轴）
+    # 分类顺序来自 wiki/_meta.txt（order 轴）。★ 2026-11-21：新增 inference（推理，
+    # order=75，插在 distributed 之后）—— 因为 ORV 是推训一体，推理词条需要自己的分组。
+    # 这条断言**跟着数据走**：新增分类时改这一行，而不是让网页悄悄少一个分组。
     assert [c["id"] for c in data["categories"]] == [
         "getting-started", "tensor", "model", "memory", "compute", "optim",
-        "distributed", "plugin", "debug", "compat", "other"]
+        "distributed", "inference", "plugin", "debug", "compat", "other"]
     # 体积合理（几百条 ~ 两百 KB；不许把数据复制成多份巨大字符串）
     assert len(html.encode("utf-8")) < 4 * 1024 * 1024
 

@@ -1,0 +1,36 @@
+[ID] cli:go:meta
+[分类] inference
+[中文名] 命令行看对话配置
+[英文名] CLI chat metadata
+[作者] TGAI
+
+=== 中文 ===
+只看模型内嵌的对话配置（系统提示、停止串、模板标记等），**不加载权重**。
+
+```
+python -m tgai_go meta -m model.TG
+```
+
+注意事项：
+1. 它输出的是**模型自己声明的**配置；你的脚本里设的 `system` 会覆盖显示，但停止串这类是叠加生效的。
+2. 输出异常（例如缺少模板标记）通常意味着训练时的对话模板与推理时期望的不一致 —— 这种不一致会直接表现为乱码或复读。
+
+=== English ===
+Shows the chat metadata embedded in the model (system prompt, stop strings, template markers) **without loading weights**.
+
+```
+python -m tgai_go meta -m model.TG
+```
+
+Notes:
+1. It prints what the **model declares**; a `system` set by your script overrides the prompt, while stop strings accumulate.
+2. An odd result (for example missing template markers) usually means the training-time chat template differs from what inference expects — that shows up directly as mojibake or repetition.
+
+=== 示例 ===
+python -m tgai_go meta -m model.TG
+python -m tgai_go info -m model.TG    # 结构信息
+
+=== 见也 ===
+cli:go:info
+api:go:chat_meta_of
+cli:go:chat

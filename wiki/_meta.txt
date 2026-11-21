@@ -8,6 +8,7 @@
 [分类] compute | 计算 | Compute | 50
 [分类] optim | 优化器 | Optimizer | 60
 [分类] distributed | 分布式 | Distributed | 70
+[分类] inference | 推理 | Inference | 75
 [分类] plugin | 插件 | Plugin | 80
 [分类] debug | 调试 | Debug | 90
 [分类] compat | 兼容性 | Compatibility | 100

@@ -1,0 +1,37 @@
+[ID] api:go:Params
+[分类] inference
+[中文名] 生成参数
+[英文名] Generation parameters
+[作者] TGAI
+
+=== 中文 ===
+生成参数的容器，**是 `dict` 的子类**。
+
+为什么是 dict 子类：`generate()` 与 `sample_numpy()` 内部大量 `params.get(...)`，子类化后两者零改动即可用；你也可以直接传裸 `dict`。
+
+注意事项：
+1. 传裸 `dict` 是**合法**的（不是偷懒）—— 引擎只做 `.get()`，不校验类型。
+2. 不传的键会落到引擎默认值 + 模型内嵌默认值；**模型内嵌默认优先于代码默认**，所以"我明明设了温度却没变"通常是模型里写了默认值。
+3. 想知道有哪些键可设，用 `describe_params()`（这是自证式的，直接读引擎注册表）。
+
+=== English ===
+Generation-parameter container; it **subclasses `dict`**.
+
+Why a dict subclass: `generate()` and `sample_numpy()` are full of `params.get(...)`, so subclassing keeps them unchanged — and a plain `dict` works just as well.
+
+Notes:
+1. Passing a bare `dict` is **legitimate**; the engine only calls `.get()`.
+2. Unset keys fall back to engine defaults plus the model's embedded defaults, and **the model wins** — that is why "I set the temperature but nothing changed".
+3. `describe_params()` enumerates the keys the engine actually registers.
+
+=== 示例 ===
+import tgai_go
+
+p = tgai_go.Params()          # dict 子类
+p["temperature"] = 0.3
+print(tgai_go.describe_params(only="temperature"))
+print(tgai_go.load("model.TG"))   # 参数在生成时传，不在 load 时传
+
+=== 见也 ===
+api:go:describe_params
+api:go:generate

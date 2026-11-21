@@ -868,16 +868,33 @@ def render_html(payload):
     return "".join(parts)
 
 
-def open_web(payload):
-    """渲染 → 写临时目录 → 尝试用默认浏览器打开；返回文件绝对路径（永不抛浏览器错误）。"""
+def open_web(payload, launch=None):
+    """渲染 → 写一个**固定**目录 → 返回路径；**默认不自动弹浏览器**。
+
+    ★ 2026-11-21（用户踩到）：旧实现每次调用都 `mkdtemp` 建新目录 **并且自动
+    `webbrowser.open()`**，于是反复调用会不断开新窗口、**把用户的前台窗口抢走**
+    （实测在用户机器上留下了 188 个 `tgai-orv-help-*` 目录，还让正在用的
+    嘉立创EDA看起来"被搞坏了"）。两处都改了：
+
+      1. 输出到**固定路径** `$TMP/tgai-orv-help/index.html`（覆盖写，不再堆积）；
+      2. **默认不弹浏览器**，只打印路径；要弹窗口必须显式 `launch=True`
+         （或环境变量 `TG_HELP_LAUNCH=1`）。
+
+    这样 `T.help(open='web')` 在脚本/CI/批量调用里不会产生任何窗口。
+    """
     text = render_html(payload)
-    directory = tempfile.mkdtemp(prefix="tgai-orv-help-")
+    directory = os.path.join(tempfile.gettempdir(), "tgai-orv-help")
+    os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, "index.html")
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
-    try:
-        webbrowser.open(pathlib.Path(path).as_uri())
-    except Exception:
-        # 无头环境 / CI / 没有默认浏览器：路径已经拿到，调用方会打印它。
-        pass
+    if launch is None:
+        launch = os.environ.get("TG_HELP_LAUNCH", "").strip().lower() in (
+            "1", "true", "yes", "on")
+    if launch:
+        try:
+            webbrowser.open(pathlib.Path(path).as_uri())
+        except Exception:
+            # 无头环境 / CI / 没有默认浏览器：路径已经拿到，调用方会打印它。
+            pass
     return os.path.abspath(path)

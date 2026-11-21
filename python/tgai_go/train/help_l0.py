@@ -48,7 +48,7 @@ __all__ = ["catalog", "entry", "nearest", "default_category", "invalidate",
            "device_source_kernel_names", "KIND_ORDER", "KINDS"]
 
 #: kind 轴的规范顺序（也是 JSON / 网页里的展示顺序）。
-KIND_ORDER = ("op", "api", "kernel", "cli", "env", "plugin")
+KIND_ORDER = ("op", "api", "kernel", "cli", "env", "plugin", "fmt")
 KINDS = frozenset(KIND_ORDER)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -235,6 +235,186 @@ def _top_level_api_entries():
             "reach_evidence": "T.%s 存在且可调用（%s）"
                               % (name, "类/构造" if is_class else "函数"),
             "unreachable": "" if reachable else "T.%s 存在但不可调用" % name,
+        })
+    return out
+
+
+# ------------------------------------------------- 推理侧（GO：ORV 是推训一体）
+#: 推理侧条目的 ID 前缀。`tgai_go` 与 `tgai_go.train` 有同名导出（`load` / `Model` /
+#: `Params`），所以推理条目用三段式 `api:go:<名字>` 消歧；kind 仍然是 `api`。
+_INFER_PREFIX = "go:"
+
+
+def _inference_api_entries():
+    """GO 推理侧的顶层 API —— **ORV 是推训一体，`tgai_go` 包本身就是推理库**。
+
+    为什么必须单列（2026-11-21 用户指出）：L0 之前只扫 `tgai_go.train`，于是整个推理面
+    在帮助系统里**完全隐形** —— 用户看不到"训练完之后怎么跑"，而 Wiki 里写
+    `api:TGEngine` 会被加载器判成"未知 ID"直接拒收。补上这一组，Wiki 才能真正
+    覆盖「训练完 → 用起来」的闭环。
+    """
+    try:
+        import tgai_go as G
+    except Exception:                            # noqa: BLE001  推理侧不可用时不要拖垮帮助
+        return []
+    out = []
+    for name in sorted(n for n in dir(G) if not n.startswith("_")):
+        try:
+            obj = getattr(G, name)
+        except Exception:                        # noqa: BLE001
+            continue
+        if not isinstance(obj, (types.FunctionType, types.BuiltinFunctionType, type)):
+            continue
+        mod = getattr(obj, "__module__", "") or ""
+        if not mod.startswith("tgai_go") or mod.startswith("tgai_go.train"):
+            continue                             # 训练侧已由上面那组覆盖
+        try:
+            sig = inspect.signature(obj)
+        except Exception:                        # noqa: BLE001
+            sig = None
+        is_class = isinstance(obj, type)
+        example = "tgai_go." + name + (_call_suffix(sig) if sig is not None else "(...)")
+        reachable = callable(obj)
+        out.append({
+            "id": "api:" + _INFER_PREFIX + name,
+            "kind": "api",
+            "name": name,
+            "signature": _signature_of(obj),
+            "example": example if reachable else "",
+            "module": mod,
+            "subkind": "inference",
+            "form": example if reachable else "",
+            "form_kind": "class" if is_class else "function",
+            "reachable": reachable,
+            "reach_evidence": "tgai_go.%s 存在且可调用（%s，模块 %s）"
+                              % (name, "类/构造" if is_class else "函数", mod),
+            "unreachable": "" if reachable else "tgai_go.%s 存在但不可调用" % name,
+        })
+    return out
+
+
+def _inference_cli_entries():
+    """`python -m tgai_go <cmd>` 的条目。
+
+    子命令**从源码机械提取**：`__main__.py` 里 `add_argument('cmd', choices=[...])`
+    的 choices 列表。解析不到就返回空 —— 绝不硬编码一份可能过期的列表。
+    """
+    path = os.path.join(os.path.dirname(_HERE), "__main__.py")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src)
+    except Exception:                            # noqa: BLE001
+        return []
+    choices, line_of = [], 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if not (isinstance(fn, ast.Attribute) and fn.attr == "add_argument"):
+            continue
+        for kw in node.keywords:
+            if kw.arg != "choices" or not isinstance(kw.value, ast.List):
+                continue
+            names = [e.value for e in kw.value.elts
+                     if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            if names:
+                choices = names
+                line_of = getattr(kw.value, "lineno", 0)
+    out = []
+    for cmd in choices:
+        if cmd == "version":                 # `version` 不需要模型，别生成假参数
+            example = "python -m tgai_go version"
+        else:
+            extras = ' "问题"' if cmd == "gen" else ""
+            example = "python -m tgai_go %s -m <model.TG>%s" % (cmd, extras)
+        out.append({
+            "id": "cli:" + _INFER_PREFIX + cmd,
+            "kind": "cli",
+            "name": cmd,
+            "signature": "tgai_go CLI 子命令",
+            "example": example,
+            "module": "tgai_go.__main__",
+            "subkind": "inference",
+            "form": example,
+            "form_kind": "cli",
+            "reachable": True,
+            "reach_evidence": "__main__.py 第 %d 行的 argparse choices 里有 %r"
+                              % (line_of, cmd),
+            "unreachable": "",
+        })
+    return out
+
+
+# --------------------------------------------------------- 文件格式轴（fmt）
+#: `.TG` / `.TG4` 容器。**证据只能来自源码**（magic、头结构、dtype 表都是常量），
+#: 所以这里解析 `read_tg.py`，解析不到就不产出条目 —— 绝不硬编码一份可能过期的说明。
+_FMT_SPECS = (
+    ("TG", "TG_MAGIC", ".TG（v3 家族容器）", "read_tg.read_tg()"),
+    ("TG4", "TG4_MAGIC", ".TG4（自描述分区容器）", "read_tg._read_tg4()"),
+)
+
+
+def _fmt_entries():
+    """文件格式轴：模型容器 `.TG` / `.TG4` 是什么、有哪些头字段、dtype 码怎么对应。
+
+    ★ 2026-11-21：用户问「有没有 `.TG` 的介绍」—— 查下来 `docs/` 里有
+    （`TG_V4_FORMAT.md`、`TG对话配置元数据`），但 **Wiki 和 `T.help` 里一条都没有**。
+    `.TG` 是训练产物**同时也是推理输入**，它比任何单个 API 都更值得有一条词条。
+    """
+    path = os.path.join(os.path.dirname(_HERE), "read_tg.py")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        tree = ast.parse(src)
+    except Exception:                            # noqa: BLE001
+        return []
+
+    consts = {}
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        tgt = node.targets[0]
+        if not isinstance(tgt, ast.Name):
+            continue
+        val = node.value
+        if isinstance(val, ast.Constant) and isinstance(val.value, (int, str)):
+            consts[tgt.id] = val.value
+
+    # dtype 码表（0 fp32 / 1 fp16 / 2 int8 / 3 int32 / 4 q8_0 / 5 q4_0 / 6 bf16）
+    dtypes = []
+    m = re.search(r"^DT\s*=\s*\{([^}]*)\}", src, re.S | re.M)
+    if m:
+        for code, name in re.findall(r'(\d+)\s*:\s*\(\s*"([a-z0-9_]+)"', m.group(1)):
+            dtypes.append("%s=%s" % (code, name))
+    header_struct = ""
+    ms = re.search(r'struct\.unpack\("<([^"]+)"', src)
+    if ms:
+        header_struct = ms.group(1)
+
+    out = []
+    for short, const_name, title, reader in _FMT_SPECS:
+        magic = consts.get(const_name)
+        if not isinstance(magic, int):
+            continue                             # 源码里没这个常量 ⇒ 不产出（不自证不写）
+        detail = "%s；magic=0x%08X" % (title, magic)
+        if short == "TG" and header_struct:
+            detail += "；头 = `struct <%s`；dtype 码：%s" % (
+                header_struct, "、".join(dtypes) if dtypes else "见源码")
+        ev = "read_tg.py 里 `%s = 0x%08X`，且 %s 负责解析" % (const_name, magic, reader)
+        out.append({
+            "id": "fmt:" + short,
+            "kind": "fmt",
+            "name": short,
+            "signature": detail,
+            "example": ".TG 文件（加载方式见 api:go:load）",
+            "module": "tgai_go.read_tg",
+            "subkind": "container",
+            "form": ".TG 文件（用 tgai_go.load(path) 加载）",
+            "form_kind": "format",
+            "reachable": True,
+            "reach_evidence": ev,
+            "unreachable": "",
         })
     return out
 
@@ -588,6 +768,43 @@ def _env_entries():
             if len(name) <= 4:
                 continue
             found.setdefault(name, filename)
+    # ★ 2026-11-21：环境变量候选是**文本扫描**出来的，会被"长得像变量名"的东西污染。
+    #   实测被误收的两个：`TG_MAGIC`（read_tg.py 里的模块常量）与
+    #   `TG_V4_FORMAT`（我文档里写的 `TG_V4_FORMAT.md` 文件名）。判据补两条：
+    #     ① 在包内任何 .py 里有模块级 `NAME = ...` 定义 ⇒ 它是**常量**，不是环境变量；
+    #     ② 出现形式是 `NAME.md/.py/.txt` ⇒ 它是**文件名**，不是环境变量。
+    try:
+        consts = {}
+        pkg_root = os.path.dirname(_HERE)
+        for dirpath, _dirs, names in os.walk(pkg_root):
+            for fn in names:
+                if not fn.endswith(".py"):
+                    continue
+                try:
+                    with open(os.path.join(dirpath, fn), encoding="utf-8",
+                              errors="replace") as fh:
+                        consts[fn] = fh.read()
+                except Exception:                # noqa: BLE001
+                    continue
+    except Exception:                            # noqa: BLE001
+        consts = {}
+    # ★ 集合式过滤（性能）：早先写成"每个候选 × 每份全文"的 re.search，67 个候选 ×
+    #   整个包源码 ⇒ 单次 catalog() 3.4 秒，直接超了网页生成 <1s 的预算。
+    #   改成**每份文件只扫一遍**，产出两个集合再判断，复杂度从 O(N×M) 降到 O(M)。
+    all_texts = list(texts.values()) + list(consts.values())
+    const_names = set()
+    filename_tokens = set()
+    for t in all_texts:
+        const_names.update(re.findall(r"^\s*([A-Z][A-Z0-9_]{3,})\s*=", t, re.M))
+        filename_tokens.update(re.findall(r"\b([A-Z][A-Z0-9_]{3,})\.(?:md|py|txt)\b", t))
+    dropped = []
+    for name in list(found):
+        # 模块级常量 / 出现在文件名里 ⇒ 不是环境变量
+        if name in const_names or name in filename_tokens:
+            dropped.append(name)
+    for name in dropped:
+        found.pop(name, None)
+
     evidence = _env_read_evidence(texts, found)
     out = []
     for name in sorted(found):
@@ -620,6 +837,9 @@ def catalog():
     entries = []
     entries.extend(_op_entries())
     entries.extend(_top_level_api_entries())
+    entries.extend(_inference_api_entries())        # 推训一体：GO 推理侧
+    entries.extend(_inference_cli_entries())          # python -m tgai_go <cmd>
+    entries.extend(_fmt_entries())                   # .TG / .TG4 容器
     entries.extend(_kernel_entries())
     entries.extend(_cli_entries())
     entries.extend(_env_entries())

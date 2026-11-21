@@ -39,7 +39,7 @@ TRAIN = os.path.join(REPO, "python", "tgai_go", "train")
 ENTRY_FIELDS = ("id", "kind", "name", "reachable", "form", "form_kind",
                 "reach_evidence", "unreachable")
 FORM_KINDS = {"method", "operator", "class", "function", "kernel", "cli",
-              "env", "plugin"}
+              "env", "plugin", "format"}   # format：fmt: 轴（.TG/.TG4 容器）
 OPERATOR_FORMS = {
     "add": "a + b",
     "sub": "a - b",
@@ -121,15 +121,34 @@ def test_op_mul_trap_documented_in_operator_entry():
 
 # ------------------------------------------------------------------ 3. api 轴
 def test_api_entries_are_getattr_able_and_callable():
+    """每条 api 都必须**在它自己声明的模块上**真的拿得到且可调用。
+
+    ★ 2026-11-21：ORV 是推训一体，`api:go:<名字>` 属于推理侧（`import tgai_go`），
+    `api:<名字>` 属于训练侧（`tgai_go.train`）。判据要按前缀分流 —— 否则推理条目
+    会被拿 `getattr(T, ...)` 去查而假失败（这正是本测试此前红的原因）。
+    """
+    import tgai_go as G
+
     rows = _by_kind("api")
     assert len(rows) >= 100
-    for e in rows:
+    train_rows = [e for e in rows if not e["id"].startswith("api:go:")]
+    infer_rows = [e for e in rows if e["id"].startswith("api:go:")]
+    assert infer_rows, "推训一体：L0 必须包含推理侧条目"
+    for e in train_rows:
         obj = getattr(T, e["name"], None)
         assert obj is not None, "api:%s 在 T 上拿不到" % e["name"]
         assert callable(obj), "api:%s 存在但不可调用" % e["name"]
         expected = "class" if isinstance(obj, type) else "function"
         assert e["form_kind"] == expected, e["id"]
         assert e["form"].startswith("T." + e["name"])
+    for e in infer_rows:
+        obj = getattr(G, e["name"], None)
+        assert obj is not None, "%s 在 tgai_go 上拿不到" % e["id"]
+        assert callable(obj), "%s 存在但不可调用" % e["id"]
+        expected = "class" if isinstance(obj, type) else "function"
+        assert e["form_kind"] == expected, e["id"]
+        assert e["form"].startswith("tgai_go." + e["name"]), e["id"]
+        assert e["module"].startswith("tgai_go"), e["id"]
 
 
 # --------------------------------------------------------------- 4. kernel 轴
@@ -155,9 +174,26 @@ def test_kernel_entries_are_in_nvrtc_device_source():
 
 # ------------------------------------------------------------------ 5. cli 轴
 def test_cli_entries_have_real_add_argument_and_main_guard():
+    """训练侧 `cli:--flag` 与推理侧 `cli:go:<cmd>` 分别用各自的证据链自证。
+
+    ★ 2026-11-21：`cli:go:<cmd>` 来自 `python -m tgai_go` 的 argparse `choices`，
+    不是训练脚本里的 `--flag`，所以不能用 add_argument 那条判据去查。
+    """
     rows = _by_kind("cli")
     assert len(rows) >= 30
-    for e in rows:
+    infer = [e for e in rows if e["id"].startswith("cli:go:")]
+    assert infer, "推训一体：L0 必须包含推理 CLI 子命令"
+    with open(os.path.join(os.path.dirname(TRAIN), "__main__.py"),
+              encoding="utf-8") as fh:
+        cli_src = fh.read()
+    for e in infer:
+        assert e["reachable"], e["id"]
+        assert e["form"].startswith("python -m tgai_go ")
+        m = re.search(r"choices\s*=\s*\[([^\]]*)\]", cli_src)
+        assert m, "__main__.py 里找不到 argparse choices"
+        assert re.search(r"[\"']%s[\"']" % re.escape(e["name"]), m.group(1)), \
+            "cli:go:%s 不在 __main__.py 的 choices 里" % e["name"]
+    for e in [x for x in rows if not x["id"].startswith("cli:go:")]:
         assert e["reachable"], e["id"]
         assert e["form"].startswith("python -m ")
         filename = e["module"].rsplit(".", 1)[-1] + ".py"

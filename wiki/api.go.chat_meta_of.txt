@@ -1,0 +1,38 @@
+[ID] api:go:chat_meta_of
+[分类] inference
+[中文名] 只读对话配置
+[英文名] Read chat metadata only
+[作者] TGAI
+
+=== 中文 ===
+只读 `.TG` 里声明的对话配置，**不加载权重**（很快，毫秒级）。
+
+签名：`chat_meta_of(tg_path)`
+
+用途：在下载/加载几十 GB 的权重之前，先确认这个模型声明了哪些对话参数（系统提示、停止串、模板标记等）。
+
+注意事项：
+1. 它读的是**模型文件里内嵌的声明**，不是你训练脚本里的默认值 —— 两者不一致时以模型为准。
+2. 想知道引擎认为"有哪些采样参数可调"，配 `describe_params()` 一起看。
+
+=== English ===
+Reads the chat metadata declared inside a `.TG` file **without loading weights** (millisecond-fast).
+
+Signature: `chat_meta_of(tg_path)`
+
+Use it before downloading or loading a multi-GB checkpoint: confirm which chat parameters (system prompt, stop strings, template markers) the model declares.
+
+Notes:
+1. It reports what is **embedded in the model**, not your training-script defaults; the model wins on conflict.
+2. Pair it with `describe_params()` to see which sampling knobs the engine exposes.
+
+=== 示例 ===
+import tgai_go
+
+meta = tgai_go.chat_meta_of("model.TG")   # 不加载权重
+print(meta)
+print(tgai_go.describe_params())          # 引擎支持哪些采样参数
+
+=== 见也 ===
+api:go:load
+api:go:describe_params

@@ -1,0 +1,52 @@
+[ID] cli:go:chat
+[分类] inference
+[中文名] 命令行对话
+[英文名] CLI chat
+[作者] TGAI
+
+=== 中文 ===
+最省事的用法：不写一行 Python，直接命令行对话。
+
+```
+python -m tgai_go chat -m model.TG
+python -m tgai_go chat -m model.TG -s "你是 TGAI" -t 0.6 -n 256
+```
+
+常用参数：`-m/--model` 模型路径、`-s/--system` 系统提示、`-n/--max-tokens`（默认 256）、
+`-t/--temperature`（默认 0.6）、`--top-k`（40）、`--top-p`（0.9）、`--threads`、`--stop`（可重复）、`--preload`。
+
+同一入口的其它子命令：`info`（只看模型信息，不加载权重）、`meta`（只看对话配置）、
+`gen`（单次生成）、`version`（版本 + 原生库是否就位）。
+
+注意事项：
+1. `-n 256` 是默认值，**不是上限**；长回答被截断先看这个。
+2 没有 `-m` 时不会瞎猜路径，会直接报错 —— 这是刻意的（避免加载到别的模型还不自知）。
+
+=== English ===
+The fastest path: no Python at all, just talk to the CLI.
+
+```
+python -m tgai_go chat -m model.TG
+python -m tgai_go chat -m model.TG -s "You are TGAI" -t 0.6 -n 256
+```
+
+Common flags: `-m/--model`, `-s/--system`, `-n/--max-tokens` (default 256),
+`-t/--temperature` (0.6), `--top-k` (40), `--top-p` (0.9), `--threads`, `--stop` (repeatable), `--preload`.
+
+Sibling subcommands: `info` (metadata only, no weights), `meta` (chat config only),
+`gen` (single generation), `version` (version plus whether the native library is present).
+
+Notes:
+1. `-n 256` is a default, not a ceiling; truncated answers usually mean you forgot it.
+2. With no `-m` it refuses instead of guessing a path — deliberately, so you never silently load the wrong model.
+
+=== 示例 ===
+python -m tgai_go info -m model.TG        # 先看这是什么模型
+python -m tgai_go meta -m model.TG        # 看它自己的对话配置
+python -m tgai_go chat -m model.TG -s "你是 TGAI"
+
+=== 见也 ===
+cli:go:gen
+cli:go:info
+cli:go:meta
+api:go:Chat

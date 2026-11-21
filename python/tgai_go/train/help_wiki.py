@@ -56,7 +56,7 @@ __all__ = [
     "json_payload", "web_payload", "text_search",
 ]
 
-KINDS = ("op", "api", "kernel", "cli", "env", "plugin")
+KINDS = ("op", "api", "kernel", "cli", "env", "plugin", "fmt")
 
 #: 头部允许的键（固定；别的键一律报错，防拼写错静默失效）。
 _HEADER_FIELDS = {
@@ -765,6 +765,7 @@ _KIND_LABEL = {
     "cli": ("命令行参数", "CLI flags"),
     "env": ("环境变量", "env vars"),
     "plugin": ("插件条目", "plugin entries"),
+    "fmt": ("文件格式", "file formats"),        # .TG / .TG4 容器（推训一体的交付物）
     "": ("全部", "all"),
 }
 
