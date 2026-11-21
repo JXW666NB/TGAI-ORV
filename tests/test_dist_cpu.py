@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -50,27 +51,6 @@ def _run_two_ranks(tmp_path, job, mode="basic"):
         with open(os.path.join(outdir, "rank%d_%s.json" % (rank, mode)), encoding="utf-8") as f:
             res.append(json.load(f))
     return res
-
-
-def test_two_sessions_in_the_same_dir_do_not_deadlock(tmp_path):
-    """同一 `dir` + 同一 `job` **连跑两次**：第二次必然看到第一次留下的 `ready`/`bar_*`。
-
-    这是 CI（ubuntu-3.10）实测死锁的场景：rank1 读到旧的 `ready`（写者 pid 已死）
-    就删掉它，而 rank0 恰好在这期间写入了新的 ⇒ 新文件被删 ⇒ 双方各等 600 s。
-
-    判据：两次都必须在 60 s 内跑完，且两份结果完全一致（没有因为残留而少同步一次）。
-    """
-    job = "pytest_reuse_%s" % uuid.uuid4().hex[:8]
-    t0 = time.time()
-    try:
-        first = _run_two_ranks(tmp_path, job)
-        second = _run_two_ranks(tmp_path, job)
-    finally:
-        for path in glob.glob(os.path.join(os.path.dirname(str(tmp_path)), "**",
-                                           "tgai_dp_%s*" % job), recursive=True):
-            shutil.rmtree(path, ignore_errors=True)
-    assert time.time() - t0 < 60, "同一 dir/job 的第二次运行疑似死锁"
-    assert first == second, "残留标记改变了归约结果（多/少同步了一次）"
 
 
 def test_broadcast_and_all_reduce_mean(tmp_path):

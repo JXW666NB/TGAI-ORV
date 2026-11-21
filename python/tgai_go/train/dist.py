@@ -275,25 +275,22 @@ class DataParallel:
         """
         if self.world <= 1 or getattr(self, "_started", False):
             return
-        ready = os.path.join(self.dir, "ready")
+        sess = self._session_token()          # 本进程的会话身份（毫秒整数，足够唯一）
         if self.rank == 0:
+            # 只清**上一轮**的东西（比本进程更老的），本轮同伴的文件一个都不碰。
             for f in os.listdir(self.dir):
-                if f.startswith("bar_") or f.startswith("ready"):
-                    try:
-                        os.remove(os.path.join(self.dir, f))
-                    except OSError:
-                        pass
-            with open(ready, "wb") as fh:
+                if not (f.startswith("bar_") or f.startswith("ready")):
+                    continue
+                p = os.path.join(self.dir, f)
+                try:
+                    if os.stat(p).st_mtime < _PROC_START - 1.0:
+                        os.remove(p)
+                except OSError:
+                    pass
+            with open(os.path.join(self.dir, "ready.%d" % sess), "wb") as fh:
                 # 三个字段：写者 pid / 写者当前时间 / **写者的进程启动时刻**。
-                # 第 3 个字段是身份判据：它比读者更早 ⇒ 这份 ready 来自别的会话。
                 fh.write(b"%d %f %f" % (os.getpid(), time.time(), _PROC_START))
-        elif self._ready_is_stale(ready):
-            # ★ 只**报告**、绝不删除：删除会踩到"我刚读到旧的、对方正好写了新的"这个
-            #   read-then-delete 窗口（CI ubuntu-3.10 实测双死锁）。`_wait_for` 每轮
-            #   重新 stat，新的 `ready` 一出现就会被接受。
-            print("[dp] 注意：%s 上有一份上一轮遗留的 ready（比本进程启动更早），"
-                  "忽略它继续等本轮 rank0 的标记" % ready, flush=True)
-        self._wait_for(ready, "rendezvous 就绪")
+        self._session_id = _PROC_START if self.rank == 0 else self._await_peer_ready()
         self._barrier("init")
         self._started = True
         self._ensure_backend()
@@ -387,6 +384,92 @@ class DataParallel:
         for r in range(self.world):
             self._wait_for(os.path.join(self.dir, "bar_%s.%d" % (t, r)), "barrier " + t)
 
+    @staticmethod
+    def _session_token():
+        """本进程的会话身份（毫秒整数）。仅用于给 `ready.<token>` 起唯一名字。"""
+        return int(round(float(_PROC_START) * 1000.0))
+
+    def _await_peer_ready(self, timeout=None):
+        """rank>0 等本轮 rank0 的 `ready.<token>`，返回**rank0 的启动时刻**当会话身份。
+
+        为什么不固定文件名 `ready`（2026-11-21，CI 三条腿红 + 本地复现）：
+        `_wait_for` 只判断"文件存在"。上一轮留下的 `ready` 一直在那儿 ⇒ 本轮 rank>0
+        会**立刻返回**并拿到**上一轮的身份**，于是两端算出不同的共享内存名，
+        各自等到超时。改成"每轮一个文件名 + 只认比我自己新的"之后，
+        残留文件在名字层面就不可能被误当成本轮 —— 也仍然不需要删除任何人。
+
+        找不到就明确报错（含修法），绝不退回自己的时刻（那会静默错配名字）。
+        """
+        limit = float(self.timeout if timeout is None else timeout)
+        t0 = time.time()
+        while True:
+            best = None
+            try:
+                names = os.listdir(self.dir)
+            except OSError:
+                names = []
+            for f in names:
+                if not f.startswith("ready."):
+                    continue
+                p = os.path.join(self.dir, f)
+                try:
+                    if os.stat(p).st_mtime < _PROC_START - 1.0:
+                        continue                     # 上一轮的，忽略（不删）
+                    with open(p, "rb") as fh:
+                        parts = fh.read(96).split()
+                    if len(parts) >= 3:
+                        sid = float(parts[2])
+                        if sid >= _PROC_START - 1.0:  # 只认本轮的
+                            if best is None or sid > best:
+                                best = sid
+                except OSError:
+                    continue
+            if best is not None:
+                return best
+            if time.time() - t0 > limit:
+                raise TimeoutError(
+                    "等不到本轮 rank0 的就绪标记（%s/ready.<会话号>）" % self.dir +
+                    "。修法：确认所有 rank 都已启动、TGAI_DP_JOB 一致、临时目录可写；"
+                    "若上一次运行崩在同一个 job 上，换个 TGAI_DP_JOB 或删掉该目录")
+            time.sleep(0.002)
+
+    def _read_session_id(self, path, timeout=5.0):
+        """从 `ready` 里取出 rank0 的会话身份（第 3 字段）。带重试：文件可能刚被写出。
+
+        取不到就 **明确报错**，绝不悄悄退回自己的启动时刻 —— 那会让两端算出
+        不同的共享内存名，然后各自等到超时（比直接报错难查得多）。
+        """
+        t0 = time.time()
+        while True:
+            try:
+                with open(path, "rb") as fh:
+                    parts = fh.read(96).split()
+                if len(parts) >= 3:
+                    return float(parts[2])
+            except OSError:
+                pass
+            if time.time() - t0 > float(timeout):
+                raise TimeoutError(
+                    "读不到会话身份（%s 里没有第 3 字段）" % path +
+                    "。修法：确认所有 rank 用的是同一个版本的 tgai-orv（旧版只写 2 个字段）")
+            time.sleep(0.01)
+
+    def _slot_name(self, need):
+        """共享内存名必须带**会话身份**，不能只用 `job`。
+
+        2026-11-21（CI 三条腿变红）：名字原本是 `tgai_dp_<job>_<need>`。
+        同一 `dir` + 同一 `job` 开**第二个会话**时名字与第一个完全相同，
+        而第一个会话收尾会 `unlink` 掉它 ⇒ 第二个会话的 rank1 挂不上、
+        rank0 卡在 `bar_init_1`，双方超时。这不是"用户用错"，是名字设计漏了会话维度。
+
+        会话身份由 `ready` 里那个**写者启动时刻**给出（rank0 自己就是它，
+        rank>0 在 `_start()` 里读到），所以两端不需要额外通信就能算出同一个名字。
+        """
+        sid = getattr(self, "_session_id", None)
+        if sid is None:
+            sid = _PROC_START
+        return "tgai_dp_%s_%d_%d" % (self.job, int(round(float(sid) * 1000.0)), int(need))
+
     def _ensure_slot(self, nbytes):
         """所有 rank 共用一块 `world * nbytes` 的共享内存，按 rank 分段写。"""
         if self._slot is not None and self._bytes >= nbytes:
@@ -394,13 +477,13 @@ class DataParallel:
         if self._slot is not None:
             self._slot.close()
         need = int(nbytes)
+        name = self._slot_name(need)
         if self.rank == 0:
             self._slot = shared_memory.SharedMemory(
-                name="tgai_dp_%s_%d" % (self.job, need), create=True, size=need * self.world)
+                name=name, create=True, size=need * self.world)
             self._slot.buf[:8] = need.to_bytes(8, "little")
             self._shm.append(self._slot)
         else:
-            name = "tgai_dp_%s_%d" % (self.job, need)
             t0 = time.time()
             while True:
                 try:
