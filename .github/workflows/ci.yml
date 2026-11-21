@@ -43,19 +43,7 @@ jobs:
             [System.IO.File]::AppendAllText($env:GITHUB_ENV, "TGAI_CC=$z`n")
           }
       - name: "test (no GPU; CUDA 用例会被 skipif 跳过)"
-        shell: bash
-        run: |
-          set -o pipefail
-          # ★ 把失败用例名写进 Job Summary + 打进日志尾部。
-          #   起因：CI 只在某个 runner 上偶发失败时，公开仓库的 actions logs API 返 403，
-          #   只能靠截图猜是哪条测试 —— 太浪费时间（2026-11-21 连续踩了三次）。
-          python -m pytest tests -q --tb=short -rf 2>&1 | tee /tmp/pytest.log
-          rc=${PIPESTATUS[0]}
-          {
-            echo "## pytest 结果"
-            echo '```'
-            grep -E "^(FAILED|ERROR) " /tmp/pytest.log | head -40 || true
-            tail -3 /tmp/pytest.log
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit $rc
+        # ★ 用仓库内脚本而不是 shell 管道：跨平台（Linux bash / Windows pwsh 都不依赖），
+        #   并把失败用例名写进 Job Summary —— 否则"哪条测试红的"只能靠截图猜
+        #   （公开仓库的 actions logs API 也返 403，2026-11-21 连续踩了三次）。
+        run: python scripts/ci_test.py
