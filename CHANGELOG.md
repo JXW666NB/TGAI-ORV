@@ -1,3 +1,93 @@
+## [1.0.19] - 2026-11-21
+
+### 修复：`T.help(open='web', launch=True)` 抛 `TypeError`（1.0.18 的回归，用户实测踩到）
+
+1.0.18 把 `open_web()` 改成默认不弹浏览器、新增 `launch` 参数，但**没有把 `launch`
+接到 `T.help()` 上** —— 文档/说明里写着 `T.help(open='web', launch=True)`，实际执行报
+`TypeError: help() 不认识参数 launch`。**"文档承诺了但代码没实现"比"没有这个功能"更糟。**
+
+现在：
+
+* `help()` 签名新增 `launch=None` 并**透传**给 `open_web`；
+* 未知参数的错误提示补上 `launch`（含「修法」），用户不会再不知道写什么；
+* 新增 `tests/test_help_launch.py`（5 条）钉住契约：默认 0 次弹窗、`launch=True` 恰好一次
+  且为 `file://`、`TG_HELP_LAUNCH=1` 等价、输出路径稳定不堆积、错误提示含 `launch`。
+
+用法（CMD）：
+
+```cmd
+python -c "import tgai_go.train as T; T.help(open='web', launch=True)"   :: 直接打开
+python -c "import tgai_go.train as T; print(T.help(open='web'))"        :: 只给路径
+start "" "%TEMP%\tgai-orv-help\index.html"                              :: 用已生成的那份
+```
+
+全套：**1195 passed / 64 skipped**。
+## [1.0.18] - 2026-11-21
+
+### 新增：推理侧与 `.TG` 容器进入帮助系统（推训一体不再是文档外的秘密）
+
+此前 `T.help` / Wiki **只覆盖训练侧**：L0 清单 434 条里 0 条推理、Word 里 0 条词条，
+用户看不到「训练完之后怎么用」。这一版补齐：
+
+* **L0 新增推理侧 21 条**：`api:go:*`（`tgai_go` 顶层：`TGEngine` / `load` / `Chat` /
+  `ChatSession` / `generate` / `chat_meta_of` / `Params` / `server` / `launcher` / 采样函数…）
+  与 `cli:go:*`（`python -m tgai_go` 的 `chat/gen/info/meta/version`，子命令从源码
+  `argparse choices` 机械提取，不硬编码）。
+* **新增文件格式轴 `fmt`**：`fmt:TG`、`fmt:TG4`。证据直接从 `read_tg.py` 解析：
+  v3 magic `0x49414754`、头 `struct <16I6Q4I`（固定 128 字节）、权重表每条 52 字节且按
+  **权名 FNV-1a 64** 查表、dtype 码 `6 = bf16`；`.TG4` 是另一套自描述分区容器。
+* **新增 11 条词条**（中英双语 + 可运行示例 + 真坑），词条总数 25 条，`wiki_check` 0 错 0 警，
+  引擎侧 `未知 ID 0`。
+* **新增文档**：`docs/INFERENCE_QUICKSTART.md`（训练产物直接推理的完整上手指南）、
+  README 新增「训练完怎么用：同一个引擎直接推（推训一体）」、
+  `skills/orv-engine-dev/SKILL.md` 新增**附录 B**（含给 AI 的硬规则：推理要 `import tgai_go`，
+  不要写 `T.chat(...)`；条目名不要写成 `api:<名字>` 会与训练侧 `load`/`Model`/`Params` 撞名）。
+
+### 新增：浅色 / 深色手动切换
+
+此前只有 `@media (prefers-color-scheme: dark)`，即**只能跟随系统**，页面上没有开关。
+现在顶栏 `Light | Dark`（与 `EN | 中文` 同一套纯文字视觉，零彩色）：
+
+* 优先级 `?theme=light|dark` > `localStorage(tgai-wiki-theme)` > 跟随系统；
+* 显式选择写 `<html data-theme>`，媒体查询收窄为 `:root:not([data-theme])`
+  ⇒ **用户选过之后，系统偏好不再覆盖他的选择**；
+* 标签跟随界面语言（中文界面显示「浅色 / 深色」）。
+
+### 修复：`T.help(open='web')` 会抢用户前台（用户实际踩到）
+
+旧实现每次调用都 `tempfile.mkdtemp` **且** `webbrowser.open()`，反复调用会不断开新窗口
+并顶掉用户正在用的前台程序；实测在某台机器上留下 **188 个** `tgai-orv-help-*` 目录。
+现在：
+
+* 输出到**固定路径** `$TMP/tgai-orv-help/index.html`（覆盖写，不再堆积）；
+* **默认不弹浏览器**，只打印路径；要弹窗口须 `launch=True` 或 `TG_HELP_LAUNCH=1`。
+
+### 修复：离线 Wiki 的排版与滚动条（读者反馈）
+
+* 滚动条改为细的、轨道透明、颜色取自既有 CSS 变量（**不新增颜色**），悬停才明显；
+* 导航栏变矮：header padding `16px 32px` → `10px 28px 9px`，品牌标题 `24px` → `18px`；
+* 行距变松：正文 `14px/1.6` → **`14px/1.75`**，代码块 `1.55` → `1.7`。
+
+### 修复：环境变量扫描器把常量与文件名误当环境变量
+
+新增文档后 `TG_MAGIC`（`read_tg.py` 的模块常量）与 `TG_V4_FORMAT`（文档文件名）被收进
+`env:` 清单并报"不可调用"。现在加了两条判据：**模块级常量不算环境变量**、
+**出现在 `NAME.md/.py/.txt` 里的不算环境变量**。第一版实现写成"每个候选 × 每份全文"的正则，
+单次清单构建 3.4 秒、直接超了网页生成 <1s 的预算，已改为**每份文件只扫一遍**产出集合。
+
+### 其他
+
+* 新增 `tests/test_help_theme.py`（8 条）钉住主题开关契约、调色板与两个布局数值；
+  `tests/test_help_l0.py` 扩展为按 `api:go:` / `cli:go:` 分流自证（推理侧在 `tgai_go` 上取，
+  训练侧在 `T` 上取），并新增 `fmt` 轴的字段校验。
+* 全套：**1190 passed / 64 skipped**。
+
+### 已知未完成
+
+* 词条覆盖率 **25 / 457 = 5.5%** —— 缺词条仍会显示名字 + 引擎自动生成的调用示例，不会空白。
+* 重叠归约（`TG_DP_OVERLAP`）NCCL 路径的等价性仍未证明，继续默认关闭。
+* GPU 推理后端的性能数字未纳入本文档（`tgai_go.gpu` 在目标机自举编译，取决于机器）。
+
 ## [1.0.17] - 2026-11-21
 
 ### 新增：`T.help` 内置离线 Wiki（词条是**数据**，可热更新）

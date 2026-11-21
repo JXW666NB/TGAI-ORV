@@ -436,7 +436,7 @@ def describe(name, cn=None, en=None, doc=None):
 
 
 def help(topic=None, tag=None, s=None, page=1, n=_PAGE, full=False, *,
-         format=None, open=None, **kw):   # noqa: A001
+         format=None, open=None, launch=None, **kw):   # noqa: A001
     """`T.help()` —— 这个库提供了什么、有什么用、怎么用（中英双语）。
 
     参数 / Args:
@@ -459,7 +459,8 @@ def help(topic=None, tag=None, s=None, page=1, n=_PAGE, full=False, *,
     do_print = bool(kw.pop("print", True))
     if kw:
         raise TypeError("help() 不认识参数 %s。修法：可用 tag / s / page / n / print / "
-                        "format / open" % ", ".join(sorted(kw)))
+                        "format / open / launch（launch=True 才会用浏览器打开网页）"
+                        % ", ".join(sorted(kw)))
 
     def out(text):
         if do_print:
@@ -529,7 +530,10 @@ def help(topic=None, tag=None, s=None, page=1, n=_PAGE, full=False, *,
     if opn is not None:
         from . import help_wiki
         from . import help_web
-        path = help_web.open_web(help_wiki.web_payload(kind, s))
+        # ★ 2026-11-21：`launch` 必须透传。我第一次只改了 open_web 的签名，
+        #   没把它接到 T.help 上，用户按文档写 T.help(open='web', launch=True)
+        #   直接 TypeError —— 文档承诺了但代码没实现，比没有更糟。
+        path = help_web.open_web(help_wiki.web_payload(kind, s), launch=launch)
         return out(path)
 
     src = {"kernels": _kernels, "api": _rt_methods, "op": _tensor_ops,
