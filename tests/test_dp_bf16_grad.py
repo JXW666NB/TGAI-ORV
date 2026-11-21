@@ -397,6 +397,21 @@ def test_ef_disables_overlap_path(monkeypatch):
     dp.close()
 
 
+def test_lowp_disables_overlap_path(monkeypatch):
+    """2026-11-21 GPU 实测：bf16 + 反向重叠的 gnorm 偏大 4.6×（非重叠路径逐位通过）。
+
+    在修好之前低精度一律退回不重叠路径 —— 不能因为「loss 看起来正常」就放过去
+    （Adam 近似尺度不变，梯度整体放大 4.6× 时 loss 曲线几乎不变，这是最危险的一类 bug）。
+    """
+    monkeypatch.delenv("TG_DP_GRAD_EF", raising=False)
+    T = _import_tensor()
+    dp = D.DataParallel(world=2, rank=0, job="pytest_lowp_ov",
+                        grad_dtype="bf16")
+    x = T.Tensor(np.ones((2,), np.float32), requires_grad=True)
+    assert dp.begin_overlap([x]) is None, "低精度 + 重叠必须自动退回不重叠路径"
+    dp.close()
+
+
 def test_ef_two_step_average_beats_no_ef(tmp_path):
     """同一梯度连跑两步：EF 把第一步的残差带到第二步，**两步平均**误差更小。
 
@@ -417,7 +432,17 @@ def test_ef_two_step_average_beats_no_ef(tmp_path):
     err_ef = float(np.abs(avg_ef - g).max())
     err_no = float(np.abs(avg_no - g).max())
     assert err_ef < err_no, "EF 的两步平均误差应更小（ef=%g, no_ef=%g）" % (err_ef, err_no)
-    assert err_ef == 0.0, "这两步的残差应当精确抵消（实测 %g）" % err_ef
+    # ★ 不能要求"精确 0"（2026-11-21，CI 只在 windows-latest 3.12 上翻车）：
+    #   实测残差 0.001953125 = 2^-9，正好是 bf16 在 1.0 附近（ulp = 2^-8）的**半个 ulp**。
+    #   也就是说 EF 已经把误差压到量化步长以内，剩下的那半个 ulp 来自
+    #   "两步残差相加后的舍入顺序"，跟 numpy/BLAS 构建有关，不同平台会不一样。
+    #   判据改成：**不超过 1 个 bf16 ulp**（值落在 [1,2) 时 ulp = 2^-8 = 0.00390625）。
+    #   注意别用 `np.spacing(np.float32(1.0))` —— 那是 **float32** 的 ulp（1.19e-7），
+    #   比 bf16 小 32768 倍，等于又变回"要求精确相等"。
+    #   这条与 CHANGELOG 里"分层等价"那次是同一类教训：把"算法正确"写成"平台无关的浮点恒等"。
+    ulp_bf16 = 2.0 ** -8
+    assert err_ef <= ulp_bf16, \
+        "EF 残差应在 1 个 bf16 ulp 内（实测 %g > %g）" % (err_ef, ulp_bf16)
 
 
 # ══════════════════════════════════════════════════════════════════════
