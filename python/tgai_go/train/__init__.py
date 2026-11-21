@@ -582,12 +582,19 @@ def _bwd_overlap_session():
 #   memory  块化 + 检查点    3,169 MiB / 0.81 s   ← 显存 0.68×，速度 1.6×（换显存）
 #   standard = extreme（用户判断：可被 2 取代；保留名字以备将来分化）
 # 完整对比与上下文长度曲线见 docs/THREE_TARGETS.md。
+# ★ 2026-11-21 修正（对外承诺与实现不一致）：
+#   `attn` 以前**没有任何代码读取**，于是 `T.set_policy("memory")` 并不能切到 flash 注意力 ——
+#   用户以为省了显存，其实没变。现在 `attn` 真的会决定 SDPA 走哪条路
+#   （`auto` = 能融合就融合；`flash` = 强制不物化；`materialized` = 强制物化），
+#   并且 `standard`/`speed` 用 `auto` —— **保持改造前的行为，不给默认用户引入回归**。
+#   `checkpoint` / `inplace_acc` 仍是**预留键**（没有任何代码读取，见函数文档），
+#   保留它们只为不破坏既有 `set_policy_value` 调用；不要把"省显存"的期望寄托在这两个键上。
 _POLICY_PRESETS = {
-    "standard": dict(attn="materialized", checkpoint=True, attn_tile=512,
+    "standard": dict(attn="auto", checkpoint=True, attn_tile=512,
                      cache_masks=True, inplace_acc=True, fused_rope=True),
-    "speed":    dict(attn="materialized", checkpoint=False, attn_tile=1024,
+    "speed":    dict(attn="auto", checkpoint=False, attn_tile=1024,
                      cache_masks=True, inplace_acc=True, fused_rope=True),
-    "extreme":  dict(attn="materialized", checkpoint=True, attn_tile=512,
+    "extreme":  dict(attn="flash", checkpoint=True, attn_tile=512,
                      cache_masks=True, inplace_acc=True, fused_rope=True),
     "memory":   dict(attn="flash", checkpoint=True, attn_tile=768,
                      cache_masks=True, inplace_acc=False, fused_rope=True),
@@ -3174,9 +3181,32 @@ class _Functional:
             scale = 1.0 / np.sqrt(dh)
         else:
             scale = float(scale)
+        # ★ 2026-11-21：让 `T.set_policy("memory")` **真的意味着 flash 注意力**。
+        #   在此之前策略里的 `attn` 键**没有任何代码读取**（`checkpoint`/`inplace_acc`
+        #   同样是死键，只有 cache_masks/attn_tile/fused_rope 被消费）——
+        #   用户设了 memory 策略却发现显存没变，属于"承诺了但不生效"。
+        #   规则：调用点显式 lowmem 优先；否则遵循策略；策略没写就按 auto。
+        lowmem = _Functional._resolve_lowmem(lowmem)
         if attn_mask is None and (lowmem is not False) and _sdpa_lowmem_ok(q, k, v, causal, dh):
             return _sdpa_lowmem(q, k, v, scale)
         return _sdpa_materialized(q, k, v, causal, scale, attn_mask=attn_mask)
+
+    @staticmethod
+    def _resolve_lowmem(lowmem):
+        """解析 lowmem：调用点显式值优先；否则看策略 `attn`；都没有则 auto(None)。
+
+        ★ 2026-11-21：策略里的 `attn` 键此前**没有任何代码读取**，
+        `T.set_policy("memory")` 并不能切到 flash 注意力（用户以为省了显存其实没变）。
+        这里让它真的生效：flash ⇒ True，materialized ⇒ False，auto ⇒ None（自动）。
+        """
+        if lowmem is not None:
+            return bool(lowmem)
+        pol = str(policy("attn", "") or "").strip().lower()
+        if pol == "flash":
+            return True
+        if pol in ("materialized", "materialised", "mat"):
+            return False
+        return None          # auto：能融合就融合，不行自动回退
 
     @staticmethod
     def sdpa_lowmem(q: Tensor, k: Tensor, v: Tensor, causal=True, scale=None):
