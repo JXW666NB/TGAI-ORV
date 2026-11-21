@@ -602,9 +602,25 @@ class DataParallel:
           早期版本里 rank0 通过后立刻删掉自己的标记，rank1 可能还没看到就已经被删，
           于是永久等待（实测 2 进程死锁）。带上自增世代之后，每次 barrier 用全新文件名，
           旧文件留着也不会让下一轮误判为「已到齐」。
+
+        ★★ 还必须带**会话号**（2026-11-21）：同一个 `dir` + 同一个 `job` 上如果有
+           **两个并发会话**，它们会看到对方的 `bar_*` 标记 ⇒ 假"已到齐" ⇒ 各走各的、
+           **静默错序**（比死锁更难查）。把会话号编进文件名，两组标记在名字层面
+           就永不交叉，于是并发会话可以安全共用同一个目录。
         """
         self._bar_gen = int(getattr(self, "_bar_gen", 0)) + 1
-        t = "%s_%d" % (tag, self._bar_gen)
+        # ★ 会话号必须是**共享的** `_session_id`（rank0 的启动时刻，rank>0 从 ready 里读到），
+        #   绝不能退回"本进程启动时刻"—— 那会让每个 rank 用各不相同的文件名，
+        #   于是互相等不到对方，直接死锁（2026-11-21 我在这里犯过一次）。
+        sid = getattr(self, "_session_id", None)
+        if sid is None:
+            if self.world > 1:
+                raise RuntimeError(
+                    "barrier 在 rendezvous 之前被调用（_session_id 未设置）" +
+                    "。修法：不要在 DataParallel._start() 之前触发集合通信")
+            sid = _PROC_START
+        tok = int(round(float(sid) * 1000.0))
+        t = "%s_%d_%d" % (tag, self._bar_gen, tok)
         p = os.path.join(self.dir, "bar_%s.%d" % (t, self.rank))
         with open(p, "wb") as f:
             f.write(b"1")
