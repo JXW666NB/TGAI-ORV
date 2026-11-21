@@ -852,6 +852,25 @@ def _chunked_ce(xh, target, head, chunk):
     return loss
 
 
+def _overlap_order(P, params):
+    """反向重叠归约的桶**就绪顺序**（下标排列，各 rank 必须逐字相同）。
+
+    * 反向是前向的逆序 ⇒ 默认取 `params` 倒序（`dp_overlap.build_plan` 的默认）；
+    * 但 `head` 的梯度在反向**一开始**就有（CE→logits 的 matmul 反向），而 `emb`
+      的梯度要到**最后**（embedding 反向）⇒ head 提到最前、emb 压到最后，
+      桶才会尽早满、尽早开始集合通信。
+    * tied（`P["head"] is P["emb"]`）：同一个张量要等 embedding 那条路也累加完才完整，
+      ⇒ 只能放**最后**，绝不能放最前（否则第一个桶永远等到反向结束才发）。
+    """
+    from . import dp_overlap as _ovl
+    emb = P.get("emb")
+    head = P.get("head")
+    if head is not None and head is emb:
+        return _ovl.plan_order_adapter(params, last=[emb])
+    return _ovl.plan_order_adapter(params, first=[head] if head is not None else (),
+                                   last=[emb] if emb is not None else ())
+
+
 def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
                  top_k=2, shared=True, use_seg=True, ce_chunk=0):
     """一次前向 + shift 后的 CE。返回 `(loss, meta)`，`loss` 是 0 维张量。
@@ -1060,6 +1079,9 @@ def build_arg_parser():
     g.add_argument("--csa", "--attn-global-every", dest="csa", type=int, default=0,
                    metavar="N", help="真 V3 的 3:1 混合注意力（每 N 层 1 层 Global），0=关闭")
     g.add_argument("--no-shared", action="store_true", help="关闭共享专家")
+    g.add_argument("--tie-embeddings", dest="tie_embeddings", action="store_true",
+                   help="emb 与 head 共享同一个参数张量（参考 tie_embeddings=True）；"
+                        "用于验 DP 重叠归约在 tied 下逐位正确")
     # ---- 数据 ----
     g = ap.add_argument_group("data")
     g.add_argument("--data", nargs="+", required=True,
@@ -1102,7 +1124,7 @@ def build_arg_parser():
                         "★ 实测：V100 上 fp16 张量核峰值 125 TFLOPS vs fp32 15.7，"
                         "但小配置下 cast 开销可能盖过收益，必须在目标配置上实测。"
                         "★ 2026-11-21（5090/seq512/12L）：`gemm` 要付 985 次 cast 发射"
-                        "（11.6 ms/步）⇒ 比 off 慢 6%；`tf32` 没有 cast ⇒ 比 off 快 2~3%。")
+                        "（11.6 ms/步）⇒ 比 off 慢 6%%；`tf32` 没有 cast ⇒ 比 off 快 2~3%%。")
     g.add_argument("--amp-no-cache", dest="amp_no_cache", action="store_true",
                    help="AMP 时不启用 fp16 权重影子缓存。1.5B 模型影子要 3 GB，"
                         "开 --amp gemm 可能 OOM；关掉则每次重新 cast（慢一点但省 3 GB）。")
@@ -1225,6 +1247,11 @@ def _vram_peak(stop, base, out):
 def _expand_cfg(a):
     cfg = dict(d=a.d, d_ff=(a.d_ff or 4 * a.d), E=a.E, layers=a.layers,
                n_q=a.n_q, n_kv=2, vocab=a.vocab, seq=a.seq)
+    if getattr(a, "tie_embeddings", False):
+        # emb 与 head 共享**同一个张量**（与 `v3_train_cli --tie-embeddings` 同义）。
+        # ★ 数据并行重叠归约必须在 tied 下和「反向结束后一次性归约」逐位一致：
+        #   这个开关就是用来做那条对拍的（见 dp_overlap 模块文档的 tied 一节）。
+        cfg["tie"] = True
     if getattr(a, "grad_ckpt", False):
         # 梯度重算：用算力换显存（每层前向不建图，反向重跑）。
         # 原型实测梯度逐位等价；默认关闭，只有显式 --grad-ckpt 才开。
@@ -1557,33 +1584,86 @@ def main(argv=None):
             else:
                 ids, labels, seg = corpus.take(int(a.batch))
             opt.zero_grad()
+            _t_fwd = _now()
             loss, fmeta = forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
                                        top_k=int(a.top_k), shared=(not a.no_shared),
                                        use_seg=(not a.no_seg),
                                        ce_chunk=_ce_chunk_rows(
                                            getattr(a, "ce_chunk", 0)))
+            _fwd_s = _now() - _t_fwd
             lv = _scalar(loss)
             if not _is_finite(lv):
                 aborted = ("loss", lv, step, ids, labels, seg)
                 break
-            loss.backward()
+            # ★ 数据并行「反向即归约」：必须在 backward **之前**装钩子（钩子挂在
+            #   `Tensor.backward` 的叶子 .grad 写入点，见 dp_overlap 模块文档）。
+            #   world<=1 / TG_DP_OVERLAP=0 / 图里有梯度检查点 / 已经有 .grad …… 时
+            #   返回 None，走原来的「反向结束后一次性 all_reduce」路径（零行为变化）。
+            _ov = None
+            if _dp is not None:
+                try:
+                    _ov = _dp.begin_overlap(params, order=_overlap_order(P, params))
+                except Exception as _ovexc:              # noqa: BLE001
+                    # 重叠归约是**可选优化**：初始化失败只该退回老路径，不该把训练搞崩。
+                    # 但必须**响亮**（打印 + 写进 stats），不允许静默降级。
+                    print("%s[dp] WARN 重叠归约初始化失败（%r）⇒ 本步退回不重叠路径"
+                          % (_prefix, _ovexc), flush=True)
+                    _dp.abort_overlap()
+                    _ov = None
+            _t_bwd = _now()
+            try:
+                loss.backward()
+            except BaseException:
+                # 反向中途异常：会话可能已经把部分桶发了出去，必须拆掉传输/钩子，
+                # 否则下一步 begin_overlap 会报「上一个会话没结束」。
+                if _ov is not None:
+                    _dp.abort_overlap()
+                _ov = None
+                raise
+            _bwd_s = _now() - _t_bwd
             del loss
             # ★ 必须在裁剪**之前**归约：否则 gnorm 只是本 rank 的范数，
             #   裁剪阈值在各 rank 上会不一致，梯度就不同步了。
             _comm_s = None
             if _dp is not None:
                 _t_r = _now()
-                _nred = sum(1 for q in params if getattr(q, "grad", None) is not None)
-                _bytes = sum(int(q.grad._gpu.n) * 4 for q in params
-                             if getattr(q, "grad", None) is not None)
-                _dp.all_reduce_grads(params)
+                _st = None
+                if _ov is not None:
+                    # 反向结束时把剩下的桶补发、等齐、写回；返回 None 表示会话在
+                    # 反向开始时已安全退回（原因在 dp.overlap_stats["reason"]）。
+                    _st = _dp.finish_overlap()
+                if _st is None:
+                    _dp.all_reduce_grads(params)
+                else:
+                    # 任务要求的 stats：暴露时间 / 重叠时间 / 桶数 / pending 是否归零
+                    if (os.environ.get("TG_DP_TIMING")
+                            or (int(a.log_every) > 0
+                                and (step - start_step) % int(a.log_every) == 0)):
+                        print("%s[dp-ov] exposed=%.2fms comm=%.2fms overlapped=%.2fms "
+                              "buckets=%d pending_zeroed=%s zero_filled=%d late=%d "
+                              "bwd=%.4fs open=%.2fms"
+                              % (_prefix, _st.get("exposed_ms", -1.0),
+                                 _st.get("comm_ms", -1.0), _st.get("overlapped_ms", -1.0),
+                                 int(_st.get("buckets", 0)),
+                                 str(_st.get("pending_zeroed")),
+                                 int(_st.get("zero_filled", 0)),
+                                 int(_st.get("late_buckets", 0)), _bwd_s,
+                                 float(_st.get("open_ms", -1.0))), flush=True)
+                        if os.environ.get("TG_DP_OV_DEBUG") and _st.get("bucket_comm_ms"):
+                            print("%s[dp-ov-dbg] per_bucket_ms=%s"
+                                  % (_prefix, _st.get("bucket_comm_ms")), flush=True)
                 _comm_s = _now() - _t_r
-                if os.environ.get("TG_DP_TIMING"):
+                if os.environ.get("TG_DP_TIMING") and _st is None:
+                    # 老路径才打打包/带宽统计（重叠路径的 exposed/comm 已在上面打印）
+                    _nred = sum(1 for q in params if getattr(q, "grad", None) is not None)
+                    _bytes = sum(int(q.grad._gpu.n) * 4 for q in params
+                                 if getattr(q, "grad", None) is not None)
                     print("[dp] reduce %.4f s  grads=%d  bytes=%.2f GiB  => %.1f GB/s"
                           "[%s]"
                           % (_comm_s, _nred, _bytes / float(1 << 30),
                              (_bytes / _comm_s) / 1e9 if _comm_s > 0 else 0.0,
                              _dp.backend), flush=True)
+            _t_opt = _now()
             gscale = 1.0
             if float(a.grad_clip) > 0:
                 if _defer_clip:
@@ -1618,7 +1698,12 @@ def main(argv=None):
             if _AMP["mlp"]:
                 amp_mlp.invalidate()
             rt.sync()
+            _opt_s = _now() - _t_opt
             dt = _now() - t0
+            if os.environ.get("TG_DP_TIMING"):
+                print("%s[phase] fwd=%.4fs bwd=%.4fs opt=%.4fs total=%.4fs rest=%.4fs"
+                      % (_prefix, _fwd_s, _bwd_s, _opt_s, dt,
+                         dt - _fwd_s - _bwd_s - _opt_s), flush=True)
             losses.append(lv)
             secs.append(dt)
             comm_hist.append(_comm_s)

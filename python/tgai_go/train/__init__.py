@@ -548,6 +548,29 @@ cuda = _CudaAPI()
 # ─────────────────────────── 自动微分 ───────────────────────────
 _GRAD_ENABLED = [True]
 
+#: 反向期间「叶子梯度就绪」的钩子（数据并行重叠归约用）。
+#: 由 `tgai_go.train.dist.DataParallel.begin_overlap()` 安装、`finish_overlap()` 卸下；
+#: 默认 `None` ⇒ **零行为变化**（`world=1` 永远走这条）。
+#: 钩子只被允许**读**叶子刚写好的 `.grad`，不许改动它（「消费完立刻释放」的语义不变）。
+_BWD_OVERLAP = [None]
+
+
+def _set_bwd_overlap(session):
+    """安装/卸下反向重叠会话（`None` = 卸下）。返回被替换掉的旧值。
+
+    为什么用长度 1 的列表而不是模块级变量：钩子读取点要的是"当前值"，
+    列表下标读取是纯 Python 属性访问，不会像 `global` 那样在闭包里被快照掉。
+    """
+    old = _BWD_OVERLAP[0]
+    _BWD_OVERLAP[0] = session
+    return old
+
+
+def _bwd_overlap_session():
+    """当前安装的重叠会话（没有就返回 None）。"""
+    return _BWD_OVERLAP[0]
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 执行策略：显存 与 速度 的取舍（用户可切）
 # ═══════════════════════════════════════════════════════════════════════
@@ -824,6 +847,11 @@ class Tensor:
                 if id(p) not in seen:
                     stack.append((p, False))
         grads = {id(self): np.asarray(grad, dtype=np.float32)}
+        # ★ 数据并行重叠归约（dist.begin_overlap 安装的会话）：建图后先核对前提、
+        #   算每个叶子的"还会不会写 .grad"。不满足前提时它自己退回 None（走老路径）。
+        _ov = _BWD_OVERLAP[0]
+        if _ov is not None:
+            _ov = _ov.attach_graph(topo, cuda=False)
         for node in reversed(topo):
             g = grads.get(id(node))
             if g is None:
@@ -835,6 +863,9 @@ class Tensor:
                     node.grad = np.array(g, copy=True)
                 else:
                     node.grad = node.grad + g
+                # ★ 钩子只读刚写好的 .grad（重叠归约的"梯度就绪"点）
+                if _ov is not None:
+                    _ov.leaf_ready(node)
             elif _GRAD_ENABLED[0]:
                 node._backward(g, grads)
             # ★ 消费完立刻释放：否则所有中间梯度在反向期间常驻，峰值≈2 倍
@@ -1358,6 +1389,10 @@ class Tensor:
                 if id(p) not in seen:
                     stack.append((p, False))
         grads = {id(self): g0}
+        # ★ 数据并行重叠归约（dist.begin_overlap 安装的会话）：见 CPU 分支同段注释。
+        _ov = _BWD_OVERLAP[0]
+        if _ov is not None:
+            _ov = _ov.attach_graph(topo, cuda=True)
         for node in reversed(topo):
             g = grads.get(id(node))
             if g is None:
@@ -1374,6 +1409,11 @@ class Tensor:
                     if not isinstance(node.grad, Tensor) or getattr(node.grad, "device", "cpu") != "cuda":
                         raise RuntimeError("CUDA 张量的 .grad 必须是 CUDA Tensor" + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
                     node.grad = Tensor._from_gpu(rt.add(node.grad._gpu, g), requires_grad=False)
+                # ★ 钩子只读刚写好的 .grad（重叠归约的"梯度就绪"点）。
+                #   放在这里而不是 `_acc`：拓扑序走到叶子时所有贡献都已累加完，
+                #   这是"梯度是最终值"的唯一权威时刻（见 dp_overlap 模块文档）。
+                if _ov is not None:
+                    _ov.leaf_ready(node)
             if node._backward is not None:
                 if _GRAD_ENABLED[0]:
                     node._backward(g, grads)
@@ -3375,6 +3415,10 @@ def checkpoint(fn, *inputs):
                                 dtype=np.float32))
 
     res._backward = bw
+    # ★ 标记"这是梯度检查点的反向"。数据并行重叠归约靠它判断能不能安全地
+    #   边反向边归约：段内参数由 `re.backward(g)` 这个**嵌套反传**各自写 .grad，
+    #   "每个叶子只写一次"不成立 ⇒ 必须整步退回不重叠路径（见 dp_overlap 模块文档）。
+    bw._is_checkpoint = True
     return res
 
 

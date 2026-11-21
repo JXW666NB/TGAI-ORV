@@ -16,6 +16,18 @@
    ``ncclCommCount`` / ``ncclCommUserRank`` 与调用方声明一致 —— rank 数不符属于
    「配错了也不报错」的经典事故（会卡死或算错），这里必须当场抛。
 
+## ZeRO 需要的两个额外集合通信（2026-11-21 加）
+
+| 符号 | 用途 | 语义 |
+| --- | --- | --- |
+| ``ncclAllGather`` | ZeRO-1/2 更新后把参数分片收回 | ``sendcount`` 指**每 rank 发出的元素数**；``recv`` 里按 rank 顺序排列 |
+| ``ncclReduceScatter`` | ZeRO-2 的梯度归约 | ``recvcount`` 指**每 rank 收到的元素数**；``send`` 按 rank 排成 ``world`` 段 |
+
+两者都是 OPTIONAL 绑定：真 NCCL（>=2.0）都有，但只要库是残缺的，就应当在**第一次用到**
+时报 ``NcclUnavailable``（带修法），而不是 ``AttributeError``。
+**注意**：这两个原语都要求**每 rank 的 count 相同**。ORV 的 ZeRO 分片按整张量切，
+各 rank 的字节数不一定相等 ⇒ 调用方必须自己 padding 到 ``cap = max(shard_elems)``。
+
 ## 为什么用 ctypes 而不是 torch
 
 ORV 全链路是 ctypes（CUDA driver + cuBLAS + NVRTC），多卡只是「每个 rank 一个进程」。
@@ -316,6 +328,32 @@ class LibNccl(object):
             cu_dev.restype = c.c_int
             self._comm_cu_device = cu_dev
 
+        # ---- ZeRO 用的两个原语（OPTIONAL：缺了就在调用时报带修法的错）----
+        # ncclAllGather(sendbuff, recvbuff, sendcount, dtype, comm, stream)
+        self._all_gather = self._opt_sym(
+            "ncclAllGather",
+            [c.c_void_p, c.c_void_p, c.c_size_t, c.c_int, c.c_void_p, c.c_void_p])
+        # ncclReduceScatter(sendbuff, recvbuff, recvcount, dtype, op, comm, stream)
+        self._reduce_scatter = self._opt_sym(
+            "ncclReduceScatter",
+            [c.c_void_p, c.c_void_p, c.c_size_t, c.c_int, c.c_int,
+             c.c_void_p, c.c_void_p])
+
+    def _opt_sym(self, name, argtypes):
+        """绑定一个**可选**符号：库里有就绑，没有就返回 None（调用时再报错）。
+
+        为什么不放进 :data:`REQUIRED`：`ncclAllGather` / `ncclReduceScatter` 只有
+        ZeRO 用得上，而 ZeRO 是可选功能；把它们列成必需会让**本来能跑 DP 的环境**
+        因为一个残缺库直接起不来。
+        """
+        try:
+            fn = getattr(self._dll, name)
+        except AttributeError:
+            return None
+        fn.argtypes = argtypes
+        fn.restype = ctypes.c_int
+        return fn
+
     def _read_version(self):
         code = ctypes.c_int(0)
         rc = int(self._get_version(ctypes.byref(code)))
@@ -410,6 +448,55 @@ class LibNccl(object):
                                     comm,
                                     st),
                    "ncclAllReduce")
+
+    # ---------- ZeRO 用的两个原语 ----------
+
+    def all_gather(self, comm, send_ptr, recv_ptr, send_count, stream=None):
+        """``ncclAllGather``：每 rank 发 ``send_count`` 个 fp32，收 ``world*send_count``。
+
+        ``recv`` 的布局是 **rank 顺序**（rank0 的 send_count 个在最前）。
+        **所有 rank 的 `send_count` 必须相同** —— 传不同的值会挂或者算错。
+        """
+        if self._all_gather is None:
+            raise NcclUnavailable(
+                "NCCL 库没有 ncclAllGather 符号：%s" % self.path +
+                "。修法：换一个完整的 libnccl.so.2（>=2.0 都有这个符号），"
+                "或不用 ZeRO（--zero 0）")
+        st = self._stream_arg(stream)
+        self.check(self._all_gather(ctypes.c_void_p(int(send_ptr)),
+                                    ctypes.c_void_p(int(recv_ptr)),
+                                    ctypes.c_size_t(int(send_count)),
+                                    ctypes.c_int(NCCL_FLOAT32),
+                                    comm, st),
+                   "ncclAllGather")
+
+    def reduce_scatter(self, comm, send_ptr, recv_ptr, recv_count, stream=None):
+        """``ncclReduceScatter``：``send`` 按 rank 排成 ``world`` 段，每段 ``recv_count``。
+
+        结果 ``recv[i] = sum_r send[r*recv_count + i]``（fp32，SUM）。
+        **所有 rank 的 `recv_count` 必须相同**。
+        """
+        if self._reduce_scatter is None:
+            raise NcclUnavailable(
+                "NCCL 库没有 ncclReduceScatter 符号：%s" % self.path +
+                "。修法：换一个完整的 libnccl.so.2（>=2.0 都有这个符号），"
+                "或把 ZeRO 降一档（--zero 1 只用 all_reduce + all_gather）")
+        st = self._stream_arg(stream)
+        self.check(self._reduce_scatter(ctypes.c_void_p(int(send_ptr)),
+                                        ctypes.c_void_p(int(recv_ptr)),
+                                        ctypes.c_size_t(int(recv_count)),
+                                        ctypes.c_int(NCCL_FLOAT32),
+                                        ctypes.c_int(NCCL_SUM),
+                                        comm, st),
+                   "ncclReduceScatter")
+
+    @staticmethod
+    def _stream_arg(stream):
+        if isinstance(stream, ctypes.c_void_p):
+            return stream
+        if stream is None:
+            return ctypes.c_void_p(0)
+        return ctypes.c_void_p(int(stream))
 
 
 def version_string(code):
@@ -514,22 +601,41 @@ class NcclComm(object):
             self.close(abort=True)
             raise
 
-    def all_reduce_group(self, entries):
+    def all_reduce_group(self, entries, stream=None):
         """``entries``: [(ptr:int, count:int), ...]，一次 group 内全部就地 Sum。
 
         所有 rank 必须以**完全相同的顺序和 count** 调用（少一个/多一个都会挂）。
+
+        ``stream``：可选的覆盖流（``None`` ⇒ 用建 communicator 时给的流）。
+        数据并行**重叠归约**用它把每个桶的 all-reduce 放到一条独立的**非阻塞**流上，
+        与反向的计算流并发（见 ``train/dp_overlap.py``）。
         """
         if self.closed:
             raise NcclError("NcclComm 已关闭" + "。修法：不要跨 close() 复用通信器")
+        st = self.stream if stream is None else stream
         lib = self.lib
         lib.group_start()
         try:
             for ptr, count in entries:
                 if int(count) <= 0:
                     continue
-                lib.all_reduce(self._comm, ptr, ptr, int(count), stream=self.stream)
+                lib.all_reduce(self._comm, ptr, ptr, int(count), stream=st)
         finally:
             lib.group_end()
+
+    def all_gather_flat(self, send_ptr, recv_ptr, send_count):
+        """一次 ``ncclAllGather``（fp32）。``send_count`` 必须各 rank 相同。"""
+        if self.closed:
+            raise NcclError("NcclComm 已关闭" + "。修法：不要跨 close() 复用通信器")
+        self.lib.all_gather(self._comm, send_ptr, recv_ptr, int(send_count),
+                            stream=self.stream)
+
+    def reduce_scatter_flat(self, send_ptr, recv_ptr, recv_count):
+        """一次 ``ncclReduceScatter``（fp32 Sum）。``recv_count`` 必须各 rank 相同。"""
+        if self.closed:
+            raise NcclError("NcclComm 已关闭" + "。修法：不要跨 close() 复用通信器")
+        self.lib.reduce_scatter(self._comm, send_ptr, recv_ptr, int(recv_count),
+                                stream=self.stream)
 
     def close(self, abort=False):
         if self.closed or self._comm is None:

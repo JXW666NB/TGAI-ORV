@@ -5606,8 +5606,16 @@ class CudaRuntime:
         self._attn_fns[name] = out
         return out
 
-    def launch(self, name, grid, block, args, shared=0, module=None):
+    def launch(self, name, grid, block, args, shared=0, module=None, stream=None):
+        """发射一个内核。
+
+        ``stream``：**可选**，默认 ``None`` ⇒ 用当前流（`self._stream`）。
+        给定时只把这一次发射放到别的流上（数据并行重叠归约用：梯度写回/缩放
+        必须在集合通信那条流上，否则会和主流上的反向内核竞争）。除了这一处
+        选择，函数的其它行为（参数模板、捕获路径、计数）完全不变。
+        """
         self._activate()
+        st = self._stream if stream is None else stream
         if self._capturing and name == "adamw_update" and module is None:
             self._note_adamw(grid, block, shared, args)
         fn = self._fn(name) if module is None else self._fn_module(module, name)
@@ -5626,7 +5634,7 @@ class CudaRuntime:
                 fn,
                 int(grid[0]), int(grid[1]), int(grid[2]),
                 int(block[0]), int(block[1]), int(block[2]),
-                int(shared), self._stream, ptrs, None)
+                int(shared), st, ptrs, None)
             if rc != 0:
                 self._chk(rc, "cuLaunchKernel(%s)" % name)
             return holders
@@ -5651,7 +5659,7 @@ class CudaRuntime:
                 self._kernel_count += 1
                 rc = self.cu.cuLaunchKernel(
                     fn, grid[0], grid[1], grid[2], block[0], block[1], block[2],
-                    shared, self._stream, ptrs, None)
+                    shared, st, ptrs, None)
                 if rc != 0:
                     self._chk(rc, "cuLaunchKernel(%s)" % name)
                 return holders
@@ -5666,7 +5674,7 @@ class CudaRuntime:
             fn,
             int(grid[0]), int(grid[1]), int(grid[2]),
             int(block[0]), int(block[1]), int(block[2]),
-            int(shared), self._stream, ptrs, None)
+            int(shared), st, ptrs, None)
         if rc != 0:
             self._chk(rc, "cuLaunchKernel(%s)" % name)
         return holders
@@ -6588,32 +6596,79 @@ class CudaRuntime:
             except Exception:
                 pass
 
-    def d2h_into(self, buf, dst, nbytes=None, dst_off=0, src_off=0):
-        """把设备缓冲拷进给定的主机缓冲（可 pinned），支持字节偏移。"""
+    def d2h_into(self, buf, dst, nbytes=None, dst_off=0, src_off=0, stream=None):
+        """把设备缓冲拷进给定的主机缓冲（可 pinned），支持字节偏移。
+
+        ``stream``：默认 ``None`` ⇒ 同步 `cuMemcpyDtoH`（老行为）。
+        给了流就改成 `cuMemcpyDtoHAsync`（只入队、不阻塞主机）——
+        数据并行重叠归约里由后台线程用，避免把主流排空。
+        """
         nb = int(nbytes if nbytes is not None else buf.n * 4)
-        rc = self.cu.cuMemcpyDtoH(ctypes.c_void_p(dst.value + int(dst_off)),
-                                  ctypes.c_uint64(buf.ptr + int(src_off)),
-                                  ctypes.c_size_t(nb))
-        self._chk(rc, "cuMemcpyDtoH(大块)")
+        if stream is None:
+            rc = self.cu.cuMemcpyDtoH(ctypes.c_void_p(dst.value + int(dst_off)),
+                                      ctypes.c_uint64(buf.ptr + int(src_off)),
+                                      ctypes.c_size_t(nb))
+            self._chk(rc, "cuMemcpyDtoH(大块)")
+            return nb
+        fn = self._copy_async_sym("cuMemcpyDtoHAsync")
+        rc = fn(ctypes.c_void_p(dst.value + int(dst_off)),
+                ctypes.c_uint64(buf.ptr + int(src_off)),
+                ctypes.c_size_t(nb), stream)
+        self._chk(rc, "cuMemcpyDtoHAsync")
         return nb
 
-    def h2d_into(self, buf, src, nbytes=None, dst_off=0, src_off=0):
-        """把主机缓冲（可 pinned）拷回设备缓冲，支持字节偏移。"""
+    def h2d_into(self, buf, src, nbytes=None, dst_off=0, src_off=0, stream=None):
+        """把主机缓冲（可 pinned）拷回设备缓冲，支持字节偏移。
+
+        ``stream``：默认 ``None`` ⇒ 同步 `cuMemcpyHtoD`（老行为）；给了流走
+        `cuMemcpyHtoDAsync`（要求源是页锁定内存，否则驱动会内部同步）。
+        """
         nb = int(nbytes if nbytes is not None else buf.n * 4)
-        rc = self.cu.cuMemcpyHtoD(ctypes.c_uint64(buf.ptr + int(dst_off)),
-                                  ctypes.c_void_p(src.value + int(src_off)),
-                                  ctypes.c_size_t(nb))
-        self._chk(rc, "cuMemcpyHtoD(大块)")
+        if stream is None:
+            rc = self.cu.cuMemcpyHtoD(ctypes.c_uint64(buf.ptr + int(dst_off)),
+                                      ctypes.c_void_p(src.value + int(src_off)),
+                                      ctypes.c_size_t(nb))
+            self._chk(rc, "cuMemcpyHtoD(大块)")
+            return nb
+        fn = self._copy_async_sym("cuMemcpyHtoDAsync")
+        rc = fn(ctypes.c_uint64(buf.ptr + int(dst_off)),
+                ctypes.c_void_p(src.value + int(src_off)),
+                ctypes.c_size_t(nb), stream)
+        self._chk(rc, "cuMemcpyHtoDAsync")
         return nb
 
-    def copy_d2d(self, dst, src, nbytes=None, dst_off=0, src_off=0):
-        """设备内整块拷贝（用来把多个小梯度拼进一个打包缓冲）。"""
+    def copy_d2d(self, dst, src, nbytes=None, dst_off=0, src_off=0, stream=None):
+        """设备内整块拷贝（用来把多个小梯度拼进一个打包缓冲）。
+
+        ``stream``：默认 ``None`` ⇒ 同步入口（老的"拼包"路径用它，顺序即主流顺序）；
+        给了流走 `cuMemcpyDtoDAsync`，用于重叠归约的"结果写回"。
+        """
         nb = int(nbytes if nbytes is not None else src.n * 4)
-        rc = self.cu.cuMemcpyDtoD(ctypes.c_uint64(dst.ptr + int(dst_off)),
-                                  ctypes.c_uint64(src.ptr + int(src_off)),
-                                  ctypes.c_size_t(nb))
-        self._chk(rc, "cuMemcpyDtoD(整块)")
+        if stream is None:
+            rc = self.cu.cuMemcpyDtoD(ctypes.c_uint64(dst.ptr + int(dst_off)),
+                                      ctypes.c_uint64(src.ptr + int(src_off)),
+                                      ctypes.c_size_t(nb))
+            self._chk(rc, "cuMemcpyDtoD(整块)")
+            return nb
+        self._bind_dto_async()
+        rc = self.cu.cuMemcpyDtoDAsync(ctypes.c_uint64(dst.ptr + int(dst_off)),
+                                       ctypes.c_uint64(src.ptr + int(src_off)),
+                                       ctypes.c_size_t(nb), stream)
+        self._chk(rc, "cuMemcpyDtoDAsync(整块)")
         return nb
+
+    def _copy_async_sym(self, name):
+        """取并绑定一个异步拷贝入口（HtoD / DtoH）。缺符号时明确报错。"""
+        sig = {"cuMemcpyDtoHAsync": [ctypes.c_void_p, ctypes.c_uint64,
+                                     ctypes.c_size_t, ctypes.c_void_p],
+               "cuMemcpyHtoDAsync": [ctypes.c_uint64, ctypes.c_void_p,
+                                     ctypes.c_size_t, ctypes.c_void_p]}[name]
+        sym = self._bind_sym(name, sig)
+        if sym is None:
+            raise CudaError("驱动缺少 %s" % name +
+                            "。修法：升级驱动；或设 TG_DP_OVERLAP=0 用不重叠的归约路径")
+        return sym
+
     def sub_view(self, buf, shape, elem_offset=0):
         """在 `buf` 的字节区间内做一个**偏移视图**（与 `reshape` 的区别：起点可偏移）。
 
@@ -7111,8 +7166,12 @@ class CudaRuntime:
                 ])
         return out
 
-    def scale_inplace(self, a, scalar):
-        """c[i] = a[i] * s 写回 a。每个线程只碰自己的下标，可以和输入同址。"""
+    def scale_inplace(self, a, scalar, stream=None):
+        """c[i] = a[i] * s 写回 a。每个线程只碰自己的下标，可以和输入同址。
+
+        ``stream``：可选，默认走当前流（老行为）；数据并行重叠归约把"乘 1/world"
+        放在集合通信那条流上，与写回同流，避免和主流反向内核抢序。
+        """
         scalar = float(scalar)
         n = int(a.n)
         if n and scalar != 1.0:
@@ -7122,13 +7181,13 @@ class CudaRuntime:
                 self.launch("ewise_scale_v4", grid, block, [
                     self._ptr(a), (scalar, ctypes.c_float), self._ptr(a),
                     (n >> 2, ctypes.c_int),
-                ])
+                ], stream=stream)
             else:
                 grid, block = self._ewise_grid(n)
                 self.launch("ewise_scale", grid, block, [
                     self._ptr(a), (scalar, ctypes.c_float), self._ptr(a),
                     (n, ctypes.c_int),
-                ])
+                ], stream=stream)
         if n == 1 and a.known_scalar is not None:
             a.known_scalar = float(a.known_scalar) * scalar
         return a
@@ -8741,8 +8800,11 @@ class CudaRuntime:
             ])
         return dx
 
-    def add_(self, x, y):
-        """原地 x += y。逐位等同 ewise_add/cuMemcpy 语义，只是不分配新缓冲。"""
+    def add_(self, x, y, stream=None):
+        """原地 x += y。逐位等同 ewise_add/cuMemcpy 语义，只是不分配新缓冲。
+
+        ``stream``：可选，默认当前流；host 后端重叠归约在后台流上把对端梯度加到桶里。
+        """
         if int(x.n) != int(y.n):
             raise CudaError("add_ 长度不同: %s vs %s" % (x.n, y.n) + "。修法：这是驱动/内核级失败；把完整错误、GPU 型号与驱动版本一起反馈（TG_DEBUG=1 可出更多日志）")
         n = int(x.n)
@@ -8754,12 +8816,12 @@ class CudaRuntime:
                 grid, block = self._vec4_grid(n >> 2)
                 self.launch("fused_add_ip_v4", grid, block, [
                     self._ptr(x), self._ptr(y), (n >> 2, ctypes.c_int),
-                ])
+                ], stream=stream)
             else:
                 grid, block = self._ewise_grid(n)
                 self.launch("fused_add_ip", grid, block, [
                     self._ptr(x), self._ptr(y), (n, ctypes.c_int),
-                ])
+                ], stream=stream)
         return x
 
     def rowwise_max(self, x):
@@ -9670,7 +9732,65 @@ class CudaRuntime:
         out.keepalive = (part, ptrs, sizes, offs)   # 防缓冲被池提前回收
         return float(self.read_scalar(out))
 
+    def sumsq_multi_shard_into(self, bufs, part, elem_offset=0):
+        """把一组张量的**分块平方和**写进 ``part[elem_offset + ...]``（ZeRO-2 用）。
+
+        与 :meth:`sumsq_multi_total_sharded` 的前半段是**同一个内核、同一套 grid
+        与分块表**（``_shard_offsets``），所以对同一批张量写出的数值逐位相同；
+        区别只在落点可以偏移进一块更大的 ``part``，好让多 rank 各写各的槽位。
+        ``part`` 的其余槽位必须由调用方**预先清零**（清零 ⇒ 该张量贡献 0.0，
+        而 ``x + 0.0 == x`` 在 fp32 下逐位精确）。
+
+        返回写进去的块数（``Σ min(1024, ceil(n/256))``）。
+        """
+        bufs = [b for b in bufs if b is not None and int(b.n) > 0]
+        n = len(bufs)
+        if n == 0:
+            return 0
+        _nb, off = self._shard_offsets(bufs)
+        total_blocks = int(off[-1])
+        ptrs, sizes = self._ptrs_and_sizes(bufs)
+        offs = self.h2d(np.ascontiguousarray(off).view(np.float32))
+        dst = part if int(elem_offset) == 0 else \
+            self.sub_view(part, (total_blocks,), int(elem_offset))
+        self.launch("sumsq_multi_shard", (total_blocks, 1, 1), (256, 1, 1), [
+            self._ptr(ptrs), self._ptr(sizes), self._ptr(offs),
+            (n, ctypes.c_int), self._ptr(dst)])
+        self._zero_keep_alive((ptrs, sizes, offs, dst))
+        return total_blocks
+
+    def sumsq_blocks_total(self, part, off_np, n_tensors):
+        """``sumsq_multi_final``：按张量下标顺序把 ``part`` 的块和累加成总平方和。
+
+        ``off_np`` 必须是**整份**张量表的累计块号（长度 ``n_tensors + 1``）。
+        跑的是与 :meth:`sumsq_multi_total_sharded` 后半段**完全同一个内核**，
+        因此槽位清零的那些张量对总和的影响是精确的 0 ——
+        这就是 ZeRO-2 的分布式 gnorm 能与不分片版本逐位一致的原因。
+        """
+        offs = self.h2d(np.ascontiguousarray(
+            np.asarray(off_np, dtype=np.int32)).view(np.float32))
+        out = self.empty((), dtype=np.float32)
+        self.launch("sumsq_multi_final", (1, 1, 1), (256, 1, 1), [
+            self._ptr(part), self._ptr(offs), (int(n_tensors), ctypes.c_int),
+            self._ptr(out)])
+        self._zero_keep_alive((part, offs))
+        return float(self.read_scalar(out))
+
+    def _zero_keep_alive(self, objs):
+        """把异步内核还在用的临时缓冲挂住（滑动窗口，超出的按 FIFO 放掉）。
+
+        为什么不用``self.xxx_keep = objs`` 那种单槽：本模块里 ZeRO 的两个新入口
+        在一步内会被调用**多次**（分块），单槽会立刻覆盖掉上一块的引用。
+        """
+        keep = getattr(self, "_zero_keep", None)
+        if keep is None:
+            keep = self._zero_keep = []
+        keep.append(objs)
+        if len(keep) > 8:
+            del keep[:-8]
+
     def scale_multi(self, bufs, scalar):
+
         """所有张量原地乘同一标量（**确定性**，无归约）。1 次发射取代 n 次。
 
         注意：grid=(n,1,1) ⇒ 每张量 1 个 block。大张量请用 `scale_multi_sharded`。

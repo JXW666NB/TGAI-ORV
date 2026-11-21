@@ -786,6 +786,9 @@ def _checkpoint_layer(fn, x):
             x.grad = None
 
     res._backward = bw
+    # ★ 同一个约定：梯度检查点的反向会让段内参数各自被写入（嵌套反传），
+    #   数据并行重叠归约看到这个标记就整步退回不重叠路径（见 dp_overlap 模块文档）。
+    bw._is_checkpoint = True
     return res
 
 
