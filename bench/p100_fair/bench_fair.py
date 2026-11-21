@@ -111,6 +111,9 @@ def run_orv(bs, dtype, attn, iters, ckpt=True, ce_chunk=0):
     tgt = T.tensor(rng.integers(0, V, (bs, S)).astype(np.int64))
 
     lowmem = True if attn == "low" else False
+    _dump_peak = [str(os.environ.get("DUMP_AT", "")).strip().lower() == "peak"
+                  and True]
+    _layer_i = [0]
 
     def blk(x, l):
         z = x.reshape(-1, D)
@@ -123,13 +126,25 @@ def run_orv(bs, dtype, attn, iters, ckpt=True, ce_chunk=0):
                                             v.reshape(bs * NH, S, DH),
                                             is_causal=True, lowmem=lowmem)
         y = y.reshape(bs, NH, S, DH).permute(0, 2, 1, 3).reshape(-1, D)
+        # ★ 峰值归因：注意力刚算完时分数矩阵还在池里，**这一刻**才是峰值的构成。
+        #   step 之后再 dump 只能看到"已释放后"的残留（朋友实测指出这一点）。
+        if _dump_peak[0] and _layer_i[0] == 0 and hasattr(rt, "pool_dump_live"):
+            _dump_peak[0] = False
+            print("  [peak dump] 第 1 层注意力输出之后：", flush=True)
+            try:
+                print(rt.pool_dump_live(top=20), flush=True)
+            except Exception as e:              # noqa: BLE001
+                print("    dump 失败：%r" % (e,), flush=True)
         x = x + (y @ l["o"].T).reshape(bs, S, D)
         f = x.reshape(-1, D)
         return x + (Fn.silu(f @ l["w1"].T) @ l["w2"].T).reshape(bs, S, D)
 
     def body():
+        _layer_i[0] = 0
+        _dump_peak[0] = (str(os.environ.get("DUMP_AT", "")).strip().lower() == "peak")
         x = emb(ids.reshape(-1)).reshape(bs, S, D)
-        for l in layers:
+        for _li, l in enumerate(layers):
+            _layer_i[0] = _li
             x = T.checkpoint(blk, x, l) if ckpt else blk(x, l)
         # CE：分块（两边同口径），V 很大时这一项能占 1 GiB+
         if ce_chunk and hasattr(Fn, "linear_cross_entropy"):
@@ -158,6 +173,13 @@ def run_orv(bs, dtype, attn, iters, ckpt=True, ce_chunk=0):
         own.sample()
     rt.sync()                              # 只在循环外 sync 一次
     dt = (time.time() - t0) / iters
+    if str(os.environ.get("DUMP_AT", "")).strip().lower() == "post" \
+            and hasattr(rt, "pool_dump_live"):
+        print("  [post-step dump] step 结束后（注意力中间量已释放）：", flush=True)
+        try:
+            print(rt.pool_dump_live(top=20), flush=True)
+        except Exception:                        # noqa: BLE001
+            pass
     st = rt.pool_stats() if hasattr(rt, "pool_stats") else {}
     return {"impl": "orv", "dtype": dtype, "attn": attn, "bs": bs,
             "s_per_step": dt, "tok_s": bs * S / dt,
@@ -202,15 +224,25 @@ def run_torch(bs, dtype, attn, iters, ckpt=True, ce_chunk=0):
 
     def blk(x, l):
         z = x.reshape(-1, D)
-        q = (z @ l["q"]).reshape(bs, S, NH, DH).transpose(1, 2)
-        kv = z @ l["kv"]
-        k = (kv @ l["ku"]).reshape(bs, S, NH, DH).transpose(1, 2)
-        v = (kv @ l["vu"]).reshape(bs, S, NH, DH).transpose(1, 2)
+        # ★ 2026-11-21 修：这里原先写成 `z @ l["q"]`（少了 .T），形状对不上，
+        #   实测报 "mat1 and mat2 shapes cannot be multiplied (4096x1152 and 256x1152)"。
+        #   权重按 (out, in) 存，必须 `z @ w.T`，与 ORV 侧完全镜像。
+        q = (z @ l["q"].T).reshape(bs, S, NH, DH).transpose(1, 2)
+        kv = z @ l["kv"].T
+        k = (kv @ l["ku"].T).reshape(bs, S, NH, DH).transpose(1, 2)
+        v = (kv @ l["vu"].T).reshape(bs, S, NH, DH).transpose(1, 2)
         with attn_ctx():
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        x = x + (y.transpose(1, 2).reshape(-1, D) @ l["o"]).reshape(bs, S, D)
+        if str(os.environ.get("DUMP_AT", "")).strip().lower() == "peak" \
+                and getattr(blk, "_dumped", False) is False:
+            blk._dumped = True
+            print("  [peak dump] torch 第 1 层注意力之后: allocated %.2f GiB, "
+                  "reserved %.2f GiB"
+                  % (torch.cuda.memory_allocated() / 2 ** 30,
+                     torch.cuda.memory_reserved() / 2 ** 30), flush=True)
+        x = x + (y.transpose(1, 2).reshape(-1, D) @ l["o"].T).reshape(bs, S, D)
         f = x.reshape(-1, D)
-        return x + (F.silu(f @ l["w1"]) @ l["w2"]).reshape(bs, S, D)
+        return x + (F.silu(f @ l["w1"].T) @ l["w2"].T).reshape(bs, S, D)
 
     def loss_of(x):
         flat = x.reshape(-1, D)
