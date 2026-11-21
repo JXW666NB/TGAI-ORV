@@ -2,7 +2,7 @@
 [分类] distributed
 [中文名] 一行接管整机
 [英文名] One call, whole host
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 不管你的训练程序怎么写，加上 `T.DUO()`，引擎自己探测拓扑、自己选方案、自己起 worker。

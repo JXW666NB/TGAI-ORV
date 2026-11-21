@@ -2,7 +2,7 @@
 [分类] inference
 [中文名] 命令行单次生成
 [英文名] CLI single generation
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 问一句、拿一个答案、退出。适合脚本里调用或快速冒烟。

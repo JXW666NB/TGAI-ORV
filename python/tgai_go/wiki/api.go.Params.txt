@@ -2,7 +2,7 @@
 [分类] inference
 [中文名] 生成参数
 [英文名] Generation parameters
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 生成参数的容器，**是 `dict` 的子类**。

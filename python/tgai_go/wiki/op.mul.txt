@@ -4,7 +4,7 @@
 [分类] compute
 [中文名] 逐元素相乘
 [英文名] Element-wise multiply
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 逐元素相乘。写 `a * b` —— Tensor **没有** `.mul()` 方法，顶层也没有 `T.mul`，

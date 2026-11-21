@@ -2,7 +2,7 @@
 [分类] compat
 [中文名] 从 numpy 建张量
 [英文名] Tensor from numpy
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 `T.from_numpy(ndarray)` —— 把一个 `numpy.ndarray` 变成 ORV 的 `Tensor`。只有一个参数：

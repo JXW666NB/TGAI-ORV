@@ -2,7 +2,7 @@
 [分类] distributed
 [中文名] 数据并行 world 大小
 [英文名] Data-parallel world size
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 `python -m tgai_go.train.v3_pretrain --dp N` 指定数据并行的 world 大小。

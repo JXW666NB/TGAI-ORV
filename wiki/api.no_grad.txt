@@ -2,7 +2,7 @@
 [分类] compute
 [中文名] 关闭梯度记录
 [英文名] Disable gradient recording
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 `T.no_grad()` —— 上下文管理器，块内运算**不记录反向闭包**（不建图）。签名是空的 `()`：

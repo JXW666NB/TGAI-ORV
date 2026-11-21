@@ -2,7 +2,7 @@
 [分类] memory
 [中文名] 梯度检查点
 [英文名] Gradient checkpointing
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 `T.checkpoint(fn, *inputs)` —— 用「重算」换显存：前向**不保留**中间激活，反向时把 `fn` 重跑一遍

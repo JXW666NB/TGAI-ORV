@@ -2,7 +2,7 @@
 [分类] memory
 [中文名] fp32 → bf16 收窄
 [英文名] fp32 -> bf16 narrowing (round-to-nearest-even)
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 把一个 fp32 缓冲**逐元素**收窄成 bf16（以 uint16 位模式存放），舍入方式是 round-to-nearest-even。

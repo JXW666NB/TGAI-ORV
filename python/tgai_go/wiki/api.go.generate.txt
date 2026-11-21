@@ -2,7 +2,7 @@
 [分类] inference
 [中文名] 底层自回归生成
 [英文名] Low-level autoregressive decode
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 底层生成循环：你给 token id，它返回生成结果。日常用 `Chat` 就行，这里是为做自定义采样/评测/批处理的人准备的。

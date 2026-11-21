@@ -2,7 +2,7 @@
 [分类] getting-started
 [中文名] 库内自省帮助 / 离线 Wiki
 [英文名] In-engine help & offline wiki
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 `T.help()` 是本库的**自省入口**，也是给 AI 的接口 —— 不确定算子、配置项或后端特性时先查它，别猜。

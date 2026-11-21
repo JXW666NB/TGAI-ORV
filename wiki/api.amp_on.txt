@@ -2,7 +2,7 @@
 [分类] compute
 [中文名] 打开 AMP（低精度 GEMM）
 [英文名] Enable AMP (low-precision GEMM)
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 `T.amp_on(dtype="auto", weight_cache=True)` —— 打开 ORV 的 AMP：让矩阵乘（GEMM）走 fp16 / bf16 / tf32

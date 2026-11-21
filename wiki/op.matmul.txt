@@ -2,7 +2,7 @@
 [分类] tensor
 [中文名] 矩阵乘法
 [英文名] Matrix multiply
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 矩阵乘法。Tensor 上**没有** `.matmul()` 方法，用 `@` 运算符（`a @ b`），或调用顶层函数 `T.matmul(a, b)`。

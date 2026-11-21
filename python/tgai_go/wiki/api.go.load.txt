@@ -2,7 +2,7 @@
 [分类] inference
 [中文名] 加载 .TG 模型
 [英文名] Load a .TG model
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 一行把训练好的 `.TG` 模型加载成可推理的 `Model` 对象。

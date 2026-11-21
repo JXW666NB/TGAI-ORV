@@ -2,7 +2,7 @@
 [分类] tensor
 [中文名] 张量
 [英文名] Tensor
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 `T.Tensor(data, requires_grad=False, _parents=(), _backward=None, device=None, dtype=None)`

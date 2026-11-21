@@ -2,7 +2,7 @@
 [分类] tensor
 [中文名] 求和（张量方法）
 [英文名] Sum reduction (Tensor method)
-[作者] TGAI
+[作者] JXW
 
 === 中文 ===
 求和。**它是 Tensor 的方法**：写 `x.sum()`，不是 `T.sum(x)` —— 顶层没有 `T.sum` / `T.mul`，
