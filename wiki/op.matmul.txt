@@ -1,0 +1,34 @@
+[ID] op:matmul
+[分类] tensor
+[中文名] 矩阵乘法
+[英文名] Matrix multiply
+[作者] TGAI
+
+=== 中文 ===
+矩阵乘法。Tensor 上**没有** `.matmul()` 方法，用 `@` 运算符（`a @ b`），或调用顶层函数 `T.matmul(a, b)`。
+两者是同一个运算。
+
+⚠️ 最大的坑：`*` 是**逐元素**乘法，不是矩阵乘。`a * b` 与 `a @ b` 都能跑，
+写错不会报错，只会静默算出不同的形状或数值 —— 这是新人第一个踩的坑。
+
+广播：最后两维做矩阵乘，前导维按 PyTorch 右对齐规则广播（`matmul_general`）；没有前导维时就是普通 GEMM。
+
+=== English ===
+Matrix multiplication. There is **no** `.matmul()` method on Tensor -- use the `@`
+operator (`a @ b`), or the top-level `T.matmul(a, b)`. Both are the same operation.
+
+⚠️ The trap: `*` is ELEMENT-WISE, not a matrix product. Both `a * b` and `a @ b` run
+fine; picking the wrong one does not raise, it silently computes a different shape or
+different numbers.
+
+Broadcasting: the last two dims are matmul'd and leading dims follow PyTorch's
+right-aligned rule (`matmul_general`); with no leading dims it is a plain GEMM.
+
+=== 示例 ===
+y = a @ b                # 矩阵乘 / matrix product
+y = T.matmul(a, b)       # 同一个运算的顶层函数形式
+z = a * b                # 逐元素乘 / element-wise，别和上面混
+
+=== 见也 ===
+op:mul
+api:matmul

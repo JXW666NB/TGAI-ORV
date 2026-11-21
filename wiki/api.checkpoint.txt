@@ -1,0 +1,60 @@
+[ID] api:checkpoint
+[分类] memory
+[中文名] 梯度检查点（用重算换显存）
+[英文名] Gradient checkpointing (recompute to save memory)
+[作者] TGAI
+
+=== 中文 ===
+`T.checkpoint(fn, *inputs)`：前向**不保留**中间激活，反向时把 `fn` 重跑一次算梯度。
+数值与直接调用 `fn(*inputs)` **完全一致** —— 这是拿时间换显存，不是近似。
+
+把 Transformer 的一层或一段包起来即可：
+
+```python
+def block(h):
+    return layer(h)
+h = T.checkpoint(block, h)
+```
+
+限制（都是**明确报错**，不静默）：
+
+- `fn` 必须返回**单个 Tensor**（多输出请自己包成 lambda 再拆，或分别调用）；
+- `fn` 必须**可重复执行且确定**（插件里带随机性的算子不能用）；
+- 只有 `requires_grad=True` 的 Tensor 输入会被追踪，纯 numpy 输入原样透传；
+- `fn` 不能直接返回某个输入张量（ptr 相同会报错，否则重算时梯度会加错位置）。
+
+实测（V100）：20 层 / 606M / B=2 / S=2048 由 31.29 GiB 降到 7.56 GiB，
+见 `docs/MEMORY_BACKWARD_PEAK_2026-11-12.md`。
+
+=== English ===
+`T.checkpoint(fn, *inputs)` drops the intermediate activations in the forward pass and
+re-runs `fn` during backward to get gradients. Numerically it is **exactly**
+`fn(*inputs)` -- this trades time for memory, it is not an approximation.
+
+Wrap one Transformer layer or a block:
+
+```python
+def block(h):
+    return layer(h)
+h = T.checkpoint(block, h)
+```
+
+Limits (all are **explicit errors**, never silent):
+
+- `fn` must return a **single Tensor** (multi-output: wrap it in a lambda that returns
+  one Tensor, or call checkpoint per output);
+- `fn` must be **repeatable and deterministic** (plugin ops with randomness cannot be used);
+- only Tensor inputs with `requires_grad=True` are tracked; plain numpy inputs pass through;
+- `fn` must not return one of its inputs directly (same ptr -> explicit error, otherwise
+  the recomputed gradient would be accumulated into the wrong place).
+
+Measured on a V100: 20 layers / 606M / B=2 / S=2048 went from 31.29 GiB to 7.56 GiB
+(`docs/MEMORY_BACKWARD_PEAK_2026-11-12.md`).
+
+=== 示例 ===
+h = T.checkpoint(block, h)             # 一层/一段包起来 / wrap a layer or block
+loss = model(x).sum()
+
+=== 见也 ===
+api:fit
+api:help

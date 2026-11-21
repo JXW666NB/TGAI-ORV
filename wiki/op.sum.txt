@@ -1,0 +1,39 @@
+[ID] op:sum
+[分类] tensor
+[中文名] 求和（张量方法）
+[英文名] Sum reduction (Tensor method)
+[作者] TGAI
+
+=== 中文 ===
+求和。**它是 Tensor 的方法**：写 `x.sum()`，不是 `T.sum(x)` —— 顶层没有 `T.sum` / `T.mul`，
+凭 PyTorch 记忆写会得到 `AttributeError: module 'tgai_go.train' has no attribute 'sum'`
+（本仓库开发者真的这样白烧过一轮 GPU）。
+
+- `x.sum()` 全元素求和，返回标量张量；
+- `x.sum(axis=0)` 沿一维求和（签名只认 `axis=`，没有 `dim=` 别名）；
+- 不想丢维度：`keepdims=True`。
+
+⚠️ 梯度平方和 / 范数的常见写法：`(g * g).sum()`（先逐元素乘再求和），不是 `T.sum(g*g)`。
+只要求 p=2 的范数可以用 `g.norm()`（内部就是 `sqrt(sum(x^2))`）。
+
+=== English ===
+Sum reduction. **It is a Tensor method**: write `x.sum()`, NOT `T.sum(x)` -- there is no
+top-level `T.sum` / `T.mul`, so PyTorch muscle memory gives you
+`AttributeError: module 'tgai_go.train' has no attribute 'sum'`.
+
+- `x.sum()` sums everything, returning a scalar tensor;
+- `x.sum(axis=0)` reduces along one axis (the signature accepts `axis=` only, no `dim=` alias);
+- `keepdims=True` keeps the reduced dimension.
+
+⚠️ The usual "sum of squared gradients": `(g * g).sum()`, not `T.sum(g*g)`. For a p=2
+norm use `g.norm()` (which is exactly `sqrt(sum(x^2))`).
+
+=== 示例 ===
+loss = (g * g).sum()          # 梯度平方和
+n = x.sum()                   # 全部元素
+col = x.sum(axis=0)           # 沿第 0 维
+keep = x.sum(axis=0, keepdims=True)
+
+=== 见也 ===
+op:mul
+op:norm
