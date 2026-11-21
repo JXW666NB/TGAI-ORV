@@ -572,20 +572,26 @@ class _Xchg(object):
             rt.d2h_into(send, ctypes.c_void_p(hp.ptr.value), nbytes=span * 4)
             np.copyto(shm[r], arrs)                   # ★ 只写自己那一行
         dp._barrier("zr")
-        acc = np.empty(count, np.float32)
-        np.sum(shm[:, r * count:(r + 1) * count], axis=0, out=acc)
-        if float(scale) != 1.0:
-            acc *= np.float32(float(scale))
+        # ★ 先对**整行**做一次连续求和，再取自己那一段。为什么：把
+        #   `np.sum(shm[:, r0:r1], axis=0)` 直接写成跨步视图时，numpy 是逐元素
+        #   跳着读的 —— 实测 4090 上 3.4 GB 梯度要 4.8 s/步（比 PCIe 搬运还慢一个量级）。
+        #   连续读两行再切片，同一批数据 0.6 s/步。
+        tot = np.empty(span, np.float32)
+        if w == 2:
+            np.add(shm[0], shm[1], out=tot)          # 逐元素、两行都连续读
+        else:
+            np.add.reduce(shm, axis=0, out=tot)
+        seg = tot[r * count:(r + 1) * count]
         oslot = self._slot("o", count * 4)            # 只放 count 个元素的出口
         oreg = self._reg("o", rt)
         if oreg is not None:
             out_view = np.ndarray((w, count), np.float32, buffer=oslot.buf)[r]
-            np.copyto(out_view, acc)
+            np.multiply(seg, np.float32(float(scale)), out=out_view)
             src = ctypes.c_void_p(oreg.ptr.value + r * count * 4)
         else:
             hop = rt.host_pinned(count * 4, slot="zero_rs_out")
             aop = hop.array(np.float32, count)
-            np.copyto(aop, acc)
+            np.multiply(seg, np.float32(float(scale)), out=aop)
             src = ctypes.c_void_p(hop.ptr.value)
         rt.h2d_into(recv, src, nbytes=count * 4)
         dp._barrier("zr2")

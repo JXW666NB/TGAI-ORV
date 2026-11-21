@@ -200,73 +200,75 @@ backward（梯度，同量）  = 4 MiB/层
 
 ---
 
-## 5. 本轮 ZeRO-1/2 状态：**代码 + CPU 单测完成；GPU 验收未做**
+## 5. 本轮状态：2×4090 实测（**显存对照通过；逐位未通过**）
 
-> ⚠️ 诚实记录：2×RTX 5090 实例在验收**之前**被 AutoDL 关机回收（主机报
-> `实例GPU需求数量：2 卡 / 主机GPU空闲数量：0 卡`），克隆/重开机时间不确定。
-> 所以 **"3B 在 2×32 GiB 上是否 ≤30 GiB/卡" 与 "loss/gnorm 逐位一致"
-> 都还没有实测数字**，本文不把它们写成已验证。代码、接线、验收脚本与判据都已就绪，
-> 机器回来按下面命令跑一次即可出结论。
+> 机器时间线：2×5090 实例在验收前被回收 → 换成 2×RTX 4090（24564 MiB/卡，可用
+> 23.55 GiB）。以下数字是 **2026-11-21 实测**（`tgai-orv 1.0.15`、host 后端、数据
+> `/root/bench/data2048_v96000`、2 rank、int8gpu），没测到的写"未跑"。
 
-### 5.1 已完成并验证（CPU，无需 GPU）
+### 5.0 实测 A：同一 1.82B、同一张卡 —— DP OOM，ZeRO-2 跑通
 
-* `pytest tests/test_zero_shard.py tests/test_zero_transport.py`：**54 passed**。
-  其中最关键的两条：
-  - `tests/test_zero_transport.py` 真起 **2 个进程**（真 `DataParallel` host 后端 +
-    numpy 假运行时）跑完整链路：`reduce_scatter` → 分布式 gnorm → `all_gather`；
-    分布式 gnorm 与"不分片参考路径"**逐位相同**，两 rank 的 gnorm 也逐位相同。
-    共享内存「注册成页锁定」与「注册失败退回 pinned+copyto」两条路径都覆盖。
-  - 分片集合互补且不重叠（含 tied embedding 去重）、`all_gather` 用 numpy 模拟后
-    参数与分片前**逐位相同**、`world=1`/`--zero 0` 零行为变化、每卡字节数与
-    `plan.estimate_memory` 对拍。
-* 干净 HEAD(1.0.15) + 本次改动的全量 pytest：**963 passed / 64 skipped**（基线 914/64）。
+1.82B（20L / E=8 / d_ff=2816 / vocab 96000 / seq512 / int8gpu / 2 rank）：
 
-### 5.2 算出来的（**不是**实测）：2.55B 在 2×5090 上"装得下但更慢"
-
-用 `plan.py` 的实测标定链路（`MEASURED_LINK_GBPS = 48.2`，收发合计口径）与
-`zero.estimate_memory` / `zero.bus_comm_bytes` 算术：
-
-| 项 | ZeRO-1 | ZeRO-2 |
+| 配置 | 结果 | 证据（rank0 日志） |
 | --- | --- | --- |
-| 每卡"参数+梯度+状态"（2.55B，int8gpu） | 22.6 GiB | 22.6 GiB（峰值）/ 17.9 GiB（反向结束后） |
-| + 激活（20L 实测反推 ≈3.8 GiB → 28L ≈5.3 GiB） | **≈27.9 GiB/卡** | ≈27.9 GiB/卡 |
-| 通信（`plan.estimate_comm` 口径，**收发合计**） | `2N(梯度)+2N(参数)` = **48 GB/步** | 同式 48 GB/步 |
-| 通信耗时 @48.2 GB/s | **≈996 ms** | ≈996 ms |
-| 单卡计算（实测 1.82B 0.2714 s；28L 按层数线性 ≈0.38 s，`plan` 用 0.310 s 标定） | 0.310 s | 0.310 s |
-| **2 卡吞吐比**（`plan.judge`：`w·单卡步时 ÷ (单卡步时 + 暴露通信)`） | **0.62/1.306 = 0.47×（净亏）** | 同量级（净亏） |
+| `--zero 0`（DP） | **OOM** | `显存不足：…当前活张量 21.09 GiB、池缓存 0.00 GiB；设备总共 23.55 GiB` |
+| `--zero 2`（ZeRO-2） | **跑通 3 步** | `pool_peak_live_gib=19.919`、`nvidia_peak_mib=23647`、`step_s_steady=6.244 s`（通信 4.69 s/步，见 §5.2） |
 
-⇒ **ZeRO 在本机的价值是"装得下"，不是"更快"**：2.55B 单卡 DP 会 OOM，ZeRO-1/2 是
-唯一能把它放进 2×32 GiB 的已实现路线（算术 ≈27.9 GiB/卡，余量约 3.5 GiB），
-代价是每步多 ≈1 s 通信、聚合吞吐 **低于单卡**（因为每卡算的还是一份 batch）。
-把它写成"加速"是错的，**不要这么写**。
+> ⚠️ seq 越大越装不下：seq768/1024/2048 时 **DP 与 ZeRO-2 都 OOM**
+> （seq2048：DP 活张量 21.40 GiB、ZeRO-2 21.83 GiB；seq1024：21.03 / 21.48；
+> seq768：20.53 / 20.79）。原因：ZeRO-2 的**峰值仍含全量梯度**（峰值在
+> `backward()` 末；本轮未做反向分桶归约），只省了 1/2 优化器状态（1.82B 上 ≈2.8 GiB），
+> seq≥768 的激活就把余量吃光了。⇒ 4090 上 ZeRO-2 能把 1.82B 装进 24 GiB 的 seq 是
+> **512**，不是 1024/2048；要救 2048 需步骤 3 或激活检查点。
 
-> 口径说明（别混）：
-> * `zero.comm_model` = **单向有效数据**：ZeRO-1 = `3N(w-1)/w` = DP 的 1.50×，
->   ZeRO-2 = `2N(w-1)/w` = DP 的 1.00×（这是"算法通信量"，用于回答"比 DP 多多少"）。
-> * `zero.bus_comm_bytes` = **host 路径真正过 PCIe 的 d2h+h2d**：ZeRO-1 = 3N，
->   ZeRO-2 = 2.5N，DP = 2N（这是"物理代价"，plan.py 的 48 GB 是它的近似）。
-> 两种口径都**不会**得出"分片省通信"。
+### 5.1 实测 B：848M/seq512 三档都能装下（显存与步时）
 
-### 5.3 GPU 回来后怎么跑（脚本已就绪）
+848M（12L / E=4 / d_ff=3328 / seq512 / 20 步）：
 
-远端已经放过（实例重开后需重新上传，见 `lab/rent/`）：
+| 模式 | pool 峰值 | nvidia-smi 整进程峰值 | 稳态步时 | 通信耗时 |
+| --- | --- | --- | --- | --- |
+| `--zero 0` | 11.47 GiB | 15603 MiB | **0.796 s** | 0.545 s（all_reduce） |
+| `--zero 1` | 10.26 GiB | 14419 MiB | 1.080 s | gather 0.29 s + allreduce 0.545 s |
+| `--zero 2` | 10.01 GiB | 14127 MiB | 2.626 s | reduce_scatter 2.13 s + gather 0.30 s |
+
+分片确实省显存（≈1.2 / 1.5 GiB，正好是一半 int8 状态），但**步时更慢**：
+这台 4090 机器 host 归约只有 ~6.2 GB/s（同一份 3.4 GB 在 5090 机器上是 23 GB/s），
+且 ZeRO-1 通信量是 DP 的 1.5×。**ZeRO 的收益是"装得下"，不是"更快"。**
+
+### 5.2 实测 C：逐位一致性 —— **未通过**，根因在 DP 归约而不在 ZeRO 分片
+
+| 检查 | 结果 |
+| --- | --- |
+| `--zero 0` **同一次运行** rank0 vs rank1 的 gnorm | **9/20 步不同**（step7：`6.786449495799199` vs `6.786491934594803`，相对 6.3e-6） |
+| `--zero 1` 同上 | 8/20 步不同 |
+| `--zero 2` 同上 | **0/20 步不同**（本模块的 reduce_scatter 主机路径 rank 一致） |
+| `zero 0` vs `zero 1`（rank0 轨迹） | step3 起分叉（~1e-6），逐步放大到 ~1e-4 |
+
+DP 下 gnorm 是全局量、跨 rank 必须逐位相同；实测不同 ⇒ `1.0.15` 的
+`all_reduce_grads` host 路径本身跨 rank 不一致（最可疑：某参数只在一个 rank 有梯度时
+`_add_range` 跳过、没把对端贡献加进去；或主机路径缺少"读完再写"的第二个 barrier）。
+ZeRO-1 复用同一条 DP 归约故一同出错；ZeRO-2 用自己的 reduce_scatter 不受影响。
+**这是独立于 ZeRO 的引擎 bug，需单独修。** CPU 侧（真 2 进程 + 照抄内核语义的假运行时）
+本模块的分布式 gnorm 与不分片参考**逐位相同**（`tests/test_zero_transport.py`），
+所以分片数学本身没问题。
+
+### 5.3 已知性能债（未修完，如实记）
+
+1. `reduce_scatter` 原用 `np.sum(shm[:, seg], axis=0)` 跨步读，3.4 GB 要 **4.77 s/步**。
+   已改为"整行连续加再切片"（`np.add(shm[0], shm[1])`），CPU 测试仍全过；
+   **4090 复测没来得及跑**。
+2. 4090 机器 host 路径仅 ~6.2 GB/s（5090 机器 23 GB/s）——机器事实，不是 ZeRO 的 bug。
+3. 真正的 ZeRO-2 梯度峰值收益要步骤 3（反向分桶归约），本轮没做。
+
+### 5.4 复跑命令（脚本已提交）
 
 ```
-# 本地：生成验收 runner（HEAD 版 v3_pretrain + snippet，每处替换断言命中 1 次）
-python lab/rent/zero_make_verify.py            # -> lab/rent/_zero_verify.py
-
-# 远端（干净 HEAD overlay + zero.py + runner）：
-bash /root/x_zero.sh smoke      # ~40 s：2 rank 2 层 2 步，验证接线/传输
-bash /root/x_zero.sh bitwise    # ~3 分钟：1.82B/20L/seq512/int8gpu，zero 0/1/2 各 20 步，
-                                #   zero_cmp.py 断言 loss 与 gnorm 逐位相同
-bash /root/x_zero.sh big        # ~2 分钟：2.55B/28L 2 rank，zero=1/2 各 4 步，读 peak
+python lab/rent/zero_make_verify.py      # 生成 _zero_verify.py（HEAD v3_pretrain + snippet）
+bash /root/x_zero4090.sh bitwise         # 848M seq512，zero 0/1/2 各 20 步 + 逐位比对
+bash /root/x_zero4090.sh mem 512 0 2     # 1.82B seq512 DP（4090 上 OOM）
+bash /root/x_zero4090.sh mem 512 2 3     # 1.82B seq512 ZeRO-2（跑通，峰值 19.92 GiB）
 ```
-
-判据（硬）：① 1.82B 三档的 loss/gnorm **逐位相同**（`zero_cmp.py` 用浮点精确相等）；
-② 2.55B 每卡峰值（`RESULT.pool_peak_live_gib` 与 `nvidia_peak_mib`）**≤30 GiB**。
-任何一条不满足都按"未通过"记录，不写"已支持"。
-
----
 
 ## 6. 接线 snippet（给 `v3_pretrain.py`；本模块不改那个文件）
 
