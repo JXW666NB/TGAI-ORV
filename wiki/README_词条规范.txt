@@ -110,17 +110,26 @@ op:add
 
 ## 7. 校验自己的词条
 
+**现在就能用**（独立脚本，不需要引擎加载器）：
+```bash
+python scripts/wiki_check.py                 # 校验仓库里的 wiki/
+python scripts/wiki_check.py --dir 我的目录    # 校验你自己的目录
+python scripts/wiki_check.py --strict        # 警告也算失败（提交前建议开）
+```
+
+它会检查：编码（UTF-8/BOM/GBK 自动识别）、`[ID]` 是否存在且格式正确、
+头部字段与区块名是否合法、字段是否重复、`[分类]` 是否在分类表里、
+中英是否缺边、以及 `=== 见也 ===` 里的引用**是否已有词条**（还没写的算"待写"、不算错）。
+
+加载器落地后（1.0.17+）还会有引擎内版本：
 ```bash
 python -c "import tgai_go.train as T; T.help.check()"
 ```
-它会告诉你：哪条词条解析失败、哪个 ID 不存在（并给出最接近的候选）、
-中英是否缺边、有没有死链（`=== 见也 ===` 里引用了不存在的 ID）。
 
-写之前可以先让引擎给你生成骨架：
+写之前可以先让引擎给你生成骨架（需要 1.0.17+）：
 ```bash
 python -c "import tgai_go.train as T; T.help.contrib('op:mul')"
 ```
-它会按真实签名把 `[ID]`、`[分类]`、区块框架都填好，你只补文字。
 
 ## 8. 插件作者：请自带词条
 
