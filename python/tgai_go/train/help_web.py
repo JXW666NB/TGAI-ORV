@@ -698,9 +698,11 @@ _JS = (r"""
   function renderStatus(list) {
     var box = $("status");
     var q = state.q.trim();
+    // 关键：kind 过滤生效时显示**过滤后的条数**，不要显示全量（否则看起来像没生效）。
+    var shown = (q || state.kind) ? list.length : ITEMS.length;
     box.textContent = (q
       ? fmt("status_match", { n: list.length, total: ITEMS.length })
-      : fmt("status_total", { n: ITEMS.length })) +
+      : fmt("status_total", { n: shown })) +
       (state.kind ? fmt("status_kind", { k: state.kind }) : "");
   }
 
