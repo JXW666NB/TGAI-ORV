@@ -1094,11 +1094,15 @@ def build_arg_parser():
                         "（常 1e-8 量级，fp16 最小正规数 6.1e-5）下溢成 0，"
                         "第 2 步 loss 就从 11.7 炸到 135；bf16 指数范围与 fp32 相同不会下溢，"
                         "V100 上可用（存储 bf16、计算 fp32）")
-    g.add_argument("--amp", default="off", choices=["off", "gemm", "mlp", "both"],
+    g.add_argument("--amp", default="off", choices=["off", "gemm", "mlp", "both", "tf32"],
                    help="混合精度。gemm=仅 GEMM 输入 fp16（参数/激活/梯度仍 fp32）；"
-                        "mlp=MLP 内激活存 fp16（省带宽，带梯度缩放）；both=两者都开。"
+                        "mlp=MLP 内激活存 fp16（省带宽，带梯度缩放）；both=两者都开；"
+                        "tf32=只把 cuBLAS 切到 TF32 math mode（tensor core，**0 次 cast "
+                        "发射**，Ampere+ 才有）。"
                         "★ 实测：V100 上 fp16 张量核峰值 125 TFLOPS vs fp32 15.7，"
-                        "但小配置下 cast 开销可能盖过收益，必须在目标配置上实测。")
+                        "但小配置下 cast 开销可能盖过收益，必须在目标配置上实测。"
+                        "★ 2026-11-21（5090/seq512/12L）：`gemm` 要付 985 次 cast 发射"
+                        "（11.6 ms/步）⇒ 比 off 慢 6%；`tf32` 没有 cast ⇒ 比 off 快 2~3%。")
     g.add_argument("--amp-no-cache", dest="amp_no_cache", action="store_true",
                    help="AMP 时不启用 fp16 权重影子缓存。1.5B 模型影子要 3 GB，"
                         "开 --amp gemm 可能 OOM；关掉则每次重新 cast（慢一点但省 3 GB）。")
@@ -1350,7 +1354,24 @@ def main(argv=None):
     # gemm: 只把 GEMM 输入 cast 成 fp16（参数/激活/梯度仍 fp32，不需要 GradScaler）
     # mlp : MLP 块内激活存 fp16（省带宽，自带梯度缩放）
     # both: 两者都开
-    _AMP = {"gemm": a.amp in ("gemm", "both"), "mlp": a.amp in ("mlp", "both")}
+    # tf32: 只切 cuBLAS 的 TF32 math mode —— tensor core，但**没有任何 cast 发射**。
+    #       2026-11-21 实测（5090 / seq512 / 12L / 848M / int8gpu）：
+    #       off 0.1389 / gemm 0.1472（+6%，985 次 cast 发射 = 11.6 ms/步）/
+    #       tf32 0.1359（−2.2%，峰值显存不变 11.22 GiB，20 步 loss 与 fp16 同轨迹）。
+    #       为什么 TF32 能赢：这台机器是**主机受限**，一次内核发射值 11.7 µs，
+    #       fp16 的 cast 账单比它买到的 GPU 时间还贵；TF32 不付这笔账。
+    _AMP = {"gemm": a.amp in ("gemm", "both"), "mlp": a.amp in ("mlp", "both"),
+            "tf32": a.amp == "tf32"}
+    if _AMP["tf32"]:
+        try:
+            T.amp_on(dtype="tf32")
+            print("[amp] tf32 math mode on（0 次 cast 发射）；state=%r"
+                  % (T.amp_state(),), flush=True)
+        except Exception as _e:
+            raise SystemExit(
+                "[amp] --amp tf32 在本机不可用：%r\n"
+                "原因：TF32 需要 Ampere(sm_80)+；V100/P100 没有。"
+                "修法：改用 --amp fp16 路径（--amp gemm）或 --amp off" % (_e,))
     if _AMP["gemm"]:
         # ★ 2026-11-20：这里**刻意**写死 fp16，并显式告诉用户 TG_BF16=1 被忽略了。
         #   为什么不是 bug 修一修就能开：`amp_api._set()` 对 fp16 分支会主动把

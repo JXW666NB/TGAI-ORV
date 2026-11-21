@@ -57,10 +57,10 @@ def _auto_compute_dtype():
 
 
 def _set(on, dtype="auto", weight_cache=True):
-    """底层开关：按 dtype 设置 fp16 或 bf16 的 GEMM 路径。"""
+    """底层开关：按 dtype 设置 fp16 / bf16 / tf32 的 GEMM 路径。"""
     rt = _rt()
     if not on:
-        # 关 AMP 时两条路径都关。否则在 bf16 机器上 amp_off() 只关掉 fp16，
+        # 关 AMP 时三条路径都关。否则在 bf16 机器上 amp_off() 只关掉 fp16，
         # bf16 仍在开（默认 dtype 从 'fp16' 改成 'auto' 后这会更常见）。
         f16 = rt._fp16_state() if hasattr(rt, "_fp16_state") else {"on": False}
         f16["on"] = False
@@ -68,11 +68,32 @@ def _set(on, dtype="auto", weight_cache=True):
             rt._bf16_state()["on"] = False
         if hasattr(rt, "f16_cache_enable"):
             rt.f16_cache_enable(False)
+        if hasattr(rt, "tf32_enable"):
+            rt.tf32_enable(False)
         return f16
     kind = str(dtype).lower()
     if kind in ("", "auto", "none", "bfloat16"):
         # 'auto' 或 bf16 别名都按策略解析；bf16 在没有 bf16 算力的卡上会被降成 fp16
         kind = _auto_compute_dtype() if kind in ("", "auto", "none") else "bf16"
+    if kind == "tf32":
+        # 只用 cuBLAS 的 TF32 math mode：**不做任何 cast**（0 次发射、0 字节转换），
+        # 但拿到的仍是 tensor core。为什么需要这条：`gemm` 模式在主机受限的配置里
+        # 被 985 次 cast 发射（11.6 ms/步）拖成负优化，TF32 没有这个成本。
+        # 实测 5090/seq512：off 0.1389 → tf32 0.1359（−2.2%），峰值显存不变。
+        f16 = rt._fp16_state() if hasattr(rt, "_fp16_state") else {"on": False}
+        f16["on"] = False
+        if hasattr(rt, "_bf16_state"):
+            rt._bf16_state()["on"] = False
+        if hasattr(rt, "f16_cache_enable"):
+            rt.f16_cache_enable(False)
+        if not hasattr(rt, "tf32_enable"):
+            raise RuntimeError("该后端没有 TF32 math mode（只有 CUDA 后端有）" +
+                               "。修法：用 dtype='fp16'")
+        if not rt.tf32_enable(True):
+            raise RuntimeError(
+                "本机 cuBLAS 不支持 TF32 math mode（sm_70 及更老的卡没有 TF32）" +
+                "。修法：改用 dtype='fp16'，或 --amp off")
+        return {"on": True, "tf32": True}
     if kind == "fp32":
         # 策略说没有可用的低精度算力：不启用 AMP，保持全 fp32（不是错误）
         f16 = rt._fp16_state() if hasattr(rt, "_fp16_state") else {"on": False}
@@ -81,6 +102,8 @@ def _set(on, dtype="auto", weight_cache=True):
             rt._bf16_state()["on"] = False
         if hasattr(rt, "f16_cache_enable"):
             rt.f16_cache_enable(False)
+        if hasattr(rt, "tf32_enable"):
+            rt.tf32_enable(False)
         return f16
     if kind in ("bf16", "bfloat16"):
         if not hasattr(rt, "_bf16_state"):
@@ -90,6 +113,8 @@ def _set(on, dtype="auto", weight_cache=True):
         # 切换精度时必须把另一条路径关掉，否则 fp16/bf16 会同时开着
         if hasattr(rt, "_fp16_state"):
             rt._fp16_state()["on"] = False
+        if hasattr(rt, "tf32_enable"):
+            rt.tf32_enable(False)
         return st
     if hasattr(rt, "_fp16_state") is False:
         raise RuntimeError("该后端没有 fp16 GEMM 支持（只有 CUDA 后端有）" +
@@ -128,9 +153,11 @@ def amp_state():
         return {"on": False, "available": False, "reason": str(exc)[:120], "cache": {}}
     f16 = rt._fp16_state() if hasattr(rt, "_fp16_state") else {"on": False}
     b16 = rt._bf16_state() if hasattr(rt, "_bf16_state") else {"on": False}
+    t32 = rt.tf32_state() if hasattr(rt, "tf32_state") else {"on": False}
     cache = rt.f16_cache_stats() if hasattr(rt, "f16_cache_stats") else {}
-    return {"on": bool(f16.get("on")) or bool(b16.get("on")),
+    return {"on": bool(f16.get("on")) or bool(b16.get("on")) or bool(t32.get("on")),
             "fp16": bool(f16.get("on")), "bf16": bool(b16.get("on")),
+            "tf32": bool(t32.get("on")),
             "available": True,
             "c32": bool(f16.get("c32", False)), "cache": cache}
 
@@ -154,10 +181,11 @@ class amp(object):
 
     def __init__(self, enabled=True, dtype="fp16", weight_cache=True):
         kind = str(dtype).lower()
-        if kind not in ("fp16", "float16", "bf16", "bfloat16"):
-            raise NotImplementedError("amp 只支持 fp16 / bf16（收到 %r）" % (dtype,) +
-                                      "。修法：dtype='fp16' 或 dtype='bf16'")
-        self.dtype = "bf16" if kind in ("bf16", "bfloat16") else "fp16"
+        if kind not in ("fp16", "float16", "bf16", "bfloat16", "tf32"):
+            raise NotImplementedError("amp 只支持 fp16 / bf16 / tf32（收到 %r）" % (dtype,) +
+                                      "。修法：dtype='fp16' / 'bf16' / 'tf32'")
+        self.dtype = ("bf16" if kind in ("bf16", "bfloat16")
+                      else ("tf32" if kind == "tf32" else "fp16"))
         self.enabled = bool(enabled)
         self.weight_cache = bool(weight_cache)
         self._prev = None
@@ -168,9 +196,17 @@ class amp(object):
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        # 恢复"进入前的状态"：原来开着的 dtype 重新打开，原来关着的就关掉
-        _set(bool(self._prev.get("fp16")), "fp16", True)
-        _set(bool(self._prev.get("bf16")), "bf16", True)
+        # 恢复"进入前的状态"：原来开着的 dtype 重新打开，原来关着的就关掉。
+        # 注意 `_set(False)` 会把 fp16/bf16/tf32 **三条路径一起关掉**，所以最后
+        # 再单独按需恢复 tf32（它与 fp16/bf16 互斥，同一时刻最多一个为真）。
+        if self._prev.get("fp16"):
+            _set(True, "fp16", True)
+        elif self._prev.get("bf16"):
+            _set(True, "bf16", True)
+        else:
+            _set(False, "fp16")
+        if self._prev.get("tf32"):
+            _set(True, "tf32")
         return False
 
 

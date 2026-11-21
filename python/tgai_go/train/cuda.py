@@ -2276,6 +2276,21 @@ extern "C" __global__ void cast_f32_to_f16(const float* __restrict__ src,
     if (i < n) dst[i] = (unsigned short)tg_f32_to_f16_bits(src[i]);
 }
 
+/* 两段 fp32→fp16 合成**一次发射**（2026-11-21）。
+ * 场景：`_sgemm_f16` 的两个操作数都不是参数（MoE 的 dW 族：x 和 dy 都是激活），
+ * 原来各发一次 cast 内核。实测这台机器上**每次发射值 11.7 µs**（985 次 cast/步
+ * = 11.6 ms/步，见 lab/rent/REPORT_amp_gemm2_20261121.md），所以把两段并成一次
+ * 是纯赚。转换用同一个 `tg_f32_to_f16_bits`，逐元素映射不变 ⇒ **与发两次逐位相同**。
+ * 线程 i 同时处理两段的第 i 个元素；grid 覆盖 max(n0,n1) 即可。 */
+extern "C" __global__ void cast2_f32_to_f16(const float* __restrict__ s0,
+                                            unsigned short* __restrict__ d0, int n0,
+                                            const float* __restrict__ s1,
+                                            unsigned short* __restrict__ d1, int n1) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n0) d0[i] = (unsigned short)tg_f32_to_f16_bits(s0[i]);
+    if (i < n1) d1[i] = (unsigned short)tg_f32_to_f16_bits(s1[i]);
+}
+
 extern "C" __global__ void cast_f16_to_f32(const unsigned short* __restrict__ src,
                                            float* __restrict__ dst, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -7276,6 +7291,23 @@ class CudaRuntime:
             ])
         return out
 
+    def _cast2_flat_ptr_into(self, src0, n0, out0, src1, n1, out1):
+        """两段 fp32→fp16 合成**一次发射**（`cast2_f32_to_f16`），不分配。
+
+        与连调两次 `_cast_flat_ptr_into` **逐位相同**：同一个转换函数
+        (`tg_f32_to_f16_bits`)、同一套下标。省下的是每次 11.7 µs 的发射成本
+        （985 次 cast/步 = 11.6 ms/步，见 lab/rent/REPORT_amp_gemm2_20261121.md）。
+        """
+        n0, n1 = int(n0), int(n1)
+        if not n0 and not n1:
+            return
+        grid, block = self._ewise_grid(n0 if n0 > n1 else n1)
+        self._activate()
+        self.launch("cast2_f32_to_f16", grid, block, [
+            (int(src0), ctypes.c_uint64), self._ptr(out0), (n0, ctypes.c_int),
+            (int(src1), ctypes.c_uint64), self._ptr(out1), (n1, ctypes.c_int),
+        ])
+
     def _cast_flat_ptr(self, src_ptr, count, to_f16):
         """把 src_ptr 起 count 个元素整块 cast 成新缓冲（形状信息不重要）。"""
         count = int(count)
@@ -7458,6 +7490,40 @@ class CudaRuntime:
         except Exception:                                # noqa: BLE001
             pass
 
+    def tf32_enable(self, on=True):
+        """把 GEMM 的 cuBLAS math mode 在 PEDANTIC（默认）↔ TF32 之间切换。
+
+        为什么需要它（2026-11-21 实测，5090 / seq512 / 12L / 848M / int8gpu）：
+        `--amp gemm` 走"先 cast 成 fp16 再算"，而这台机器上**一次内核发射值 11.7 µs**
+        （985 次 cast/步 ⇒ 11.6 ms/步，`PROBE_SKIP` 阶梯消融），把 tensor core 的收益
+        全吃掉，端到端反而慢 6%。TF32 用的是**同一批 tensor core**，但只改 cuBLAS 的
+        输入舍入策略：**0 次发射、0 字节转换**。实测 off 0.1389 → tf32 0.1359（−2.2%），
+        峰值显存不变（11.22 GiB，因为没有 fp16 影子），20 步 loss 与 fp16 GEMM 同轨迹
+        （11.5934 vs 11.5908）。数值上 TF32 也是 10 位尾数，且指数范围比 fp16 大。
+
+        是**幂等**的（重复调用不重复设），并且失败时返回 False 且不改状态：
+        V100（sm_70）没有 TF32，`cublasSetMathMode` 会拒绝 ⇒ 调用方必须退回 fp32，
+        绝不静默假设成功。
+        """
+        st = getattr(self, "_tf32", None)
+        if st is None:
+            st = self._tf32 = {"on": False, "ok": True}
+        want = bool(on)
+        if bool(st["on"]) == want:
+            return bool(st["ok"])
+        if want:
+            ok = self.ns_math_mode_begin()
+            st["ok"] = bool(ok)
+            st["on"] = bool(ok)
+            return bool(ok)
+        self.ns_math_mode_end()
+        st["on"] = False
+        return True
+
+    def tf32_state(self):
+        st = getattr(self, "_tf32", None) or {"on": False, "ok": True}
+        return {"on": bool(st["on"]), "supported": bool(st["ok"])}
+
     def _sgemm_f16(self, transa, transb, m, n, k, A, lda, B, ldb, C, ldc):
         """列主序调用和 _sgemm 完全一致，只是 A/B 先转 fp16、按 fp32 累加。
 
@@ -7476,14 +7542,22 @@ class CudaRuntime:
         # 两种情况都不再"每次调用新分配"，这正是压掉 fp16 收益的地方。
         pinned = getattr(self, "_f16_pinned", None) or ()
         cache_on = bool(getattr(self, "_f16_cache_on", False))
-        if cache_on and int(A) in pinned:
+        a_cached = cache_on and int(A) in pinned
+        b_cached = cache_on and int(B) in pinned
+        if a_cached:
             a16 = self._cast_f16_cached(A, na)
-        else:
+        if b_cached:
+            b16 = self._cast_f16_cached(B, nb)
+        if not a_cached and not b_cached:
+            # 两个操作数都要现 cast（MoE 的 dW 族就是这样）⇒ 合成**一次**发射。
+            # 逐位等价：同一个转换函数、同一套下标，只是两段共用一次 launch。
+            a16 = self._f16_scratch(0, na)
+            b16 = self._f16_scratch(1, nb)
+            self._cast2_flat_ptr_into(A, na, a16, B, nb, b16)
+        elif not a_cached:
             a16 = self._f16_scratch(0, na)
             self._cast_flat_ptr_into(A, na, a16)
-        if cache_on and int(B) in pinned:
-            b16 = self._cast_f16_cached(B, nb)
-        else:
+        elif not b_cached:
             b16 = self._f16_scratch(1, nb)
             self._cast_flat_ptr_into(B, nb, b16)
         if st["c32"]:
