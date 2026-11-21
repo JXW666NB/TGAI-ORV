@@ -28,8 +28,8 @@ run_pair () {
   echo "  rc: $r0/$r1" >> $LOG
 }
 
-run_pair ovOFF "TG_DP_OVERLAP=0"
-run_pair ovDEF "TG_DP_OVERLAP="
+#run_pair ovOFF "TG_DP_OVERLAP=0"
+run_pair ovON "TG_DP_OVERLAP=1"
 
 $PY - >> $LOG 2>&1 <<'PY'
 import re

@@ -140,6 +140,31 @@ def _aux_coefs():
 # ═════════════════════════════════════════════════════════════════════════
 # 小工具
 # ═════════════════════════════════════════════════════════════════════════
+def _check_overlap_stats(st, world):
+    """重叠路径的**硬自检**：世界>1 时它必须真的产生了通信时间。
+
+    2026-11-21 实测（2×4090, `--dp 2`, mode=host, 13 桶）：
+    `[dp-ov] comm=0.00ms exposed=0.03ms pending_zeroed=True` —— 看起来完全健康，
+    但普通 `all_reduce_grads` 一次都没被调用、两个 rank 的 gnorm 相差 1e-2
+    ⇒ **梯度根本没被归约，数据并行退化成"没开 DP"**，而 loss 照样在降。
+
+    这种"静默少做工作"比慢一万倍更危险，所以宁可当场炸掉：
+    `comm_ms` 几乎为 0 就是"没搬东西"的确定信号（无 P2P 时归约 3 GiB 至少几十毫秒）。
+    """
+    if st is None or int(world) <= 1:
+        return
+    try:
+        comm = float(st.get("comm_ms", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        comm = 0.0
+    if comm <= 0.5:
+        raise RuntimeError(
+            "重叠归约没有真的发生（[dp-ov] comm=%.2fms，world=%d）" % (comm, int(world)) +
+            "。这说明梯度没有被归约，数据并行会退化成各卡各训（loss 仍会下降，"
+            "极难发现）。修法：设 TG_DP_OVERLAP=0 用不重叠路径；"
+            "若你必须用重叠路径，先修好 HostBucketTransport 的后台线程再开")
+
+
 def _overlap_enabled():
     """「反向即归约」是否启用。**默认关（opt-in）**，这是 2026-11-21 实测后改的。
 
@@ -1653,6 +1678,7 @@ def main(argv=None):
                     # 反向结束时把剩下的桶补发、等齐、写回；返回 None 表示会话在
                     # 反向开始时已安全退回（原因在 dp.overlap_stats["reason"]）。
                     _st = _dp.finish_overlap()
+                    _check_overlap_stats(_st, _dp.world)
                 if _st is None:
                     _dp.all_reduce_grads(params)
                 else:
@@ -1662,14 +1688,16 @@ def main(argv=None):
                                 and (step - start_step) % int(a.log_every) == 0)):
                         print("%s[dp-ov] exposed=%.2fms comm=%.2fms overlapped=%.2fms "
                               "buckets=%d pending_zeroed=%s zero_filled=%d late=%d "
-                              "bwd=%.4fs open=%.2fms"
+                              "bwd=%.4fs open=%.2fms mode=%s params=%d deduped=%d"
                               % (_prefix, _st.get("exposed_ms", -1.0),
                                  _st.get("comm_ms", -1.0), _st.get("overlapped_ms", -1.0),
                                  int(_st.get("buckets", 0)),
                                  str(_st.get("pending_zeroed")),
                                  int(_st.get("zero_filled", 0)),
                                  int(_st.get("late_buckets", 0)), _bwd_s,
-                                 float(_st.get("open_ms", -1.0))), flush=True)
+                                 float(_st.get("open_ms", -1.0)),
+                                 str(_st.get("mode")), int(_st.get("params", 0)),
+                                 int(_st.get("deduped", 0))), flush=True)
                         if os.environ.get("TG_DP_OV_DEBUG") and _st.get("bucket_comm_ms"):
                             print("%s[dp-ov-dbg] per_bucket_ms=%s"
                                   % (_prefix, _st.get("bucket_comm_ms")), flush=True)
