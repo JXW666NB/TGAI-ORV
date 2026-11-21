@@ -61,6 +61,9 @@ import webbrowser
 
 __all__ = ["render_html", "open_web", "_I18N", "_I18N_CORE"]
 
+# ★ 主题切换（浅色/深色）。放在字典字面量之后 merge，避免在几百行字面量里插行；
+#   zh / en 的 key 集合仍然必须完全相同（tests/test_help_web_i18n.py 钉住）。
+
 # ------------------------------------------------------------------ 界面词表
 # ★ 界面文案的唯一来源：zh / en 的 key 集合必须完全相同（tests/test_help_web_i18n.py 钉住）。
 #   `{n}` / `{total}` 这类占位符由前端 `fmt(key, vars)` 替换。
@@ -183,6 +186,11 @@ _I18N = {
     },
 }
 
+# ★ 主题切换（浅色/深色）标签。必须放在 _I18N 定义**之后**（第一次插在 __all__ 后面，
+#   导致 NameError: name '_I18N' is not defined）。zh / en 的 key 集合仍必须完全相同。
+_I18N["zh"].update({"theme_light": "浅色", "theme_dark": "深色"})
+_I18N["en"].update({"theme_light": "Light", "theme_dark": "Dark"})
+
 # ------------------------------------------------------------------ 纯逻辑 JS
 # ★ 只放**不碰 DOM 渲染**的语言逻辑：测试用 Node 单独 eval 这一块（见 tests/test_help_web_i18n.py）。
 #   依赖的全局：DATA（内嵌 payload）、state（含 lang）、document（仅 applyHtmlLang）。
@@ -244,22 +252,28 @@ _CSS = """
 --line:#e5e5e5;--code:#fafafa;--bg:#ffffff}
 *{box-sizing:border-box}
 html,body{height:100%}
+html{scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:2px}
+::-webkit-scrollbar-thumb:hover{background:var(--faint)}
 body{margin:0;background:var(--bg);color:var(--body);
-font:14px/1.6 -apple-system,"Segoe UI","Helvetica Neue",Arial,"Noto Sans SC",sans-serif}
+font:14px/1.75 -apple-system,"Segoe UI","Helvetica Neue",Arial,"Noto Sans SC",sans-serif}
 code,pre,.mono{font-family:ui-monospace,"SF Mono",Consolas,ui-monospace,monospace}
 header{position:sticky;top:0;z-index:10;background:var(--bg);
-border-bottom:1px solid var(--line);padding:16px 32px}
+border-bottom:1px solid var(--line);padding:10px 28px 9px}
 .brand{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
-.brand-title{margin:0;font-size:24px;font-weight:600;color:var(--fg);letter-spacing:-.01em}
+.brand-title{margin:0;font-size:18px;font-weight:600;color:var(--fg);letter-spacing:-.01em}
 .sub,.ver{font-size:12px;color:var(--faint)}
 .ver{font-family:ui-monospace,"SF Mono",Consolas,ui-monospace,monospace}
 .langswitch{display:flex;gap:14px;margin-left:auto;align-items:baseline}
+.themeswitch{margin-left:16px;padding-left:16px;border-left:1px solid var(--line)}
 .langlink{border:0;background:none;padding:0 0 3px;margin:0;cursor:pointer;font:inherit;
 font-size:13px;color:var(--dim);border-bottom:1px solid transparent}
 .langlink:hover{color:var(--fg)}
 .langlink.on{color:var(--fg);font-weight:600;border-bottom-color:var(--fg)}
-.searchrow{display:flex;gap:16px;align-items:center;margin-top:14px;flex-wrap:wrap}
-#q{flex:1 1 320px;max-width:520px;padding:7px 10px;border:1px solid var(--line);
+.searchrow{display:flex;gap:16px;align-items:center;margin-top:8px;flex-wrap:wrap}
+#q{flex:1 1 320px;max-width:520px;padding:5px 10px;border:1px solid var(--line);
 border-radius:2px;background:var(--bg);color:var(--fg);font:inherit;font-size:14px;
 outline:none}
 #q:focus{border-color:var(--fg)}
@@ -296,7 +310,7 @@ font-size:12px;color:var(--faint);margin:0 0 22px;word-break:break-word}
 .block h3{margin:0 0 10px;font-size:12px;font-weight:600;color:var(--dim);
 letter-spacing:.05em;text-transform:uppercase}
 pre.code{margin:0;background:var(--code);border:1px solid var(--line);border-radius:2px;
-padding:10px 12px;overflow:auto;font-size:12.5px;line-height:1.55;color:var(--fg);
+padding:10px 12px;overflow:auto;font-size:12.5px;line-height:1.7;color:var(--fg);
 white-space:pre}
 .sig{font-family:ui-monospace,"SF Mono",Consolas,ui-monospace,monospace;
 font-size:12px;color:var(--faint);margin:8px 0 0;word-break:break-word}
@@ -335,9 +349,15 @@ mark{background:var(--code);color:var(--fg);font-weight:600;padding:0}
 #toTop{position:fixed;right:24px;bottom:20px;border:1px solid var(--line);
 background:var(--bg);color:var(--faint);border-radius:2px;padding:4px 9px;
 font-size:12px;text-decoration:none}
+/* 显式选择（顶栏 浅色/深色 开关）：写在 <html data-theme>，优先级高于系统偏好 */
+[data-theme="dark"]{--fg:#f5f5f5;--body:#f5f5f5;--dim:#888888;--faint:#888888;
+--line:#2a2a2a;--code:#1a1a1a;--bg:#111111}
+[data-theme="light"]{--fg:#111111;--body:#222222;--dim:#666666;--faint:#888888;
+--line:#e5e5e5;--code:#fafafa;--bg:#ffffff}
+/* 跟随系统：仅在没有显式 data-theme 时生效（:not([data-theme])） */
 @media (prefers-color-scheme: dark){
-:root{--fg:#f5f5f5;--body:#f5f5f5;--dim:#888888;--faint:#888888;--line:#2a2a2a;
---code:#1a1a1a;--bg:#111111}
+:root:not([data-theme]){--fg:#f5f5f5;--body:#f5f5f5;--dim:#888888;--faint:#888888;
+--line:#2a2a2a;--code:#1a1a1a;--bg:#111111}
 }
 @media (max-width:820px){
 .app{grid-template-columns:1fr}
@@ -347,7 +367,7 @@ header{padding:12px 20px}
 main{padding:20px 20px 48px}
 }
 @media print{
-aside,#q,#kinds,#status,#toTop,.langswitch{display:none}
+aside,#q,#kinds,#status,#toTop,.langswitch,.themeswitch{display:none}
 .app{display:block}
 header{position:static;border-bottom:1px solid var(--line)}
 main{max-width:none;padding:0}
@@ -760,6 +780,56 @@ _JS = (r"""
     foot.appendChild(el("span", "muted", t("footer_offline")));
   }
 
+  // ---------------- 主题（浅色/深色）：?theme= > localStorage > 跟随系统 ----------------
+  var THEME_KEY = "tgai-wiki-theme";
+
+  function systemTheme() {
+    try {
+      if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+        return "dark";
+      }
+    } catch (e) {}
+    return "light";
+  }
+
+  function detectTheme() {
+    try {
+      var fromUrl = new URLSearchParams(location.search).get("theme");
+      if (fromUrl === "light" || fromUrl === "dark") { return fromUrl; }
+    } catch (e) {}
+    try {
+      var saved = localStorage.getItem(THEME_KEY);
+      if (saved === "light" || saved === "dark") { return saved; }
+    } catch (e) {}
+    return systemTheme();                      // 没有显式选择 ⇒ 跟随系统
+  }
+
+  function applyTheme(theme, persist) {
+    state.theme = (theme === "dark") ? "dark" : "light";
+    try {
+      if (document.documentElement) {
+        document.documentElement.setAttribute("data-theme", state.theme);
+      }
+    } catch (e) {}
+    if (persist) {
+      try { localStorage.setItem(THEME_KEY, state.theme); } catch (e) {}
+    }
+    renderThemeSwitch();
+    return state.theme;
+  }
+
+  function renderThemeSwitch() {
+    var box = $("theme"); if (!box) { return; }
+    clear(box);
+    var cur = state.theme || detectTheme();
+    [["light", "theme_light"], ["dark", "theme_dark"]].forEach(function (pair) {
+      var b = el("button", "langlink" + (cur === pair[0] ? " on" : ""), t(pair[1]));
+      b.setAttribute("data-theme-choice", pair[0]);
+      b.onclick = function () { applyTheme(pair[0], true); };
+      box.appendChild(b);
+    });
+  }
+
   function renderLangSwitch() {
     var box = $("lang"); if (!box) { return; }
     clear(box);
@@ -803,6 +873,7 @@ _JS = (r"""
 
   // ---- 初始化：?lang= > localStorage > 默认英文（不读 navigator），然后整页按该语言渲染 ----
   state.lang = detectLang(window.location.search || "", readStoredLang());
+  applyTheme(detectTheme(), false);   // 先定主题再渲染，避免闪一下再变色
   bindSearch();
   applyLang(state.lang, false);
   // 支持直接链接到某条：#op:mul
@@ -852,7 +923,8 @@ def render_html(payload):
         "<h1 class=\"brand-title\">TGAI-ORV Wiki</h1>\n"
         "<span id=\"tagline\" class=\"sub\"></span>\n",
         "<span class=\"ver\">wiki digest ", version, "</span>\n",
-        "<div id=\"lang\" class=\"langswitch\"></div>\n",
+        "<div id=\"lang\" class=\"langswitch\"></div>\n"
+        "<div id=\"theme\" class=\"langswitch themeswitch\"></div>\n",
         "</div>\n<div class=\"searchrow\">\n",
         "<input id=\"q\" type=\"search\" autocomplete=\"off\" autofocus placeholder=\"\">\n",
         "<span id=\"status\"></span>\n</div>\n",
