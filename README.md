@@ -613,6 +613,36 @@ import tgai_go.train as T
 
 迁移检查清单见 [`docs/`](docs/)。
 
+## 查文档：`T.help` 与离线 Wiki（1.0.16+）
+
+**不要靠记忆猜 API** —— ORV 与 PyTorch 命名相近，但边界处有真实差异（例如没有
+`T.sum(x)`，张量是 `x.sum()`；没有 `Tensor.mul()`，逐元素乘用 `a * b`）。
+不确定就先查：
+
+```python
+import tgai_go.train as T
+
+T.help()                          # 总览：有哪些内核 / API / 算子 / 命令行 / 环境变量
+T.help("mul")                     # 跨类别搜索（同时搜中英文正文）
+T.help(tag="op")                  # 张量算子
+T.help("mul", format="json")      # 纯 JSON（stdout 只有 JSON），给 AI / 脚本
+T.help(open="web")                # 生成单文件离线 Wiki 并打印路径（可选 ?lang=zh）
+```
+
+- 清单是**引擎运行时自省**出来的，每条都带**真实调用形式**（`x.sum()` / `a * b` /
+  `T.matmul(a, b)` / `rt.launch(...)` / `python -m ... --flag` / `TG_X=1`）；
+  引擎里拿不到的条目会**明说不可调用**，不会给你一个照抄就报错的假示例。
+- 词条是**外部数据**：`wiki/*.txt` 改完即热更新（不用重装、不用重启进程）；
+  没写词条的条目也照样显示名字、签名与自动生成的调用示例（带「未编写」标记）。
+- `T.help.check()` 词条健康度 / `T.help.missing()` 待写清单 /
+  `T.help.contrib("op:mul")` 生成骨架 / `T.help.refresh()` 清缓存。
+- 离线 Wiki 是**单个自包含 HTML**：黑白极简、零外链、零 CDN、零外部字体；
+  顶栏 `EN | 中文` 全局语言开关（默认英文，选择记在 localStorage），搜索始终中英双语。
+
+协议见 [`wiki/README_词条规范.txt`](wiki/README_词条规范.txt)，分层设计见
+[`docs/HELP_SYSTEM.md`](docs/HELP_SYSTEM.md)。
+
+
 ---
 
 ## 项目结构
