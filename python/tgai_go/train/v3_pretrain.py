@@ -140,6 +140,40 @@ def _aux_coefs():
 # ═════════════════════════════════════════════════════════════════════════
 # 小工具
 # ═════════════════════════════════════════════════════════════════════════
+def _dump_grad_norms(params, path):
+    """把**每个参数**的梯度范数落成 JSON（诊断用，`TG_DP_DUMP_GRADS=<path>`）。
+
+    为什么需要它：两条归约路径的**总** gnorm 差 10.3%（11.850 vs 10.741），
+    但总范数看不出是哪几个参数错了。逐参数一比就能立刻区分：
+    漏乘 `1/world`（所有参数同比例）、某个参数被重复加（个别参数显著偏大）、
+    还是某个参数根本没被归约（个别参数≈本地值）。
+    """
+    rows = []
+    for i, p in enumerate(params):
+        g = getattr(p, "grad", None)
+        if g is None:
+            rows.append([i, int(p.numel()), None])
+            continue
+        try:
+            # ★ 用引擎文档里的写法（`T.help('op')` 明说：算子都是**张量方法**）：
+            #   `t.mul(x)` / `t.sum()`，而不是 `T.sum(t)`。
+            #   （我第一版写成 `T.sum(g*g)`，321 个参数全报 AttributeError，白烧一轮 GPU。）
+            v = float(_scalar(g.mul(g).sum()))
+            rows.append([i, int(p.numel()), v])
+        except Exception:                            # noqa: BLE001
+            try:                                     # 兜底：拷回主机用 numpy
+                arr = np.asarray(g.to_numpy(), dtype=np.float64)
+                rows.append([i, int(p.numel()), float(np.square(arr).sum())])
+            except Exception as exc2:                # noqa: BLE001
+                rows.append([i, int(p.numel()), "err:%r" % (exc2,)])
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"n": len(rows), "rows": rows}, f)
+        print("[dpdump] 已写出 %d 个参数的梯度平方和 → %s" % (len(rows), path), flush=True)
+    except OSError as exc:                           # noqa: BLE001
+        print("[dpdump] 写文件失败（%r）" % (exc,), flush=True)
+
+
 def _check_overlap_stats(st, world):
     """重叠路径的**硬自检**：世界>1 时它必须真的产生了通信时间。
 
@@ -1722,6 +1756,12 @@ def main(argv=None):
                              (_bytes / _comm_s) / 1e9 if _comm_s > 0 else 0.0,
                              _dp.backend), flush=True)
             _t_opt = _now()
+            # ★ 诊断钩子：把**每个参数**的梯度范数落盘（`TG_DP_DUMP_GRADS=<前缀>`）。
+            #   放在裁剪之前、归约之后 —— 这时梯度已经是最终值。
+            _dump_path = os.environ.get("TG_DP_DUMP_GRADS")
+            if _dump_path:
+                _dump_grad_norms(params, "%s.rank%d.step%d"
+                                 % (_dump_path, int(getattr(_dp, "rank", 0)), int(step)))
             gscale = 1.0
             if float(a.grad_clip) > 0:
                 if _defer_clip:
