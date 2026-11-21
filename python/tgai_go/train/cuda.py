@@ -7346,12 +7346,23 @@ class CudaRuntime:
         if cache is None:
             cache = {}
             self._f16_cache = cache
+            self._f16_index = {}
         key = (p, int(count))
         hit = cache.get(key)
         if hit is not None:
             return hit
         buf = self._cast_flat_ptr(p, count, True)
         cache[key] = buf
+        # 反向索引：ptr -> {cache key}，让 `_f16_cache_drop_ptr` 变成 O(1)
+        # （见该方法注释：线性扫描一次 7.2 µs × 每步 4093 次 free = 29.6 ms/步）。
+        idx = getattr(self, "_f16_index", None)
+        if idx is None:
+            idx = self._f16_index = {}
+        slot = idx.get(p)
+        if slot is None:
+            idx[p] = {key}
+        else:
+            slot.add(key)
         return buf
 
     def f16_cache_pin(self, ptrs):
@@ -7368,15 +7379,27 @@ class CudaRuntime:
         空缓存时立刻返回，fp32 路径零开销。这是 `_cast_f16_cached` 正确性的前提：
         缓存只能覆盖"内容在一个 step 内不变"的操作数（权重），
         而"同一地址装不同张量"必须让缓存失效，否则反向会读到前向的旧影子。
+
+        ★ 2026-11-21：原来是 `[k for k in cache if int(k[0]) == p]` —— **线性扫描整个缓存**。
+        缓存里是权重影子（本配置 193 条），而 `free()` 每一步要调 4093 次，
+        实测每步 **29.6 ms**（每次 7.2 µs），是 `--amp gemm` 负优化的**最大单项**
+        （fp32 路径因缓存为空只需 0.93 ms/步）。
+        现在用 `_f16_index: ptr -> {key}` 反向索引，单次 0.24 µs（与空缓存同量级）。
+        语义完全不变：释放哪个地址就丢哪个地址的影子，不依赖地址以外的任何假设，
+        所以 4130 倍梯度爆炸那次的"陈旧影子"不变量照旧成立。
         """
-        cache = getattr(self, "_f16_cache", None)
-        if not cache:
+        idx = getattr(self, "_f16_index", None)
+        if not idx:
             return
         p = int(ptr or 0)
         if not p:
             return
-        for k in [k for k in cache if int(k[0]) == p]:
-            del cache[k]
+        keys = idx.pop(p, None)
+        if keys:
+            cache = getattr(self, "_f16_cache", None)
+            if cache:
+                for k in keys:
+                    cache.pop(k, None)
 
     def f16_cache_enable(self, on=True):
         """打开/关闭 fp16 GEMM 的权重影子缓存。关闭时清空。"""
@@ -7386,9 +7409,14 @@ class CudaRuntime:
         return self._f16_cache_on
 
     def f16_cache_clear(self):
-        """清空影子缓存。**参数被更新后必须调用**（优化器 step 已自动调用）。"""
+        """清空影子缓存。**参数被更新后必须调用**（优化器 step 已自动调用）。
+
+        `_f16_index` 一起清掉：它只是 `_f16_cache` 的 ptr -> key 反向索引，
+        留着就等于让失效路径指向已经不存在的条目。
+        """
         n = len(getattr(self, "_f16_cache", None) or {})
         self._f16_cache = {}
+        self._f16_index = {}
         return n
 
     def f16_cache_stats(self):
