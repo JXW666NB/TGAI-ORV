@@ -5993,6 +5993,10 @@ GradScaler = _amp_api.GradScaler
 #   T.help("opt")       优化器
 #   T.help("mods")      子模块与公开名
 #   T.help("flash")     任意关键字全局搜索
+#   T.help(format="json")   纯 JSON（给 AI/脚本；stdout 只有 JSON）
+#   T.help(open="web")      本地离线 Wiki（单个自包含 HTML），打印文件路径
+#   T.help.check() / T.help.missing() / T.help.contrib("op:mul") / T.help.refresh()
+#                           外部词条 wiki/*.txt 的健康度、待写清单、生成骨架、清缓存
 # ═══════════════════════════════════════════════════════════
 from .apilist import help as help                                     # noqa: E402,F401
 from .apilist import describe as describe                             # noqa: E402,F401
@@ -6008,4 +6012,21 @@ from .data import read_jsonl, train_eval_split as split_dataset        # noqa: E
 # SFT 数据集与 PPO 子模块：README 里直接写 T.SftDataset / T.ppo.gae，必须真的能点出来
 from .sft_data import SftDataset, iter_jsonl_texts                     # noqa: E402
 from . import ppo as ppo                                              # noqa: E402
+
+
+# ═══════════════════════════════════════════════════════════
+# 惰性导出（1.0.17）：README 承诺的 `T.DUO()` 一行接管整机
+#   duo.py 会 import plan/topo，放进启动路径会拖慢 `import tgai_go.train`；
+#   这里用模块级 `__getattr__`：只有真的写 `T.DUO` 时才导入。
+#   T.help 的 L0 清单会触碰一次以确认它可用（只在 help 调用里发生）。
+# ═══════════════════════════════════════════════════════════
+_LAZY_EXPORTS = ("DUO", "DuoSession", "DuoResult", "DuoRefused")
+
+
+def __getattr__(name):
+    if name in _LAZY_EXPORTS:
+        from . import duo as _duo
+        return getattr(_duo, name)
+    raise AttributeError("module %r has no attribute %r。修法：用 T.help() 查可用名字"
+                         % (__name__, name))
 

@@ -14,6 +14,24 @@
     T.help(s="flash")               # 全类别搜索
     T.help("flash")                 # 等价：位置参数当关键字
     T.help(n=50)                    # 自定每页条数
+    T.help("mul", format="json")    # 给 AI/脚本：stdout 只有 JSON
+    T.help(open="web")              # 生成离线 Wiki（单个自包含 HTML）并打印路径
+
+给 AI / 自动化脚本 / for AI & scripts
+--------------------------------------
+* `format="json"`：**纯 JSON**（stdout 里除 JSON 外没有任何东西、无 ANSI 颜色、
+  不分页），schema 稳定为 `tgai-help/1`：
+
+      顶层：schema / query / kind / count / items / hint（字段名是契约）
+      item：kind / name / zh / en / usage / namespace
+
+  同名条目可能出现在不同 kind（例如 `abs` 既是运行时 API 又是张量算子），
+  用 item 里的 `kind` 区分；`namespace` 给出调用入口（`rt.abs(...)` / `t.abs(...)`）。
+  未命中时 `count=0`、`hint` 给出可执行的下一步，**不会静默空输出**。
+* `open="web"`：把当前（可带关键词过滤的）条目渲染成**一个自包含 HTML**，
+  写进 `tempfile` 临时目录，尝试用默认浏览器打开，并把文件路径打印到 stdout。
+  无头/CI 下浏览器打不开不算失败；路径照常打印并返回。渲染模块 `help_web`
+  **只在此时才 import**，默认路径的导入开销为零。
 
 tag 认中英文 / tag accepts CN & EN
 -----------------------------------
@@ -134,9 +152,14 @@ _INTRO = {
         "    Backend primitives; call them as rt.<name>(...)."
     ),
     "op": (
-        "张量算子 / Tensor operators — 对 Tensor 直接调用的运算，会自动建图并参与求导。\n"
-        "    调用方式是 t.<名字>(...)，例如 t.mul(x) / t.reshape((2,3))。\n"
-        "    Ops on Tensors with autograd; call as t.<name>(...)."
+        "张量算子 / Tensor operators — Tensor 上**真实存在**的方法（自动建图并参与求导）。\n"
+        "    方法形式：<张量>.<方法>(...)，例如 a.sum() / a.reshape((2,3)) / a.numel()。\n"
+        "    **没有方法形式**的运算走运算符：逐元素加 a + b、减 a - b、乘 a * b、除 a / b，\n"
+        "    矩阵乘 a @ b（或顶层 T.matmul(a, b)），标量幂 a ** 2。\n"
+        "    ⚠️ Tensor 没有 .mul()/.add()/.matmul() 方法，顶层也没有 T.mul ——\n"
+        "    照 PyTorch 写 a.mul(b) 会 AttributeError；矩阵乘更不能用 *（那是逐元素）。\n"
+        "    Methods on Tensor: a.<method>(...). Element-wise ops are operators (a + b, a * b);\n"
+        "    matmul is a @ b or T.matmul(a, b); scalar power is a ** 2. There is no .mul()/T.mul."
     ),
     "opt": (
         "优化器 / Optimizers — 直接实例化即可，接口同 torch.optim（step()/zero_grad()）。\n"
@@ -308,7 +331,8 @@ def _modules():
         if not fn.endswith(".py") or fn.startswith("_"):
             continue
         mod = fn[:-3]
-        if mod in ("help", "apilist", "backend", "dispatch", "dtypes"):
+        if mod in ("help", "apilist", "backend", "dispatch", "dtypes",
+                   "help_l0", "help_wiki", "help_web"):
             continue
         txt = _read(fn)
         names = sorted(set(re.findall(r"^def\s+([a-zA-Z]\w*)", txt, re.M))
@@ -403,22 +427,31 @@ def describe(name, cn=None, en=None, doc=None):
     return {"cn": _CN.get(key, ""), "en": _EN.get(key, "")}
 
 
-def help(topic=None, tag=None, s=None, page=1, n=_PAGE, full=False, **kw):   # noqa: A001
+def help(topic=None, tag=None, s=None, page=1, n=_PAGE, full=False, *,
+         format=None, open=None, **kw):   # noqa: A001
     """`T.help()` —— 这个库提供了什么、有什么用、怎么用（中英双语）。
 
     参数 / Args:
       tag   : 类别 `kernel` / `api` / `op` / `opt` / `mod`（也认中文：内核/API/算子/优化器/模块）
-      s     : 关键词（在名字与说明里做不区分大小写的子串匹配）
+      s     : 关键词（在名字、中英文说明与**用法签名**里做不区分大小写的子串匹配）
       page  : 页码，从 1 开始（每页默认 30 条）
       n     : 每页条数
       topic : 位置参数；若等于某个类别名则当 tag，否则当关键词 s
       full  : 保留参数（当前用于打印完整签名）
       print : 传 `print=False` 时返回字符串而不打印
+      format: `None`/`"text"`（默认）或 `"json"` —— json 只输出纯 JSON（给 AI/脚本）
+      open  : `None` 或 `"web"` —— 生成自包含离线 Wiki（单文件）并把路径打印到 stdout
+
+    附加属性 / attributes（全部惰性加载，默认路径不付任何代价）：
+      T.help.check()          词条健康度：解析失败/未知 ID/中英缺边/死链/覆盖率
+      T.help.missing()        待编写清单（按 kind/category 分组，给朋友们的看板）
+      T.help.contrib("op:mul") 有词条打印路径；没有就生成 TXT 骨架
+      T.help.refresh()        强制清空 wiki 缓存（热更新一般不需要，改文件会自动生效）
     """
     do_print = bool(kw.pop("print", True))
     if kw:
-        raise TypeError("help() 不认识参数 %s。修法：可用 tag / s / page / n / print"
-                        % ", ".join(sorted(kw)))
+        raise TypeError("help() 不认识参数 %s。修法：可用 tag / s / page / n / print / "
+                        "format / open" % ", ".join(sorted(kw)))
 
     def out(text):
         if do_print:
@@ -464,6 +497,33 @@ def help(topic=None, tag=None, s=None, page=1, n=_PAGE, full=False, **kw):   # n
     except Exception:
         n = _PAGE
 
+    # ---- 给 AI / 脚本的接口：纯 JSON、离线网页（★ 惰性导入，默认路径零开销）----
+    fmt = None if format is None else str(format).strip().lower()
+    if fmt in ("", "text", "txt", "plain"):
+        fmt = None
+    if fmt not in (None, "json"):
+        raise ValueError("format 只支持 'text'（默认）或 'json'，收到 %r。"
+                         "修法：批量场景用 T.help('关键词', format='json')" % (format,))
+    opn = None if open is None else str(open).strip().lower()
+    if opn == "":
+        opn = None
+    if opn not in (None, "web", "browser", "html"):
+        raise ValueError("open 只支持 'web'（生成离线 Wiki），收到 %r。"
+                         "修法：用 T.help(open='web')" % (open,))
+    if fmt == "json" and opn is not None:
+        raise ValueError("format='json' 与 open='web' 不能同时用。"
+                         "修法：分两次调用 —— JSON 走 stdout，Wiki 走浏览器")
+    if fmt == "json":
+        from . import help_wiki
+        import json as _json
+        payload = help_wiki.json_payload(kind, s)
+        return out(_json.dumps(payload, ensure_ascii=False, indent=2))
+    if opn is not None:
+        from . import help_wiki
+        from . import help_web
+        path = help_web.open_web(help_wiki.web_payload(kind, s))
+        return out(path)
+
     src = {"kernels": _kernels, "api": _rt_methods, "op": _tensor_ops,
            "opt": _optimizers, "mods": _modules}
     label = {"kernels": "内核 / kernels", "api": "运行时 API / runtime APIs",
@@ -477,8 +537,11 @@ def help(topic=None, tag=None, s=None, page=1, n=_PAGE, full=False, **kw):   # n
 
             def hit(it):
                 nm = it["name"]
+                # ★ 关键词要能命中"用法签名"：只知道参数名也能搜到（例如 entries / keepdims）
                 blob = " ".join((nm, str(it.get("doc", "")),
-                                 _CN.get(nm, ""), _EN.get(nm, ""))).lower()
+                                 _CN.get(nm, ""), _EN.get(nm, ""),
+                                 str(it.get("sig", "")), str(it.get("params", "")),
+                                 " ".join(it.get("names") or ()))).lower()
                 return key in blob
             items = [it for it in items if hit(it)]
         # ★ 有中英文说明的排前面：默认列举时才看得出"这东西有什么用"，
@@ -519,13 +582,90 @@ def help(topic=None, tag=None, s=None, page=1, n=_PAGE, full=False, **kw):   # n
                 continue
             total += len(items)
             lines.append("\n" + _render(k, items, 1, n))
+        wiki = _wiki_text(s) if s else ""
         if total == 0:
-            lines.append("  没有命中。先用 T.help() 看总览，或 T.help(tag=\"内核\") 列全部内核。")
+            if wiki:
+                lines.append("  内置类别里没有命中；下面是外部 Wiki 词条 / matched wiki entries:")
+            else:
+                lines.append("  没有命中 / no match（不区分大小写）。")
+                lines.extend(_no_hit_hints())
+        if wiki:
+            lines.append("\n" + wiki)
         return out("\n".join(lines))
 
     # ---- 指定类别 ----
     items = gather(kind)
     if not items:
-        return out("%s 里没有匹配 %r 的条目。换个关键词，或不带 s 列出全部。"
-                   % (label[kind], s))
-    return out(_render(kind, items, page, n))
+        text = "%s 里没有匹配 %r 的条目 / no match in %s. 换个关键词，或不带 s 列出全部。" \
+               % (label[kind], s, kind)
+        wiki = _wiki_text(s, kind) if s else ""
+        if wiki:
+            text += "\n\n" + wiki
+        else:
+            text += "\n" + "\n".join(_no_hit_hints())
+        return out(text)
+    text = _render(kind, items, page, n)
+    if s:
+        wiki = _wiki_text(s, kind)
+        if wiki:
+            text += "\n\n" + wiki
+    return out(text)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 外部词条（wiki/*.txt）的惰性入口 —— 默认 `T.help()` 不会 import 这些模块
+# ═══════════════════════════════════════════════════════════════════════════
+def _lazy_wiki():
+    """惰性拿到 L2 加载器（只有 JSON / web / check / missing / contrib / 搜索时才导入）。"""
+    from . import help_wiki
+    return help_wiki
+
+
+def _wiki_text(s, kind=None):
+    """终端搜索追加的 Wiki 片段；任何异常都降级为空（帮助本身不能因此报错）。"""
+    try:
+        return _lazy_wiki().text_search(s, kind)
+    except Exception:
+        return ""
+
+
+def _no_hit_hints():
+    """没有命中时给出**可执行**的下一步（不要静默空输出）。"""
+    return [
+        "  可执行的下一步 / next:",
+        "    T.help()                     总览（每类前 10 条）",
+        "    T.help(tag='kernels')        全部 CUDA 内核",
+        "    T.help(tag='api')            运行时 API",
+        "    T.help(tag='op')             张量算子（t.<名字>）",
+        "    T.help(tag='opt' / 'mods')   优化器 / 子模块",
+        "    T.help(s='gemm')             换关键词，跨类别搜索",
+        "    T.help(open='web')           生成可搜索的离线 Wiki（单个自包含 HTML）",
+        "    T.help(format='json')        给 AI/脚本的纯 JSON（stdout 只有 JSON）",
+    ]
+
+
+def _help_refresh():
+    """`T.help.refresh()` —— 强制清空 wiki 缓存（改文件一般自动生效）。"""
+    return _lazy_wiki().refresh()
+
+
+def _help_missing():
+    """`T.help.missing()` —— 待编写清单（按 kind/category 分组）。"""
+    return _lazy_wiki().missing()
+
+
+def _help_check():
+    """`T.help.check()` —— 词条健康度：解析失败/未知 ID/中英缺边/死链/覆盖率。"""
+    return _lazy_wiki().check()
+
+
+def _help_contrib(item_id=None):
+    """`T.help.contrib('op:mul')` —— 有词条打印路径，没有就生成 TXT 骨架。"""
+    return _lazy_wiki().contrib(item_id)
+
+
+#: 挂在函数上（不是模块级新名字），`T.help.check()` 这样调用最自然。
+help.refresh = _help_refresh
+help.missing = _help_missing
+help.check = _help_check
+help.contrib = _help_contrib

@@ -33,5 +33,5 @@ duo.run(["python", "train.py"])
 
 === 见也 ===
 env:TG_DP_OVERLAP
-env:TG_DP_JOB
+env:TGAI_DP_JOB
 api:help
