@@ -75,7 +75,9 @@ UNIQUE_ID_BYTES = 128
 MIN_VERSION_CODE = 20000
 
 #: ncclDataType_t
+NCCL_FLOAT16 = 6
 NCCL_FLOAT32 = 7
+NCCL_BFLOAT16 = 9
 #: ncclRedOp_t
 NCCL_SUM = 0
 
@@ -434,12 +436,7 @@ class LibNccl(object):
 
     def all_reduce(self, comm, send_ptr, recv_ptr, count, stream=None):
         """单次 ``Sum(float32)`` 就地归约。``stream`` 为 ``c_void_p`` / int / None。"""
-        if isinstance(stream, ctypes.c_void_p):
-            st = stream
-        elif stream is None:
-            st = ctypes.c_void_p(0)
-        else:
-            st = ctypes.c_void_p(int(stream))
+        st = self._stream_arg(stream)
         self.check(self._all_reduce(ctypes.c_void_p(int(send_ptr)),
                                     ctypes.c_void_p(int(recv_ptr)),
                                     ctypes.c_size_t(int(count)),
@@ -448,6 +445,23 @@ class LibNccl(object):
                                     comm,
                                     st),
                    "ncclAllReduce")
+
+    def all_reduce_typed(self, comm, send_ptr, recv_ptr, count, dtype, stream=None):
+        """带数据类型的 ``Sum`` 就地归约（bf16/fp16 低精度梯度通信用）。
+
+        为什么单开一个方法而不是给 :meth:`all_reduce` 加参数：fp32 的老调用路径
+        保持不变（假库/老测试的签名不用动），只有低精度路径才走这里。
+        ``dtype`` 是 ``ncclDataType_t`` 整数（NCCL_FLOAT16 / NCCL_BFLOAT16）。
+        """
+        st = self._stream_arg(stream)
+        self.check(self._all_reduce(ctypes.c_void_p(int(send_ptr)),
+                                    ctypes.c_void_p(int(recv_ptr)),
+                                    ctypes.c_size_t(int(count)),
+                                    ctypes.c_int(int(dtype)),
+                                    ctypes.c_int(NCCL_SUM),
+                                    comm,
+                                    st),
+                   "ncclAllReduce(typed)")
 
     # ---------- ZeRO 用的两个原语 ----------
 
@@ -601,7 +615,7 @@ class NcclComm(object):
             self.close(abort=True)
             raise
 
-    def all_reduce_group(self, entries, stream=None):
+    def all_reduce_group(self, entries, stream=None, dtype=None):
         """``entries``: [(ptr:int, count:int), ...]，一次 group 内全部就地 Sum。
 
         所有 rank 必须以**完全相同的顺序和 count** 调用（少一个/多一个都会挂）。
@@ -609,17 +623,26 @@ class NcclComm(object):
         ``stream``：可选的覆盖流（``None`` ⇒ 用建 communicator 时给的流）。
         数据并行**重叠归约**用它把每个桶的 all-reduce 放到一条独立的**非阻塞**流上，
         与反向的计算流并发（见 ``train/dp_overlap.py``）。
+
+        ``dtype``：``None`` ⇒ fp32（**老路径，调用签名不变**）；
+        给了 ``ncclDataType_t`` 就走 ``ncclAllReduce(typed)``，用于 bf16/fp16
+        梯度通信 —— ``count`` 仍是**元素数**，字节数由 NCCL 按 dtype 自己算。
         """
         if self.closed:
             raise NcclError("NcclComm 已关闭" + "。修法：不要跨 close() 复用通信器")
         st = self.stream if stream is None else stream
         lib = self.lib
+        dt = None if dtype is None else int(dtype)
         lib.group_start()
         try:
             for ptr, count in entries:
                 if int(count) <= 0:
                     continue
-                lib.all_reduce(self._comm, ptr, ptr, int(count), stream=st)
+                if dt is None:
+                    lib.all_reduce(self._comm, ptr, ptr, int(count), stream=st)
+                else:
+                    lib.all_reduce_typed(self._comm, ptr, ptr, int(count), dt,
+                                         stream=st)
         finally:
             lib.group_end()
 

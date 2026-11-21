@@ -44,6 +44,23 @@ NCCL 的 unique id 走同一个 rendezvous 目录（`<dir>/nccl_id`，rank0 原�
 每卡 batch = B、world = W 时，默认"梯度平均"让更新方向等价于 **W×B 的大 batch**。
 所以学习率要按 W×B 的口径调（常见做法是 lr 保持、B 不变、靠更大 batch 换稳定；
 或 lr 按 √W 放宽）。本模块**不会**替你改 lr。
+
+## 梯度通信精度：`TG_DP_GRAD_DTYPE=fp32|bf16|fp16`（默认 fp32）
+
+PCIe-only 机器上 DP 的瓶颈是**字节数**（实测 2×5090：3.16 GiB fp32 all-reduce
+≈141 ms，而单卡整步只要 141–251 ms，重叠救不回来）。本模块支持把梯度**按低精度
+通信**：归约前 cast 成 bf16/fp16，在低精度下做 all-reduce，结果 cast 回 fp32 写回
+`p.grad`。**参数本身永远是 fp32**（不碰主权重、不碰优化器状态）。
+
+* 默认 `fp32` ⇒ 所有路径与历史实现**逐位一致**（老路径的代码一个字没改）；
+* 通信字节：848.6M 参数 × 4 B = **3.16 GiB** → bf16 = **1.58 GiB**（正好一半）；
+* 均值语义不变（仍然 `sum/world`），只改精度；单元素相对舍入误差上界 bf16 = 2^-8
+  （~3.9e-3，尾段典型 2^-9）、fp16 = 2^-11（~4.9e-4），真实 loss/gnorm 偏差见
+  `docs/DP_BF16_GRAD.md` 的实测表；
+* `world=1` 时仍然是**快速空操作**（单卡不涉及归约精度，梯度逐位不变）；
+* `TG_DP_GRAD_EF=1` 打开误差反馈（把 cast 截断的残差留在 fp32 影子里，下次加回）。
+  代价是**多一份 fp32 影子梯度**（848M 时 3.16 GiB 显存/内存），所以默认关；
+  且 EF 需要「不重叠」路径（残差在打包缓冲里结算），会自动让 `begin_overlap()` 返回 None。
 """
 import os
 import ctypes
@@ -133,6 +150,185 @@ def _env_float(name, default):
         return default
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 梯度通信精度（TG_DP_GRAD_DTYPE）：fp32 / bf16 / fp16
+# ══════════════════════════════════════════════════════════════════════════
+
+#: 允许的低精度通信类型。默认 fp32 ⇒ 历史行为逐位不变。
+GRAD_DTYPES = ("fp32", "bf16", "fp16")
+
+#: 通信时每个元素的字节数（bf16/fp16 都是 2）。
+_GRAD_ITEMSIZE = {"fp32": 4, "bf16": 2, "fp16": 2}
+
+
+def grad_dtype_requested():
+    """读 `TG_DP_GRAD_DTYPE` 并归一化。非法值**当场报错**，不静默当 fp32。
+
+    为什么不静默：写错一个字母（`TG_DP_GRAD_DTYPE=b16`）就退回 **2 倍**通信字节，
+    而日志里看不出任何异常 —— 这类「悄悄降级」是性能实验最难查的错
+    （与 `dp_backend_requested` 同一条纪律）。
+    """
+    raw = os.environ.get("TG_DP_GRAD_DTYPE", "")
+    v = str(raw).strip().lower()
+    if v in ("", "fp32", "float32", "none", "off", "0"):
+        return "fp32"
+    if v in ("bf16", "bfloat16"):
+        return "bf16"
+    if v in ("fp16", "half", "float16"):
+        return "fp16"
+    raise ValueError(
+        "TG_DP_GRAD_DTYPE=%r 不认识（可选 %s）" % (raw, "/".join(GRAD_DTYPES)) +
+        "。修法：设成 fp32、bf16 或 fp16；想保持历史行为就删掉这个环境变量")
+
+
+def grad_ef_requested():
+    """读 `TG_DP_GRAD_EF`（误差反馈开关，默认关）。非法值当场报错。"""
+    raw = os.environ.get("TG_DP_GRAD_EF", "")
+    v = str(raw).strip().lower()
+    if v in ("", "0", "false", "off", "no", "none"):
+        return False
+    if v in ("1", "true", "on", "yes"):
+        return True
+    raise ValueError(
+        "TG_DP_GRAD_EF=%r 不认识" % (raw,) +
+        "。修法：设 1 开、0 关；不想用就删掉这个环境变量")
+
+
+def grad_itemsize(dtype):
+    """低精度通信的每元素字节数（fp32=4，bf16/fp16=2）。未知 dtype 报错。"""
+    try:
+        return _GRAD_ITEMSIZE[str(dtype)]
+    except KeyError:
+        raise ValueError(
+            "未知的梯度通信 dtype=%r（可选 %s）"
+            % (dtype, "/".join(GRAD_DTYPES)) +
+            "。修法：用 grad_dtype_requested() 归一化后再传，或别传这个参数")
+
+
+def _f32_bits_flat(a):
+    """fp32 主机数组 → uint32 位模式（一维、连续）。"""
+    return np.ascontiguousarray(a, dtype=np.float32).reshape(-1).view(np.uint32)
+
+
+def bf16_bits_from_f32(a):
+    """fp32 → bf16 位模式（uint16），round-to-nearest-even。
+
+    与 CUDA 内核 `cast_f32_to_bf16` 的公式**逐位一致**：
+    ``(u + 0x7FFF + ((u >> 16) & 1)) >> 16``（u 是 fp32 的 32 位模式）。
+    主机侧用 uint64 做加法避免 numpy 的 uint32 溢出告警；CUDA 里无符号回绕语义相同。
+    """
+    u = _f32_bits_flat(a).astype(np.uint64)
+    r = (u + np.uint64(0x7FFF) + ((u >> np.uint64(16)) & np.uint64(1))) >> np.uint64(16)
+    return r.astype(np.uint16)
+
+
+def f32_from_bf16_bits(bits):
+    """bf16 位模式（uint16）→ fp32（左移 16 位，**精确**，不丢位）。"""
+    b = np.ascontiguousarray(bits, dtype=np.uint16).reshape(-1)
+    return (b.astype(np.uint32) << np.uint32(16)).view(np.float32)
+
+
+def quantize_to_bits(a, dtype):
+    """fp32 主机数组 → 2 字节低精度位模式（uint16；bf16/fp16 都是 16 位位模式）。"""
+    if dtype == "bf16":
+        return bf16_bits_from_f32(a)
+    if dtype == "fp16":
+        return (np.ascontiguousarray(a, dtype=np.float32).reshape(-1)
+                .astype(np.float16).view(np.uint16))
+    raise ValueError(
+        "quantize_to_bits 只接受 bf16/fp16，收到 %r" % (dtype,) +
+        "。修法：fp32 不走位模式；先确认 self.grad_dtype != 'fp32' 再调用")
+
+
+def dequantize_from_bits(bits, dtype):
+    """2 字节低精度位模式 → fp32 主机数组（这一侧是精确的，误差只来自收窄）。"""
+    if dtype == "bf16":
+        return f32_from_bf16_bits(bits)
+    if dtype == "fp16":
+        b = np.ascontiguousarray(bits, dtype=np.uint16).reshape(-1)
+        return b.view(np.float16).astype(np.float32)
+    raise ValueError(
+        "dequantize_from_bits 只接受 bf16/fp16，收到 %r" % (dtype,) +
+        "。修法：fp32 不走位模式；先确认 self.grad_dtype != 'fp32' 再调用")
+
+
+# ---- 设备侧：把低精度 cast 进**已分配**缓冲（复用 cuda.py 里已有的内核） ----
+# 为什么不调用 `rt.cast_f32_to_bf16_flat()`：那个每次调用都 `empty()` 一块新显存。
+# 3.16 GiB 梯度每步分配 1.58 GiB（cast 后）再释放，既抬峰值又拖慢 —— 实测过一次，
+# 显存红线（≤0.5 GiB 涨幅）直接破。这里直接发射同名内核，目标缓冲跨步复用。
+
+def _mark_ptrs(rt, *bufs):
+    """把缓冲标成「已提交到流」（内存池的复用安全前提）。"""
+    for b in bufs:
+        if b is not None:
+            try:
+                rt._mark_submitted(int(b.ptr))
+            except Exception:                            # noqa: BLE001
+                pass
+
+
+def _cast_f32_to_16(rt, dtype, src_f32, dst16, n, src_off=0, dst_off=0, stream=None):
+    """fp32 缓冲 ``[src_off, src_off+n)`` → 2 字节缓冲 ``[dst_off, dst_off+n)``（异步）。"""
+    n = int(n)
+    if n <= 0:
+        return
+    name = "cast_f32_to_bf16" if str(dtype) == "bf16" else "cast_f32_to_f16"
+    grid, block = rt._ewise_grid(n)
+    _mark_ptrs(rt, src_f32, dst16)
+    rt.launch(name, grid, block, [
+        (int(src_f32.ptr) + 4 * int(src_off), ctypes.c_uint64),
+        (int(dst16.ptr) + 2 * int(dst_off), ctypes.c_uint64),
+        (n, ctypes.c_int),
+    ], stream=stream)
+
+
+def _cast_16_to_f32(rt, dtype, src16, dst_f32, n, src_off=0, dst_off=0, stream=None):
+    """2 字节缓冲 ``[src_off, src_off+n)`` → fp32 缓冲 ``[dst_off, dst_off+n)``（异步）。"""
+    n = int(n)
+    if n <= 0:
+        return
+    name = "cast_bf16_to_f32" if str(dtype) == "bf16" else "cast_f16_to_f32"
+    grid, block = rt._ewise_grid(n)
+    _mark_ptrs(rt, src16, dst_f32)
+    rt.launch(name, grid, block, [
+        (int(src16.ptr) + 2 * int(src_off), ctypes.c_uint64),
+        (int(dst_f32.ptr) + 4 * int(dst_off), ctypes.c_uint64),
+        (n, ctypes.c_int),
+    ], stream=stream)
+
+
+def _zero_16_region(rt, dtype, buf16, elem_off, n_elems, zero1, stream=None):
+    """把 2 字节缓冲的 ``[elem_off, elem_off+n_elems)`` 置为 0（bf16/fp16 的 +0 位模式都是 0）。
+
+    为什么不用内核：没有现成的「按 2 字节填 0」内核，而 `scale_inplace` 只认 fp32。
+    做法：成对的元素用 `cuMemsetD32Async`（4 字节字，正好两个元素），奇数尾元素
+    用 ``cast_f32_to_16(0.0)`` 精确写进去。**绝不**越界写 4 字节（那会把相邻参数
+    的第一个元素抹掉 —— 重叠归约里那是一个已经 stage 好的梯度）。
+    """
+    n = int(n_elems)
+    if n <= 0:
+        return
+    words = n // 2
+    if words:
+        st = rt._stream if stream is None else stream
+        rt.cu.cuMemsetD32Async(ctypes.c_uint64(int(buf16.ptr) + 2 * int(elem_off)),
+                               ctypes.c_uint(0), ctypes.c_size_t(words), st)
+    if n % 2:
+        _cast_f32_to_16(rt, dtype, zero1, buf16, 1,
+                        dst_off=int(elem_off) + n - 1, stream=stream)
+
+
+def _lowp_chunk_elems(total):
+    """低精度打包的分块元素数（`TG_DP_PACK_MB` 默认 256 MB；0 ⇒ 一整块）。
+
+    抽成函数是为了单测能用**假运行时**把多分块路径也跑到（见 tests/test_dp_bf16_grad.py）。
+    """
+    pack_mb = _env_int("TG_DP_PACK_MB", 256)
+    total = int(total)
+    return (total if pack_mb <= 0
+            else max(1, min(total, (int(pack_mb) << 20) // 4)))
+
+
 #: 允许的归约后端。默认 host（与历史行为逐位一致）。
 BACKENDS = ("host", "nccl", "auto")
 
@@ -206,7 +402,8 @@ def _set_data(p, val):
 
 
 class DataParallel:
-    def __init__(self, world=None, rank=None, job=None, timeout=None, backend=None):
+    def __init__(self, world=None, rank=None, job=None, timeout=None, backend=None,
+                 grad_dtype=None):
         self.world = _env_int("TGAI_DP_WORLD", 1) if world is None else int(world)
         self.rank = _env_int("TGAI_DP_RANK", 0) if rank is None else int(rank)
         self.job = job or os.environ.get("TGAI_DP_JOB", "default")
@@ -221,6 +418,19 @@ class DataParallel:
             raise ValueError("backend=%r 不认识（可选 %s）"
                              % (backend, "/".join(BACKENDS)) +
                              "。修法：传 host、nccl 或 auto；默认 host")
+        # 梯度通信精度：显式参数 > 环境变量 > 默认 fp32（历史行为逐位不变）
+        self.grad_dtype = (str(grad_dtype).strip().lower() if grad_dtype is not None
+                           else grad_dtype_requested())
+        if self.grad_dtype not in GRAD_DTYPES:
+            raise ValueError(
+                "grad_dtype=%r 不认识（可选 %s）" % (grad_dtype, "/".join(GRAD_DTYPES)) +
+                "。修法：传 fp32/bf16/fp16；默认 fp32")
+        # 误差反馈：默认关（多一份 fp32 影子梯度，见模块文档）
+        self.grad_ef = bool(grad_ef_requested()) and self.grad_dtype != "fp32"
+        if grad_ef_requested() and self.grad_dtype == "fp32":
+            raise ValueError(
+                "TG_DP_GRAD_EF=1 只对低精度通信有意义（当前 TG_DP_GRAD_DTYPE=fp32）" +
+                "。修法：把 TG_DP_GRAD_DTYPE 设成 bf16/fp16，或删掉 TG_DP_GRAD_EF")
         self.backend = "host"                # 实际生效的后端（nccl 初始化失败时可能回退）
         self._nccl = None
         self._nccl_lib = None
@@ -232,6 +442,19 @@ class DataParallel:
         #: 最近一次 all_reduce 的 NCCL-only 耗时（host 路径为 None）
         self.nccl_sec = None
         self._nccl_calls = 0
+        #: 最近一次归约的**通信有效载荷字节**（每 rank 发出去的字节数）。
+        #: 验收口径：fp32 时 848.6M 参数 = 3.16 GiB，bf16 = 1.58 GiB（正好一半）。
+        #: 低精度路径每条都会写；fp32 路径保持不变（None），由调用方自己算。
+        self.comm_rank_bytes = None
+        self.comm_rank_bytes_fp32 = None
+        #: 误差反馈的影子梯度缓冲（延迟分配，见 _ef_*；fp32 / 未开 EF 时恒为 None）
+        self._ef_host_buf = None
+        self._ef_dev_buf = None
+        #: 低精度归约用的跨步复用缓冲（pack32 / pack16 / scratch32）
+        self._lp_buf = None
+        self._zero1 = None
+        self._host16 = None
+        self._ef_ov_warned = False
         # ── 反向重叠归约（`begin_overlap` / `finish_overlap`）的状态 ──
         #: 当前 step 的重叠会话（`dp_overlap.OverlapSession`）；没开就是 None
         self._ov = None
@@ -292,6 +515,10 @@ class DataParallel:
                 fh.write(b"%d %f %f" % (os.getpid(), time.time(), _PROC_START))
         self._session_id = _PROC_START if self.rank == 0 else self._await_peer_ready()
         self._barrier("init")
+        # ★ 各 rank 的通信 dtype 必须一致，否则集合通信的字节数/类型不同：
+        #   NCCL 会挂或算出垃圾，host 路径会因共享内存名字不同而互相死等。
+        #   写错环境变量是最容易发生的一种「各 rank 不一致」，所以在 _start 里强制对齐。
+        self._sync_grad_dtype()
         self._started = True
         self._ensure_backend()
 
@@ -469,6 +696,36 @@ class DataParallel:
         if sid is None:
             sid = _PROC_START
         return "tgai_dp_%s_%d_%d" % (self.job, int(round(float(sid) * 1000.0)), int(need))
+
+    def _sync_grad_dtype(self):
+        """各 rank 交换自己的梯度通信 dtype，不一致就**当场报错**。
+
+        为什么必须对齐：低精度归约改变了集合通信的「元素类型 × 字节数」。
+        两个 rank 一个 bf16 一个 fp32 时，NCCL 的调用类型不一致（挂或算错），
+        host 路径则因共享内存名字里的字节数不同而互相死等 —— 后者会表现为
+        「训练卡住」，极难定位。所以宁可在启动时就炸。
+        """
+        if self.world <= 1:
+            return
+        sid = int(round(float(getattr(self, "_session_id", _PROC_START)) * 1000.0))
+        path = os.path.join(self.dir, "grad_dtype_%d.%d" % (sid, int(self.rank)))
+        with open(path, "wb") as fh:
+            fh.write(str(self.grad_dtype).encode("ascii"))
+        self._barrier("dtype")
+        seen = {}
+        for r in range(int(self.world)):
+            p = os.path.join(self.dir, "grad_dtype_%d.%d" % (sid, r))
+            try:
+                with open(p, "rb") as fh:
+                    seen[r] = fh.read(64).decode("ascii", "replace").strip() or "?"
+            except OSError:
+                seen[r] = "?"
+        if len(set(seen.values())) > 1:
+            raise RuntimeError(
+                "各 rank 的 TG_DP_GRAD_DTYPE 不一致：%s"
+                % ", ".join("rank%d=%s" % (r, v) for r, v in sorted(seen.items())) +
+                "。修法：所有 rank 必须设成同一个值（fp32/bf16/fp16）；"
+                "低精度归约会改变集合通信的类型与字节数，不一致会挂死或算错")
 
     def _ensure_slot(self, nbytes):
         """所有 rank 共用一块 `world * nbytes` 的共享内存，按 rank 分段写。"""
@@ -813,6 +1070,11 @@ class DataParallel:
         total = sum(e[2] for e in entries)
         if total <= 0:
             raise RuntimeError("梯度总长度为 0" + "。修法：确认反向已经跑过、params 非空")
+        if self.grad_dtype != "fp32":
+            # ★ 低精度通信：256 MiB 的 fp32 打包缓冲在 bf16 下只需 128 MiB，
+            #   峰值涨幅是 384 MiB（< 0.5 GiB 红线），详见 docs/DP_BF16_GRAD.md。
+            self._all_reduce_lowp(entries, total, scale)
+            return
         if self.backend == "nccl":
             self._all_reduce_nccl(entries, total, scale)
             return
@@ -1116,14 +1378,276 @@ class DataParallel:
         self._barrier("za2")
         return out.reshape(shape)
 
-    def stats(self):
+    # ---------- 低精度梯度通信（TG_DP_GRAD_DTYPE=bf16/fp16） ----------
+    #
+    # 三条路径共用同一套语义：「cast → 低精度 all-reduce → cast 回 fp32 → ×1/world」：
+    #
+    #   pack32 = 本 rank 梯度分块打包（缺梯度按 0）
+    #   pack16 = cast(pack32)            ← 只有这 1/2 的字节走集合通信
+    #   all_reduce(pack16, dtype)        ← NCCL 用 bf16/fp16 类型；host 走共享内存交换
+    #   pack32 = dequant(pack16) * 1/world
+    #   写回各 p.grad（**覆盖**，不是累加：p.grad 里原来那份本 rank 梯度已经打包过）
+    #
+    # 参数本身**永远 fp32**；`world=1` 在 `all_reduce_grads` 开头就返回，
+    # 所以单卡的梯度逐位不变（验收硬要求）。
 
+    def _set_comm_bytes(self, total):
+        """记录本步通信有效载荷字节（验收口径：3.16 GiB → 1.58 GiB 的算术值）。"""
+        self.comm_rank_bytes = int(total) * _GRAD_ITEMSIZE[self.grad_dtype]
+        self.comm_rank_bytes_fp32 = int(total) * 4
+        return self.comm_rank_bytes
+
+    def _ef_host(self, total):
+        """CPU 路径的误差反馈影子（主机内存，total×4 字节；未开 EF 返回 None）。"""
+        if not self.grad_ef:
+            return None
+        buf = self._ef_host_buf
+        if buf is None or int(buf.size) != int(total):
+            self._ef_host_buf = np.zeros(int(total), dtype=np.float32)
+            buf = self._ef_host_buf
+        return buf
+
+    def _ef_dev(self, rt, total):
+        """CUDA 路径的误差反馈影子（显存，total×4 字节；未开 EF 返回 None）。"""
+        if not self.grad_ef:
+            return None
+        buf = self._ef_dev_buf
+        if buf is None or int(buf.n) != int(total):
+            self._ef_dev_buf = rt.zeros((int(total),), dtype=np.float32)
+            buf = self._ef_dev_buf
+        return buf
+
+    def _nccl_dtype(self):
+        """低精度通信的 ncclDataType_t。fp32 返回 None（调用方走老的无类型路径）。"""
+        from . import dist_nccl as _N
+        if self.grad_dtype == "bf16":
+            return int(_N.NCCL_BFLOAT16)
+        if self.grad_dtype == "fp16":
+            return int(_N.NCCL_FLOAT16)
+        return None
+
+    def _all_reduce_lowp(self, entries, total, scale):
+        """低精度归约入口：按「有没有 CUDA 运行时」分派。"""
+        self._set_comm_bytes(total)
+        sc = float(scale) if scale is not None else 1.0 / float(self.world)
+        rt = None
+        try:
+            rt = _runtime()
+        except Exception:                                # noqa: BLE001
+            rt = None
+        if rt is None:
+            self._all_reduce_lowp_cpu(entries, total, sc)
+        else:
+            self._all_reduce_lowp_gpu(rt, entries, total, sc)
+        if os.environ.get("TG_DP_TIMING"):
+            print("[dp-lp] dtype=%s comm_rank_bytes=%d (fp32=%d, ratio=%.3f) backend=%s"
+                  % (self.grad_dtype, int(self.comm_rank_bytes),
+                     int(self.comm_rank_bytes_fp32),
+                     float(self.comm_rank_bytes)
+                     / max(1, int(self.comm_rank_bytes_fp32)), self.backend),
+                  flush=True)
+
+    def _all_reduce_lowp_cpu(self, entries, total, sc):
+        """无 CUDA 时的 numpy 直通路径（语义与 GPU 路径一致，用于 CPU 对拍/单测）。"""
+        total = int(total)
+        esz = _GRAD_ITEMSIZE[self.grad_dtype]
+        self._ensure_slot(max(total * esz, 8))
+        resid = self._ef_host(total)
+        own_off = int(self.rank) * total * esz
+        own_bits = np.ndarray((total,), dtype=np.uint16, buffer=self._slot.buf,
+                              offset=own_off)
+        off = 0
+        for p, g, n in entries:
+            n = int(n)
+            if g is None:
+                own_bits[off:off + n] = 0
+                if resid is not None:
+                    resid[off:off + n] = 0.0
+            else:
+                arr = _grad_to_numpy(g)
+                if arr is None or int(arr.size) != n:
+                    raise RuntimeError(
+                        "低精度归约读不出梯度 #%d 的数值（长度 %s，期望 %d）"
+                        % (off, None if arr is None else int(arr.size), n) +
+                        "。修法：确认该 rank 的 .grad 是有效张量（CUDA 张量用 to_numpy）；"
+                        "或先设 TG_DP_GRAD_DTYPE=fp32 排除低精度路径")
+                v = arr.reshape(-1).astype(np.float32, copy=True)
+                if resid is not None:
+                    v += resid[off:off + n]
+                bits = quantize_to_bits(v, self.grad_dtype)
+                own_bits[off:off + n] = bits
+                if resid is not None:
+                    # 残差 = g_eff − dequant(quant(g_eff))
+                    resid[off:off + n] = v - dequantize_from_bits(bits, self.grad_dtype)
+            off += n
+        self._barrier("grads")
+        allb = np.ndarray((int(self.world), total), dtype=np.uint16, buffer=self._slot.buf)
+        acc = np.zeros(total, np.float32)
+        for r in range(int(self.world)):
+            acc += dequantize_from_bits(allb[r], self.grad_dtype)
+        acc *= np.float32(sc)
+        off = 0
+        for p, g, n in entries:
+            n = int(n)
+            val = acc[off:off + n].reshape(tuple(getattr(p, "shape", (n,))))
+            _set_grad(p, val, g)
+            off += n
+
+    def _all_reduce_lowp_gpu(self, rt, entries, total, sc):
+        """CUDA 路径：分块「打包 → cast → 集合通信 → dequant → ×1/world → 写回」。"""
+        total = int(total)
+        esz = _GRAD_ITEMSIZE[self.grad_dtype]
+        chunk = _lowp_chunk_elems(total)
+        b = self._lp_buf
+        if b is None or int(b[0].n) < chunk:
+            b = (rt.empty((chunk,), dtype=np.float32),      # pack32：本 rank 打包
+                 rt.empty((chunk,), dtype=np.uint16),       # pack16：通信载荷
+                 rt.empty((chunk,), dtype=np.float32))      # scratch32：对端 dequant / EF
+            self._lp_buf = b
+        pack32, pack16, scratch32 = b
+        if self._zero1 is None:
+            self._zero1 = rt.zeros((1,), dtype=np.float32)
+        resid = self._ef_dev(rt, total)
+        use_nccl = (self.backend == "nccl")
+        if use_nccl and self._nccl is None:
+            raise RuntimeError("NCCL 后端未初始化" + "。修法：先调用一次 broadcast()/_start()")
+        total16 = total * esz
+        shm_stage = None
+        own_view = None
+        own_off = 0
+        if not use_nccl:
+            self._ensure_slot(max(total16, 8))
+            own_off = int(self.rank) * total16
+            shm_stage = rt.host_register(self._slot.buf)
+            if shm_stage is None:
+                raise RuntimeError(
+                    "低精度归约要求共享内存能被 cuMemHostRegister 注册成页锁定内存" +
+                    "。修法：设 TG_DP_BACKEND=nccl 走设备侧归约（推荐），"
+                    "或 TG_DP_GRAD_DTYPE=fp32 退回逐位不变的老路径")
+            own_view = np.ndarray((total,), dtype=np.uint16, buffer=self._slot.buf,
+                                  offset=own_off)
+        nccl_dtype = self._nccl_dtype() if use_nccl else None
+        if use_nccl and self.grad_dtype == "bf16":
+            ver = int(getattr(self._nccl_lib, "version", 0) or 0)
+            if ver and ver < 21000:
+                raise RuntimeError(
+                    "当前 libnccl %s 不支持 bf16 集合通信（需要 >= 2.10）"
+                    % (self._nccl_lib.version_str(),) +
+                    "。修法：升级 NCCL（>=2.10）；或改用 TG_DP_GRAD_DTYPE=fp16/fp32")
+        for lo in range(0, total, chunk):
+            hi = min(total, lo + chunk)
+            n = hi - lo
+            self._zero_pack_range(rt, lo, hi, pack32)
+            self._pack_range(rt, entries, lo, hi, pack32)
+            if resid is not None:
+                self._add_resid_range(rt, entries, lo, hi, pack32, resid)
+            _cast_f32_to_16(rt, self.grad_dtype, pack32, pack16, n)
+            if resid is not None:
+                # 残差 = g_eff − dequant(quant(g_eff))；缺梯度区间 0−0=0（残差重置）
+                _cast_16_to_f32(rt, self.grad_dtype, pack16, scratch32, n)
+                rt.scale_inplace(rt.sub_view(scratch32, (n,), 0), -1.0)
+                rt.add_(rt.sub_view(scratch32, (n,), 0), rt.sub_view(pack32, (n,), 0))
+                rt.copy_d2d(resid, scratch32, nbytes=n * 4, dst_off=lo * 4)
+            if use_nccl:
+                self._nccl_before(rt)
+                self._nccl.all_reduce_group([(int(pack16.ptr), n)], dtype=nccl_dtype)
+                self._nccl_after(rt)
+                rt.sync()
+                # 归约结果（低精度 sum）→ fp32 → ×1/world → 覆盖写回各 grad
+                _cast_16_to_f32(rt, self.grad_dtype, pack16, pack32, n)
+            else:
+                # host：把自己的低精度载荷 d2h 进共享内存，缺梯度区间在主机侧清零
+                rt.d2h_into(pack16, ctypes.c_void_p(
+                    int(shm_stage.ptr.value) + own_off + lo * esz), nbytes=n * esz)
+                self._zero_host_missing(entries, lo, hi, own_view)
+                self._barrier("grads")
+                _cast_16_to_f32(rt, self.grad_dtype, pack16, pack32, n)
+                for r in range(int(self.world)):
+                    if r == int(self.rank):
+                        continue
+                    rt.h2d_into(pack16, ctypes.c_void_p(
+                        int(shm_stage.ptr.value) + r * total16 + lo * esz),
+                        nbytes=n * esz)
+                    _cast_16_to_f32(rt, self.grad_dtype, pack16, scratch32, n)
+                    rt.add_(rt.sub_view(pack32, (n,), 0), rt.sub_view(scratch32, (n,), 0))
+            rt.scale_inplace(rt.sub_view(pack32, (n,), 0), sc)
+            self._copy_range_to_grads(rt, entries, lo, hi, pack32)
+            if not use_nccl:
+                # 下一个分块要覆盖共享内存：必须等对端读完本块（否则静默读到半新半旧）
+                self._barrier("grads2")
+        # 缺梯度：与 fp32 路径一致，补**全 0** 的梯度（不是跳过）
+        for p, g, n in entries:
+            if g is None:
+                _set_grad(p, np.zeros(tuple(getattr(p, "shape", (n,))), np.float32), None)
+
+    @staticmethod
+    def _zero_pack_range(rt, lo, hi, pack32):
+        """把 pack32 的分块区间清零（缺梯度位置不能留上一块的旧值）。"""
+        n = int(hi) - int(lo)
+        if n > 0:
+            rt.scale_inplace(rt.sub_view(pack32, (n,), 0), 0.0)
+
+    @staticmethod
+    def _add_resid_range(rt, entries, lo, hi, pack32, resid):
+        """EF：把残差加到**有梯度**的参数区间上（缺梯度不参与，不能把残差当梯度发出去）。"""
+        off = 0
+        for p, g, n in entries:
+            a = off
+            off += int(n)
+            b = off
+            if g is None or b <= lo or a >= hi:
+                continue
+            s = max(a, lo)
+            e = min(b, hi)
+            m = e - s
+            rt.add_(rt.sub_view(pack32, (m,), s - lo), rt.sub_view(resid, (m,), s))
+
+    @staticmethod
+    def _copy_range_to_grads(rt, entries, lo, hi, pack):
+        """把 pack 的分块区间**覆盖**写回各梯度（不是 add：本 rank 梯度已打包）。
+
+        ★ `dst_off=(s-a)*4` 不能写成 0：分块边界可能落在**一个参数中间**（256 MB 的块
+          与 321 个参数几乎必然错位），只写 param 头部会把后半段留在"本 rank 原值"，
+          结果是"一半归约过、一半没归约"，而且不报错。这条由假运行时单测
+          `test_gpu_pipeline_multi_chunk_matches_reference` 钉住。
+        """
+        off = 0
+        for p, g, n in entries:
+            a = off
+            off += int(n)
+            b = off
+            if g is None or b <= lo or a >= hi:
+                continue
+            s = max(a, lo)
+            e = min(b, hi)
+            rt.copy_d2d(g._gpu, pack, nbytes=(e - s) * 4, dst_off=(s - a) * 4,
+                        src_off=(s - lo) * 4)
+
+    @staticmethod
+    def _zero_host_missing(entries, lo, hi, own_view):
+        """host 路径：本 rank 缺失的梯度在共享内存里必须是 0（各 rank 都发同样多的字节）。"""
+        off = 0
+        for p, g, n in entries:
+            a = off
+            off += int(n)
+            b = off
+            if g is not None or b <= lo or a >= hi:
+                continue
+            s = max(a, lo)
+            e = min(b, hi)
+            own_view[s:e] = 0
+
+    def stats(self):
         """给日志/RESULT 用的后端信息（**实测值，不是配置值**）。"""
         out = {"backend_requested": self.backend_requested,
                "backend": self.backend,
                "world": int(self.world), "rank": int(self.rank),
                "comm_sec": self.comm_sec, "nccl_sec": self.nccl_sec,
-               "nccl_calls": int(self._nccl_calls)}
+               "nccl_calls": int(self._nccl_calls),
+               "grad_dtype": self.grad_dtype,
+               "grad_ef": bool(self.grad_ef),
+               "comm_rank_bytes": self.comm_rank_bytes,
+               "comm_rank_bytes_fp32": self.comm_rank_bytes_fp32}
         if self.overlap_stats is not None:
             out["overlap"] = self.overlap_stats
         if self._nccl_lib is not None:
@@ -1247,6 +1771,14 @@ class DataParallel:
             return None                        # ★ 单卡零行为变化
         if not dp_overlap.overlap_enabled():
             return None
+        if self.grad_ef:
+            # EF 的残差要在**打包缓冲**里结算（见 _add_resid_range），重叠路径没有那个
+            # 时刻：stage 一进桶就发集合通信了。所以 EF 开着时整步走不重叠路径。
+            if not self._ef_ov_warned:
+                self._ef_ov_warned = True
+                print("[dp] WARN TG_DP_GRAD_EF=1 需要不重叠路径（残差在打包缓冲里结算）"
+                      "⇒ 本步及后续都走 all_reduce_grads", flush=True)
+            return None
         if self._ov is not None:
             raise RuntimeError(
                 "上一个重叠会话还没 finish_overlap()/abort_overlap()" +
@@ -1283,10 +1815,12 @@ class DataParallel:
             if self.backend == "nccl":
                 st = self._make_overlap_stream(rt)
                 transport = dp_overlap.NcclBucketTransport(
-                    self._nccl, st, rt, sc, slots=dp_overlap.resolve_slots())
+                    self._nccl, st, rt, sc, slots=dp_overlap.resolve_slots(),
+                    grad_dtype=self.grad_dtype)
             else:
                 transport = dp_overlap.HostBucketTransport(
-                    self, rt, sc, slots=dp_overlap.resolve_slots())
+                    self, rt, sc, slots=dp_overlap.resolve_slots(),
+                    grad_dtype=self.grad_dtype)
         except dp_overlap.OverlapUnavailable as exc:
             print("[dp] WARN 重叠归约不可用（%s）⇒ 退回不重叠路径" % (exc,), flush=True)
             return None

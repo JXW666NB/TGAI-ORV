@@ -84,7 +84,40 @@ lm_head 权重。前向里它被两条路径用到，所以反向里 `_acc()` �
 桶缓冲是**环形复用**的 `slots` 块（默认 3 × 256 MB = 768 MiB），不是「每个桶一块」
 （那要 3.16 GiB）。slot 被复用前，主流程先等上一轮用它的桶完成
 （`cuStreamWaitEvent`，只挡流不挡主机线程）。
+
+## 低精度通信（`TG_DP_GRAD_DTYPE=bf16|fp16`，默认 fp32）
+
+三条传输都支持把桶按低精度通信（字节数减半，见 `dist.py` 的同一节）：
+
+* `NumpyTransport`：stage 时量化（`bf16/fp16` 收窄再升宽），缓冲里是「对端会收到的
+  数值」，用于 CPU 上逐位对拍；
+* `NcclBucketTransport`：桶缓冲本身是 2 字节，`ncclAllReduce(bf16/fp16)`；
+* `HostBucketTransport`：共享内存里传 2 字节，对端 H2D 后 dequant 成 fp32 再累加。
+
+量化语义：**先在 stage 时乘 `1/world` 再收窄**（`bf16` 下乘 2 的幂是精确的，
+所以 world=2 时与不重叠路径的「先求和再乘」逐位一致），归约完后直接 dequant
+覆盖写回 `p.grad`。fp32 路径**一个字节都没改**。
 """
+
+def _dist_lowp():
+    """取 `dist.py` 里的低精度 cast/清零内核封装（延迟 import：避免循环依赖）。"""
+    from . import dist as _d
+    return _d
+
+
+def _nccl_dtype_for(dtype):
+    """低精度 dtype → ``ncclDataType_t``。fp32 返回 None（调用方走无类型的老路径）。"""
+    if dtype == "fp32":
+        return None
+    from . import dist_nccl as _N
+    if dtype == "bf16":
+        return int(_N.NCCL_BFLOAT16)
+    if dtype == "fp16":
+        return int(_N.NCCL_FLOAT16)
+    raise ValueError(
+        "未知的梯度通信 dtype=%r" % (dtype,) +
+        "。修法：只支持 fp32/bf16/fp16；先用 resolve_grad_dtype() 归一化")
+
 import os
 import queue
 import threading
@@ -169,6 +202,26 @@ def resolve_bucket_bytes():
 def resolve_slots():
     """环形缓冲槽数（`TG_DP_OVERLAP_SLOTS`，默认 3）。"""
     return _env_int("TG_DP_OVERLAP_SLOTS", DEFAULT_SLOTS, lo=1, hi=16)
+
+
+def resolve_grad_dtype(dtype=None):
+    """归一化梯度通信精度。``None`` ⇒ 读 `TG_DP_GRAD_DTYPE`（默认 fp32）。
+
+    非法值**当场报错**（与 dist 里同一条纪律：写错字母悄悄退回 2 倍字节，
+    日志里看不出来）。
+    """
+    if dtype is None:
+        return _dist_lowp().grad_dtype_requested()
+    v = str(dtype).strip().lower()
+    if v in ("fp32", "float32"):
+        return "fp32"
+    if v in ("bf16", "bfloat16"):
+        return "bf16"
+    if v in ("fp16", "half", "float16"):
+        return "fp16"
+    raise ValueError(
+        "grad_dtype=%r 不认识（可选 fp32/bf16/fp16）" % (dtype,) +
+        "。修法：传 fp32、bf16 或 fp16；想保持历史行为就传 fp32 / 不传")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -682,15 +735,22 @@ class NumpyTransport(TransportBase):
 
     默认不做集合通信（world=1 语义：桶里的值就是最终值）。测试里可以塞一个
     `reduce_fn` 模拟「各 rank 求和 / 取平均」，验证算术与写回是否逐位正确。
+
+    低精度（`grad_dtype=bf16/fp16`）时：stage 先把梯度**量化**（收窄再升宽），
+    缓冲里存的是「对端实际会收到的数值」（fp32 表示、但只有低精度的信息量），
+    `reduce_fn` 与写回都作用在量化后的值上 —— 因此可以在 CPU 上**逐位**断言
+    「cast 路径 + 均值语义」是否正确。`comm_bytes` 记下真实通信载荷字节。
     """
 
     kind = "numpy"
     slots = 1
     supports_cpu = True
 
-    def __init__(self, reduce_fn=None, scale=None):
+    def __init__(self, reduce_fn=None, scale=None, grad_dtype="fp32"):
         self.reduce_fn = reduce_fn
         self.scale = scale
+        self.grad_dtype = resolve_grad_dtype(grad_dtype)
+        self.comm_bytes = 0
         self._bufs = {}
         self._sess = None
         self._comm = 0.0
@@ -712,7 +772,13 @@ class NumpyTransport(TransportBase):
         if src.size != n:
             raise RuntimeError("numpy 传输：梯度大小 %d != 期望 %d" % (src.size, n) +
                                "。修法：这是测试用直通传输的内部校验；检查会话 params 是否被中途替换（真实训练请用 NCCL/host 传输）")
-        dst[...] = src
+        if self.grad_dtype == "fp32":
+            dst[...] = src
+            return
+        D = _dist_lowp()
+        bits = D.quantize_to_bits(src, self.grad_dtype)
+        dst[...] = D.dequantize_from_bits(bits, self.grad_dtype)
+        self.comm_bytes = int(self.comm_bytes) + int(n) * 2
 
     def submit(self, info):
         t0 = time.perf_counter()
@@ -746,6 +812,12 @@ class NumpyTransport(TransportBase):
     def comm_seconds(self):
         return self._comm
 
+    def stats(self):
+        out = {"grad_dtype": self.grad_dtype}
+        if self.grad_dtype != "fp32":
+            out["comm_bytes"] = int(self.comm_bytes)
+        return out
+
     def close(self):
         self.closed = True
         self._bufs = {}
@@ -768,12 +840,13 @@ class NcclBucketTransport(TransportBase):
 
     kind = "nccl"
 
-    def __init__(self, comm, stream, rt, scale, slots=None):
+    def __init__(self, comm, stream, rt, scale, slots=None, grad_dtype="fp32"):
         self.comm = comm
         self.stream = stream
         self.rt = rt
         self.scale = float(scale)
         self.slots = int(slots if slots is not None else resolve_slots())
+        self.grad_dtype = resolve_grad_dtype(grad_dtype)
         self._bufs = []
         self._ev_in = []
         self._ev_done = []
@@ -781,6 +854,9 @@ class NcclBucketTransport(TransportBase):
         self._comm = 0.0
         self._n_reduced = 0
         self._bucket_ms = {}
+        self._dt = None
+        self._zero1 = None
+        self.comm_bytes = 0
 
     def open(self, sess):
         self._sess = sess
@@ -789,7 +865,18 @@ class NcclBucketTransport(TransportBase):
         if nb <= 0:
             raise OverlapUnavailable("桶总字节为 0（没有要归约的梯度）" +
                                  "。修法：确认反向前已把参数加入 begin_overlap(params)；若模型没有任何可训练参数，请设 TG_DP_OVERLAP=0")
-        self._bufs = [rt.empty((nb // 4,), dtype=np.float32) for _ in range(self.slots)]
+        if self.grad_dtype == "fp32":
+            self._bufs = [rt.empty((nb // 4,), dtype=np.float32) for _ in range(self.slots)]
+        else:
+            # ★ 低精度桶缓冲：**元素数不变、字节数减半**（bf16/fp16 都是 2 字节/元素）。
+            #   用 uint16 存位模式，cast 走 dist 里那两个已存在的 CUDA 内核。
+            if nb % 4:
+                raise OverlapUnavailable(
+                    "桶字节数 %d 不是 4 的倍数，低精度桶布局不成立" % (nb,) +
+                    "。修法：设 TG_DP_GRAD_DTYPE=fp32，或把 TG_DP_BUCKET_MB 设为 4 的倍数（MB）")
+            self._bufs = [rt.empty((nb // 4,), dtype=np.uint16) for _ in range(self.slots)]
+            self._dt = _nccl_dtype_for(self.grad_dtype)
+            self._zero1 = rt.zeros((1,), dtype=np.float32)
         self._ev_in = [rt.event_create() for _ in range(sess.plan.nbuckets)]
         self._ev_done = [rt.event_create() for _ in range(sess.plan.nbuckets)]
         #: 每个桶在**归约流**上真正开始/结束的 event（用于测「真实通信时长」；
@@ -802,11 +889,20 @@ class NcclBucketTransport(TransportBase):
             raise OverlapUnavailable(
                 "参数 #%d 的梯度不在 GPU 上（NCCL 重叠归约只支持 CUDA）" % (i,) +
                 "。修法：TG_DP_BACKEND=nccl 只能配 CUDA 训练；CPU 后端请设 TG_DP_OVERLAP=0")
-        # ★ 必须用**主流量上的异步** D2D：同步版 cuMemcpyDtoD 会挡住主机线程，
-        #   把反向流水打断（实测 bwd 0.10s → 0.22s，重叠收益全丢）。异步只入队，
-        #   顺序仍由主流量保证（grad 写完 → 拷进桶），ev_in 也在主流量上之后记录。
-        self.rt.copy_d2d(self._bufs[slot], g._gpu, nbytes, dst_off=off, src_off=0,
-                         stream=self.rt._stream)
+        if self.grad_dtype == "fp32":
+            # ★ 必须用**主流量上的异步** D2D：同步版 cuMemcpyDtoD 会挡住主机线程，
+            #   把反向流水打断（实测 bwd 0.10s → 0.22s，重叠收益全丢）。异步只入队，
+            #   顺序仍由主流量保证（grad 写完 → 拷进桶），ev_in 也在主流量上之后记录。
+            self.rt.copy_d2d(self._bufs[slot], g._gpu, nbytes, dst_off=off, src_off=0,
+                             stream=self.rt._stream)
+            return
+        # 低精度：先乘 1/world（stage 里做，省掉一次 fp32 归约后的缩放），再收窄进桶。
+        # bf16 下乘 2 的幂是精确的 ⇒ world=2 时与不重叠路径「先求和再乘」逐位一致。
+        n = int(nbytes) // 4
+        self.rt.scale_inplace(g._gpu, self.scale, stream=self.rt._stream)
+        _dist_lowp()._cast_f32_to_16(self.rt, self.grad_dtype, g._gpu, self._bufs[slot], n,
+                                     dst_off=int(off) // 4, stream=self.rt._stream)
+        self.comm_bytes = int(self.comm_bytes) + n * 2
 
     def await_slot(self, slot, prev_bucket):
         self._wait_bucket(prev_bucket)
@@ -822,10 +918,15 @@ class NcclBucketTransport(TransportBase):
         slot = info.slot
         buf = self._bufs[slot]
         for (off, i, nb) in info.zero_regions:
-            # ★ 不养一块 256MB 的常驻零缓冲（那是显存红线里的 1/4）：直接在桶上原地
-            #   乘 0。缺失区很少，代价可忽略。
-            rt.scale_inplace(rt.sub_view(buf, (nb // 4,), off // 4), 0.0,
-                             stream=rt._stream)
+            # ★ 不养一块 256MB 的常驻零缓冲（那是显存红线里的 1/4）：直接在桶上清零。
+            #   缺失区很少，代价可忽略。低精度下 2 字节填 0 没有现成内核，
+            #   用 dist._zero_16_region（D32 字 + 单元素 cast，绝不越界写）。
+            if self.grad_dtype == "fp32":
+                rt.scale_inplace(rt.sub_view(buf, (nb // 4,), off // 4), 0.0,
+                                 stream=rt._stream)
+            else:
+                _dist_lowp()._zero_16_region(rt, self.grad_dtype, buf, off // 4,
+                                             nb // 4, self._zero1, stream=rt._stream)
         rt.cu.cuEventRecord(self._ev_in[b], rt._stream)
         rt.cu.cuStreamWaitEvent(st, self._ev_in[b], 0)
         rt.cu.cuEventRecord(self._ev_start[b], st)
@@ -833,9 +934,10 @@ class NcclBucketTransport(TransportBase):
         #   而 stage/writeback/ev_done 都在 `st` 上 —— 两条流之间没有依赖，
         #   writeback 可能先跑完（把旧桶内容写回梯度）⇒ 梯度静默算错。
         #   实测症状：gnorm 偏小、rank0 与 rank1 的 gnorm 不相等。
-        self.comm.all_reduce_group([(int(buf.ptr), int(info.elems))], stream=st)
+        self.comm.all_reduce_group([(int(buf.ptr), int(info.elems))], stream=st,
+                                   dtype=self._dt)
         self._n_reduced += 1
-        if self.scale != 1.0:
+        if self.grad_dtype == "fp32" and self.scale != 1.0:
             rt.scale_inplace(buf, self.scale, stream=st)
         for (off, i, nb) in info.regions:
             g = getattr(self._sess.params[i], "grad", None)
@@ -843,7 +945,12 @@ class NcclBucketTransport(TransportBase):
                 raise OverlapUnavailable(
                     "参数 #%d 的梯度在归约期间丢了（写回阶段）" % (i,) +
                     "。修法：说明归约过程中 .grad 被外部清空了；别在反向/归约期间手动改 .grad，或设 TG_DP_OVERLAP=0")
-            rt.copy_d2d(g._gpu, buf, nb, dst_off=0, src_off=off, stream=st)
+            if self.grad_dtype == "fp32":
+                rt.copy_d2d(g._gpu, buf, nb, dst_off=0, src_off=off, stream=st)
+            else:
+                # 低精度：桶里是「已乘过 1/world 的和」，dequant 后直接覆盖 p.grad
+                _dist_lowp()._cast_16_to_f32(rt, self.grad_dtype, buf, g._gpu, nb // 4,
+                                             src_off=off // 4, stream=st)
         rt.cu.cuEventRecord(self._ev_done[b], st)
 
     def begin_window(self):
@@ -892,7 +999,11 @@ class NcclBucketTransport(TransportBase):
         self._bufs = []
 
     def stats(self):
-        out = {"nccl_reduced": int(self._n_reduced), "nccl_stream": "own"}
+        out = {"nccl_reduced": int(self._n_reduced), "nccl_stream": "own",
+               "grad_dtype": self.grad_dtype}
+        if self.grad_dtype != "fp32":
+            out["comm_bytes"] = int(self.comm_bytes)
+            out["nccl_dtype"] = int(self._dt) if self._dt is not None else None
         if os.environ.get("TG_DP_OV_DEBUG") and self._bucket_ms:
             out["bucket_comm_ms"] = {int(k): round(v, 3)
                                      for k, v in sorted(self._bucket_ms.items())}
@@ -917,14 +1028,21 @@ class HostBucketTransport(TransportBase):
 
     kind = "host"
 
-    def __init__(self, dp, rt, scale, slots=None):
+    def __init__(self, dp, rt, scale, slots=None, grad_dtype="fp32"):
         self.dp = dp
         self.rt = rt
         self.scale = float(scale)
         self.slots = int(slots if slots is not None else max(2, resolve_slots()))
+        self.grad_dtype = resolve_grad_dtype(grad_dtype)
+        self._esz = 4 if self.grad_dtype == "fp32" else 2
         self._bufs = []
         self._peer = None
+        self._peer16 = None      # 低精度：对端数据（2 字节）
+        self._tmp32 = None       # 低精度：对端 dequant 后的 fp32 临时区
+        self._zero1 = None
+        self.comm_bytes = 0
         self._shm = None
+        self._shm_total = 0
         self._shm_ptr = 0
         self._ev_in = []
         self._ev_done = []
@@ -941,16 +1059,16 @@ class HostBucketTransport(TransportBase):
         self._n = 0
 
     def open(self, sess):
-        import ctypes
-
         rt = self.rt
         self._sess = sess
         self.dp._start()
-        total = int(sess.plan.total_bytes)
-        nb = int(sess.plan.max_bucket_bytes)
-        if nb <= 0:
+        # 低精度下共享内存/桶缓冲都按 2 字节/元素：字节数减半，元素数不变。
+        bucket_elems = int(sess.plan.max_bucket_bytes) // 4
+        if bucket_elems <= 0:
             raise OverlapUnavailable("桶总字节为 0（没有要归约的梯度）" +
                                  "。修法：确认 begin_overlap(params) 的 params 非空且非全 0 元素；否则设 TG_DP_OVERLAP=0")
+        nb = bucket_elems * self._esz            # 每块桶的**通信字节数**
+        total = (int(sess.plan.total_bytes) // 4) * self._esz
         self._stream = self._new_stream()          # H2D/加法/写回
         self._stream_d2h = self._new_stream()      # D2H（与上面那条流真并发）
         # ★ 批大小必须 <= 槽数：同一批里若有两个桶共用一个 slot，后一个的 D2H 会在
@@ -961,8 +1079,18 @@ class HostBucketTransport(TransportBase):
         except (TypeError, ValueError):
             self._batch = self.slots
         self._batch = max(1, min(int(self._batch), int(self.slots)))
-        self._bufs = [rt.empty((nb // 4,), dtype=np.float32) for _ in range(self.slots)]
-        self._peer = rt.empty((nb // 4,), dtype=np.float32)
+        if self.grad_dtype == "fp32":
+            self._bufs = [rt.empty((bucket_elems,), dtype=np.float32)
+                          for _ in range(self.slots)]
+            self._peer = rt.empty((bucket_elems,), dtype=np.float32)
+        else:
+            # ★ 元素数必须与 fp32 相同（bucket_elems），只是每元素 2 字节。
+            self._bufs = [rt.empty((bucket_elems,), dtype=np.uint16)
+                          for _ in range(self.slots)]
+            self._peer16 = rt.empty((bucket_elems,), dtype=np.uint16)
+            self._tmp32 = rt.empty((bucket_elems,), dtype=np.float32)
+            self._zero1 = rt.zeros((1,), dtype=np.float32)
+        self._shm_total = total
         self.dp._ensure_slot(total)
         self._shm = self.dp._slot
         reg = rt.host_register(self._shm.buf)
@@ -1003,8 +1131,16 @@ class HostBucketTransport(TransportBase):
             raise OverlapUnavailable("参数 #%d 的梯度不在 GPU 上" % (i,) +
                                  "。修法：host 重叠传输只支持 CUDA 张量；CPU 后端设 TG_DP_OVERLAP=0")
         # 同 NCCL 路径：必须异步（同步版会把主机线程挡住，打断反向流水）
-        self.rt.copy_d2d(self._bufs[slot], g._gpu, nbytes, dst_off=off, src_off=0,
-                         stream=self.rt._stream)
+        if self.grad_dtype == "fp32":
+            self.rt.copy_d2d(self._bufs[slot], g._gpu, nbytes, dst_off=off, src_off=0,
+                             stream=self.rt._stream)
+            return
+        # 低精度：先乘 1/world（bf16 下乘 2 的幂精确）再收窄进桶；写回时 dequant 即均值
+        n = int(nbytes) // 4
+        self.rt.scale_inplace(g._gpu, self.scale, stream=self.rt._stream)
+        _dist_lowp()._cast_f32_to_16(self.rt, self.grad_dtype, g._gpu, self._bufs[slot], n,
+                                     dst_off=int(off) // 4, stream=self.rt._stream)
+        self.comm_bytes = int(self.comm_bytes) + n * 2
 
     def await_slot(self, slot, prev_bucket):
         if prev_bucket is not None and 0 <= int(prev_bucket) < len(self._ev_done):
@@ -1015,7 +1151,12 @@ class HostBucketTransport(TransportBase):
         rt = self.rt
         slot = info.slot
         for (off, i, nb) in info.zero_regions:
-            rt.scale_inplace(rt.sub_view(self._bufs[slot], (nb // 4,), off // 4), 0.0)
+            if self.grad_dtype == "fp32":
+                rt.scale_inplace(rt.sub_view(self._bufs[slot], (nb // 4,), off // 4), 0.0)
+            else:
+                # 低精度：2 字节区填 0（D32 字 + 单元素 cast，不越界写相邻参数）
+                _dist_lowp()._zero_16_region(rt, self.grad_dtype, self._bufs[slot],
+                                             off // 4, nb // 4, self._zero1)
         rt.cu.cuEventRecord(self._ev_in[info.index], rt._stream)
         if self._err is not None:
             raise OverlapUnavailable("host 重叠线程已经失败：%s" % (self._err,) +
@@ -1029,7 +1170,7 @@ class HostBucketTransport(TransportBase):
         rt = self.rt
         st = self._stream
         st_d2h = self._stream_d2h
-        total = int(self._sess.plan.total_bytes)
+        total = int(self._shm_total)          # 共享内存里每 rank 的字节数（低精度时是 fp32 的一半）
         own_base = self.dp.rank * total
         plan = self._sess.plan
         n = int(plan.nbuckets)
@@ -1046,6 +1187,9 @@ class HostBucketTransport(TransportBase):
             self._err = exc
             return
         b0 = 0
+        lowp = self.grad_dtype != "fp32"
+        esz = int(self._esz)
+        D = _dist_lowp() if lowp else None
         try:
             while b0 < n:
                 b1 = min(n, b0 + B)
@@ -1060,12 +1204,12 @@ class HostBucketTransport(TransportBase):
                 # ② 批量发起 D2H（异步，直接写进已注册共享内存自己那一段）
                 for info in infos:
                     b = info.index
-                    nb = int(info.elems) * 4
-                    off_b = int(plan.bucket_off[b]) * 4
+                    n_elems = int(info.elems)
+                    off_b = int(plan.bucket_off[b]) * esz
                     rt.cu.cuStreamWaitEvent(st_d2h, self._ev_in[b], 0)
                     rt.d2h_into(self._bufs[info.slot],
                                 ctypes.c_void_p(self._shm_ptr + own_base + off_b),
-                                nbytes=nb, stream=st_d2h)
+                                nbytes=n_elems * esz, stream=st_d2h)
                     rt.cu.cuEventRecord(self._ev_d2h[b], st_d2h)
                 # ③ 这批 D2H 全完成 → **一次** barrier
                 for info in infos:
@@ -1074,27 +1218,50 @@ class HostBucketTransport(TransportBase):
                 # ④ 对端：H2D 到 peer，再就地加进桶（rank 升序，与不重叠路径一致）
                 for info in infos:
                     b = info.index
-                    nb = int(info.elems) * 4
-                    off_b = int(plan.bucket_off[b]) * 4
-                    for r in range(self.dp.world):
-                        if r == self.dp.rank:
-                            continue
-                        src = self._shm_ptr + r * total + off_b
-                        rt.h2d_into(self._peer, ctypes.c_void_p(src), nbytes=nb,
-                                    stream=st)
-                        rt.add_(self._bufs[info.slot], self._peer, stream=st)
-                    if self.scale != 1.0:
-                        rt.scale_inplace(self._bufs[info.slot], self.scale, stream=st)
-                    # ⑤ 写回各 grad（同一条流，顺序在加/缩放之后）
-                    for (off, i, nbb) in info.regions:
-                        g = getattr(self._sess.params[i], "grad", None)
-                        if g is None or getattr(g, "_gpu", None) is None:
-                            raise OverlapUnavailable(
-                                "参数 #%d 的梯度在写回阶段丢了" % (i,) +
-                                "。修法：归约期间 .grad 被外部清空；"
-                                "不要在反向/归约期间手动改 .grad，或设 TG_DP_OVERLAP=0")
-                        rt.copy_d2d(g._gpu, self._bufs[info.slot], nbb,
-                                    dst_off=0, src_off=off, stream=st)
+                    n_elems = int(info.elems)
+                    off_b = int(plan.bucket_off[b]) * esz
+                    if not lowp:
+                        for r in range(self.dp.world):
+                            if r == self.dp.rank:
+                                continue
+                            src = self._shm_ptr + r * total + off_b
+                            rt.h2d_into(self._peer, ctypes.c_void_p(src),
+                                        nbytes=n_elems * 4, stream=st)
+                            rt.add_(self._bufs[info.slot], self._peer, stream=st)
+                        if self.scale != 1.0:
+                            rt.scale_inplace(self._bufs[info.slot], self.scale, stream=st)
+                        # ⑤ 写回各 grad（同一条流，顺序在加/缩放之后）
+                        for (off, i, nbb) in info.regions:
+                            g = getattr(self._sess.params[i], "grad", None)
+                            if g is None or getattr(g, "_gpu", None) is None:
+                                raise OverlapUnavailable(
+                                    "参数 #%d 的梯度在写回阶段丢了" % (i,) +
+                                    "。修法：归约期间 .grad 被外部清空；"
+                                    "不要在反向/归约期间手动改 .grad，或设 TG_DP_OVERLAP=0")
+                            rt.copy_d2d(g._gpu, self._bufs[info.slot], nbb,
+                                        dst_off=0, src_off=off, stream=st)
+                    else:
+                        # 低精度：本 rank 的 grads 在 stage 时已经被乘过 1/world，
+                        # 这里只需把**对端**的量化值 dequant 成 fp32 后加进去。
+                        # 自贡献 + Σ对端 ≈ mean(梯度)；写回步骤因此可以省掉。
+                        for r in range(self.dp.world):
+                            if r == self.dp.rank:
+                                continue
+                            src = self._shm_ptr + r * total + off_b
+                            rt.h2d_into(self._peer16, ctypes.c_void_p(src),
+                                        nbytes=n_elems * esz, stream=st)
+                            D._cast_16_to_f32(rt, self.grad_dtype, self._peer16,
+                                              self._tmp32, n_elems, stream=st)
+                            for (off, i, nbb) in info.regions:
+                                g = getattr(self._sess.params[i], "grad", None)
+                                if g is None or getattr(g, "_gpu", None) is None:
+                                    raise OverlapUnavailable(
+                                        "参数 #%d 的梯度在写回阶段丢了" % (i,) +
+                                        "。修法：归约期间 .grad 被外部清空；"
+                                        "不要在反向/归约期间手动改 .grad，或设 TG_DP_OVERLAP=0")
+                                rt.add_(g._gpu,
+                                        rt.sub_view(self._tmp32, (nbb // 4,), off // 4),
+                                        stream=st)
                     rt.cu.cuEventRecord(self._ev_done[b], st)
                 self._comm += time.perf_counter() - t0
                 b0 = b1
@@ -1159,8 +1326,15 @@ class HostBucketTransport(TransportBase):
         self._ev_in, self._ev_done, self._ev_d2h = [], [], []
         self._bufs = []
         self._peer = None
+        self._peer16 = None
+        self._tmp32 = None
+        self._zero1 = None
 
     def stats(self):
-        return {"host_thread": "yes", "host_buckets": int(self._n),
-                "host_batch": int(self._batch),
-                "host_dual_stream": bool(self._stream_d2h is not None)}
+        out = {"host_thread": "yes", "host_buckets": int(self._n),
+               "host_batch": int(self._batch),
+               "host_dual_stream": bool(self._stream_d2h is not None),
+               "grad_dtype": self.grad_dtype}
+        if self.grad_dtype != "fp32":
+            out["comm_bytes"] = int(self.comm_bytes)
+        return out
