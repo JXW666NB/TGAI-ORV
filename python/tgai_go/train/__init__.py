@@ -1411,12 +1411,8 @@ class Tensor:
         _ov = _BWD_OVERLAP[0]
         if _ov is not None:
             _ov = _ov.attach_graph(topo, cuda=True)
-        _ACC_PEND.clear()          # 防御：上一轮异常遗留
         for node in reversed(topo):
             g = grads.get(id(node))
-            if _ACC_PEND:
-                # 走到该节点 = 它的梯度已收齐 ⇒ 把挂起的贡献一次折完（逐位等价）
-                g = _acc_flush(grads, node)
             if g is None:
                 continue
             if getattr(node, "device", "cpu") != "cuda":
@@ -2254,55 +2250,12 @@ def _maybe_compact(t):
     return t
 
 
-# ---- F3：梯度累加批量化（TG_ACC_BATCH=1，默认关）------------------------------
-# 背景：一次反向里 `_acc` 被调用约 2250 次，其中约 366 次触发 `add_`（同一节点收到
-# 第 2、3… 份梯度贡献）。差量 cProfile 显示这些 add_ 合计约 366 次发射/步。
-#
-# 做法：把"第 2 份及以后"的贡献先挂起，等拓扑序走到该节点时（`grads.get(id(node))`
-# 那一刻，数学上梯度已收齐）用**一次** `add_multi` 顺序折完。
-#   顺序折叠 `((x+y0)+y1)` 与原来连续 `add_` 的每次 __fadd_rn 完全相同 ⇒ 逐位一致。
-# 任何异常路径（开关关、节点不是 cuda、挂起表残留）都原样走旧实现。
-_ACC_BATCH = [None]
-_ACC_PEND = {}
-
-
-def _acc_batch_on():
-    v = _ACC_BATCH[0]
-    if v is None:
-        v = os.environ.get("TG_ACC_BATCH", "0").strip().lower() in ("1", "true", "yes", "on")
-        _ACC_BATCH[0] = v
-    return v
-
-
-def _acc_flush(grads, node):
-    """把该节点挂起的多份贡献一次折进 grads[id(node)]，返回最终梯度缓冲。"""
-    lst = _ACC_PEND.pop(id(node), None)
-    dst = grads.get(id(node))
-    if not lst:
-        return dst
-    if dst is None:
-        # 只有挂起、没有首份（不该发生）：按原顺序退回 add_/直接取第一份
-        dst = lst[0]
-        for g in lst[1:]:
-            _cuda().add_(dst, g)
-        grads[id(node)] = dst
-        return dst
-    _cuda().add_multi(dst, lst)
-    return dst
-
-
 def _acc(grads, node, g):
     if getattr(node, "device", "cpu") == "cuda":
         rt = _cuda()
         old = grads.get(id(node))
         if old is None:
             grads[id(node)] = g
-        elif _acc_batch_on():
-            lst = _ACC_PEND.get(id(node))
-            if lst is None:
-                _ACC_PEND[id(node)] = [g]
-            else:
-                lst.append(g)
         else:
             # ★ 2026-11-15：就地累加。以前每次 rt.add 都分配新缓冲 + 拷一遍，
             #   一个多消费者的节点一次反向就要多一次 37.7 MB 级往返。

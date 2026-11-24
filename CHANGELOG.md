@@ -1,3 +1,28 @@
+## [1.0.27] - 2026-11-24
+
+### 移除：两项负结果的实验代码（`TG_MOE_DEV` / `TG_ACC_BATCH`）
+
+两者在 1.0.24 已实测为**负收益**（MoE 设备端分派墙钟 +1.7%、梯度累加批量化 +0.6%），
+本版把它们的实现从代码库里删掉，减少维护面；`v3_moe.py` / `v3_pretrain.py` 回到
+加入这两项之前的状态（逐位行为不变）。
+
+* 删除 `cuda.py` 的 `fused_add_multi` / `fused_add_multi_v4` 内核与 `add_multi()` 方法
+* 删除 `__init__.py` 的 `_ACC_BATCH` / `_ACC_PEND` / `_acc_batch_on` / `_acc_flush`
+  以及 `_acc()` 的批量化分支、反向循环里的 flush
+* 删除 `v3_moe.py` 的 `DeviceRouteIdx` / `moe_dev_enabled` / `moe_dispatch_dev` /
+  `moe_topk_dev` / `_dev_*` 与 `route_topk(return_idx_buf=)` 门控、`v3_pretrain.py` 的调用
+
+**验证**：`TG_DETERMINISTIC=1` 4 步 loss/gnorm 与 1.0.26 完全一致
+（11.698156 / 11.659061 / 11.651151 / 11.706464；13.959 / 14.921 / 14.754 / 13.559）；
+本地测试 1199 passed / 66 skipped（20 个失败全部是引用了已移出仓库的开发工具脚本）。
+
+### 仓库
+
+随 GitHub 仓库瘦身，本版起仓库只包含构建/运行必需文件（见
+`docs/REPO_LAYOUT.md`），测试与实验脚本不再随仓库发布。
+
+---
+
 ## [1.0.26] - 2026-11-24
 
 ### 默认值变更：`TG_POOL_FAST` 与 `TG_LAUNCH_TMPL2` **默认开启**

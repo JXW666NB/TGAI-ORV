@@ -3342,35 +3342,6 @@ extern "C" __global__ void fused_add_ip_v4(float4* x, const float4* y, int n4) {
     }
 }
 
- /* 多缓冲**顺序**累加：x = ((x + y[0]) + y[1]) + ...，与连续调用 fused_add_ip 的
-  * 每次 __fadd_rn 完全相同（顺序也一样）⇒ 结果逐位一致。
-  * 一次发射把"同一节点的 k 份梯度贡献"折完，替代 k 次 add_。
-  * 参数刻意不加 __restrict__：允许 x 与某个 y 同址。 */
- extern "C" __global__ void fused_add_multi(float* x, const float* const* ys,
-                                            int k, int n) {
-     int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-     if (i >= n) return;
-     float a = x[i];
-     for (int j = 0; j < k; ++j) a = __fadd_rn(a, ys[j][i]);
-     x[i] = a;
- }
-
- /* 向量版：与 fused_add_ip_v4 逐元素同一条 __fadd_rn，逐位一致。 */
- extern "C" __global__ void fused_add_multi_v4(float4* x, const float4* const* ys,
-                                               int k, int n4) {
-     int i = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
-     if (i >= n4) return;
-     float4 a = x[i];
-     for (int j = 0; j < k; ++j) {
-         float4 b = ys[j][i];
-         a.x = __fadd_rn(a.x, b.x);
-         a.y = __fadd_rn(a.y, b.y);
-         a.z = __fadd_rn(a.z, b.z);
-         a.w = __fadd_rn(a.w, b.w);
-     }
-     x[i] = a;
- }
-
 /* 广播加的向量版。主机侧保证：n%4==0、c3%4==0，且 a3/b3 只取 0 或 1；
  * 取 1 时对应的 (a0,a1,a2)/(b0,b1,b2) 都是 4 的倍数，因此 a+ia、b+ib 是 16B 对齐的
  * 连续 4 个元素。取 0 时该源在末维是广播，4 个 lane 读同一个标量。 */
@@ -9651,49 +9622,6 @@ class CudaRuntime:
                 self.launch("fused_add_ip", grid, block, [
                     self._ptr(x), self._ptr(y), (n, ctypes.c_int),
                 ], stream=stream)
-        return x
-
-    def add_multi(self, x, ys, stream=None):
-        """原地 `x += y0; x += y1; ...`（**顺序折叠**），一次发射。
-
-        与连续调用 `add_` 的算术顺序完全相同（每次 `__fadd_rn`），因此结果
-        逐位一致；用途是把同一节点在一次反向里的多份梯度贡献一次折完。
-        """
-        k = len(ys)
-        if k == 0:
-            return x
-        if k == 1:
-            return self.add_(x, ys[0], stream=stream)
-        n = int(x.n)
-        for y in ys:
-            if int(y.n) != n:
-                raise CudaError(
-                    "add_multi 第 %d 个缓冲长度 %d ≠ 目标 %d" % (ys.index(y), int(y.n), n)
-                    + "。修法：只有同形状的梯度才能折叠；检查该节点的梯度是否被裁剪/重置")
-        if n <= 0:
-            return x
-        key = (int(x.ptr), tuple(int(y.ptr) for y in ys))
-        cache = getattr(self, "_addm_cache", None)
-        if cache is None:
-            cache = self._addm_cache = {}
-        arr = cache.get(key)
-        if arr is None:
-            arr = self.h2d(np.array([int(y.ptr) for y in ys], np.uint64),
-                           dtype=np.uint64)
-            if len(cache) > 8192:
-                cache.clear()
-            cache[key] = arr
-        self._split_forget_ptr(x)
-        if self._vec4_ok(n, x, ys[0]):
-            grid, block = self._vec4_grid(n >> 2)
-            self.launch("fused_add_multi_v4", grid, block, [
-                self._ptr(x), self._ptr(arr), (k, ctypes.c_int), (n >> 2, ctypes.c_int),
-            ], stream=stream)
-        else:
-            grid, block = self._ewise_grid(n)
-            self.launch("fused_add_multi", grid, block, [
-                self._ptr(x), self._ptr(arr), (k, ctypes.c_int), (n, ctypes.c_int),
-            ], stream=stream)
         return x
 
     def _launch_lean(self, name, grid, block, args, shared=0, module=None, stream=None):

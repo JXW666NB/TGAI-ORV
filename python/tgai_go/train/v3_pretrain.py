@@ -1065,13 +1065,7 @@ def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
                 eids, g, _s = MOE.route_top1(hn, L["router"])
                 mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
             else:
-                # ★ TG_MOE_DEV=1（默认关）：top-k 下标**留在设备上**，分派改由
-                #   `moe_compact` 的设备端分组驱动 —— 每层只读回 int32[E+1] 一个偏移，
-                #   替代旧的「idx 回读 + 反向 gate 索引兜底」两次阻塞 D2H。
-                #   不设该环境变量时 `eids` 仍是主机 int64[N,k]，行为逐位不变。
-                eids, gates, _s = MOE.route_topk(
-                    hn, L["router"], int(top_k),
-                    return_idx_buf=MOE.moe_dev_enabled())
+                eids, gates, _s = MOE.route_topk(hn, L["router"], int(top_k))
                 mo = MOE.moe_topk_orv(hn, eids, gates, L["W1"], L["W2"], L["W3"])
             if shared:
                 mo = mo + V.situ_glu_orv(hn, L["S1"], L["S2"], L["S3"])

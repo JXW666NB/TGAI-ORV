@@ -198,3 +198,4 @@
 | ★ `HOSTHOTSPOTS_2026-11-23.md` | **ORV 每步 host 时间分布**（差量 cProfile）：26 次 D2H(0.05s) + 3071 次 launch(0.043s) + 2 次 sync(0.022s) + 池/对象记账(0.066s)；含 PyTorch 对照、TG_LAUNCH_FAST A/B（−11% 墙钟/−15% CPU，确定性下逐位一致）与剩余优化项 |
 | ★ `HOSTOPT_ROUND2_2026-11-23.md` | **本轮优化总表**：`TG_POOL_FAST` −1.4%（采纳，opt-in）、`TG_MOE_DEV` +1.7%（负结果，默认关）、`TG_LAUNCH_FAST` 默认开（关掉 −17%）、CUDA Graph 结案（显存）、PyTorch 1.38B 在 32GB 可训 |
 | ★ `FUSION_FINAL_2026-11-23.md` | **融合专项结项报告**：F1 −1.18%（采纳）、F2 判定不做、F3 负结果 (+0.6%)；五项主机侧优化叠加仅 −2.5%（饱和证据链）；8% 与逐位一致判据不相容 |
+| `REPO_LAYOUT.md` | 仓库结构（1.0.27 起只保留构建/运行必需 + wiki + 宣传用性能原始日志 + 算子源码）|
