@@ -1,0 +1,100 @@
+[ID] api:Tensor
+[分类] tensor
+[中文名] 张量
+[英文名] Tensor
+[作者] JXW
+
+=== 中文 ===
+`T.Tensor(data, requires_grad=False, _parents=(), _backward=None, device=None, dtype=None)`
+—— ORV 的张量：一块 numpy 缓冲（CPU）＋ 一个梯度槽 ＋ 一个反向闭包。前两个参数是给用户用的，
+后四个里 `device` / `dtype` 偶尔要写，`_parents` / `_backward` 是内部建图用的，**别手填**。
+
+参数逐个说：
+
+- `data`：numpy 数组、嵌套 list、标量都收；**默认存成 float32**，传 float64 会被静默降精度。
+- `requires_grad`：要不要建图/求梯度；**只有浮点张量能开**，对整数张量开会直接 `RuntimeError`。
+- `device`：`"cpu"`（默认）或 `"cuda"`；不写就跟随 `T.set_default_device()`。没有 GPU 时传 `"cuda"` 报 `CudaError`。
+- `dtype`：只有显式给 `"int32"` / `"int64"` 才保留整数，不给一律 float32。
+- `_parents` / `_backward`：内部参数（父节点元组、反向闭包），用户不该传。
+
+常用成员：`.shape`（tuple）/ `.ndim` / `.numel()` / `.device` / `.dtype` / `.data`（CPU 上是 numpy 数组）；
+`.backward(grad=None)` / `.zero_grad()` / `.detach()` / `.numpy()` / `.to_numpy()` / `.to(device)` /
+`.cuda()` / `.cpu()`；数学用方法：`.sum()` / `.mean()` / `.abs()` / `.sqrt()` / `.exp()` / `.log()` /
+`.tanh()` / `.relu()` / `.gelu()` / `.clamp()` / `.masked_fill()` / `.max()` / `.min()` / `.norm()` /
+`.reshape()` / `.view()` / `.transpose()` / `.permute()` / `.contiguous()`。
+
+⚠️ 坑 1（和 PyTorch 不一样，静默或直接挂）：**没有 `.mul()` / `.matmul()` 方法**，也没有顶层 `T.sum`。
+运算走运算符：`a * b`（逐元素）、`a @ b` 或 `T.matmul(a, b)`（矩阵乘）、`a + b`、`a ** 2`；
+求和写成 `a.sum()`。写成 `a.mul(b)` 直接 `AttributeError`。
+
+⚠️ 坑 2（静默错误）：`T.Tensor([1, 2])` 是 **float32**，而 PyTorch 的 `torch.tensor([1, 2])` 是 int64。
+拿它当索引/整数用不会报错，只会算出浮点结果；要整数必须写 `dtype="int32"` / `"int64"`，
+且这种张量不能再开 `requires_grad`。
+
+⚠️ 坑 3（读梯度的姿势）：CPU 上反传后 `.grad` 是 **numpy.ndarray**（CUDA 上类型 ⚠️ 未验证），
+它的 `.data` 属性是 memoryview、**不是数值**；取值用 `np.asarray(x.grad)` 或直接 `x.grad`。
+
+⚠️ 坑 4：`.to()` 只收 device（`x.to("cuda")`），**不收 dtype** —— 想换精度没有对应接口（⚠️ 未验证，读源码只有 device 形参）。
+
+⚠️ 坑 5（静默，和 PyTorch 不同）：对**非标量输出**或**叶子张量**直接 `.backward()` ORV **不报错**，
+它会自己补一个全 1 的上游梯度反传（叶子张量直接把 `.grad` 填成 1）；PyTorch 在这两种情况下会
+报 "grad can be implicitly created only for scalar outputs"。要拿真实梯度，一定在**最终标量输出**上调用
+`loss.backward()`。
+
+=== English ===
+`T.Tensor(data, requires_grad=False, _parents=(), _backward=None, device=None, dtype=None)`
+is ORV's tensor: a numpy buffer on CPU plus a gradient slot and a backward closure. The first two
+parameters are what you normally use; `device` / `dtype` are occasionally needed, and
+`_parents` / `_backward` are internal graph plumbing that must be left alone.
+
+- `data`: numpy array, nested list or scalar; it is stored as **float32 by default**, so a float64
+  input is silently downcast.
+- `requires_grad`: whether to record a graph; **float tensors only** -- enabling it on an integer
+  tensor raises `RuntimeError`.
+- `device`: `"cpu"` (default) or `"cuda"`; omit it to follow `T.set_default_device()`. Passing
+  `"cuda"` with no driver raises `CudaError`.
+- `dtype`: integers survive only when you pass `"int32"` / `"int64"` explicitly; otherwise float32.
+- `_parents` / `_backward`: internal (parent tuple, backward closure) -- do not pass them.
+
+Members: `.shape` (tuple), `.ndim`, `.numel()`, `.device`, `.dtype`, `.data` (numpy on CPU);
+`.backward(grad=None)`, `.zero_grad()`, `.detach()`, `.numpy()`, `.to_numpy()`, `.to(device)`,
+`.cuda()`, `.cpu()`; math lives on methods: `.sum()`, `.mean()`, `.abs()`, `.sqrt()`, `.exp()`,
+`.log()`, `.tanh()`, `.relu()`, `.gelu()`, `.clamp()`, `.masked_fill()`, `.max()`, `.min()`,
+`.norm()`, `.reshape()`, `.view()`, `.transpose()`, `.permute()`, `.contiguous()`.
+
+⚠️ Gotcha 1: there is **no `.mul()` / `.matmul()`** method and no top-level `T.sum`. Use operators --
+`a * b` (element-wise), `a @ b` or `T.matmul(a, b)` (matrix product), `a + b`, `a ** 2`, and
+`a.sum()` for reduction. `a.mul(b)` raises AttributeError.
+
+⚠️ Gotcha 2 (silent): `T.Tensor([1, 2])` is **float32**, whereas `torch.tensor([1, 2])` is int64.
+Using it where you meant integers does not raise, it just computes floats; ask for
+`dtype="int32"` / `"int64"` when you need integers, and such a tensor cannot require grad.
+
+⚠️ Gotcha 3: after backward on CPU `.grad` is a **numpy.ndarray** (CUDA type ⚠️ unverified); its
+`.data` attribute is a memoryview, not the values -- read `np.asarray(x.grad)` or just `x.grad`.
+
+⚠️ Gotcha 4: `.to()` takes a device only (`x.to("cuda")`), **no dtype argument**; there is no dtype
+conversion helper (⚠️ unverified: source shows a single `device` parameter).
+
+⚠️ Gotcha 5 (silent, unlike PyTorch): calling `.backward()` on a **non-scalar output** or on a
+**leaf tensor** does not raise; ORV seeds an all-ones upstream gradient (a leaf's `.grad` simply
+becomes ones). PyTorch refuses both with "grad can be implicitly created only for scalar outputs".
+Always call `loss.backward()` on the final scalar loss.
+
+=== 示例 ===
+import numpy as np
+x = T.Tensor([[1., 2.], [3., 4.]], requires_grad=True)
+y = (x * 2).sum()                        # ✅ 逐元素乘后求和 / element-wise then reduce
+m = x @ x.T                              # ✅ 矩阵乘 / matrix product
+try:
+    x.mul(2)                             # ❌ AttributeError：Tensor 没有 .mul()
+except AttributeError as e:
+    print("expected:", e)
+y.backward()                             # ✅ 在标量输出上反传
+print(np.asarray(x.grad))                # [[2. 2.] [2. 2.]]（CPU 上是 ndarray）
+print(T.Tensor([1, 2]).data.dtype)       # float32，不是 int64
+
+=== 见也 ===
+api:from_numpy
+api:no_grad
+op:matmul

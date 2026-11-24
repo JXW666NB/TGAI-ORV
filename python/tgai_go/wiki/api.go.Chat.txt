@@ -1,0 +1,53 @@
+[ID] api:go:Chat
+[分类] inference
+[中文名] 多轮对话封装
+[英文名] Chat helper
+[作者] JXW
+
+=== 中文 ===
+最顺手的多轮对话封装：连续 `ask()` 会自动拼接上下文。
+
+签名：`Chat(engine, system='', params=None, mode='auto', max_turns=8, think=None, stream=False)`
+
+- `system`：系统提示词
+- `params`：采样参数（`dict` / `Params` / `None`，`None` ⇒ 默认 + 模型内嵌默认）
+- `mode`：`'auto'`（自动拼接）/ `'single'`（单次）/ `'stateless'`
+- `max_turns`：进 prompt 的历史轮数上限（**默认只有 8** —— 长对话会被截断，重要信息要自己写进 `system`）
+- `think`：思考档（`'think'` / `'direct'`，默认跟随模型）
+- `stream`：逐 token 产出（配 `ask_stream()`）
+
+注意事项：
+1. `ask(text, keep=False)` 是**单次调用、不进历史**，适合"顺手问一句"，不会污染上下文。
+2. 超过 `max_turns` 的老轮次会被丢掉，但**系统提示词始终保留** —— 长对话的稳定做法是把关键约束放 `system`。
+
+=== English ===
+The friendliest multi-turn wrapper: successive `ask()` calls concatenate context automatically.
+
+Signature: `Chat(engine, system='', params=None, mode='auto', max_turns=8, think=None, stream=False)`
+
+- `system`: system prompt
+- `params`: sampling params (`dict` / `Params` / `None` = defaults plus the model's embedded defaults)
+- `mode`: `'auto'` (concatenate) / `'single'` / `'stateless'`
+- `max_turns`: how many past turns enter the prompt (**default is only 8**; long chats get truncated, so put hard constraints in `system`)
+- `think`: thinking mode (`'think'` / `'direct'`, defaults to the model's own setting)
+- `stream`: token-by-token output (used with `ask_stream()`)
+
+Notes:
+1. `ask(text, keep=False)` is a one-off that does **not** enter history — good for side questions.
+2. Turns beyond `max_turns` are dropped, but the system prompt is **always** kept.
+
+=== 示例 ===
+import tgai_go
+
+e = tgai_go.TGEngine()
+m = tgai_go.load("model.TG")
+c = tgai_go.Chat(e, system="你是 TGAI")
+print(c.ask("你好"))
+c.ask("我叫小明")
+print(c.ask("我叫什么？"))        # 它记得
+print(c.ask("天气如何", keep=False))  # 单次，不进历史
+
+=== 见也 ===
+api:go:load
+api:go:ChatSession
+api:go:Params

@@ -1,0 +1,42 @@
+[ID] api:go:TGEngine
+[分类] inference
+[中文名] 推理引擎
+[英文名] Inference engine
+[作者] JXW
+
+=== 中文 ===
+推理引擎对象：持有原生库句柄与设备上下文，模型、会话、生成都从它出发。
+
+签名：`TGEngine(dll_path=None)`
+
+- `dll_path`：指定引擎动态库；`None` ⇒ 用包内 `_native/`
+
+注意事项：
+1. **一个进程建议只建一个引擎**：每建一个都会多占一份设备上下文/显存，多实例不会自动共享。
+2. 建之前最好 `native_available()` 为真，否则走纯 Python 回退，速度慢一个数量级。
+3. 它是"设备侧"资源持有者，多线程共享同一个引擎前先确认你的场景（同一引擎并发 decode 不在已验证范围内）。
+
+=== English ===
+The inference engine: it owns the native library handle and device context, and models, sessions and generation all start from it.
+
+Signature: `TGEngine(dll_path=None)`
+
+- `dll_path`: engine library; `None` uses the bundled `_native/`
+
+Notes:
+1. **One engine per process is the recommended shape**: each extra instance holds another device context, and instances do not share it.
+2. Prefer `native_available() == True`; otherwise the pure-Python fallback is an order of magnitude slower.
+3. It owns device-side resources; concurrent decode on one engine is not in the verified set of scenarios.
+
+=== 示例 ===
+import tgai_go
+
+print(tgai_go.native_dir())
+print(tgai_go.native_available())
+e = tgai_go.TGEngine()                 # 用包内 _native/
+m = tgai_go.load("model.TG", dll=None) # 模型加载可与引擎解耦
+
+=== 见也 ===
+api:go:load
+api:go:native_available
+api:go:Chat

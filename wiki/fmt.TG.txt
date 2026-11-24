@@ -1,0 +1,74 @@
+[ID] fmt:TG
+[分类] inference
+[中文名] .TG 模型文件
+[英文名] .TG model container
+[作者] JXW
+
+=== 中文 ===
+`.TG` 是 **ORV 自己定义的模型容器：训练产物就是它，推理输入也是它**，中间不需要任何格式转换。
+（这一点很关键：PyTorch 生态里 `.pt` 要转成 GGUF/ONNX 才能部署，ORV 是省掉这一步的。）
+
+v3 家族的布局（`read_tg.py` 实测）：
+
+| 项 | 值 |
+|---|---|
+| magic | `0x49414754`（小端字节即 `TGAI`）|
+| 头 | `struct <16I6Q4I`，固定 **128 字节** |
+| 头字段 | magic / version / weight_dtype / n_layers / d_model / n_heads / d_ff / vocab / max_seq / n_experts / n_act / rope_theta / pad / bos / eos / unk / tok_off / tok_len / wt_off / wt_cnt / wd_off / wd_len / arch / nkv / modflags / ext_off |
+| 权重表 | 每条 **52 字节**：`hash(8) off(8) len(8) dtype(4) ndim(4) shape(4×4) scale(4)`；`hash` 是**权名 FNV-1a 64**，所以张量按名字查而不是靠顺序 |
+| dtype 码 | `0=fp32 1=fp16 2=int8 3=int32 4=q8_0 5=q4_0 6=bf16` —— **V2.7 实际存的是 6=bf16** |
+| 分词器 | `TOK` 段，与 TG4 的 `SEC_TOK` 分区**同一套字节布局**（共用解析器）|
+| 对话配置 | `ext_off` 处存放；自带 magic `0x46434754` |
+
+另有一种容器 `.TG4`（magic `0x00344754`，即 `TG4\0`）：**自描述分区 + NAM 名字表**，
+头偏移与 v3 家族不同、没有 FNV 表 —— 两者不是同一个格式，`read_tg` 会按 magic 自动分派。
+
+注意事项（都是真坑）：
+1. **`ext_off` 处不一定是对话 magic**：V2.7 的真实文件在那里就不是 `CHAT_MAGIC`，
+   但文件本身是好的 —— 早期解析器在这上面 assert 太严，会误报"文件损坏"。读的时候要宽容。
+2. **`weight_dtype=6` 是 bf16，不是 fp16**：按 fp16 解释权重会得到一片 NaN/乱码，
+   而且不会报错（都是 2 字节）。用 `read_tg` 的 dtype 表判断，别自己猜。
+3. 想先看模型声明了什么，用 `chat_meta_of()`/`python -m tgai_go meta`（**不加载权重**）；
+   想看结构用 `python -m tgai_go info`。
+
+=== English ===
+`.TG` is **ORV's own model container: the training artifact is already the inference input**, with no
+conversion step in between (unlike `.pt` → GGUF/ONNX in the PyTorch world).
+
+v3-family layout (verified against `read_tg.py`):
+
+| Item | Value |
+|---|---|
+| magic | `0x49414754` (little-endian bytes `TGAI`) |
+| header | `struct <16I6Q4I`, exactly **128 bytes** |
+| header fields | magic / version / weight_dtype / n_layers / d_model / n_heads / d_ff / vocab / max_seq / n_experts / n_act / rope_theta / pad / bos / eos / unk / tok_off / tok_len / wt_off / wt_cnt / wd_off / wd_len / arch / nkv / modflags / ext_off |
+| weight table | **52 bytes** per entry: `hash(8) off(8) len(8) dtype(4) ndim(4) shape(4x4) scale(4)`; `hash` is the **FNV-1a 64 of the tensor name**, so tensors are looked up by name, not by order |
+| dtype codes | `0=fp32 1=fp16 2=int8 3=int32 4=q8_0 5=q4_0 6=bf16` — **V2.7 stores 6=bf16** |
+| tokenizer | the `TOK` section, byte-identical layout to TG4's `SEC_TOK` partition |
+| chat metadata | stored at `ext_off`, with its own magic `0x46434754` |
+
+There is also `.TG4` (magic `0x00344754` = `TG4\0`): **self-describing partitions plus a NAM name
+table**, different header offsets and no FNV table. `read_tg` dispatches on the magic automatically.
+
+Pitfalls (all real):
+1. **`ext_off` does not always hold the chat magic**: in real V2.7 files it does not, yet the file is
+   fine — parsers that assert there report a false "corrupt file".
+2. **`weight_dtype=6` is bf16, not fp16**: reinterpreting weights as fp16 yields NaN/garbage with no
+   error at all (both are 2 bytes). Use the dtype table, never guess.
+3. To inspect a model without loading weights: `chat_meta_of()` / `python -m tgai_go meta`, and
+   `python -m tgai_go info` for structure.
+
+=== 示例 ===
+# 看 .TG 声明了什么（不加载权重）
+python -m tgai_go meta -m model.TG
+python -m tgai_go info -m model.TG
+
+# 读头字段
+from tgai_go.read_tg import read_tg
+info = read_tg("model.TG")
+print(info["header"]["weight_dtype"])   # 6 = bf16
+
+=== 见也 ===
+api:go:load
+api:go:chat_meta_of
+cli:go:info

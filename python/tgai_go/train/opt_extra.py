@@ -1,0 +1,462 @@
+# -*- coding: utf-8 -*-
+"""补齐 torch 常用优化器与梯度累加簿记：SGD、Lion、Adafactor、Accumulator、scale_grads。
+
+实现方式与取舍（重要）：
+  * `SGD` / `Lion` / `Adafactor` 都有**两条路径**，按参数所在设备自动选：
+      - **CUDA 参数**：整条更新留在显存（`rt.sgd_multi` / `rt.lion_multi` /
+        `rt.adafactor_multi`，一次调用＝几次内核发射覆盖全部参数），状态也是设备缓冲。
+        逐参数 D2H/H2D 在 9.4M 参数下实测 143~160 ms/步，修好后 **0.69 ms**（207×）——
+        所以设备路径是 CUDA 上的**唯一**实现，不是可选优化。
+      - **CPU 参数**：仍然是主机端 numpy（`p.data` 原地写）。这条路径**原样保留**，
+        CPU 语义与数值都不变。
+  * 写回参数时：CPU 直接原地写 `p.data[...]`；CUDA 路径根本不在主机上碰数据。
+  * 语义严格对齐：
+      SGD：  g = grad + wd*p （wd 为 L2，与 torch 的 weight_decay 一致）
+             **首步 buf = g（torch 不做 dampening）**，之后 buf = momentum*buf + (1-dampening)*g
+             g   = g + momentum*buf  if nesterov else buf
+             p  -= lr*g
+      Lion： upd = sign(b1*m + (1-b1)*g) + wd*p
+             p  -= lr*upd
+             m   = b2*m + (1-b2)*g
+      Adafactor：见 `Adafactor` 类文档（因子化二阶矩 + 相对 β2 + 可选 β1/clip/scale_parameter）
+"""
+import numpy as np
+
+
+from . import _Optim, _invalidate_fp16_after_step, _bf16_step_boundary, _cuda, _f32
+
+__all__ = ["SGD", "Lion", "Adafactor", "Accumulator", "scale_grads"]
+
+
+def _is_cuda(p):
+    return getattr(p, "device", "cpu") == "cuda"
+
+
+def _is_f32_gpu(p):
+    """CUDA 参数是不是 fp32 设备缓冲（Adafactor 的设备内核按 fp32 指针读写）。"""
+    try:
+        return np.dtype(p._gpu.dtype).itemsize == 4 and np.dtype(p._gpu.dtype).kind == "f"
+    except Exception:                       # noqa: BLE001 - 没有 _gpu 就不是设备缓冲
+        return False
+
+
+def _cpu_view(buf):
+    """把 CPU 侧的存储统一看成 float32 ndarray 视图。
+
+    踩过的坑：`Linear` 的权重 `p.data` 是 **memoryview**，`p.data[...] = x` 会抛
+    "memoryview: invalid slice key"；必须先 `np.asarray` 拿到共享内存的 ndarray 再写。
+    """
+    return np.asarray(buf, dtype=np.float32)
+
+
+def _read(p):
+    if _is_cuda(p):
+        return np.array(p.to_numpy(), dtype=np.float32, copy=True)
+    return np.array(p.data, dtype=np.float32, copy=True)
+
+
+def _write(p, arr):
+    arr = np.ascontiguousarray(arr, np.float32)
+    if _is_cuda(p):
+        rt = _cuda()
+        p._gpu = rt.h2d(arr)
+    else:
+        np.copyto(_cpu_view(p.data), arr)
+
+
+def _read_grad(p):
+    g = p.grad
+    if g is None:
+        return None
+    if _is_cuda(p):
+        return np.array(g.to_numpy(), dtype=np.float32, copy=True)
+    return np.array(g.data if hasattr(g, "data") else g, dtype=np.float32, copy=True)
+
+
+
+def _warn_host_path(opt_name, params):
+    """在 CUDA 参数上使用"主机路径"优化器时给一次明确告警。
+
+    2026-11-20 实测：`SGD` / `Adafactor` 曾是 numpy 实现 —— 每个参数都要
+    D2H(梯度) + D2H(参数) + numpy 更新 + H2D(写回)，状态也在主机。
+    9.4M 参数下 `Adafactor` 的 `opt.step` **143~160 ms**（占整步 93%），
+    而同一模型的融合版 `AdamW` 只要 0.34 ms。它不报错，只是慢 400 倍 ——
+    所以必须显式告警，否则用户会在 CUDA 上默默付这个代价。
+
+    ★ 目前 `SGD` / `Lion` / `Adafactor` 都已改成设备端内核（`sgd_multi_flat` /
+    `lion_multi_flat` / `ada_*`），这条告警**没有调用方了**；保留它是给以后
+    新增的、还只有主机路径的优化器用的（照抄这段而不是重新发明）。
+    """
+    try:
+        is_cuda = any(getattr(q, "device", "cpu") == "cuda" for q in params)
+    except TypeError:
+        return
+    if is_cuda:
+        import warnings
+        warnings.warn(
+            "%s 在 CUDA 参数上走**主机路径**（每个参数 D2H/H2D），实测 9.4M 参数下 "
+            "opt.step 慢约两个数量级。修法：CUDA 上改用 AdamW / Int8AdamWGpu / "
+            "Fp16MomAdamW / Lion（都已是单 kernel 设备端）。"
+            % opt_name, RuntimeWarning, stacklevel=3)
+class SGD(_Optim):
+    """与 torch.optim.SGD 语义一致（momentum / dampening / nesterov / weight_decay）。"""
+
+    def __init__(self, params, lr=1e-3, momentum=0.0, dampening=0.0, weight_decay=0.0,
+                 nesterov=False):
+        super().__init__(params, lr)
+        if float(momentum) < 0:
+            raise ValueError("SGD 的 momentum 不能为负。修法：传 >=0 的浮点数")
+        if float(weight_decay) < 0:
+            raise ValueError("SGD 的 weight_decay 不能为负。修法：传 >=0 的浮点数")
+        if nesterov and (float(momentum) <= 0 or float(dampening) != 0):
+            raise ValueError("nesterov 需要 momentum>0 且 dampening==0（与 torch 一致）。"
+                             "修法：改 momentum 或 dampening")
+        self.momentum = float(momentum)
+        self.dampening = float(dampening)
+        self.wd = float(weight_decay)
+        self.nesterov = bool(nesterov)
+        self.buf = [np.zeros(p.shape, np.float32) for p in self.params]
+        # torch 的 SGD 在**第一步直接把 grad 存进 momentum buffer**（不做 dampening），
+        # 从第二步起才乘 (1-dampening)。这一点 torch 文档没强调，但实测如此。
+        self._started = [False] * len(self.params)
+        # ★ 2026-11-20：CUDA 上走**单 kernel**（`sgd_multi_flat`），动量留在显存。
+        #   原来每参数 D2H(梯度)+D2H(参数)+numpy+H2D(参数)，与 Adafactor 同病。
+        self._rt = None
+        self._dev = bool(self.params) and all(
+            getattr(p, "device", "cpu") == "cuda" for p in self.params)
+        if self._dev:
+            self._rt = _cuda()
+            if self.momentum > 0:
+                self.buf = [self._rt.zeros(tuple(p.shape)) for p in self.params]
+
+    @_invalidate_fp16_after_step
+    def step(self):
+        _bf16_step_boundary()
+        lr = float(self.lr)
+        if self._dev:
+            if self.momentum > 0:
+                entries = []
+                for i, p in enumerate(self.params):
+                    g = getattr(p, "grad", None)
+                    if g is None:
+                        continue
+                    entries.append((p._gpu, g._gpu, self.buf[i]))
+                started = [1 if s else 0 for s in self._started]
+            else:
+                entries = []
+                for p in self.params:
+                    g = getattr(p, "grad", None)
+                    if g is None:
+                        continue
+                    entries.append((p._gpu, g._gpu, p._gpu))   # buf 不会被读
+                started = None
+            if entries:
+                self._rt.sgd_multi(entries, lr, self.wd, self.momentum,
+                                   self.dampening, self.nesterov, started)
+                if self.momentum > 0:
+                    self._started = [True] * len(self.params)
+            return
+        for i, p in enumerate(self.params):
+            g = _read_grad(p)
+            if g is None:
+                continue
+            pv = _read(p)
+            if self.wd:
+                g = g + self.wd * pv
+            if self.momentum > 0:
+                if not self._started[i]:
+                    self.buf[i] = g.copy()          # 与 torch 一致：首步 buf = grad
+                    self._started[i] = True
+                else:
+                    b = self.buf[i]
+                    b *= self.momentum
+                    b += (1.0 - self.dampening) * g
+                b = self.buf[i]
+                g = g + self.momentum * b if self.nesterov else b
+            _write(p, pv - lr * g)
+
+
+class Lion(_Optim):
+    """与论文（Chen et al. 2023）一致；torch 无官方 Lion，测试用独立参考实现对照。"""
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.99), weight_decay=0.0):
+        super().__init__(params, lr)
+        b1, b2 = float(betas[0]), float(betas[1])
+        if not (0.0 <= b1 < 1.0 and 0.0 <= b2 < 1.0):
+            raise ValueError("Lion 的 betas 必须在 [0,1)。修法：传 (0.9, 0.99) 之类的值")
+        if float(weight_decay) < 0:
+            raise ValueError("Lion 的 weight_decay 不能为负。修法：传 >=0 的浮点数")
+        self.b1, self.b2 = b1, b2
+        self.wd = float(weight_decay)
+        self.m = [np.zeros(p.shape, np.float32) for p in self.params]
+        # ★ 2026-11-20：CUDA 上走**单 kernel**，动量留在显存。
+        #   原来是 numpy 实现 —— 每个参数 D2H(梯度)+D2H(参数)+H2D(参数)，
+        #   实测 9.4M 参数 **149 ms/步**（融合版 AdamW 0.34 ms）。这是纯浪费。
+        self._rt = None
+        self._dev = bool(self.params) and all(
+            getattr(p, "device", "cpu") == "cuda" for p in self.params)
+        if self._dev:
+            self._rt = _cuda()
+            self.m = [self._rt.zeros(tuple(p.shape)) for p in self.params]
+
+    @_invalidate_fp16_after_step
+    def step(self):
+        _bf16_step_boundary()
+        lr = float(self.lr)
+        if self._dev:
+            entries = []
+            for i, p in enumerate(self.params):
+                g = getattr(p, "grad", None)
+                if g is None:
+                    continue
+                entries.append((p._gpu, g._gpu, self.m[i]))
+            if entries:
+                self._rt.lion_multi(entries, self.b1, 1.0 - self.b1,
+                                    self.b2, 1.0 - self.b2, lr, self.wd)
+            return
+        for i, p in enumerate(self.params):
+            g = _read_grad(p)
+            if g is None:
+                continue
+            pv = _read(p)
+            m = self.m[i]
+            upd = np.sign(self.b1 * m + (1.0 - self.b1) * g)
+            if self.wd:
+                upd = upd + self.wd * pv
+            _write(p, pv - lr * upd)
+            m *= self.b2
+            m += (1.0 - self.b2) * g
+
+
+def scale_grads(params, factor):
+    """把所有参数的梯度乘一个标量（梯度累加时通常传 1/accum_steps）。
+
+    CUDA 梯度走 `rt.scale_inplace` 原地做（不产生新缓冲）；CPU 梯度直接 numpy 乘。
+    返回真正被缩放的参数个数。
+    """
+    f = float(factor)
+    if f == 1.0:
+        return 0
+    n = 0
+    rt = None
+    for p in params:
+        g = getattr(p, "grad", None)
+        if g is None:
+            continue
+        if getattr(p, "device", "cpu") == "cuda":
+            if rt is None:
+                rt = _cuda()
+            rt.scale_inplace(g._gpu, _f32(f))
+        else:
+            buf = _cpu_view(g.data)
+            np.copyto(buf, buf * np.float32(f))
+        n += 1
+    return n
+
+
+class Accumulator(object):
+    """梯度累加簿记（等价于 torch 里手写的 loss/accum_steps + 每 N 步 step）。
+
+    用法：
+        acc = Accumulator(model.parameters(), steps=4)
+        for batch in loader:
+            loss.backward()
+            if acc.tick():                 # 累计满 steps 次
+                acc.finalize()             # 默认按 1/steps 平均（average=True）
+                clip_grad_norm_(params, max_norm)   # 裁剪在累加**之后**生效
+                opt.step(); opt.zero_grad(); acc.reset()
+
+    为什么需要 `tick()` 返回布尔：ORV 没有 torch 那种"每步自动清零"的语义，
+    没有簿记很容易忘记 scale/step，导致"等效 batch 变大但梯度没平均"。
+    """
+
+    def __init__(self, params, steps, average=True):
+        self.params = list(params)
+        self.steps = int(steps)
+        if self.steps < 1:
+            raise ValueError("Accumulator 的 steps 必须 >=1。修法：传正整数微批次数")
+        self.average = bool(average)
+        self._n = 0
+        self._scaled = False
+
+    def tick(self):
+        """记一次微批。返回 True 表示已累计满，应当 step。"""
+        self._n += 1
+        return self._n >= self.steps
+
+    def finalize(self):
+        """按 1/steps 缩放梯度（average=True 时），返回被缩放的参数个数。"""
+        if self._scaled or not self.average:
+            return 0
+        self._scaled = True
+        return scale_grads(self.params, 1.0 / float(self.steps))
+
+    def reset(self):
+        self._n = 0
+        self._scaled = False
+
+    @property
+    def pending(self):
+        return self._n
+
+
+class Adafactor(_Optim):
+    """Adafactor（Shazeer & Stern 2018），语义对齐 `transformers.optimization.Adafactor`。
+
+    因子化二阶矩：
+      * 2D 参数：只存 row/col 两份统计（显存 O(r+c) 而不是 O(r*c)）；
+      * 1D 参数：存一份普通二阶矩。
+
+    β2 用相对衰减（与 transformers 一致）：
+        beta2_t = 1 - step ** decay_rate        # 每参数独立计数，step 从 1 开始
+    更新：
+        update = g / sqrt(row_mean ⊗ col + eps1)
+        裁剪：rms(update) 超过 clip_threshold 时按比例缩回
+        步长：scale_parameter=True 时 lr_t = lr * max(eps2, rms(p))，否则 lr_t = lr
+
+    显存：2D 参数只多两份小向量（相对 AdamW 的两个满矩阵是 O(1/r + 1/c)），
+    3B 模型上这是把优化器状态从 ~11 GB 压到几百 MB 的量级 —— 具体数值见 docs。
+
+    ★ 2026-11-20：CUDA 参数走**设备端**（`rt.adafactor_multi`，6 条内核一次覆盖
+    全部参数），状态也是 `rt.zeros(...)` 设备缓冲。原来每个参数
+    D2H(梯度)+D2H(参数)+numpy+H2D(写回)，9.4M 参数实测 **143 ms/步**；设备端后
+    **0.69 ms**（含主机侧 6 次发射的 0.16 ms），每步 0 次 D2H。
+    **CPU 参数仍走原来的 numpy 路径，语义与数值都不变。**
+    """
+
+    def __init__(self, params, lr=1e-2, eps1=1e-30, eps2=1e-3, clip_threshold=1.0,
+                 decay_rate=-0.8, beta1=None, weight_decay=0.0, scale_parameter=False):
+        super().__init__(params, lr)
+        if lr is None:
+            raise ValueError("Adafactor 需要显式 lr（本实现不内置 transformers 的相对步长调度）。"
+                             "修法：传 lr，例如 Adafactor(params, lr=1e-3)")
+        self.eps1 = float(eps1)
+        self.eps2 = float(eps2)
+        self.clip = float(clip_threshold) if clip_threshold else 0.0
+        self.decay_rate = float(decay_rate)
+        self.beta1 = None if beta1 is None else float(beta1)
+        self.wd = float(weight_decay)
+        self.scale_parameter = bool(scale_parameter)
+        self._t = [0] * len(self.params)
+        # ★ 2026-11-20：设备端判定与 Lion/SGD 同一套写法 —— 全部参数都在 cuda 才走设备。
+        #   维度上限 2 是因为 numpy 版本身只支持 0/1/2 维（3 维时 `c *= beta2_t` 会因
+        #   col 只有 shp[-1] 而抛 broadcast 错误），遇到 >2 维就**保持原样**走主机路径，
+        #   行为与改前一致（不静默换算法）。
+        #   另加 dtype 闸门：内核按 fp32 指针读写，非 fp32 参数（fp16/bf16 缓冲）若走设备
+        #   会把位模式当 float 解释 —— 那比慢更糟。这种参数一律回主机路径（`_read` 会转 fp32）。
+        self._rt = None
+        self._dev = bool(self.params) and all(
+            getattr(p, "device", "cpu") == "cuda" and len(tuple(p.shape)) <= 2
+            and _is_f32_gpu(p) for p in self.params)
+        if self._dev:
+            self._rt = _cuda()
+
+        def _zeros(shp):
+            # 调用点会传 `shp[:-1]`（tuple）与 `shp[-1]`（int）两种形态，统一成 tuple
+            shape = ((int(shp),) if isinstance(shp, (int, np.integer))
+                     else tuple(int(x) for x in shp))
+            if self._dev:
+                return self._rt.zeros(shape)
+            return np.zeros(shape, np.float32)
+        self.row = []
+        self.col = []
+        self.sq = []
+        self.mom = []
+        for p in self.params:
+            shp = tuple(int(s) for s in p.shape)
+            if len(shp) >= 2:
+                self.row.append(_zeros(shp[:-1]))
+                self.col.append(_zeros(shp[-1]))
+                self.sq.append(None)
+            else:
+                self.row.append(None)
+                self.col.append(None)
+                self.sq.append(_zeros(shp))
+            self.mom.append(None if self.beta1 is None else _zeros(shp))
+
+    @staticmethod
+    def _rms(a):
+        return float(np.sqrt(np.mean(np.square(a.astype(np.float64)))))
+
+    @_invalidate_fp16_after_step
+    def step(self):
+        _bf16_step_boundary()
+        if self._dev:
+            self._step_dev()
+            return
+        for i, p in enumerate(self.params):
+            g = _read_grad(p)
+            if g is None:
+                continue
+            pv = _read(p)
+            self._t[i] += 1
+            step = self._t[i]
+            beta2_t = 1.0 - float(step) ** self.decay_rate
+
+            if self.row[i] is not None:
+                g2 = g * g
+                r = self.row[i]
+                c = self.col[i]
+                r *= beta2_t
+                r += (1.0 - beta2_t) * g2.mean(axis=-1)
+                c *= beta2_t
+                c += (1.0 - beta2_t) * g2.mean(axis=0)
+                row_mean = r / float(np.mean(c))
+                denom = np.sqrt(row_mean.reshape(row_mean.shape + (1,)) * c.reshape((1,) + c.shape)
+                                + np.float32(self.eps1))
+            else:
+                s = self.sq[i]
+                s *= beta2_t
+                s += (1.0 - beta2_t) * (g * g)
+                denom = np.sqrt(s + np.float32(self.eps1))
+            update = g / denom
+
+            if self.beta1 is not None:
+                m = self.mom[i]
+                m *= self.beta1
+                m += (1.0 - self.beta1) * update
+                update = m
+
+            if self.clip:
+                rms = self._rms(update)
+                if rms > self.clip:
+                    update = update * np.float32(self.clip / rms)
+
+            lr_t = float(self.lr)
+            if self.scale_parameter:
+                lr_t = lr_t * max(self.eps2, self._rms(pv))
+            if self.wd:
+                pv = pv - np.float32(lr_t * self.wd) * pv
+            _write(p, pv - np.float32(lr_t) * update)
+
+    def _step_dev(self):
+        """设备端一步：把整个更新交给 `rt.adafactor_multi`（6 条内核）。
+
+        和 numpy 路径**逐项对应**（含 `_t` 只对"有梯度"的参数自增、β2 用
+        `1 - step**decay_rate`、clip/scale_parameter 的标量都在设备上算）。
+        一步里 0 次 D2H：主机只上传 n_tensors 个 b2t（几十个 float）。
+        """
+        entries = []
+        steps = []
+        for i, p in enumerate(self.params):
+            g = getattr(p, "grad", None)
+            if g is None:
+                continue
+            if getattr(g, "_gpu", None) is None:
+                # 显式报错而不是静默切回主机路径：状态已经在显存里，主机会算错。
+                raise TypeError(
+                    "Adafactor 设备路径要求 CUDA 梯度张量，参数 %d 的 grad 是 %s。"
+                    "修法：用 backward() 产生梯度，或 p.grad = T.tensor(arr).cuda()"
+                    % (i, type(g).__name__))
+            self._t[i] += 1
+            # 2D 用因子化的 (row, col)；1D 的二阶矩存在 `sq` 里，直接当 c 传下去
+            r = self.row[i]
+            c = self.col[i] if r is not None else self.sq[i]
+            entries.append((p._gpu, g._gpu, r, c, self.mom[i],
+                            tuple(int(s) for s in p.shape)))
+            steps.append(self._t[i])
+        if entries:
+            self._rt.adafactor_multi(entries, steps, float(self.lr), self.eps1,
+                                     self.eps2, self.clip, self.decay_rate,
+                                     self.beta1, self.wd, self.scale_parameter)
+

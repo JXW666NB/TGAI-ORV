@@ -1,0 +1,87 @@
+[ID] api:amp_on
+[分类] compute
+[中文名] 打开 AMP（低精度 GEMM）
+[英文名] Enable AMP (low-precision GEMM)
+[作者] JXW
+
+=== 中文 ===
+`T.amp_on(dtype="auto", weight_cache=True)` —— 打开 ORV 的 AMP：让矩阵乘（GEMM）走 fp16 / bf16 / tf32
+张量核，其它一切保持 fp32。返回 `amp_state()` 的字典。**需要 CUDA**，没有 NVIDIA 驱动直接抛 `CudaError`。
+
+参数逐个说：
+
+- `dtype="auto"`：计算精度。`"auto"` 按显卡能力选（有 bf16 张量核 → bf16；只有 fp16 → fp16；
+  策略判定没有低精度算力 → 保持 fp32，**不报错**）；也可显式写 `"fp16"` / `"float16"`、
+  `"bf16"` / `"bfloat16"`、`"tf32"`（tf32 只开 cuBLAS math mode，不做任何 cast）。
+- `weight_cache=True`：缓存一份 fp16 权重影子，省掉每次 GEMM 前的 cast。**代价**：权重在优化器之外
+  被改写后，影子不会自动失效 —— 自定义优化器必须主动调 `T.amp_invalidate()`，否则可能拿旧权重算
+  （`Fp16MomAdamW` 已自动接好）。设 `False` 则每次重 cast，慢一点但不会陈旧。
+
+⚠️ 坑 1（要探测，别硬写）：CPU-only 机器上 `T.amp_on()` 直接 `CudaError`（实测本机：找不到
+`nvcuda.dll`）。先问 `T.amp_state()` —— 它**永远不抛异常**，无卡时返回
+`{"on": False, "available": False, "reason": "...", "cache": {}}`。注意 `cache` 键**两种情况都有**
+（无卡时是空 `{}`），别用 `"fp16" in st` 判断能否用 AMP，要看 `st["available"]`。
+
+⚠️ 坑 2（全局开关，会一直开着）：`amp_on()` 把进程级状态打开，**必须记得 `amp_off()`**（它会把
+fp16 / bf16 / tf32 三条路径一起关掉）。只想开一段就用作用域写法 `with T.amp(): ...`，退出自动还原。
+
+⚠️ 坑 3（和 `torch.autocast` 完全不同，别硬搬）：ORV 只在 GEMM 的**输入**上 cast，
+参数 / 激活 / 梯度**全程 fp32**、累加也是 fp32，所以**不需要 loss scaling / GradScaler**；
+`T.GradScaler` 只为 PyTorch 迁移代码兼容而存在，不是必需品。反过来，别指望它像 autocast 那样
+把卷积/激活也降到 fp16 —— 那部分显存不会省。
+
+⚠️ 坑 4：`amp_on` 对 `dtype` 字符串**不做严格校验**（`with T.amp()` 才会抛 `NotImplementedError`），
+写错（例如 `"fp8"`）会静默落到 fp16 路径（⚠️ 未验证，仅读源码）。另外 V100 没有 bf16 硬件，
+`dtype="bf16"` 时按源码说明会**回退 fp32 并只警告一次**（⚠️ 未验证，本机无 GPU）。
+
+=== English ===
+`T.amp_on(dtype="auto", weight_cache=True)` enables ORV's AMP: matrix multiplies (GEMM) run on
+fp16 / bf16 / tf32 tensor cores while everything else stays fp32. It returns the `amp_state()`
+dict. **CUDA is required** -- without an NVIDIA driver it raises `CudaError`.
+
+- `dtype="auto"`: compute precision. `"auto"` follows the hardware (bf16 tensor cores -> bf16;
+  fp16 only -> fp16; when the policy says no low-precision compute exists -> stay fp32, **not an
+  error**). You may also pass `"fp16"` / `"float16"`, `"bf16"` / `"bfloat16"`, or `"tf32"`
+  (tf32 only switches cuBLAS math mode, no casts at all).
+- `weight_cache=True`: caches an fp16 shadow of the weights so each GEMM avoids a cast. **Cost**:
+  the shadow is not invalidated automatically when weights are modified outside the optimizer --
+  a custom optimizer must call `T.amp_invalidate()` or it may compute with stale weights
+  (`Fp16MomAdamW` already does this). `False` re-casts every time: slower, never stale.
+
+⚠️ Gotcha 1 (probe first): on a CPU-only box `T.amp_on()` raises `CudaError` (verified here:
+`nvcuda.dll` not found). Ask `T.amp_state()` first -- it **never raises** and returns
+`{"on": False, "available": False, "reason": "...", "cache": {}}` without a GPU. The `cache` key
+is **always** present (an empty `{}` when unavailable), so test `st["available"]`, not
+`"fp16" in st`, to decide whether AMP can run.
+
+⚠️ Gotcha 2 (global switch, stays on): `amp_on()` flips process-wide state, so **remember
+`amp_off()`** (it turns off fp16 / bf16 / tf32 together). For a scoped run use
+`with T.amp(): ...`, which restores the previous state on exit.
+
+⚠️ Gotcha 3 (not `torch.autocast`): ORV casts only the **inputs** of GEMM; parameters, activations
+and gradients stay fp32 and accumulation is fp32, so **no loss scaling / GradScaler is needed**
+(`T.GradScaler` exists only for PyTorch code compatibility). Conversely, do not expect autocast-like
+savings on convolutions or activations -- their memory is unchanged.
+
+⚠️ Gotcha 4: `amp_on` does **not** validate `dtype` strictly (`with T.amp()` raises
+`NotImplementedError` instead), so a typo such as `"fp8"` silently falls through to the fp16 path
+(⚠️ unverified, source reading only). Also, a V100 has no bf16 hardware: with `dtype="bf16"` the
+source docstring says the runtime falls back to fp32 with a single warning (⚠️ unverified, no GPU here).
+
+=== 示例 ===
+st = T.amp_state()                  # 先探测：CPU-only 也不抛异常
+if not st["available"]:
+    print("AMP 需要 CUDA:", st["reason"][:50])
+else:
+    T.amp_on(dtype="auto")          # V100→fp16，A100/H100→bf16
+    # ... 训练一步 ...
+    T.amp_off()                     # ⚠️ 别忘了关；三条路径一起关
+# 推荐作用域写法（退出自动还原）：
+# with T.amp():
+#     loss = model(x)
+# loss.backward()                   # 梯度仍是 fp32，不需要 GradScaler
+
+=== 见也 ===
+api:no_grad
+op:matmul
+api:Tensor

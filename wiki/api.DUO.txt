@@ -1,0 +1,37 @@
+[ID] api:DUO
+[分类] distributed
+[中文名] 一行接管整机
+[英文名] One call, whole host
+[作者] JXW
+
+=== 中文 ===
+不管你的训练程序怎么写，加上 `T.DUO()`，引擎自己探测拓扑、自己选方案、自己起 worker。
+
+默认无脑，但旋钮全在：`devices` 指定哪几张卡，`experts` 指定每张卡放几个专家，
+`strategy` 选并行方式，`dry_run=True` 只看计划不碰进程。
+
+⚠️ 它会**拒绝**坏方案：显存装不下、或者算出来加卡是净亏（吞吐比 < 1.00×）时直接报错，
+并给出修法。`strategy="tensor_parallel"` / `"pipeline_parallel"` 目前调用即拒绝（引擎还没实现）。
+
+=== English ===
+Whatever shape your training script has, add `T.DUO()` and the engine probes the
+topology, picks a plan, and spawns the workers itself.
+
+Brainless by default, but every knob is exposed: `devices`, `experts`, `strategy`,
+and `dry_run=True` to print the plan without touching any process.
+
+⚠️ It REFUSES bad plans: not enough memory, or a plan whose estimated throughput
+ratio is below 1.00x, raises with a fix hint. `strategy="tensor_parallel"` and
+`"pipeline_parallel"` are refused because the engine has not implemented them.
+
+=== 示例 ===
+duo = T.DUO()                                    # 全自动
+duo = T.DUO(devices=[0, 1], strategy="data_parallel")
+duo = T.DUO(experts={0: 6, 1: 2})                # 0 号卡 6 个专家，1 号卡 2 个
+T.DUO(dry_run=True)                              # 只看计划
+duo.run(["python", "train.py"])
+
+=== 见也 ===
+env:TG_DP_OVERLAP
+env:TGAI_DP_JOB
+api:help

@@ -1,0 +1,242 @@
+# ORV vs PyTorch 审查（2026-11-10）
+
+> 原则：**每个数字都标实测来源**；没测过的写"未验证"，不外推。
+> 目标：让 ORV（PyPI `tgai-orv`）能替代 PyTorch 做**单卡自定义模型训练**；TGAI V2.7 只是验收样例。
+
+## 0. 一句话结论
+
+- **能力面**：训练闭环（前向/反向/优化器/调度/裁剪/累积/DataLoader/AMP/checkpoint/权重互转）齐，
+  0.9.14 补齐 Dropout / 池化 / BatchNorm / `Module.train()|eval()`。
+- **质量**：多数路径**逐位一致（0.00e+00）**，其余 ≤1e-7~1e-5。
+- **显存**：3B MoE 全参 + **真 AdamW** 在 32 GB 单卡可跑（≈25 GB）；PyTorch 同配置需 ≈48 GB，
+  实测 31.34 GB 处 OOM。**这是 ORV 的核心卖点**。
+- **速度**：PyTorch 纯 fwd/bwd 仍快约 1.6–2×（T=512 口径）；ORV 通过融合优化器 + embedding 设备化 +
+  逐层图反向把差距大幅缩小（T=128 整步 1843 → **721 ms**，逐位一致）。**T=512 的图反向尚未打通**。
+
+## 1. 训练模式支持
+
+| 模式 | 状态 | 依据 |
+| --- | --- | --- |
+| 预训练 | ✅ | `tests/test_api_pretrain.py::test_pretrain_tiny_end_to_end_runs`；3B MoE 单卡整步实测 |
+| SFT | ✅ 数据+训练 | `sft_data`（JSONL→打包）、`tests/test_qwen_sft_smoke.py` |
+| DPO | ✅ 可训 | `DPOTrainer`（0.9.16）：GPU 20 步 loss 0.688→**0.213**、margin 0.0995→**14.398**；数学件 `align.dpo_pair_loss` 与 torch 对照通过 |
+| GRPO | ✅ 可训 | `GRPOTrainer`（0.9.16）：GPU 一步 loss 有限、裁剪范数 0.367；`grpo_loss` 原先在 CUDA 上出 nan（常量未对齐设备 + 用 `.data` 统计），0.9.16 已修 |
+| RLHF / PPO | ❌ 未实现 | 无 value model、无 PPO trainer（DPO/GRPO 属偏好优化，不是完整 RLHF） |
+
+## 2. 质量（与 torch 同类实现对照）
+
+| 项 | 相对差 | 来源 |
+| --- | --- | --- |
+| gather / scatter（前+反向） | **0.00e+00** | `tests/test_gather*` |
+| CUDA Graph 逐层反向（loss / 梯度合计） | **0.00e+00** | `tools/graph_whole_step.py` |
+| 融合 fp16-AdamW vs 逐参数 | **逐位** | `tests/test_fused_adamw*` |
+| embedding 设备化 vs numpy 路径 | **loss 0.00e+00** | `tools/full_step_embed.py` |
+| LayerNorm（CUDA 前/反向） | 4.38e-08 / 9.29e-07 | `tools/layernorm_gpu_check.py` |
+| conv2d（CUDA，fwd/dx/dw/db，6 组配置） | **2.39e-07** | `tools/conv_cuda_parity.py` |
+| conv1d（CUDA，3 组配置） | 1.26e-07 | `tools/conv_cuda_extra.py` |
+| MaxPool2d（CUDA vs CPU / vs torch / 反向） | **0.00e+00** | `tools/layers_cuda_check.py` |
+| AvgPool2d（CUDA vs torch / 反向） | 4.76e-08 / 9.69e-08 | 同上 |
+| BatchNorm2d（CUDA vs CPU，含 running 统计） | **0.00e+00** | 同上 |
+| torch 权重互转（logits / 往返） | ≤1e-5 / **逐位** | `tests/test_interop.py` |
+| LR 调度 | 4.55e-15 | `tests/test_sched*` |
+| DataLoader 批次内容与顺序 | 逐元素一致 | `tests/test_loader*` |
+
+## 3. 速度与显存（V100-32GB，单卡）
+
+### 3.1 加速做了什么（都有实测）
+
+| 优化 | 实测 |
+| --- | --- |
+| 融合 fp16-AdamW（原 2550 个张量逐个更新，≈0.98 s/步） | 0.375 → **0.047 s（8×）**，与逐参数**逐位相同** |
+| embedding 设备化（省掉 128 MB/步主机往返） | T=128 −160 ms；**T=512：1.359 → 1.198 s（−162 ms）**，loss 0.00e+00 |
+| 逐层 CUDA Graph 反向 | T=128 整步 1843 → **721 ms（2.56×）**，loss/梯度 0.00e+00 |
+| 逐层图（28 层 attention 单测） | 1016.3 → **140.5 ms（7.24×）**，梯度 0.00e+00 |
+| 融合投影路线（一次全宽 GEMM + 分头切片） | 等价但**无提速**（7.81 ms → 7.81 ms）⇒ **已放弃** |
+
+### 3.3 头对头（同结构 8 层、同卡 V100、各自独立进程）
+
+结构：8 层、d_model=1024、16 头、d_ff=4096、8 专家 top-2；`tools/h2h_table.py`。
+每种组合**单独一个进程**（同一进程先后跑两个栈会被显存池污染，上一轮已踩过）。
+
+| 栈 | T | 精度 | 整步 | 峰值显存 |
+| --- | --- | --- | --- | --- |
+| PyTorch | 128 | fp32 | 107.7 ms | 10.64 GiB |
+| PyTorch | 128 | AMP | 89.7 ms | 10.64 GiB |
+| PyTorch | 512 | fp32 | 221.9 ms | 10.65 GiB |
+| PyTorch | 512 | AMP | 108.1 ms | 10.65 GiB |
+| **ORV** | 128 | fp32 | **92.6 ms（1.16× 快）** | 11.36 GiB |
+| **ORV** | 128 | AMP | **80.7 ms（1.11× 快）** | 12.43 GiB |
+| **ORV** | 512 | fp32 | **198.3 ms（1.12× 快）** | 12.84 GiB |
+| **ORV** | 512 | AMP | **96.2 ms（1.12× 快）** | 14.19 GiB |
+
+**结论（两种精度、两个序列长度，四格一致）**：
+
+- ORV 在**速度**上稳定快 **1.11~1.16×**；
+- **显存这一格 ORV 是输的**：11.36~14.19 GiB vs PyTorch 的 10.64~10.65 GiB。
+  多出来的主要是 AMP 的 fp16 权重影子缓存（+1.07~1.35 GiB）。
+- **8 层这个规模上，PyTorch 的显存更省**。ORV 的显存优势只在 28 层 / 3B 那种
+  "PyTorch 根本装不下"的规模才出现（见 3.4）。
+
+> 旧 README 曾写"4/8/14 层比 PyT 快 1.41~1.74×"，那是早期对拍方式的数字。
+> 换成"两边同一份算式、各自独立进程"后是 **1.11~1.16×**。本表以新数为准。
+
+### 3.3.1 修正记录：MoE 孪生曾用不同的算式
+
+第一版对拍里，PyTorch 那边用 `topk` + `torch.where` 做稀疏路由，ORV 那边用稠密等价式
+`sum_e w2_e(silu(w1_e(x))) * (TOPK/NE)` —— **两边算的不是同一件事**，比较无效。
+现在统一成同一份稠密等价式，专家数/FFN 宽度/计算量都不变，只消除实现差异。
+
+| 项 | 数值 |
+| --- | --- |
+| PyTorch fwd / bwd（T=512，同结构） | 0.438–0.586 s / 0.471–0.536 s |
+| ORV fwd / bwd（T=512，加速前表） | 0.53 s / 1.16 s（逐层） |
+| 根因 | ① 逐层重算（梯度检查点在 **Python 层**，非 C 端）；② 分头小 kernel（q/k/v 各 16 次） |
+
+### 3.2.0 分头小 kernel 已解决（0.9.24）——目标 0.911 s 达成
+
+**根因确认**：attention 是**逐头循环 16 次**（不是 permute 的问题）。每层约 80+ 次小 kernel，
+每个都填不满 V100，同时让每张图的 arena 膨胀到 459 MiB。
+
+**修法**：改成**堆叠实现** —— 每层用 `cat` 把 16 个 `[DH,D]` 权重拼成 `[D,D]`（反向经 `cat`
+自动回到原 `Parameter`，**不改权重布局、不影响 .tg 加载**），然后：
+3 次全宽投影 GEMM + 1 次批量 SDPA（16 头一起）+ 1 次输出 GEMM。
+
+数值等价（对照逐头实现）：前向 ≤5.47e-07、`dL/dx` ≤5.75e-07、权重梯度 ≤1.46e-06。
+
+| T=512 整步（28 层） | 逐头循环 | **堆叠** |
+| --- | --- | --- |
+| 前向链 | 411.6 ms | **234.3 ms** |
+| MoE 反向 | 347.9 ms | 329.8 ms |
+| 注意力反向（逐算子） | 638.4 ms | **208.0 ms** |
+| 词表头 | 14.2 ms | 10.7 ms |
+| **合计（逐算子）** | **1412 ms** | **783 ms** |
+| **合计（开图）** | 1058–1098 ms | **754 ms（min）/ 780 ms（mean）** |
+
+⇒ **T=512 整步 754 ms < 0.911 s 目标（余量 17%）**；相对加速：起始 2038.5 → **754 ms（2.70×）**。
+loss 13.20335388 vs 13.20335865（相对差 3.6e-07，fp32 求和顺序差异，非逐位）。
+
+### 3.2.1 T=512 整步分解（28 层，实测，CUDA event）
+
+| 段 | 时间 | 占整步 |
+| --- | --- | --- |
+| 前向链（attn+MoE） | **411.6 ms** | 29% |
+| MoE 反向 | **347.9 ms** | 25% |
+| 注意力反向（逐算子） | **638.4 ms** | 45% |
+| 词表头 loss+反向 | 14.2 ms | 1% |
+| 合计 | 1412 ms | — |
+
+注意力反向是最大头；按单层图加速比 7.24× 估算，**若 28 层全走图 ⇒ 约 862 ms**（< 911 目标）。
+
+### 3.2.2 但图数量受显存限制（实测边界）
+
+每张图 arena 在 T=512 下需 **459 MiB**（fwd+bwd 的中间缓冲）。模型占 11.3 GiB，装载后空闲 20.6 GiB。
+
+| 捕获张数 | arena 合计 | 整步 | 结果 |
+| --- | --- | --- | --- |
+| 4 | 1.9 GiB | 1296 ms | ✅ |
+| 16 | 7.5 GiB | 1165 ms | ✅ |
+| 20 | 9.4 GiB | 1140 ms | ✅ |
+| **22–24** | **10.3–11.3 GiB** | **1058–1098 ms** | ✅ 当前最优 |
+| 26 | 12.2 GiB | 1311 ms | ⚠️ 反而变慢（分配器抖动） |
+| 28 | 13.1 GiB | — | ❌ 读梯度 `rc=700` |
+
+⇒ **T=512 整步从 2038.5 ms 降到约 1058–1098 ms（1.86–1.93×）**，
+但**没有达到 911 ms 目标**。差约 150–190 ms，根因是 arena 太大导致只能捕 22–24/28 层；
+26 张以上剩余显存不足以支撑 MoE 反向工作集，分配器抖动甚至非法访存。
+
+**下一步真正的解法**：把 `permute/reshape` 在 CUDA 上做成**视图（零拷贝）**。
+当前它们是真拷贝，使 arena 有约 3× 冗余（按理论计算这一层只需 ~100–150 MiB，实测 459 MiB）。
+视图化后 28 张只需约 4.4 GiB，可全部捕获 ⇒ 预计落到 862 ms 附近，才可能满足目标。
+| T=512 图反向 | 28 张图**捕获成功**（每图 459 MiB），单独驱动时 28 层**逐位一致 0.00e+00**；但**接进整步**（捕获后再跑含 MoE 的前向链）触发 `cuMemcpyDtoHAsync rc=700`，**未根因定位** |
+
+### 3.3 显存（核心卖点）
+
+#### 3.3.0 直接实测：PyTorch + 真 AdamW 在这张卡上 OOM
+
+`tools/pyt_adamw_oom.py`：**纯 PyTorch 进程**（不加载任何 ORV 代码/权重），28 层 MoE、
+T=512、fp32、开 gradient checkpointing、`torch.optim.AdamW`。
+
+```
+参数量 1.997 B（权重 7.44 GiB）
+① 仅 fwd+bwd 峰值        14.96 GiB
+② 建 AdamW（m/v 需 14.88 GiB）后走一整步
+   ⇒ OutOfMemoryError: 31.40 GiB allocated, 14 MiB free
+```
+
+**结论**：PyTorch 用真 AdamW 训练这个 MoE 时，**连 1.997B（比 V2.7 的 2.97B 还小）都装不下**。
+不是"接近上限"，是直接 OOM。
+
+对照：ORV 在**更大**的 2.97B 上跑完了完整一步，**峰值 24.78 GiB、709 ms**。
+
+差距不是"实现快慢"，而是**能不能跑**：PyT 的 fp32 动量需要 2× 参数量的显存
+（1.997B ⇒ 14.88 GiB），加上 fp32 梯度和权重就超了；ORV 用 fp16 动量（减半）
++ 逐层即时释放梯度才腾出空间。
+
+| 方案 | 真 AdamW 需求 | 32 GB 可跑？ |
+| --- | --- | --- |
+| PyTorch 3B fp32 | 权重 12.1 + 梯度 12.1 + 两个 fp32 状态 24.2 ≈ **48 GB** | ❌ 实测 31.34 GB 处 OOM，只能退 Adafactor |
+| **ORV（fp16 动量）** | ≈ **25 GB** | ✅ 可跑（实测） |
+
+## 4. 与 PyTorch 的能力缺口（逐项）
+
+| 缺口 | 状态 |
+| --- | --- |
+| Dropout / MaxPool / AvgPool / BatchNorm（1d/2d） | ✅ **0.9.14 已补**，torch 对照通过 |
+| `Module.train()` / `eval()` | ✅ **0.9.14 已补**（递归到子模块） |
+| `Tensor.max/min/var/std/norm` | ✅ **0.9.15 已补**（max/min 用 one-hot mask，梯度只落到 argmax）|
+| CUDA 上的 `abs/relu/clamp/log` | ✅ **0.9.16 沉到 C 端**（新增 7 个内核），`_cpu_only` 调用点 **4 → 0** |
+| `Tensor.to/cuda/cpu`、`minimum` | ✅ **0.9.16 已补**（`maximum` 的 CUDA 分支也修了）|
+| 高层 DPO / GRPO 训练器 | ✅ **0.9.16 已补**（GPU smoke 通过）|
+| CUDA `conv` `groups>1` | ✅ **0.9.17 已补**（按组切片 + 单组路径 + 通道拼接）：groups=2/4 × stride 1/2 的 fwd/dx/dw/db 均 ≤2.39e-07 |
+| PPO / RLHF | ⛔ 未实现 |
+| 多卡（DDP/FSDP/流水线） | 不在本阶段范围 |
+| `torch.compile` 类图优化 | 未做（CUDA Graph 覆盖逐层反向，非通用编译） |
+
+## 5. 复跑入口
+
+### 5.1 已评估但**不启用**的优化（有实测，避免重复投入）
+
+| 项 | 实测 | 结论 |
+| --- | --- | --- |
+| 融合投影（一次全宽 GEMM + 分头切片） | 等价（5.55e-07 / 梯度 9.14e-07），发射 339→302（−10.9%），但块时间 **7.81 → 7.81 ms** | **放弃**：无墙钟收益 |
+| 低显存 SDPA（`functional.sdpa_lowmem`，不物化 P） | 与物化版**逐位一致**（前向与 dq/dk/dv 均 0.00e+00）；时间 **3.91 → 4.74 ms（慢 1.21×）**；净显存无差异 | **不默认启用**：慢；显存收益未测出 |
+| ORV 的 fp16 GEMM 快路径（`TG_FP16=1`，默认关） | 无缓存：nl=8/seq=512 fp32 **171.9–187.5 ms** → fp16 **218.8 ms（慢）**；加权重影子缓存（0.9.19）后 **171.9 ms**，loss 与无缓存 fp16 完全相同 | **缓存修掉了负优化，但只是打平 fp32**：M=512 的 GEMM 不是算力受限，fp16 tensor core 用不上 |
+
+### 5.2 AMP 口径（V100 无 bf16，只能 fp16）
+
+**0.9.19 起 ORV 的 fp16 GEMM 真正吃到 tensor core**（此前 `_FP16_MAX_K=1280` 把大 K 形状全挡回 fp32，
+叠加一处 `hit[0]` 的缓存 BUG，导致"AMP 没用"的错误结论）。典型 dense 形状（CUDA event，20 次迭代）：
+
+| 形状 (M×K×N) | ORV fp32 | **ORV fp16** | PyT fp32 | PyT AMP |
+| --- | --- | --- | --- | --- |
+| 512×1024×3072 | 0.28 ms | **0.08 ms** | 0.27 ms | 0.10 ms |
+| 512×1024×4096 | 0.35 ms | **0.08 ms** | 0.35 ms | 0.11 ms |
+| 2048×2048×6144 | 3.86 ms | **0.67 ms（5.8×）** | 3.86 ms | 0.71 ms |
+| 2048×2048×8192 | 5.30 ms | **0.94 ms（5.6×）** | 5.35 ms | 0.97 ms |
+| 2048×4096×11008 | 13.89 ms | **2.13 ms（6.5×）** | 14.05 ms | 2.33 ms |
+| 2048×2048×32000 | 19.24 ms | **3.15 ms（6.1×）** | 19.26 ms | 3.57 ms |
+
+数值：fp16 输入 + fp32 累加，相对 fp32 误差 **2.78e-04 ~ 2.88e-04**，与 **torch AMP 完全同值**。
+⇒ 在通用 dense 形状上，**ORV fp16 与 PyT AMP 同级或略快**（6 项里 6 项不慢于 PyT AMP）。
+
+TGAI 的 MoE 形状（M=512、K=1024）受益有限，因为那些 GEMM 不是算力受限 —— 这是**形状问题**，
+不是 AMP 能力问题。
+
+```powershell
+# 质量对照
+python tools\conv_cuda_parity.py          # conv2d CUDA vs torch
+python tools\conv_cuda_extra.py           # conv1d / groups 拒绝 / 模块类
+python tools\layers_cuda_check.py         # 池化 / BatchNorm / Dropout（CUDA）
+python tools\graph_whole_step.py          # 图反向 loss/梯度 0.00e+00 + 整步提速
+# 速度
+python tools\full_step_512.py             # T=512 老口径（1.198 s）
+python tools\graph_whole_step_512.py      # T=512 图反向（当前 rc=700，未通）
+```
+
+## 6. 下一步（按价值排序）
+
+1. 修 T=512 图重放 `rc=700`（打通后 T=512 也能吃到图加速）
+2. 补 `Tensor.max/min/var`（PyT 面 + 让池化/BN 不必绕路）
+3. CUDA `groups>1` conv
+4. 高层 DPO/GRPO trainer（loss 已有，只差训练循环 + 对照测试）
+5. 目标：T=512 整步 ≤ 0.911 s（PyT Adafactor 步），显存仍 ≤32 GB

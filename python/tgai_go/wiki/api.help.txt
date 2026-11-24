@@ -1,0 +1,54 @@
+[ID] api:help
+[分类] getting-started
+[中文名] 库内自省帮助 / 离线 Wiki
+[英文名] In-engine help & offline wiki
+[作者] JXW
+
+=== 中文 ===
+`T.help()` 是本库的**自省入口**，也是给 AI 的接口 —— 不确定算子、配置项或后端特性时先查它，别猜。
+
+- `T.help()` 总览（每类前 10 条）；`T.help("关键词")` 按名字 / 中文说明 / 英文说明 / **用法签名**
+  搜索（大小写不敏感）
+- `T.help(tag="内核"/"API"/"算子"/"优化器"/"模块", page=...)` 分类浏览（每页默认 30 条）
+- `T.help("mul", format="json")` **纯 JSON**：stdout 里只有 JSON、无 ANSI 颜色、不分页，
+  字段名是契约（`schema="tgai-help/2"`，item 字段 id/kind/name/zh/en/usage/namespace/…）
+- `T.help(open="web")` 生成**单个自包含离线 HTML Wiki**（无 CDN、无外链、不联网），
+  并把文件路径打印到 stdout；无头/CI 下浏览器打不开也不报错
+- 词条是**外部数据**（仓库 `wiki/*.txt`）：改文件**同一进程内下一次调用立刻生效**（热更新）
+- `T.help.check()` 词条健康度（解析失败 / 未知 ID / 中英缺边 / 死链 / 覆盖率）；
+  `T.help.missing()` 待编写清单；`T.help.contrib("op:mul")` 有词条打印路径、没有就生成 TXT 骨架
+
+为什么先查再写：ORV 与 PyTorch 命名相近但边界不同 —— Tensor 没有 `.mul()` 方法、
+没有顶层 `T.sum`，凭记忆猜 API 会直接 AttributeError。
+
+=== English ===
+`T.help()` is this engine's introspection entry point and the AI-facing interface. Look
+before you write -- do not guess operator, config or backend behaviour.
+
+- `T.help()` overview (first 10 per kind); `T.help("keyword")` searches names, Chinese
+  prose, English prose and **usage signatures** (case-insensitive)
+- `T.help(tag="kernel"/"API"/"op"/..., page=...)` browse by category (30 per page)
+- `T.help("mul", format="json")` **pure JSON**: nothing but JSON on stdout, no ANSI, no
+  paging; field names are a contract (`schema="tgai-help/2"`, items have
+  id/kind/name/zh/en/usage/namespace/...)
+- `T.help(open="web")` renders a **single self-contained offline HTML wiki** (no CDN, no
+  external links, no network) and prints the file path; a headless browser failure never raises
+- Entries are **external data** (repo `wiki/*.txt`): editing a file takes effect on the
+  next call **in the same process** (hot reload)
+- `T.help.check()` health report (parse failures / unknown IDs / missing zh-en / dead links /
+  coverage); `T.help.missing()` the to-write list; `T.help.contrib("op:mul")` prints the
+  entry path or generates a TXT skeleton
+
+Why look first: ORV is close to PyTorch but differs at the edges -- Tensor has no
+`.mul()` method and there is no top-level `T.sum`, so guessing raises AttributeError.
+
+=== 示例 ===
+T.help("mul")                          # 文本搜索（含外部 Wiki 词条）
+T.help("mul", format="json")           # 纯 JSON，给 AI/脚本解析
+T.help(open="web")                     # 生成离线 Wiki 并打印路径
+T.help.check()                         # 词条健康度
+T.help.contrib("op:mul")               # 生成/查看词条
+
+=== 见也 ===
+op:mul
+api:DUO

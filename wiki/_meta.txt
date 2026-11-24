@@ -1,0 +1,15 @@
+# 分类表：决定 Wiki 网页侧边栏的分组与顺序
+# 格式：[分类] 英文id | 中文名 | English | 排序权重（小的排前面）
+# 这是唯一不需要 [ID] 的文件；引擎按文件名 _meta.txt 特殊处理。
+[分类] getting-started | 入门 | Getting started | 10
+[分类] tensor | 张量 | Tensor | 20
+[分类] model | 模型 | Model | 30
+[分类] memory | 显存 | Memory | 40
+[分类] compute | 计算 | Compute | 50
+[分类] optim | 优化器 | Optimizer | 60
+[分类] distributed | 分布式 | Distributed | 70
+[分类] inference | 推理 | Inference | 75
+[分类] plugin | 插件 | Plugin | 80
+[分类] debug | 调试 | Debug | 90
+[分类] compat | 兼容性 | Compatibility | 100
+[分类] other | 其他 | Other | 999

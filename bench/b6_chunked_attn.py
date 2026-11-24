@@ -1,0 +1,121 @@
+# -*- coding: utf-8 -*-
+"""b6：用**纯 ORV 算子**的分块注意力替代物化 S²，在群友形状上对比显存与速度。
+
+背景：P100 上融合内核编不出来（68 KB smem > 48 KB 上限），只能物化 S²，
+B=4 时占 4.18 GB。但"不物化 S²"不一定非要写内核 —— 把 query 切块，
+每块只与截至自己的 key 相乘，分数矩阵就从 B·H·S² 降到 B·H·C·S。
+
+对比四档：物化 / 融合 / **分块(C=256)** / 分块(C=512)
+"""
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, "D:/orv_pip_0962")
+sys.path.insert(0, "D:/orv_pip_0962/Lib/site-packages")
+
+import tgai_go.train as T  # noqa: E402
+from tgai_go.train import functional as Fn  # noqa: E402
+
+
+def _rect_mask(rows, cols, q_offset):
+    r = np.arange(rows)[:, None] + int(q_offset)
+    c = np.arange(cols)[None, :]
+    return np.where(c <= r, 0.0, -np.inf).astype(np.float32)[None, :, :]
+
+
+_DIAG = {}
+
+
+def _diag_mask(n, bh):
+    """对角块的方阵因果掩码（bh x n x n），按 n 缓存 —— 只有一块，不再逐块重建大掩码。"""
+    if n not in _DIAG:
+        m = np.repeat(_rect_mask(n, n, 0), bh, axis=0)
+        _DIAG[n] = T.tensor(np.ascontiguousarray(m))
+    return _DIAG[n]
+
+
+def chunked(q, k, v, chunk):
+    """q,k,v: [BH, S, DH]。按 query 块算，**不再为大块构造掩码**。
+
+    每块拆两段：
+      · 前面的键 [0, st)：对块内所有行都可见 -> causal=False，无掩码
+      · 对角键段 [st, en)：方阵因果 -> causal=True + 一个 n×n 的复用掩码
+    这样峰值只有 C*st + C*C，而不是 C*S，也不再逐块上传大掩码。
+    """
+    BH, S, DH = q.shape
+    outs = []
+    C = int(chunk)
+    for st in range(0, S, C):
+        en = min(st + C, S)
+        qb = q[:, st:en, :]
+        if st > 0:
+            head = Fn.scaled_dot_product_attention(
+                qb, k[:, :st, :], v[:, :st, :], causal=False)
+        else:
+            head = None
+        n = en - st
+        # 用 causal=False + 方阵掩码，避免依赖「causal 与 attn_mask 同时生效」的语义
+        diag = Fn.scaled_dot_product_attention(
+            qb, k[:, st:en, :], v[:, st:en, :], causal=False,
+            attn_mask=_diag_mask(n, BH))
+        ob = diag if head is None else head + diag
+        outs.append(ob)
+    return outs[0] if len(outs) == 1 else T.cat(outs, dim=1)
+
+
+def bench(kind, BH, S, DH, chunk=None, reps=5):
+    rng = np.random.default_rng(0)
+    q = T.tensor(rng.normal(0, .3, (BH, S, DH)).astype(np.float32), requires_grad=True)
+    k = T.tensor(rng.normal(0, .3, (BH, S, DH)).astype(np.float32), requires_grad=True)
+    v = T.tensor(rng.normal(0, .3, (BH, S, DH)).astype(np.float32), requires_grad=True)
+    rt = T._cuda()
+
+    def one():
+        if kind == "materialized":
+            y = Fn.scaled_dot_product_attention(q, k, v, is_causal=True, lowmem=False)
+        elif kind == "fused":
+            y = Fn.scaled_dot_product_attention(q, k, v, is_causal=True, lowmem=True)
+        else:
+            y = chunked(q, k, v, chunk)
+        (y * y).sum().backward()
+
+    one()
+    rt.sync()
+    rt.empty_cache()
+    t0 = time.time()
+    for _ in range(reps):
+        one()
+    rt.sync()
+    dt = (time.time() - t0) / reps
+    st = rt.pool_stats()
+    label = kind if chunk is None else "%s(C=%d)" % (kind, chunk)
+    print("  %-18s %6.3f s  峰值 %6.2f GB" % (label, dt, st["peak_live_bytes"] / 2**30),
+          flush=True)
+
+
+def main():
+    T.set_default_device("cuda")
+    B, S, NH, DH = 4, 2048, 12, 64
+    BH = B * NH
+    print("注意力形状：BH=%d S=%d DH=%d（B=4, 12 头）" % (BH, S, DH), flush=True)
+    # ★ 一次进程只测一档：peak_live_bytes 单调不减，同进程先后测会继承前面的峰值。
+    what = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if what == "all":
+        print("（提示：一次进程只应测一档，见 docstring）", flush=True)
+    if what in ("materialized", "all"):
+        bench("materialized", BH, S, DH)
+    if what in ("fused", "all"):
+        try:
+            bench("fused", BH, S, DH)
+        except Exception as exc:
+            print("  fused              失败：%s" % str(exc)[:70], flush=True)
+    if what.startswith("chunk"):
+        c = int(what.split("=")[1]) if "=" in what else 256
+        bench("chunked", BH, S, DH, chunk=c)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,47 @@
+[ID] api:go:load
+[分类] inference
+[中文名] 加载 .TG 模型
+[英文名] Load a .TG model
+[作者] JXW
+
+=== 中文 ===
+一行把训练好的 `.TG` 模型加载成可推理的 `Model` 对象。
+
+签名：`load(path, *, dll=None, extend_ctx=0, threads=None, preload=False)`
+
+- `path`：`.TG` 文件路径（训练产物，直接就是可推理格式，**不需要额外转换**）
+- `dll`：指定引擎库；默认用包内 `_native/`
+- `extend_ctx`：扩展上下文长度（NTK/YaRN），`0` = 用模型自带 `max_seq`
+- `threads`：CPU 线程数（`None` = 引擎默认，通常是逻辑核数）
+- `preload`：`True` = 预解码全部权重（首次推理不卡顿，但占更多内存）
+
+注意事项：
+1. **外部分词器不用手动指定**：模型旁若有 `<model.TG>.tokenizer.json`，引擎会自动使用它 —— 手动传反而可能冲突。
+2. 加载前先 `native_available()` 看一眼原生库在不在；不在会退到纯 Python 路径，速度差一个数量级。
+
+=== English ===
+Loads a trained `.TG` model into an inferable `Model` in one call.
+
+Signature: `load(path, *, dll=None, extend_ctx=0, threads=None, preload=False)`
+
+- `path`: path to the `.TG` file (the training artifact is already the inference format, no extra conversion)
+- `dll`: engine library; defaults to the bundled `_native/`
+- `extend_ctx`: extended context length (NTK/YaRN); `0` keeps the model's own `max_seq`
+- `threads`: CPU thread count (`None` = engine default, usually the logical core count)
+- `preload`: `True` pre-decodes all weights (no first-token stall, more memory)
+
+Notes:
+1. An external tokenizer needs no manual wiring: if `<model.TG>.tokenizer.json` sits next to the model, the engine picks it up automatically.
+2. Check `native_available()` first; without the native library the pure-Python path is an order of magnitude slower.
+
+=== 示例 ===
+import tgai_go
+
+print(tgai_go.native_available())        # 先确认原生引擎在不在
+m = tgai_go.load("model.TG")             # 直接加载训练产物
+m = tgai_go.load("model.TG", preload=True, threads=8)
+
+=== 见也 ===
+api:go:Chat
+api:go:chat_meta_of
+cli:go:chat

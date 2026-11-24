@@ -1,0 +1,75 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+tools/_qwen_ref.npz
+*_ref.npz
+examples/_corpus_*.txt
+examples/_tiny_sft.jsonl
+*.bak_*
+/_*.log
+/_*.py
+/_msg*.txt
+/_z_*.py
+/_a10_*.py
+/_v100_*.py
+/_diag_ptx222.py
+/_chk.py
+/_a10_*.sh
+/_*.csv
+/_sweep_*.csv
+
+# 仓库根目录的临时测量/排查输出：不要提交，证据请放 docs/measurements/
+/*.txt
+/*.log
+
+# 朋友的复现包（第三方代码，不入库）
+_repro_v21e/
+tools/_*.txt
+
+# PyTorch 源码（只用于研读，不入库）
+pytorch-src/
+backups/
+*.bak-*
+python/tgai_go/train/*.bak*
+publish_ready/
+cpu/build/
+cpu/build/*
+pytest-ci.log
+# ---- 2026-11-24 仓库瘦身：实验/评测/第三方内容一律不入库 --------------------
+# 仓库只保留：GPU 后端与算子源码、Python 源码、wiki、运行时资源、宣传用性能原始日志。
+/lab/
+/tests/
+/release/
+/"release/
+/embedded/
+/tcc/
+/skills/
+/dist/
+/build/
+/backups/
+/publish_ready/
+/_repro_v21e/
+/.pytest_cache/
+*.TG
+*.gguf
+*.safetensors
+*.npy
+*.npz
+*.dll
+!python/tgai_go/_native/*.dll
+!tools/bin/*.exe
+*.exe
+*.lib
+*.exp
+*.obj
+*.pdb
+
+# 白名单（必须放在所有通配规则之后）
+!python/tgai_go/_native/*.dll
+!tools/bin/glslangValidator.exe

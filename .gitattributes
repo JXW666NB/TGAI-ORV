@@ -1,0 +1,12 @@
+# 统一换行：仓库内一律 LF，避免 tests/test_hygiene.py::test_no_crlf 在不同机器上反复失败。
+# 背景：core.autocrlf 会让 git 存 LF、检出 CRLF，导致工作区出现 CRLF（2026-11-09 实测踩过）。
+* text=auto eol=lf
+
+# 二进制/派生物不做换行转换
+*.whl binary
+*.tar.gz binary
+*.tg binary
+*.png binary
+*.jpg binary
+*.zip binary
+*.pyc binary

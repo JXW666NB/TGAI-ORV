@@ -1,0 +1,54 @@
+[ID] kernel:cast_f32_to_bf16
+[分类] memory
+[中文名] fp32 → bf16 收窄
+[英文名] fp32 -> bf16 narrowing (round-to-nearest-even)
+[作者] JXW
+
+=== 中文 ===
+把一个 fp32 缓冲**逐元素**收窄成 bf16（以 uint16 位模式存放），舍入方式是 round-to-nearest-even。
+它是 CUDA 内核，不能直接调用：
+
+```c
+extern "C" __global__ void cast_f32_to_bf16(
+    const float* __restrict__ src, unsigned short* __restrict__ dst, int n);
+```
+
+日常使用走运行时 `rt.cast_f32_to_bf16(src, dst, n)`，或者让张量自己走 bf16 存储：
+
+```python
+x.compact_bf16()        # 把该张量改成 bf16 存储（省一半显存），读时临时升回 fp32
+x.is_bf16_stored()      # 查当前是不是 bf16 存储
+```
+
+⚠️ bf16 存储与 AMP 是两件事：AMP 只把 **GEMM 输入** cast 成 fp16/bf16，
+参数/激活/梯度全程 fp32；`compact_bf16()` 才是把这块张量的**存储**减半。
+
+=== English ===
+Narrows an fp32 buffer **element-wise** to bf16 (stored as uint16 bit patterns) using
+round-to-nearest-even. It is a CUDA kernel and cannot be called directly:
+
+```c
+extern "C" __global__ void cast_f32_to_bf16(
+    const float* __restrict__ src, unsigned short* __restrict__ dst, int n);
+```
+
+In normal code use the runtime `rt.cast_f32_to_bf16(src, dst, n)`, or let a tensor use
+bf16 storage itself:
+
+```python
+x.compact_bf16()        # store this tensor as bf16 (half memory); reads upcast temporarily
+x.is_bf16_stored()      # whether this tensor is currently bf16-stored
+```
+
+⚠️ bf16 storage and AMP are different things: AMP only casts **GEMM inputs** to
+fp16/bf16 while params/activations/grads stay fp32; `compact_bf16()` halves the
+**storage** of that tensor.
+
+=== 示例 ===
+x.compact_bf16()
+y = x.is_bf16_stored()
+z = rt.cast_f32_to_bf16(src_gpubuf, dst_gpubuf, n)
+
+=== 见也 ===
+op:compact_bf16
+op:is_bf16_stored

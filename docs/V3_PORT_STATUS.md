@@ -1,0 +1,126 @@
+# V3 移植到 ORV：已对齐 / 缺什么 / 下一步
+
+> 2026-11-13。目标：把 V3 1.5B（`D:\TGAI-V3-1.5B`，ORV 未来必须训的模型）搬到 ORV，
+> 与 PyTorch 做**真实训练步**对拍（带完整优化器、真实更新），据此指导 ORV 优化。
+> 本文只记录**已实测**的状态，不写"应该能行"。
+
+## 1. 已经跑在 ORV 张量上、且与参考数值一致的
+
+| 组件 | 验证方式 | 实测误差 |
+| --- | --- | --- |
+| RoPE（**partial** 旋转 + 异构 θ）| 与 numpy 同式对拍，partial 取 1.0 / 0.5 / 0.25 | **0.0** |
+| 注意力掩码（块对角因果 + 滑窗 + 增量右对齐）| 回归断言：batch1 用自己的文档边界；扰动位置 p 不影响 < p | 逐位 |
+| GlobalAttention（causal 路径）| 与 numpy 参考（其本身被三重循环暴力版验证过）| **3.2e-08** |
+| GlobalAttention（**块对角掩码**路径）| 同上 + "改另一篇文档不影响本文档" | **6.0e-08** |
+| MoEv3 路由（`bias=None`）| 与 numpy 同式；**专家下标逐个相同** | **3.0e-08** |
+| SiTU-GLU（专家 FFN 激活）| 与 numpy 同式；有界性在 ORV 路径上单独验 | **1.4e-07** |
+| ORV 的 SDPA 新增 `attn_mask`（加性掩码）| 上面两条块对角测试 | — |
+
+## 2. 缺的 ORV 原语（有实测依据，不是猜的）
+
+> **2026-11-13 更新（重要）**：本节原先把 `gather` 列为硬缺口，**实测推翻**。
+> ORV 的张量已支持整数数组索引 `x[ids]`，且反向**正确 scatter-add**
+> （`ids=[0,2,2]` 时行 0 梯度 4.0、行 2 梯度 8.0，未选中行严格为 0）。
+> ⇒ **嵌入查表不需要新算子**；"模型无法从 token id 前向"这个结论不成立。
+> 回归测试：`tests/test_v3_gather.py`。MoE 的**按专家分组再合并**仍需另行设计，但"取行"不是障碍。
+
+> **2026-11-13 第二次更新（同样实测）**：赋值型索引 `x[ids] = v` **不支持**
+> （`TypeError: 'Tensor' object does not support item assignment`），因此**无法回填**，
+> 也就不能用"取行算完再写回"的方式做 MoE。
+>
+> 剩下的两条路都有硬伤：
+>
+> | 方案 | 问题 |
+> | --- | --- |
+> | 每专家对**全部 token** 算，再用掩码加权累加 | 显存 O(N·d) 可控，但**算力 ×E**（E=8~16）⇒ 吞吐崩，且不再是 MoE 的稀疏计算 |
+> | 每专家只算选中行，再回填 | **回填需要 scatter**，当前做不到 |
+>
+> ⇒ **真正缺的原语是 `scatter_add` / 分段求和（segment-sum）**，其反向是 gather（已有）。
+> 这一条落地后，MoE 分派才能既省算力又省显存 —— 否则"与 PyTorch 同口径比显存/速度"没有意义。
+
+| 缺什么 | 为什么卡住 | 影响的 V3 部件 |
+| --- | --- | --- |
+| **`gather`（按下标取元素）** | 有偏置时：`topi = topk(s_all + b)`，门控要 `s_all[topi]`；没有 gather 就取不回来 | MoE 路由的**偏置路径**（训练几十步后必然用到）|
+| **`scatter` / 按行可分派** | MoE 要把 token 按选中的专家分组再算 FFN；没有分派只能"每个专家都算全部 token 再筛"，会**成倍放大算力与显存** | MoEv3 的专家分派（`mask`/`sorted` 两种实现都依赖它）|
+| 函数式 `rmsnorm` | ORV 的 `RMSNorm` 是模块（带参数），缺一个可复用的纯函数 | `TransformerBlockV3` 的两次 norm |
+| 深度可分离**卷积**（depthwise conv1d，因果）| ORV 没有卷积原语 | `CSA` 的 `_conv` |
+| 打包训练时的 `seg` 感知池化 | 需要按文档边界切分再池化；张量上没有 slice+动态长度池化 | `CSA._compress` |
+
+## 3. 关键判断：为什么"每个专家都算全部 token"不可接受
+
+参考实现的 `moe_impl` 有 `mask` / `sorted` 两种，都是**把 token 分派到专家**再算。
+若用"全算再筛"替代：E 个专家 × 全部 token ⇒ 算力与**激活显存**都放大 E 倍。
+
+V3 1.5B 的 E 是 8～16（`save_1_5b` 与 `save_1_5b_exp` 分别是 8 / 16 专家）。
+在 32 GB 卡上，PyTorch 基线已经用掉 **29.20 GB**（实测，见 `V3_1.5B_ORV_vs_PYT.md`），
+**只剩 2.66 GB**。放大 8 倍激活必然 OOM —— 所以分派是硬需求，不能绕过。
+
+## 4. 下一步（按依赖顺序，每步都要能独立验证）
+
+1. **给 ORV 加 `gather_rows(x, idx)`**（运行时已有 `gather_rows` 供 embedding 用，
+   把它提到 Tensor 层并接好反向）。验收：与 numpy 索引逐位一致 + 反向数值梯度对拍。
+2. 用它做 **MoE 分派**：`sorted` 路径（按专家排序 → 分段算 → 散回），
+   验收：与"全算再筛"的 numpy 参考一致。
+3. **函数式 rmsnorm** + **depthwise 因果卷积**。
+4. `CSA` 完整前向（压缩池化 → 卷积 → RMSNorm → 压缩注意力 → 上投影，再加局部窗口与 gate）。
+5. `TransformerBlockV3` 组装 → 与 PyTorch **同权重同输入比 logits** → 堆满 28 层 → 真实训练步。
+
+## 5. 不许含糊的一条
+
+在三档（seq 512/1024/2048）+ 完整优化器跑通之前，**任何"ORV 比 PyTorch 快/省 N 倍"的说法都不成立**。
+目前只有一条同口径实测：V2.7 2.999B 的**前反向**（无优化器）seq512，
+ORV 0.688 s/步、峰值 14,666 MiB vs PyTorch 0.923 s/步、14,815 MiB —— 显存 0.99×、速度 1.34×。
+
+## 6. 续做清单（按顺序，每条都写清验收标准）
+
+### 6.1 给 ORV 加 `scatter_add` 张量实现
+
+> **2026-11-13 末次更新（缩小工作量）**：运行时里**已有内核**，不必从零写：
+>
+> * `train/cuda.py::scatter_add_rows(g, idx, n_src_rows, row_size, n_rows)` —— 按行累加；
+> * `train/cuda.py::scatter_add_flat(g, idx, n_src, n)` —— 扁平版；
+> * `train/cuda.py::gather_rows(src, idx, n_src_rows, row_size, n_rows)` —— 取行（前向已可用）；
+> * `train/cuda.py::emb_bwd(...)` —— 嵌入反向后向，就是"scatter 到词表"的特例。
+>
+> ⇒ 剩下的是 **Tensor 层包装 + autograd 接线**（估 ~20 行），不是新内核。
+> 接线写法可参照 `train/__init__.py::_sdpa_lowmem` 里
+> `Tensor._from_gpu(..., _parents=(...))` 加自定义 VJP 的既有模式。
+
+**判定基准已就绪**：`python/tgai_go/train/v3_ops.py::scatter_add_numpy` /
+`scatter_add_backward_numpy`，四条断言在 `tests/test_v3_scatter_add.py`。
+
+**验收**：上表四条断言全过 + 数值梯度对拍（`(f(x+ε)-f(x-ε))/2ε` 与反向一致）。
+
+### 6.2 用它做 MoE 分派（sorted 路径）
+
+`topi` → 按专家排序 → 每个专家只算自己那段 → `scatter_add` 回原位置 → 乘门控累加。
+
+**验收**：与"全算再筛"的 numpy 参考逐位一致（同权重同输入）。
+
+### 6.3 补齐 CSA 张量侧
+
+压缩池化（`csa_compress`，含 `seg` 分段）与因果 depthwise 卷积（`csa_conv_causal`）。
+**验收**：与 numpy 参考一致 + 两条泄漏回归（跨文档不混池、扰动位置 p 不影响 < p）。
+
+### 6.4 组装整模型并跑真实训练步
+
+嵌入（`weight[ids]`，**已可用**）→ N 层 → final norm → head → CE。
+**验收**：与 PyTorch 同权重同输入比 logits（相对误差 < 1e-3），
+再跑 ≥20 步完整训练步（AdamW，权重真更新），记录峰值显存 / 每步耗时 / tok/s / loss。
+
+### 6.5 两侧多组配置 → 曲线与倍数
+
+(batch, seq) 网格上各跑一轮，产出：
+**显存上升曲线**、**速度下降曲线**、**ORV/PyT 显存倍数**（红线：≤ 1.0）。
+
+### 6.6 读 `D:\DSH-Workspace\pytorch-src` 后优化 ORV
+
+先读 PyTorch 在显存/速度上的关键做法（分配器、checkpointing、融合），再逐项优化 ORV，
+每项都要有**优化前后实测对比**，否则不算完成。
+
+## 7. 现在的诚实结论
+
+* **PyTorch 侧**：0.5B = 9.12 GB / 3529.8 tok/s；1.5B = 29.20 GB / 1319.6 tok/s（均为真实训练步）。
+* **ORV 侧**：V3 的**训练步数据为零**。已对齐的是算子（1e-7~1e-4）与单层（<1e-4），
+  但整模型跑不起来 —— 缺 6.1 与 6.2，缺了就只能是单专家，而单专家的显存/速度**不代表 V3**。
+* 因此：**任何"ORV 与 PyTorch 的 V3 显存倍数/速度比"目前都不存在**，不要引用。

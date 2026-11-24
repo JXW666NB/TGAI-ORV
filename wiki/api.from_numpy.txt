@@ -1,0 +1,77 @@
+[ID] api:from_numpy
+[分类] compat
+[中文名] 从 numpy 建张量
+[英文名] Tensor from numpy
+[作者] JXW
+
+=== 中文 ===
+`T.from_numpy(ndarray)` —— 把一个 `numpy.ndarray` 变成 ORV 的 `Tensor`。只有一个参数：
+`ndarray` 必须是真正的 `np.ndarray`（list / 别的类型直接 `TypeError`）。
+
+它**总是拷贝一份**，然后按下面的规则定 dtype：
+
+| 输入 numpy dtype | 得到的 Tensor dtype |
+| --- | --- |
+| 浮点（`float16` / `float32` / `float64` …）| **float32** |
+| `int32` | `int32` |
+| 其它整数（`int8` / `uint8` / `int64` …）| **int64** |
+| `bool` | ❌ `TypeError`（bool 张量未实现）|
+| 其它（复数 / object / 字符串 …）| ❌ `TypeError` 不支持该 dtype |
+
+⚠️ 坑 1（静默降精度）：`float64` 输入会**悄悄变成 float32**，不警告；要双精度就别用它。
+这和 `torch.from_numpy` 的行为相反（PyTorch 原样保留 dtype）。
+
+⚠️ 坑 2（总是拷贝，不是共享）：PyTorch 的 `torch.from_numpy` 与 numpy **共享内存**，改一个另一个跟着变；
+ORV **一定拷贝**。实测：`t.data[0] = 42` 之后原 numpy 数组仍是旧值，反向也一样。
+好处是不会踩原地改坏；代价是同一份数据占两份内存。
+
+⚠️ 坑 3（静默涨内存）：`int8` / `uint8` 会被升成 **int64**，元素内存变成 8 倍；量化后的数据直接
+`from_numpy` 会悄悄变大。
+
+⚠️ 坑 4（没有 `requires_grad` 参数）：返回的张量固定 `requires_grad=False`，想训练得自己置
+`t.requires_grad = True`（实测可用）。结果落在 `T.set_default_device()` 的默认 device 上（默认 cpu），
+要上卡再 `.to("cuda")`。
+
+=== English ===
+`T.from_numpy(ndarray)` turns a `numpy.ndarray` into an ORV `Tensor`. There is exactly one parameter:
+`ndarray` must be a real `np.ndarray` (a list or anything else raises `TypeError`).
+
+It **always copies**, then picks the dtype as follows:
+
+| input numpy dtype | resulting Tensor dtype |
+| --- | --- |
+| float (`float16` / `float32` / `float64`, ...) | **float32** |
+| `int32` | `int32` |
+| any other integer (`int8` / `uint8` / `int64`, ...) | **int64** |
+| `bool` | ❌ `TypeError` (bool tensors are not implemented) |
+| anything else (complex / object / str, ...) | ❌ `TypeError`, dtype unsupported |
+
+⚠️ Gotcha 1 (silent): a `float64` input is **quietly downcast to float32** with no warning. This is
+the opposite of `torch.from_numpy`, which preserves the dtype.
+
+⚠️ Gotcha 2 (copy, not a view): `torch.from_numpy` shares memory with numpy, so writing one side
+changes the other. ORV **always copies** -- verified: after `t.data[0] = 42` the original array is
+unchanged, and vice versa. Safe against aliasing, but the data occupies memory twice.
+
+⚠️ Gotcha 3 (silent memory growth): `int8` / `uint8` are promoted to **int64**, i.e. 8x the bytes per
+element, so feeding quantized arrays through `from_numpy` silently balloons them.
+
+⚠️ Gotcha 4 (no `requires_grad` argument): the result is always `requires_grad=False`; set
+`t.requires_grad = True` yourself if you want gradients (verified to work). The tensor lands on the
+default device from `T.set_default_device()` (cpu by default); call `.to("cuda")` to move it.
+
+=== 示例 ===
+import numpy as np
+a = np.array([1.0, 2.0], dtype=np.float64)
+t = T.from_numpy(a)                 # ✅ 得到 float32 张量
+t.requires_grad = True              # 没有 requires_grad 参数，要手动开
+print(t.data.dtype, t.requires_grad)     # float32 True
+t.data[0] = 42.0                    # 改张量不影响原数组
+print(a)                            # [1. 2.] —— 不是共享内存
+# T.from_numpy([1.0, 2.0])          # ❌ TypeError：必须是 np.ndarray
+# T.from_numpy(np.array([True]))    # ❌ TypeError：bool 张量未实现
+
+=== 见也 ===
+api:Tensor
+op:to_numpy
+api:set_default_device
