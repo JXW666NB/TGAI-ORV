@@ -1046,49 +1046,95 @@ def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
     # ★ 2026-11-21：可调档位。`--grad-ckpt-layers N`（N>0）⇒ 只重算**前 N 层**，
     #   其余层照常建图。显存不够时全开、显存够时调小换速度，是"算力/显存"的连续旋钮。
     _ckpt_lim = int((cfg or {}).get("grad_ckpt_layers") or 0)
-    for Li, L in enumerate(P["layers"]):
-        kind = kinds[Li]
-        # 计数放在循环里做一次（重算会再跑一遍层体，不能在里面计数，否则翻倍）
-        counts["csa" if kind == "csa" else "global"] += 1
+    # ★ 2026-11-24：拆成「attn 半段 / mlp 半段」，以便同时支持两种层循环：
+    #   · 普通残差：h = x + attn(x); x = h + mlp(h)
+    #   · AttnRes ：`v3_attnres.run_attn_res_layers` 的四段式（与真 V3 逐行对应）
+    #   两种循环共用同一套半段实现，避免"两条前向各写一份"再次漂移。
+    _lowmem = bool(cfg.get("lowmem", False))
+    _flash = bool(cfg.get("flash", False))
 
-        def _layer(x, Li=Li, L=L, kind=kind):
-            xn = V.rmsnorm_orv(x, L["ln1"])
-            if kind == "csa":
-                attn = C.csa_forward(xn, L["csa"], plan, cos, sin)
-            else:
-                attn = V.attention_orv(xn, L["wq"], L["wk"], L["wv"], L["wo"], cos, sin,
-                                       d // n_q, n_q, n_kv_attn,
-                                       causal=(am is None), attn_mask=am)
-            h = x + attn
-            hn = V.rmsnorm_orv(h, L["ln2"]).reshape(B * Tlen, d)
-            if int(top_k) == 1:
-                eids, g, _s = MOE.route_top1(hn, L["router"])
-                mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
-            else:
-                eids, gates, _s = MOE.route_topk(hn, L["router"], int(top_k))
-                mo = MOE.moe_topk_orv(hn, eids, gates, L["W1"], L["W2"], L["W3"])
-            if shared:
-                mo = mo + V.situ_glu_orv(hn, L["S1"], L["S2"], L["S3"])
-            # ★ MoE 辅助项（系数为 0 时这段完全跳过 ⇒ 与以前逐位相同）
-            if _aux_z or _aux_a:
-                _E = int(L["router"].shape[0])
-                _N = int(hn.shape[0])
-                if _aux_z:
-                    _lg = hn @ L["router"].transpose(0, 1)
-                    # `x_j - log_softmax_j == lse`（对每列成立），见 nn.MoE._router_z_loss
-                    _lp = T.functional.log_softmax(_lg, axis=-1)
-                    _lse = (_lg - _lp).sum(axis=-1) / float(_E)
-                    aux_terms.append((_lse * _lse).mean() * _aux_z)
-                if _aux_a:
-                    _cnt = np.bincount(np.asarray(eids).reshape(-1), minlength=_E)
-                    _f = T.tensor((_E / float(int(top_k) * _N))
-                                  * _cnt.astype(np.float32))
-                    _P = _s.sum(axis=0) * (1.0 / float(_N))
-                    aux_terms.append((_f * _P).sum() * _aux_a)
-            return h + mo.reshape(B, Tlen, d)
+    def _attn_half(x, Li, L, kind):
+        xn = V.rmsnorm_orv(x, L["ln1"])
+        if kind == "csa":
+            return C.csa_forward(xn, L["csa"], plan, cos, sin)
+        if cfg.get("qk_norm"):
+            # 参考 GlobalAttention.forward：先 QK-Norm（沿 d_k）再 RoPE
+            return CLI._attention_qk_norm(
+                xn, L["wq"], L["wk"], L["wv"], L["wo"], L["qn"], L["kn"],
+                cos, sin, d // n_q, n_q, n_kv_attn,
+                causal=(am is None), lowmem=_lowmem, flash=_flash)
+        return V.attention_orv(xn, L["wq"], L["wk"], L["wv"], L["wo"], cos, sin,
+                               d // n_q, n_q, n_kv_attn,
+                               causal=(am is None), attn_mask=am,
+                               lowmem=_lowmem, flash=_flash)
 
-        _do_ckpt = use_ckpt and (_ckpt_lim <= 0 or Li < _ckpt_lim)
-        x = CLI._checkpoint_layer(_layer, x) if _do_ckpt else _layer(x)
+    def _mlp_half(h, Li, L):
+        hn = V.rmsnorm_orv(h, L["ln2"]).reshape(B * Tlen, d)
+        if int(top_k) == 1:
+            eids, g, _s = MOE.route_top1(hn, L["router"])
+            mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
+        else:
+            eids, gates, _s = MOE.route_topk(hn, L["router"], int(top_k))
+            mo = MOE.moe_topk_orv(hn, eids, gates, L["W1"], L["W2"], L["W3"])
+        # 参考 MoEv3.forward：routed 聚合 → post_norm → (+ 共享专家)，顺序不能反
+        if cfg.get("moe_post_norm"):
+            mo = V.rmsnorm_orv(mo, L["post_norm"])
+        if shared:
+            mo = mo + V.situ_glu_orv(hn, L["S1"], L["S2"], L["S3"])
+        # ★ MoE 辅助项（系数为 0 时这段完全跳过 ⇒ 与以前逐位相同）
+        if _aux_z or _aux_a:
+            _E = int(L["router"].shape[0])
+            _N = int(hn.shape[0])
+            if _aux_z:
+                _lg = hn @ L["router"].transpose(0, 1)
+                # `x_j - log_softmax_j == lse`（对每列成立），见 nn.MoE._router_z_loss
+                _lp = T.functional.log_softmax(_lg, axis=-1)
+                _lse = (_lg - _lp).sum(axis=-1) / float(_E)
+                aux_terms.append((_lse * _lse).mean() * _aux_z)
+            if _aux_a:
+                _cnt = np.bincount(np.asarray(eids).reshape(-1), minlength=_E)
+                _f = T.tensor((_E / float(int(top_k) * _N))
+                              * _cnt.astype(np.float32))
+                _P = _s.sum(axis=0) * (1.0 / float(_N))
+                aux_terms.append((_f * _P).sum() * _aux_a)
+        return mo.reshape(B, Tlen, d)
+
+    if cfg.get("attn_res"):
+        # 与 CLI.forward_logits 的 attn_res 分支同一个实现（不复制第二份）
+        AR = CLI._attnres_module()
+        _bs = int(cfg.get("attn_res_block", 4) or 4)
+        _layers = []
+        _ares = []
+        _mres = []
+        for Li, L in enumerate(P["layers"]):
+            kind = kinds[Li]
+            counts["csa" if kind == "csa" else "global"] += 1
+            _do_ckpt = use_ckpt and (_ckpt_lim <= 0 or Li < _ckpt_lim)
+
+            def _a(x, Li=Li, L=L, kind=kind, _c=_do_ckpt):
+                fn = lambda t: _attn_half(t, Li, L, kind)      # noqa: E731
+                return CLI._checkpoint_layer(fn, x) if _c else fn(x)
+
+            def _m(h, Li=Li, L=L, _c=_do_ckpt):
+                fn = lambda t: _mlp_half(t, Li, L)             # noqa: E731
+                return CLI._checkpoint_layer(fn, h) if _c else fn(h)
+
+            _layers.append((_a, _m))
+            _ares.append((L["res_w_attn"], L["res_gn_attn"]))
+            _mres.append((L["res_w_mlp"], L["res_gn_mlp"]))
+        x = AR.run_attn_res_layers(x, _layers, _ares, _mres, block_size=_bs)
+    else:
+        for Li, L in enumerate(P["layers"]):
+            kind = kinds[Li]
+            # 计数放在循环里做一次（重算会再跑一遍层体，不能在里面计数，否则翻倍）
+            counts["csa" if kind == "csa" else "global"] += 1
+            _do_ckpt = use_ckpt and (_ckpt_lim <= 0 or Li < _ckpt_lim)
+
+            def _layer(x, Li=Li, L=L, kind=kind, _c=_do_ckpt):
+                h = x + _attn_half(x, Li, L, kind)
+                return h + _mlp_half(h, Li, L)
+
+            x = CLI._checkpoint_layer(_layer, x) if _do_ckpt else _layer(x)
 
     xh = V.rmsnorm_orv(x, P["ln_f"])[:, :Tlen - 1, :].reshape(B * (Tlen - 1), d)
     target = np.ascontiguousarray(labels[:, 1:]).reshape(-1)
@@ -1221,6 +1267,16 @@ def build_arg_parser():
     g.add_argument("--tie-embeddings", dest="tie_embeddings", action="store_true",
                    help="emb 与 head 共享同一个参数张量（参考 tie_embeddings=True）；"
                         "用于验 DP 重叠归约在 tied 下逐位正确")
+    g.add_argument("--attn-res", dest="attn_res", action="store_true",
+                   help="打开 BlockAttnRes 四段式层循环（参考 attn_res_enabled=True，"
+                        "默认关；打开后 loss 曲线才与真 V3 同构）")
+    g.add_argument("--attn-res-block", dest="attn_res_block", type=int, default=4,
+                   metavar="N", help="AttnRes 的块大小（参考 attn_res_block=4）")
+    g.add_argument("--moe-post-norm", dest="moe_post_norm", action="store_true",
+                   help="routed 聚合后、共享专家前做 RMSNorm（参考 moe_post_norm=True）")
+    g.add_argument("--qk-norm", dest="qk_norm", action="store_true",
+                   help="Global 层 q/k 在 RoPE 前做 RMSNorm（参考 attn_qk_norm=True；"
+                        "CSA 层内部默认已开）")
     # ---- 数据 ----
     g = ap.add_argument_group("data")
     g.add_argument("--data", nargs="+", required=True,
@@ -1404,6 +1460,13 @@ def _expand_cfg(a):
         # ★ 数据并行重叠归约必须在 tied 下和「反向结束后一次性归约」逐位一致：
         #   这个开关就是用来做那条对拍的（见 dp_overlap 模块文档的 tied 一节）。
         cfg["tie"] = True
+    if getattr(a, "attn_res", False):
+        cfg["attn_res"] = True
+        cfg["attn_res_block"] = int(getattr(a, "attn_res_block", 4) or 4)
+    if getattr(a, "moe_post_norm", False):
+        cfg["moe_post_norm"] = True
+    if getattr(a, "qk_norm", False):
+        cfg["qk_norm"] = True
     if getattr(a, "grad_ckpt", False):
         # 梯度重算：用算力换显存（每层前向不建图，反向重跑）。
         # 原型实测梯度逐位等价；默认关闭，只有显式 --grad-ckpt 才开。

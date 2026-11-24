@@ -94,3 +94,17 @@ C:\Python311\python.exe D:\orv_bench\_loss_curve_parity.py --d 1024 --layers 4 ^
     --E 4 --n_q 16 --d_ff 2816 --vocab 96000 --seq 512 --steps 50 ^
     --json-out D:\orv_bench\curve_50.json
 ```
+
+### 补：开启 AttnRes / post-norm / QK-Norm 后的曲线（faithful 模式）
+
+1.0.29 起 `v3_pretrain` 支持 `--attn-res --moe-post-norm --qk-norm`；两侧都打开后重测
+（同一份 PyT 初始化权重灌进 ORV，d=1024/4 层/E=4/d_ff=2816/vocab=96000/seq=512）：
+
+| 指标 | 结果 |
+| --- | --- |
+| logits 相对差（同权重）| **3.4e-06** |
+| 首步 loss 差 | **1.8e-06**（ORV 11.669359 / PyT 11.669338）|
+| 首步 gnorm | 10.743 / 10.745（差 0.02%）|
+| 20 步逐 step 相对差 | 约 1e-3 量级（fp32 归约顺序 + 裁剪归一化差异被混沌放大）|
+
+原始数据：`docs/measurements/curve_faithful_20.json`。

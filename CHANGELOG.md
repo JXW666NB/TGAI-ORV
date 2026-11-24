@@ -1,3 +1,29 @@
+## [1.0.29] - 2026-11-24
+
+### 新增：训练前向补齐真 V3 的三项（默认关，纯增量）
+
+`v3_pretrain` 的训练前向此前只有"普通残差 + 无 post-norm + global 无 QK-Norm"，
+与对拍路径 `v3_train_cli.forward_logits` 不是同一个模型（同权重下 logits 差到 4.3）。
+本版把三项补上，均为显式开关、默认关 ⇒ **默认行为与 1.0.28 逐位一致**：
+
+* `--attn-res [--attn-res-block N]`：BlockAttnRes 四段式层循环（参考 `attn_res_enabled`）；
+* `--moe-post-norm`：routed 聚合后、共享专家前做 RMSNorm（参考 `moe_post_norm`）；
+* `--qk-norm`：Global 层 q/k 在 RoPE 前做 RMSNorm（参考 `attn_qk_norm`；CSA 层内部默认已开）。
+
+实现上把层循环拆成 attn/mlp 两个半段，普通残差与 AttnRes 共用同一套半段；
+梯度重算（`--grad-ckpt`）在两种循环下都保留。
+
+**验证（V100）**：
+* `forward_loss` 与 `forward_logits` 内部 logits **逐位一致（max_abs=0.0）**；
+* 与 PyTorch 全开配置同权重：logits 相对差 **3.4e-6**、首步 loss 差 **1.8e-6**；
+* 20 步 loss 曲线首步 1.8e-6，之后约 1e-3 量级漂移（fp32 归约顺序 + 裁剪归一化差异）；
+* 12 层真训练器开三项可跑：0.26 s/步、峰值 11.6 GiB；
+* 默认 4 步 loss/gnorm 与 1.0.28 完全一致（11.698156 / 11.659061 / 11.651151 / 11.706464）。
+
+详见 `docs/V3_FAITHFUL_PARITY.md` 第五节与 `docs/PYT_COMPARE_2026-11-24.md`。
+
+---
+
 ## [1.0.28] - 2026-11-24
 
 ### 打包

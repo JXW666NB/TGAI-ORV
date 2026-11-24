@@ -130,6 +130,10 @@ print(T.policy("attn_tile"))            # 读某一项（带默认值：T.policy
 | `TG_LAUNCH_TMPL2` | **开** | 发射参数模板按 kernel 名直取，−0.9% | `=0` |
 | `TG_LAUNCH_LEAN` | 关 | 极简发射路径，−1.3% | 默认关，`=1` 开 |
 | `TG_FUSE_BCAST_ACC` | 关 | 广播乘反向三合一，−1.18% | 默认关，`=1` 开 |
+| `--attn-res` | 关 | BlockAttnRes 四段式层循环（对标真 V3 必备）| 不加该开关 |
+| `--attn-res-block N` | 4 | AttnRes 块大小（参考值 4）| 不加/改 N |
+| `--moe-post-norm` | 关 | routed 聚合后、共享专家前 RMSNorm（对标真 V3）| 不加该开关 |
+| `--qk-norm` | 关 | Global 层 q/k 在 RoPE 前 RMSNorm（对标真 V3；CSA 内部默认已开）| 不加该开关 |
 
 * 两项默认开合计 **−2.0%（0.2205 → 0.2160 s/步）**，`TG_DETERMINISTIC=1` 下逐位一致
 * 全部开关叠加约 −2.5%：主机侧已饱和，瓶颈在"每步约 2900–3100 次发射"的固定成本本身
