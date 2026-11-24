@@ -1,3 +1,17 @@
+## [1.0.28] - 2026-11-24
+
+### 打包
+
+* 新增 `MANIFEST.in`：sdist 只含 `python/tgai_go` 包与 README/CHANGELOG/LICENSE/
+  pyproject，**不再把仓库侧的 `tests/`、`docs/`、`lab/` 等打进 PyPI 源码包**。
+  （1.0.27 的 sdist 误带了本地 `tests/`，wheel 不受影响；1.0.28 起修正。）
+
+### 说明
+
+本版无算法/内核变更，行为与 1.0.27 逐位相同。
+
+---
+
 ## [1.0.27] - 2026-11-24
 
 ### 移除：两项负结果的实验代码（`TG_MOE_DEV` / `TG_ACC_BATCH`）

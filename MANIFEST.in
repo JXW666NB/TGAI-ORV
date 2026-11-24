@@ -1,0 +1,10 @@
+# sdist 只包含运行 pip 包所需的内容：Python 包 + 构建/说明文件。
+# 其余目录（tests/ lab/ bench/ examples/ docs/ tools/ src/ cuda/ shaders/ 等）
+# 是仓库侧的开发/构建资源，不随 PyPI sdist 分发（wheel 只含 python/tgai_go）。
+prune *
+graft python/tgai_go
+include README.md
+include CHANGELOG.md
+include LICENSE
+include PLUGINS.md
+include pyproject.toml
