@@ -68,3 +68,49 @@ ssh -i $env:USERPROFILE\.ssh\<ssh-key> <用户名>@<内网IP> `
 * 12 层真训练器（`--attn-res --moe-post-norm --qk-norm`）实测可跑：0.26 s/步、峰值 11.6 GiB。
 
 默认（不带开关）行为与 1.0.28 **逐位一致**（4 步 loss/gnorm 完全相同），所以这是一组纯增量的可选能力。
+
+---
+
+## 六、2026-11-24 续：K3 quantile 平衡 + pad_token_id 也已接入
+
+上一节补完 AttnRes / post-norm / QK-Norm 后，训练侧还剩两项与真 V3 不一致：
+
+| 项 | 参考实现 | 本版做法 |
+| --- | --- | --- |
+| 专家平衡 | `moe_balance='quantile'`（sigmoid 亲和度、选中集合内重归一化、每步更新专家 bias）| `--moe-balance quantile`：路由走运行时内核 `moe_topk/gather_pairs/scatter_pairs`（`v3_train_cli._route_quantile`），`opt.step()` 之后调 `update_moe_bias` |
+| pad token | `nn.Embedding(..., padding_idx=256)`（该行恒 0，反向不给梯度）| `--pad-id 256`：建表时该行置 0 + 前向 per-token 掩码（等价 per-edge 语义，兼容 tie embeddings）|
+
+### 算子级对拍（排除训练混沌，单独验算子）
+
+给两侧喂**同一批输入**（随机 `x`、`W`、`bias`，N=512 / d=128 / E=8 / k=2）：
+
+| 检查 | 结果 |
+| --- | --- |
+| 选中的专家集合 | **完全一致** |
+| `s_all`（sigmoid 亲和度）| max\|diff\| = **1.19e-07** |
+| 门控 gates（重归一化后）| max\|diff\| = **1.19e-07** |
+| bias 更新结果 | max\|diff\| = **0.000e+00（逐位一致）** |
+
+### 整链路（同权重 + 全开六项 + quantile + pad）
+
+| 指标 | 结果 |
+| --- | --- |
+| logits 相对差 | **2.97e-06** |
+| `forward_loss` vs `forward_logits` 内部 logits | **0.0（逐位）** |
+| 首步 loss | ORV 11.671686 / PyT 11.671661 → **2.5e-05 绝对 / 2.1e-06 相对** |
+| 首步 gnorm | **9.997 / 9.999** |
+| 首步 bias 范数（各层）| **0.044 / 0.062 / 0.047 完全一致** |
+| 20 步曲线 | 首步 2e-6，之后漂移约 **1e-2 绝对 / 5e-3 相对**（见下）|
+
+### 漂移根因（已定位，属数值而非语义）
+
+1. **梯度裁剪的归一化**：关掉裁剪（`--clip 1e9`）后，第 1 步 loss 差从 5.8e-3 降到 **9.1e-4**（小 6 倍）
+   ——fp32 下 grad-norm 的求和顺序不同（10.743 vs 10.745），缩放整个梯度后产生 ~2e-4 相对差异。
+2. **AdamW 更新顺序**（fused vs foreach）在 fp32 下的末位差异，被训练动力学逐步放大。
+3. 算子本身（路由/门控/bias 更新/前向）都已在 1e-6 内对齐，见上面的算子级表。
+
+### 附：checkpoint 持久化
+
+`moe_state["bias"]` 已写进 `train_state.json` 的 `moe_bias` 字段（实测 2 层 bias 范数
+0.055 / 0.093 落盘），续训时自动恢复；`int8gpu` 优化器本来就不支持续训，这条只在
+`--opt adamw` 下验证。

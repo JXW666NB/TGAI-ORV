@@ -1,3 +1,30 @@
+## [1.0.30] - 2026-11-24
+
+### 新增：K3 quantile 平衡与 pad_token_id 接入训练前向（默认关，纯增量）
+
+补齐与 PyTorch 真 V3 的最后两项差异（1.0.29 已补 AttnRes / post-norm / QK-Norm）：
+
+* `--moe-balance quantile`：真 V3 的 K3 Quantile Balancing —— 路由 = sigmoid 亲和度
+  + 选中集合内重归一化 + `opt.step()` 之后更新每个专家的 bias（复现 `update_bias` 公式）。
+  路由复用运行时内核 `moe_topk / moe_gather_pairs / moe_scatter_pairs`，bias 更新在主机
+  侧 numpy 做（(N,E) 只有几 KB）。
+* `--pad-id N`：`nn.Embedding(padding_idx)` 语义 —— 建表时该行置 0，前向用 per-token
+  掩码保证反向不给该行送梯度（兼容 tied embeddings）。
+* `moe_bias` 随 checkpoint 存进 `train_state.json`，续训自动恢复。
+
+**算子级对拍**（同输入，排除训练混沌）：选中专家完全一致、`s_all`/`gates` 差 1.19e-07、
+**bias 更新逐位一致（0.0）**。
+
+**整链路**（同权重 + 六项全开 + quantile + pad，4 层）：logits 相对差 **2.97e-06**、
+首步 loss 差 **2.5e-05**、首步 gnorm 9.997/9.999、首步 bias 范数完全一致；
+20 步曲线首步 2e-6、之后约 7e-3 相对漂移。关掉梯度裁剪后第 1 步差从 5.8e-3 降到
+9.1e-4 ⇒ 漂移主因是 fp32 下 grad-norm 求和顺序 + AdamW 更新顺序的末位差异被动力学放大，
+不是算子语义问题。
+
+默认（不带开关）行为与 1.0.29 逐位一致。详见 `docs/V3_FAITHFUL_PARITY.md` 第六节。
+
+---
+
 ## [1.0.29] - 2026-11-24
 
 ### 新增：训练前向补齐真 V3 的三项（默认关，纯增量）

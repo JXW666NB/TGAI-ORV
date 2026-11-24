@@ -133,6 +133,8 @@ print(T.policy("attn_tile"))            # 读某一项（带默认值：T.policy
 | `--attn-res` | 关 | BlockAttnRes 四段式层循环（对标真 V3 必备）| 不加该开关 |
 | `--attn-res-block N` | 4 | AttnRes 块大小（参考值 4）| 不加/改 N |
 | `--moe-post-norm` | 关 | routed 聚合后、共享专家前 RMSNorm（对标真 V3）| 不加该开关 |
+| `--moe-balance sign\|quantile` | sign | quantile=K3 QB：sigmoid 亲和度 + 选中集内重归一化 + 每步 bias 更新（对标真 V3 默认） | 用默认 sign |
+| `--pad-id N` | 不启用 | padding token：该行恒 0 且反向不给梯度（对标 padding_idx） | 不加 |
 | `--qk-norm` | 关 | Global 层 q/k 在 RoPE 前 RMSNorm（对标真 V3；CSA 内部默认已开）| 不加该开关 |
 
 * 两项默认开合计 **−2.0%（0.2205 → 0.2160 s/步）**，`TG_DETERMINISTIC=1` 下逐位一致

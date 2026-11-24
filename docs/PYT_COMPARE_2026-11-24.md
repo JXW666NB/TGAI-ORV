@@ -108,3 +108,17 @@ C:\Python311\python.exe D:\orv_bench\_loss_curve_parity.py --d 1024 --layers 4 ^
 | 20 步逐 step 相对差 | 约 1e-3 量级（fp32 归约顺序 + 裁剪归一化差异被混沌放大）|
 
 原始数据：`docs/measurements/curve_faithful_20.json`。
+
+### 补二：六项全开 + quantile 平衡 + pad_token_id（1.0.30）
+
+| 指标 | 结果 |
+| --- | --- |
+| logits 相对差（同权重）| **2.97e-06** |
+| 首步 loss 差 | **2.5e-05**（11.671686 vs 11.671661）|
+| 首步 gnorm | 9.997 / 9.999 |
+| 首步专家 bias 范数 | 两侧**完全一致**（0.044 / 0.062 / 0.047）|
+| 路由/门控算子 | 选择一致、数值差 1.19e-07 |
+| bias 更新算子 | **逐位一致（0.0）** |
+| 20 步曲线 | 首步 2e-6 → 末步约 8.6e-2 绝对 / 7.3e-3 相对（fp32 混沌放大）|
+
+原始数据：`docs/measurements/curve_full_20.json`。

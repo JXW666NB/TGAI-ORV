@@ -1007,7 +1007,7 @@ def _overlap_order(P, params):
 
 
 def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
-                 top_k=2, shared=True, use_seg=True, ce_chunk=0):
+                 top_k=2, shared=True, use_seg=True, ce_chunk=0, moe_state=None):
     """一次前向 + shift 后的 CE。返回 `(loss, meta)`，`loss` 是 0 维张量。
 
     与参考实现（`model_v3.py:1368-1515`）对齐的三点：
@@ -1038,6 +1038,12 @@ def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
         plan = C.make_plan(csac, B, Tlen, seg=(seg if use_seg else None))
 
     x = P["emb"][ids.reshape(-1)].reshape(B, Tlen, d)
+    _pad_id = cfg.get("pad_id")
+    if _pad_id is not None:
+        # 参考 nn.Embedding(padding_idx=pad)：该行恒 0，反向也不给该行送梯度。
+        # 用 per-token 掩码（乘 0）实现，等价于 CLI._embed，但支持 B>1。
+        _keep = (np.asarray(ids).reshape(-1) != int(_pad_id)).astype(np.float32)
+        x = x * T.tensor(_keep.reshape(B, Tlen, 1))
     counts = {"csa": 0, "global": 0}
     # ★ 2026-11-17：**预训练有自己的层循环**（不走 `CLI.forward_logits`）。
     #   重算开关必须在**这里**生效，否则等于没开（实测内核数 6898 完全不变）。
@@ -1070,7 +1076,22 @@ def forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
 
     def _mlp_half(h, Li, L):
         hn = V.rmsnorm_orv(h, L["ln2"]).reshape(B * Tlen, d)
-        if int(top_k) == 1:
+        _bal = cfg.get("moe_balance", "sign")
+        if _bal == "quantile":
+            # K3 QB：sigmoid 亲和度 + 选中集合内重归一化；b 只影响选择（参考 ①②③）
+            _bias = None
+            if moe_state is not None:
+                _bias = (moe_state.get("bias") or {}).get(Li)
+            eids, gates, _s = CLI._route_quantile(hn, L["router"], int(top_k), _bias)
+            if moe_state is not None:
+                _sv = _s.to_numpy() if hasattr(_s, "to_numpy") else _s
+                moe_state.setdefault("scores", {})[Li] = np.asarray(_sv, np.float32)
+            if int(top_k) == 1:
+                mo = MOE.moe_dispatch_orv(hn, eids[:, 0], gates[:, 0],
+                                          L["W1"], L["W2"], L["W3"])
+            else:
+                mo = MOE.moe_topk_orv(hn, eids, gates, L["W1"], L["W2"], L["W3"])
+        elif int(top_k) == 1:
             eids, g, _s = MOE.route_top1(hn, L["router"])
             mo = MOE.moe_dispatch_orv(hn, eids, g, L["W1"], L["W2"], L["W3"])
         else:
@@ -1267,6 +1288,14 @@ def build_arg_parser():
     g.add_argument("--tie-embeddings", dest="tie_embeddings", action="store_true",
                    help="emb 与 head 共享同一个参数张量（参考 tie_embeddings=True）；"
                         "用于验 DP 重叠归约在 tied 下逐位正确")
+    g.add_argument("--moe-balance", dest="moe_balance", default="sign",
+                   choices=["sign", "quantile"],
+                   help="专家平衡策略：sign=DeepSeek aux-free（默认，旧行为）；"
+                        "quantile=K3 Quantile Balancing（sigmoid 亲和度 + 每步 bias 更新，"
+                        "与参考实现的默认值一致）")
+    g.add_argument("--pad-id", dest="pad_id", type=int, default=None, metavar="N",
+                   help="padding token id（参考 pad_token_id=256；该行恒 0 且不给梯度）。"
+                        "默认不启用")
     g.add_argument("--attn-res", dest="attn_res", action="store_true",
                    help="打开 BlockAttnRes 四段式层循环（参考 attn_res_enabled=True，"
                         "默认关；打开后 loss 曲线才与真 V3 同构）")
@@ -1460,6 +1489,11 @@ def _expand_cfg(a):
         # ★ 数据并行重叠归约必须在 tied 下和「反向结束后一次性归约」逐位一致：
         #   这个开关就是用来做那条对拍的（见 dp_overlap 模块文档的 tied 一节）。
         cfg["tie"] = True
+    cfg["top_k"] = int(getattr(a, "top_k", 2) or 2)
+    if getattr(a, "moe_balance", None):
+        cfg["moe_balance"] = str(a.moe_balance)
+    if getattr(a, "pad_id", None) is not None:
+        cfg["pad_id"] = int(a.pad_id)
     if getattr(a, "attn_res", False):
         cfg["attn_res"] = True
         cfg["attn_res_block"] = int(getattr(a, "attn_res_block", 4) or 4)
@@ -1794,6 +1828,15 @@ def main(argv=None):
     t_run0 = _now()
     step = start_step - 1
     aborted = None
+    # ★ K3 quantile 平衡的状态：bias 跨步保留（随 checkpoint 存盘），scores 每步刷新。
+    _moe_state = {"bias": {}, "scores": {}}
+    if saved is not None and saved.get("moe_bias"):
+        for _bk, _bv in saved["moe_bias"].items():
+            _moe_state["bias"][int(_bk)] = np.asarray(_bv, np.float32)
+
+    def _moe_bias_json():
+        return {str(k): np.asarray(v, np.float32).astype(float).tolist()
+                for k, v in _moe_state["bias"].items()}
     try:
         for step in range(start_step, stop_step):
             lr = sched.step()
@@ -1808,12 +1851,15 @@ def main(argv=None):
             else:
                 ids, labels, seg = corpus.take(int(a.batch))
             opt.zero_grad()
+            if _moe_state["scores"]:
+                _moe_state["scores"].clear()      # 只留本步的亲和度给 bias 更新用
             _t_fwd = _now()
             loss, fmeta = forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
                                        top_k=int(a.top_k), shared=(not a.no_shared),
                                        use_seg=(not a.no_seg),
                                        ce_chunk=_ce_chunk_rows(
-                                           getattr(a, "ce_chunk", 0)))
+                                           getattr(a, "ce_chunk", 0)),
+                                       moe_state=_moe_state)
             _fwd_s = _now() - _t_fwd
             lv = _scalar(loss)
             if not _is_finite(lv):
@@ -1916,6 +1962,10 @@ def main(argv=None):
                 opt.step(grad_scale=gscale)
             else:
                 opt.step()
+            # ★ 参考 Trainer.optim_step()：opt.step() 之后立刻 update_moe_bias()，
+            #   新 b 从下一步生效（因果性）。只有 quantile 平衡需要。
+            if cfg.get("moe_balance") == "quantile":
+                CLI.update_moe_bias(P, cfg, _moe_state)
             # ★ 权重已更新 ⇒ 必须让 fp16 权重影子失效，否则下一步会用上一步的 fp16 权重。
             #   `cuda.py` 写明"缓存失效责任在调用方"；只 amp_on 不失效是静默错误。
             if _AMP["gemm"]:
@@ -1973,7 +2023,7 @@ def main(argv=None):
                     and (step + 1) % int(a.ckpt_every) == 0):
                 d = save_run(a.out, step + 1, corpus, P, opt, sched,
                              state_extra={"seed": seed, "model": _jsonable(cfg),
-                                          "schedule": dict(sc), "batch": int(a.batch),
+                                          "schedule": dict(sc), "batch": int(a.batch), "moe_bias": _moe_bias_json(),
                                           "history_tail": hist_tail},
                              extra_meta={"loss": lv, "lr": float(lr)})
                 rm = ckpt.rotate(a.out, int(a.keep))
@@ -2023,7 +2073,7 @@ def main(argv=None):
     if a.out and not a.no_final_save and _is_main:
         final_dir = save_run(a.out, step + 1, corpus, P, opt, sched,
                              state_extra={"seed": seed, "model": _jsonable(cfg),
-                                          "schedule": dict(sc), "batch": int(a.batch),
+                                          "schedule": dict(sc), "batch": int(a.batch), "moe_bias": _moe_bias_json(),
                                           "history_tail": hist_tail},
                              extra_meta={"loss": losses[-1] if losses else None,
                                          "final": True})
