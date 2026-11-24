@@ -1,5 +1,13 @@
 # TGAI ORV — Origin Requiem Vehicle（原生之初）
 
+[![PyPI](https://img.shields.io/pypi/v/tgai-orv.svg)](https://pypi.org/project/tgai-orv/)
+[![GitHub release](https://img.shields.io/github/v/release/JXW666NB/TGAI-ORV)](https://github.com/JXW666NB/TGAI-ORV/releases)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://pypi.org/project/tgai-orv/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/JXW666NB/TGAI-ORV.svg)](https://github.com/JXW666NB/TGAI-ORV/stargazers)
+
+**当前版本：1.0.30**（2026-11-24 发布 · [PyPI](https://pypi.org/project/tgai-orv/) · [Release 说明](https://github.com/JXW666NB/TGAI-ORV/releases/tag/v1.0.30)）
+
 **用纯 Python 跑深度学习训练，不需要 PyTorch。**
 
 自动微分、张量算子、优化器、训练循环都是自带的；CUDA 后端直接调 **驱动 + cuBLAS + NVRTC**，
