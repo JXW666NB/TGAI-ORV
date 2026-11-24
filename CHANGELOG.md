@@ -12,6 +12,13 @@
 * 删除 `v3_moe.py` 的 `DeviceRouteIdx` / `moe_dev_enabled` / `moe_dispatch_dev` /
   `moe_topk_dev` / `_dev_*` 与 `route_topk(return_idx_buf=)` 门控、`v3_pretrain.py` 的调用
 
+### 修复
+
+删除 `add_multi` 时用的行区间（`def add_multi` → `def rowwise_max`）把 1.0.26 新增的
+`_launch_lean`（`TG_LAUNCH_LEAN=1` 的极简发射路径）一起删掉了。它默认关，所以全量单元测试
+没暴露；多配置 GPU A/B 一开 `TG_LAUNCH_LEAN=1` 就 `AttributeError`。已从改动前备份原样补回，
+并在 seq512 / seq2048 / batch2 / amp=gemm / 24 层五组配置下重新实测（`docs/HOSTOPT_ROUND2_2026-11-23.md` §13）。
+
 **验证**：`TG_DETERMINISTIC=1` 4 步 loss/gnorm 与 1.0.26 完全一致
 （11.698156 / 11.659061 / 11.651151 / 11.706464；13.959 / 14.921 / 14.754 / 13.559）；
 本地测试 1199 passed / 66 skipped（20 个失败全部是引用了已移出仓库的开发工具脚本）。

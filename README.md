@@ -763,6 +763,7 @@ tools/                     少量维护脚本（验收 accept.py、GGUF 转 .TG�
 | [`docs/THREE_TARGETS.md`](docs/THREE_TARGETS.md) | 三档目标的完整实测、上下文曲线、每次优化的前后对比 |
 | [`docs/ORV_KERNEL_INVENTORY.md`](docs/ORV_KERNEL_INVENTORY.md) | 引擎里已有哪些内核/入口（避免重复造轮子） |
 | `docs/OP_COVERAGE.md` | 算子支持矩阵 |
+| [`docs/PYT_COMPARE_2026-11-24.md`](docs/PYT_COMPARE_2026-11-24.md) | ORV vs PyTorch 实测：速度、显存、数学对齐、loss 曲线 |
 | [`CHANGELOG.md`](CHANGELOG.md) | 逐版本变更 |
 | `bench/` | 逐模块微基准（CUDA event 计时），可单独运行 |
 

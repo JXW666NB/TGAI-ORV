@@ -199,3 +199,4 @@
 | ★ `HOSTOPT_ROUND2_2026-11-23.md` | **本轮优化总表**：`TG_POOL_FAST` −1.4%（采纳，opt-in）、`TG_MOE_DEV` +1.7%（负结果，默认关）、`TG_LAUNCH_FAST` 默认开（关掉 −17%）、CUDA Graph 结案（显存）、PyTorch 1.38B 在 32GB 可训 |
 | ★ `FUSION_FINAL_2026-11-23.md` | **融合专项结项报告**：F1 −1.18%（采纳）、F2 判定不做、F3 负结果 (+0.6%)；五项主机侧优化叠加仅 −2.5%（饱和证据链）；8% 与逐位一致判据不相容 |
 | `REPO_LAYOUT.md` | 仓库结构（1.0.27 起只保留构建/运行必需 + wiki + 宣传用性能原始日志 + 算子源码）|
+| `PYT_COMPARE_2026-11-24.md` | ORV vs PyTorch 实测：速度 1.30× / 显存 −16% / logits 3e-6 / loss 曲线 20 步 4e-4 |
