@@ -41,10 +41,88 @@ def _build_turn_eog(engine):
 
 
 
-def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
-    """Autoregressive generation with all anti-degradation from GUI"""
+def _forward_copy(engine, ids, seq_len, cache, cache_pos):
+    """跑一次前向，返回 logits 的独立 numpy 拷贝；失败返回 None。
+
+    ★ 缺陷 C（last_logits 竞态）：优先走 engine.forward_logits —— 它在 CPU
+      路径会用引擎级锁把 "tg_forward + 读出 + copy" 包成一个原子段，避免
+      「拿到指针后、copy 之前被另一线程的下一次前向覆盖」。
+      下面的兼容分支只用于"老 engine 对象没有 forward_logits"的极端场景，
+      行为与改造前一致（拿指针后立刻 copy）。
+    """
+    f = getattr(engine, 'forward_logits', None)
+    if callable(f):
+        return f(ids, seq_len, cache, cache_pos)
+    lp = engine.lib.tg_forward(engine.model, ids, seq_len, cache, cache_pos)
+    if not lp:
+        return None
+    FloatArr = ctypes.POINTER(ctypes.c_float)
+    return np.ctypeslib.as_array(ctypes.cast(lp, FloatArr),
+                                 shape=(engine.vocab_size,)).copy()
+
+
+def _kv_capacity_of(engine, kv):
+    """CPU 前向下本槽的 KV 容量（位置数）；None = 不做 Python 侧守卫。
+
+    ★ 缺陷 B：C 层 CPU 前向按 `cache_pos + t` 无边界写 cache->k/v。
+      CUDA 前向接管时不读这份数组（按 TGKVCache* 各自维护 GPU KV，
+      新槽 host 容量只有 1），所以 CUDA 生效时不能拿 capacity 做守卫；
+      其余情况（纯 CPU / Vulkan 逐算子加速 / CUDA 某次回落 CPU）
+      都必须守。
+    """
+    f = getattr(engine, 'cuda_forward_active', None)
+    try:
+        if callable(f) and f():
+            return None
+    except Exception:                                             # noqa: BLE001
+        pass
+    cap = getattr(kv, 'capacity', None) if kv is not None else None
+    if cap is None:
+        cap = getattr(engine, 'max_seq', None)
+    try:
+        cap = int(cap)
+    except (TypeError, ValueError):
+        return None
+    return cap if cap > 0 else None
+
+
+def _check_kv_capacity(cap, cache_pos, seq_len):
+    """KV 越界前置守卫：绝不越界写（宁可抛错，不可静默数据损坏）。"""
+    if cap is None:
+        return
+    cache_pos = int(cache_pos)
+    seq_len = int(seq_len)
+    if cache_pos + seq_len > int(cap):
+        raise RuntimeError("[KV overflow] cache_pos=%d seq_len=%d capacity=%d"
+                           % (cache_pos, seq_len, cap))
+
+
+def _dry_decode_fn(engine):
+    """DRY 用的 token→文本解码器（缺陷 E：按 token 缓存 + 不推进 detok 状态机）。
+
+    优先用 engine.dry_decode；老引擎没有该方法时退回 engine.decode
+    （行为与改造前一致，只是没有加速）。
+    """
+    f = getattr(engine, 'dry_decode', None)
+    if callable(f):
+        return f
+    return engine.decode
+
+
+def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None, state=None):
+    """Autoregressive generation with all anti-degradation from GUI
+
+    state: 可选的 dict，作为"截断信号"通道（最小侵入方案）：
+           撞 max_seq 或 max_tokens 时置
+               state['truncated'] = True
+               state['finish_reason'] = 'length'
+           正常遇到停止条件时保持 'stop'。server.py 用它把 finish_reason
+           如实报给 OpenAI 客户端。
+           为什么不用"yield 特殊值"：generate 的产出是纯文本 token 流，
+           插控制值会污染所有调用方（ChatSession / chat.py / 第三方代码）。
+    """
     lib = engine.lib; model = engine.model; vocab = engine.vocab_size
-    max_seq = engine.max_seq; FloatArr = ctypes.POINTER(ctypes.c_float)
+    max_seq = engine.max_seq
     # ★ 每轮生成前重置 SentencePiece detokenize 状态（2026-10-11 加）
     #   动机：detok 是【有状态】的（_detok_first 控制"是否吞掉前导空格"）。
     #   若不重置，上一轮的"已产出可见内容"状态会带到下一轮，
@@ -77,6 +155,9 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
     params.setdefault('dry_penalty_last_n', 256)
     if eos_set is None:
         eos_set = {eos_id}
+    if state is not None:
+        state.setdefault('truncated', False)
+        state.setdefault('finish_reason', 'stop')
 
     # ==============================================================
     #  停止串（stop_patterns）
@@ -156,20 +237,28 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
         kv.ids = list(input_ids)
 
     try:
+        # ★ 2026-11-25 缺陷 B：CPU 前向下 C 层按 cache_pos+t 无边界写 KV 数组，
+        #   这里每次前向前先校验容量，越界就抛错（绝不让它静默写坏内存）。
+        #   CUDA 前向接管时 _cap=None（它不读这份 host 数组）。
+        _cap = _kv_capacity_of(engine, kv)
         if own_cache:
             ids = (ctypes.c_int32 * len(input_ids))(*input_ids)
-            lp = lib.tg_forward(model, ids, len(input_ids), cache, 0)
+            _check_kv_capacity(_cap, 0, len(input_ids))
+            arr = _forward_copy(engine, ids, len(input_ids), cache, 0)
         else:
             seg = input_ids[start:]
             if not seg:                      # 完全命中（无新增）⇒ 复用最后一位
                 seg = input_ids[-1:]
                 start = len(input_ids) - 1
+            _check_kv_capacity(_cap, start, len(seg))
             ids = (ctypes.c_int32 * len(seg))(*seg)
-            lp = lib.tg_forward(model, ids, len(seg), cache, start)
-        if not lp: yield "[prefill error]"; return
+            arr = _forward_copy(engine, ids, len(seg), cache, start)
+        if arr is None: yield "[prefill error]"; return
 
         cur = len(input_ids); resp = ""; _lid = -1; _con = 0
         _recent = []; _so_far = ""; _first = True
+        # ★ 缺陷 E：DRY 用的 token→文本解码器（缓存 + 不推进 detok 状态机）
+        _dry_fn = _dry_decode_fn(engine)
         # ★ TURN_SCOPED_DRY：仅本轮生成的 token（DRY 的作用域）
         _turn_ids = []
         # _THINK_CLOSE_REAL: 思考档 <回答> 收束偏置（此前只定义未实现）
@@ -246,8 +335,8 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
         _stop_trace = _os2.environ.get('TGAI_STOP_TRACE') == '1'
 
         for step in range(max_tok):
-            arr = np.ctypeslib.as_array(ctypes.cast(lp, FloatArr), shape=(vocab,)).copy()
-
+            # arr 是上一步前向返回的【独立拷贝】（_forward_copy 里 copy 过），
+            # 下面原地施加 penalties/top-k 等不会影响 C 层共享缓冲。
             if _con >= 3: arr[_lid] -= _con * 5.0
             if _con > 15:
                 _stop_reason = 'same-token x%d' % _con
@@ -279,7 +368,7 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
                         arr[_closing_tid] += min(_CODE_CMAX, _code_len * _CODE_CSLP)
             tid = sample_numpy(arr, temp, top_k, top_p, vocab,
                                p=params, recent=_recent,
-                               decode_fn=engine.decode,
+                               decode_fn=_dry_fn,
                                turn_recent=_turn_ids,
                                # ★ Soft-Stop 收尾偏置（2026-10-14 移植）
                                #   块内传空集 ⇒ 让路，免得催停半截代码
@@ -369,14 +458,25 @@ def generate(engine, input_ids, params, eos_id, eos_set=None, kv=None):
                 yield ts
 
             na = (ctypes.c_int32 * 1)(tid)
-            lp = lib.tg_forward(model, na, 1, cache, cur)
-            if not lp:
+            # ★ 缺陷 B：写下一个位置（cur）前再校验一次容量，越界即抛错
+            _check_kv_capacity(_cap, cur, 1)
+            arr = _forward_copy(engine, na, 1, cache, cur)
+            if arr is None:
                 _stop_reason = 'forward failed'
                 break
             cur += 1
             if cur >= max_seq:
                 _stop_reason = 'max_seq reached'
+                # ★ 缺陷 D：撞 max_seq 截断要能把信号带出去（finish_reason=length）
+                if state is not None:
+                    state['truncated'] = True
+                    state['finish_reason'] = 'length'
                 break
+        else:
+            # for 循环正常跑完（没 break）⇒ 撞 max_tokens 截断
+            if state is not None:
+                state['truncated'] = True
+                state['finish_reason'] = 'length'
     finally:
         # ★ 防御式判断：这个 finally 归属的 try 起点很早，若异常发生在 _stop_trace
         #   赋值之前，直接引用会抛 UnboundLocalError 并**掩盖真正的异常**

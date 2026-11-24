@@ -1,3 +1,26 @@
+## 1.0.31 — 2026-11-25
+
+引擎正确性与服务语义修复（全部经 V100 实机重编 + 数值验证）。
+
+### 修复
+- **温度参数此前完全未生效**（`_sampling.sample_numpy` 的第③步是空分支）：现按
+  llama.cpp 语义实现 —— `temp<=0` 贪心、`temp==1.0` 逐位不变、否则 `logits/temp`
+  （在 penalties / DRY / soft-stop 之后）。
+- **CPU 路径 KV 越界写**（`new_kv_slot` 把 host 容量压到 1，而 CPU 前向按
+  `cache_pos` 无边界写 ⇒ 跨层污染 + 堆破坏）：Python 侧新增容量守卫（显式报
+  `[KV overflow]`），C 侧 `tg_forward` 入口与 `tg_kvcache_new` 增加参数/容量检查。
+- **`last_logits` 竞态**：新增 `TGEngine.forward_logits()`，CPU 路径把
+  `tg_forward + 读出 + copy` 放进引擎级锁；CUDA 路径不加锁（按槽返回）。
+- **服务端语义**：KV 池满由"静默自建 1.88GB KV"改为 **503 + `Retry-After: 1`**；
+  `_collect` 加 `try/finally` 归还槽；删除每请求 stderr 调试打印（原代码 `ids`
+  NameError 被吞、且会打印用户 prompt 尾巴）；`finish_reason` 区分 `stop`/`length`。
+- **DRY 每 token 256 次 ctypes 跨界**：新增 `TGEngine.dry_decode()`（token→文本缓存、
+  无状态），每 token 跨界数 258 → 2，采样结果与旧实现逐 token 一致。
+
+### 构建
+- `_native/libtgai_engine.dll` 用修复后源码在 V100 机器（MSVC 19.44 + CUDA 12.4）
+  重新编译；与旧 DLL 在同一模型上的 logits **逐位一致**，TG4 挂接与 KV 溢出守卫均已实测。
+
 ## [1.0.30] - 2026-11-24
 
 ### 新增：K3 quantile 平衡与 pad_token_id 接入训练前向（默认关，纯增量）

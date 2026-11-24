@@ -165,14 +165,20 @@ class _KVSlot:
       · 析构时自动归还槽位，不会把 C 层的槽池耗光。
 
     接口与 kv_handle() 兼容（.cache / .ids），可直接做 generate(kv=...)。
-    """
-    __slots__ = ('engine', 'cache', 'ids', 'think_mode', '_released')
 
-    def __init__(self, engine, cache):
+    ★ capacity（2026-11-25 加）：该槽的 CPU 侧容量（位置数）。
+      C 层 CPU 前向按 `cache_pos + t` 无边界写 cache->k/v，超过容量就是
+      跨层污染 + 堆越界；_session.generate() 用这个字段做前置守卫。
+    """
+    __slots__ = ('engine', 'cache', 'ids', 'think_mode', 'capacity', '_released')
+
+    def __init__(self, engine, cache, capacity=None):
         self.engine = engine
         self.cache = cache
         self.ids = []
         self.think_mode = 'direct'
+        # CPU 前向下这个槽能容纳多少个位置（token）；None = 未知（不做 Python 守卫）
+        self.capacity = int(capacity) if capacity else None
         self._released = False
 
     def reset(self):
@@ -200,8 +206,9 @@ class _KVSlot:
             pass
 
     def __repr__(self):
-        return '<KVSlot cache=%s ids=%d%s>' % (
-            hex(self.cache or 0), len(self.ids), ' released' if self._released else '')
+        return '<KVSlot cache=%s ids=%d cap=%s%s>' % (
+            hex(self.cache or 0), len(self.ids), self.capacity,
+            ' released' if self._released else '')
 
 
 class TGEngine:
@@ -209,6 +216,15 @@ class TGEngine:
         self.lib = None; self.model = None; self.cfg = {}; self.dll_path = dll_path
         self.max_seq = 512; self.vocab_size = 32768
         self.kvcache = None; self.kvcache_pos = 0
+        # ★ CPU 前向互斥锁（2026-11-25 加，缺陷 C）
+        #   C 层 CPU 前向把 logits 拷到【模型级】last_logits 再返回裸指针；
+        #   tg_forward 返回时 C 自旋锁已释放，另一线程的下一次前向会覆盖这块内存
+        #   ⇒ 旧代码 "拿指针 → .copy()" 之间存在竞态（偶发错 token）。
+        #   现在把 "调用 tg_forward + 读出 + copy" 整段放进这把 Python 锁。
+        #   CUDA 路径按 KV 槽返回各自的 logits，不用这把锁（见 forward_logits）。
+        self._cpu_fwd_lock = threading.Lock()
+        # 引擎级 KV cache（kv_handle）的容量（位置数），供 generate 的溢出守卫用
+        self.kv_cache_capacity = None
         # Sidecar tokenizer (HF tokenizer.json) — 用于大词表模型 (如 Qwen2.5 vocab=151936)
         # 引擎内置分词器用 uint16 存 merge 对 (max 65535), 大词表会丢 24%+ merge.
         # sidecar 检测到就用 Python tokenizers 库做 encode/decode, 绕过限制.
@@ -430,6 +446,9 @@ class TGEngine:
         self.kvcache = self.lib.tg_kvcache_new(self.model, actual_seq)
         if not self.kvcache: raise RuntimeError("KV cache failed")
         self.kvcache_pos = 0
+        # ★ 2026-11-25：记下引擎级 KV 的真实容量，供 _session.generate 的
+        #   KV 溢出守卫使用（C 层 CPU 前向按 max_seq_len 无边界写这份数组）。
+        self.kv_cache_capacity = int(actual_seq)
 
         # ── GPU 后端初始化（2026-10-11 加，用户要求）────────────────
         #   用户原话："检测到独立显卡就接线（门槛是显存要装得下所加载的模型）"
@@ -598,6 +617,86 @@ class TGEngine:
             tl.first = False              # 产出过可见内容，后续不再吞前导空格
         return out
 
+    # ★★ DRY 专用的【无状态 + 带缓存】token→文本解码器（2026-11-25 加，缺陷 E）
+    #
+    # 为什么不能直接把 engine.decode 传给 _sampling._dry_penalize：
+    #   ① 性能：DRY 每个生成步都要看最近 N（默认 256）个 token，
+    #      由于 temperature/top_k 等逻辑，之前每个 step 都重新解码这 256 个
+    #      token ⇒ 每 token 多 256 次 ctypes 跨界调用。实测（原 tgai_chat.py
+    #      注释）979 token 上下文下吞吐从 13.2 tok/s 掉到 1.6 tok/s。
+    #   ② 正确性：engine.decode 带 SentencePiece detokenize 状态机
+    #      （_detok_first / _detok_pend）。DRY 只是"看看这个 token 是什么字符"，
+    #      不应该推进主输出的解码状态，否则会打乱 ▁ 的还原。
+    #
+    # 与 engine.decode 的区别：不碰 detok 状态机；按 token id 缓存，
+    # 同一个 token 全程只跨界解码一次。sidecar 模型走 sidecar.decode([tid])，
+    # 该调用本身与上下文无关（逐 token 纯函数），缓存结果逐位一致。
+    def dry_decode(self, tid):
+        cache = getattr(self, '_dry_decode_cache', None)
+        if cache is None:
+            cache = {}
+            self._dry_decode_cache = cache
+        s = cache.get(tid)
+        if s is None:
+            if self.sidecar:
+                try:
+                    s = self.sidecar.decode([tid])
+                except Exception:                                  # noqa: BLE001
+                    s = ''
+            else:
+                s = self._token_str(tid) or ''
+            cache[tid] = s
+        return s
+
+    # ── 前向入口与 KV/GPU 状态（2026-11-25 加，缺陷 B/C）────────────
+    def cuda_forward_active(self):
+        """CUDA 前向是否【真的接管】了 tg_forward。
+
+        判据全部来自 C 层导出的状态（不猜）：
+          · 加载时 tg_gpu_backend_init() 返回 ready=1，且
+          · tg_gpu_backend_name() == 'cuda'
+        ⇒ 每次 tg_forward 会先走 tg_engine_cuda_forward，成功则 CPU 路径
+          （包括 TGKVCache 的 host k/v 数组）一行都不执行。
+
+        其余情况（CPU 版 DLL / Vulkan 逐算子加速 / TGAI_USE_GPU 没开）
+        都走 CPU 前向 ⇒ host KV 数组是【真的在用】，必须按容量守卫。
+        """
+        gi = getattr(self, 'gpu_info', None) or {}
+        return bool(gi.get('ready')) and \
+            (str(gi.get('backend') or '').strip().lower() == 'cuda')
+
+    def forward_logits(self, ids, seq_len, cache, cache_pos):
+        """跑一次前向，返回 logits 的【独立 numpy 拷贝】；失败返回 None。
+
+        ★ 为什么必须由引擎统一做（缺陷 C 修复）：
+          CPU 前向返回的是模型级共享的 `m->last_logits`。tg_forward 内部只在
+          "memcpy 完 → 释放 C 自旋锁"之间保证安全；函数一返回裸指针，另一个
+          线程的下一次前向就会覆盖它。旧代码在 _session.py 里
+          "先拿指针 → 再 np.ctypeslib.as_array(...).copy()" 中间没有 Python 侧
+          互斥 ⇒ 偶发错 token。这里把 "tg_forward + 读出 + copy" 整段放进
+          self._cpu_fwd_lock，Python 调用方之间不会再互相覆盖。
+          CUDA 路径按槽返回各自的 logits（tgai_cuda.cu 多槽设计），不加锁，
+          保持 GPU 并发。
+
+        ids: ctypes 的 c_int32 数组（由调用方构造，长度 = seq_len）
+        """
+        lib = self.lib
+        use_cpu_lock = not self.cuda_forward_active()
+        if use_cpu_lock:
+            with self._cpu_fwd_lock:
+                lp = lib.tg_forward(self.model, ids, seq_len, cache, cache_pos)
+                if not lp:
+                    return None
+                return np.ctypeslib.as_array(
+                    ctypes.cast(lp, ctypes.POINTER(ctypes.c_float)),
+                    shape=(self.vocab_size,)).copy()
+        lp = lib.tg_forward(self.model, ids, seq_len, cache, cache_pos)
+        if not lp:
+            return None
+        return np.ctypeslib.as_array(
+            ctypes.cast(lp, ctypes.POINTER(ctypes.c_float)),
+            shape=(self.vocab_size,)).copy()
+
     def kv_handle(self):
         """★ KV_CACHE_REUSE：返回可复用的 KV cache 句柄（跨轮保留）
 
@@ -617,6 +716,8 @@ class TGEngine:
             self._kvh = h
         # 若底层 cache 被重建（如 extend_ctx 变更），同步句柄
         self._kvh.cache = self.kvcache
+        # 真实容量（位置数），供 _session.generate 的 KV 溢出守卫
+        self._kvh.capacity = self.kv_cache_capacity
         return self._kvh
 
     # ══════════════════════════════════════════════════════════════════
@@ -631,27 +732,60 @@ class TGEngine:
     #  new_kv_slot() 就是这件事，返回的句柄与 kv_handle() 接口兼容，
     #  可以直接传给 _session.generate(kv=...)。
     # ══════════════════════════════════════════════════════════════════
+    # CPU 槽默认容量（位置数）。★ 2026-11-25 缺陷 B 修复：
+    #   旧实现无脑给 1（注释说"CUDA 路径不用这份数组"），但【CPU 前向恰恰
+    #   用这份数组】并按 cache_pos+t 无边界写 ⇒ 纯 CPU / Vulkan / CUDA 回落
+    #   路径一跑多 token 就跨层污染 + 堆越界（静默数据损坏）。
+    #   现在 CPU 生效路径给 min(engine.max_seq, 2048)：
+    #     · 2048 覆盖绝大多数对话（prompt+生成）；
+    #     · 按旧注释实测，V2.7 在 8192 位置时每槽 host KV ≈1.88GB ⇒ 2048 位置
+    #       约 0.5GB/槽；server 池默认 4 个槽约 2GB，32GB 机器可接受；
+    #     · 要跑更长上下文时用 TGAI_KV_CPU_SLOT_SEQ 调大（上限仍是模型 max_seq）。
+    #   CUDA 接管时仍给 1（省 host 内存），但 capacity 字段如实记录，
+    #   万一 CUDA 某次失败回落到 CPU 路径，Python/C 守卫会拒绝越界写而不是损坏。
+    _CPU_KV_SLOT_SEQ_DEFAULT = 2048
+
+    def _cpu_kv_slot_seq(self):
+        """CPU 生效路径下新槽的默认容量（位置数）。"""
+        raw = os.environ.get('TGAI_KV_CPU_SLOT_SEQ', '2048')
+        try:
+            cap = int(raw)
+        except (TypeError, ValueError):
+            cap = self._CPU_KV_SLOT_SEQ_DEFAULT
+        if cap < 1:
+            cap = 1
+        model_cap = int(self.max_seq or 1)
+        return min(model_cap, cap)
+
     def new_kv_slot(self, max_seq=None):
         """申请一条【独立的】KV 槽（自己的 TGKVCache ⇒ C 层自己的 GPU KV 槽）。
 
-        max_seq: 该槽的 CPU 侧容量；None = 用引擎的 max_seq。
+        max_seq: 该槽的 CPU 侧容量（位置数）。
+                 · 显式传值 ⇒ 用它（必须 > 0）
+                 · None ⇒ CUDA 前向接管时给 1（省 host 内存）；
+                           否则给 min(engine.max_seq, TGAI_KV_CPU_SLOT_SEQ=2048)
                  （GPU 侧容量由 C 层按 TGAI_CUDA_KV_SLOT_SEQ 懒分配并自动增长，
-                  与这里的值无关；这里只是 TGKVCache 结构体自己的 k/v 数组，
-                  CUDA 路径根本不用它，所以给大给小于正确性无影响。）
-        返回: 句柄对象（.cache / .ids / .reset() / .release()），可直接做 kv= 参数。
+                  与这里的值无关；这里只是 TGKVCache 结构体自己的 k/v 数组。）
+        返回: 句柄对象（.cache / .ids / .capacity / .reset() / .release()）。
         """
         if not hasattr(self, '_slots'):
             self._slots = set()
-        # ★ 2026-10-13: CPU 侧容量默认降到 1 —— CUDA 路径不用这份数组，
-        #   而 seq=max_seq(8192) 会让每个槽 calloc 1.88 GB host 内存，
-        #   8 个槽 = 15 GB，实测把 32 GB 机器吃满 ⇒ tg_kvcache_new
-        #   返回 NULL ⇒ 输出 "[KV error]"。给 1 即可，显式传值仍尊重调用方。
-        _KV_CPU_SEQ_MIN = 1
-        seq = int(max_seq or _KV_CPU_SEQ_MIN)
+        if max_seq is not None:
+            seq = int(max_seq)
+            if seq <= 0:
+                raise ValueError(
+                    'new_kv_slot(max_seq=%r) 非法：容量必须 > 0' % (max_seq,))
+        elif self.cuda_forward_active():
+            # CUDA 前向只把 TGKVCache* 当槽键，不读 host k/v ⇒ 1 即可省 host 内存。
+            # capacity 如实记 1：真回落 CPU 路径时守卫会报错，宁可报错不可损坏。
+            seq = 1
+        else:
+            seq = self._cpu_kv_slot_seq()
         c = self.lib.tg_kvcache_new(self.model, seq)
         if not c:
-            raise RuntimeError('KV slot alloc failed (tg_kvcache_new returned NULL)')
-        h = _KVSlot(self, c)
+            raise RuntimeError(
+                'KV slot alloc failed (tg_kvcache_new returned NULL, seq=%d)' % seq)
+        h = _KVSlot(self, c, capacity=seq)
         self._slots.add(h)
         return h
 

@@ -2862,6 +2862,14 @@ static int ensure_work(TGModel* m, int seq_len) {
 
 /* ─── KV Cache ────────────────────────────────── */
 TGKVCache* tg_kvcache_new(const TGModel* m, int max_seq_len) {
+    /* ★ 2026-11-25：参数守卫（缺陷 B）。max_seq_len<=0 时下面 per_layer=0，
+     *   calloc(0) 可能返回非 NULL 指针，随后 tg_forward 按 cache_pos+t 写
+     *   cache->k/v 就是堆越界（静默数据损坏）。这里直接失败，由调用方报错。
+     *   负值若不拦，转成 size_t 会变成天文数字大小的分配请求。 */
+    if (!m || max_seq_len <= 0) {
+        set_err("tg_kvcache_new: 参数非法（model 为空或 max_seq_len <= 0）");
+        return NULL;
+    }
     TGKVCache* c = (TGKVCache*)calloc(1, sizeof(TGKVCache));
     if (!c) return NULL;
 
@@ -4584,6 +4592,28 @@ const float* tg_forward(TGModel* m, const int32_t* input_ids, int seq_len,
         }
     }
 #endif
+
+    /* ★ KV 容量守卫（2026-11-25 加，缺陷 B）：
+     *   CPU 前向在 transformer_block 里按 `cache_pos + t` 直接写
+     *   cache->k/v[layer, head, pos, :]。若调用方给的 cache_pos+seq_len
+     *   超过该槽容量 (cache->max_seq_len)，就会写到下一层甚至堆外
+     *   ⇒ 跨层污染 + 堆破坏（静默数据损坏，不报错）。
+     *   这里在进入 CPU 路径前显式拒绝，并沿用 set_err/tg_last_error 的错误风格。
+     *
+     *   ★ 必须放在 CUDA 接管判断【之后】：
+     *     CUDA 前向只把 TGKVCache* 当槽键，不读这里的 host k/v 数组
+     *     （新槽 host 容量可能只有 1），提前拒绝会错误地打断 GPU 路径。
+     *   ★ 只改源码：本机没有 cl/gcc/nvcc，_native/*.dll 仍是旧二进制；
+     *     重建 DLL 后这条守卫才真正生效（Python 侧已有等价守卫）。 */
+    if (cache && (cache_pos < 0 ||
+                  (size_t)cache_pos + (size_t)seq_len > (size_t)cache->max_seq_len)) {
+        char _kve[160];
+        snprintf(_kve, sizeof(_kve),
+                 "[KV overflow] cache_pos=%d seq_len=%d capacity=%d",
+                 cache_pos, seq_len, cache->max_seq_len);
+        set_err(_kve);
+        return NULL;
+    }
 
     _forward_lock_acquire();
 

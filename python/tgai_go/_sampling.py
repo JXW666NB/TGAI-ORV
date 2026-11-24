@@ -133,11 +133,12 @@ def _dry_penalize(logits, recent, p, decode_fn):
 def sample_numpy(logits, temp, top_k, top_p, vocab, p=None, recent=None,
                  decode_fn=None, turn_recent=None,
                  max_tok=0, step=0, eos_ids=None):
-    """采样（linearly: penalties -> dry -> top_k -> top_p -> min_p -> multinomial）。
+    """采样（linearly: penalties -> dry -> soft-stop -> temp -> top_k -> top_p -> min_p -> multinomial）。
 
     p: 完整参数字典（含 seed / *_penalty / dry_* / min_p）；缺省时退化为旧行为。
     recent: 已生成 token 列表（供 repeat/frequency/presence 惩罚）
     decode_fn: token -> 文本（供 DRY 断句）；为 None 时 DRY 跳过断句检查
+    temp: 温度。<=0 = 贪心（argmax）；==1（含 None）= 不改 logits；>0 且 !=1 = logits/temp
     turn_recent: ★ TURN_SCOPED_DRY（2026-10-10 加）
         仅【本轮生成】的 token。DRY 只在这个窗口内匹配 ⇒ 等价于 llama.cpp 的
         "每请求重置采样器状态"语义。为 None 时退回用 recent（旧行为）。
@@ -183,7 +184,25 @@ def sample_numpy(logits, temp, top_k, top_p, vocab, p=None, recent=None,
                 if 0 <= _e < arr.size and np.isfinite(arr[_e]):
                     arr[_e] += _bias
 
-    # ③ 温度
+    # ③ 温度（llama.cpp 语义）
+    #
+    # ★ 2026-11-25 修：此前这个分支是空的 ⇒ `temperature` 参数完全不生效
+    #   （无论传 0 / 0.01 / 2.0，采样分布都等于 temp=1）。
+    #
+    #   llama.cpp 的 temp 语义（llama-sampler.cpp, llama_sampler_apply 里的 temp 采样器）：
+    #       temp <= 0  ⇒ greedy：直接取 argmax（不再走随机采样）
+    #       temp  > 0  ⇒ logits /= temp（temp == 1 是恒等变换，逐位不变）
+    #
+    #   ★ 顺序要求：必须放在 ① penalties / ② DRY / ②.5 soft-stop【之后】：
+    #     那三项是对 logits 的加性偏置，温度是对数域的乘性缩放；
+    #     先缩放再加偏置会得到不同的分布（与 llama.cpp 不一致）。
+    #   ★ temp=None 视作 1.0：保持旧行为（旧代码根本不看这个参数）。
+    _temp = 1.0 if temp is None else float(temp)
+    if _temp <= 0.0:
+        # 贪心：对已施加 penalties/DRY/soft-stop 的 arr 取 argmax
+        return int(np.argmax(arr))
+    if abs(_temp - 1.0) > 1e-9:
+        arr = arr / _temp
 
     # ④ top_k
     if 0 < top_k < vocab:

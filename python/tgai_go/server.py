@@ -196,6 +196,10 @@ def kv_reuse_enabled():
     return v in ('1', 'true', 'yes', 'on')
 
 
+class ServerOverloaded(Exception):
+    """服务过载（KV 槽池耗尽）：Handler 回 503 + Retry-After，不静默降级。"""
+
+
 def kv_for_request(engine):
     """借一个 KV 槽（固定池复用，指针不增长）。
 
@@ -205,11 +209,24 @@ def kv_for_request(engine):
       返回 NULL ⇒ 输出 [KV error]（实测第 14 条开始复现）。
       现改为固定池：只创建最多 TGAI_KV_POOL_SIZE（默认 8）个，
       借出/归还复用同一批指针 ⇒ 名额不增长。
+
+    ★ 2026-11-25 缺陷 D 修复：拿不到槽时【抛 ServerOverloaded】，不再返回 None。
+      旧行为：返回 None → 调用方 kv=None → generate() 里自建一份
+      max_seq×… 的 KV（V2.7 8192 位置 ≈ 1.88GB host）⇒ 过载时每个请求
+      都再申请一份大内存，服务直接雪崩，且客户端拿不到 429/503。
+      现在由 Handler 统一回 503 + Retry-After。
     """
     try:
-        return _kv_pool_acquire(engine)
-    except Exception:
-        return None
+        kv = _kv_pool_acquire(engine)
+    except Exception as exc:                                    # noqa: BLE001
+        raise ServerOverloaded(
+            'KV slot pool error: %s: %s' % (type(exc).__name__, exc)) from exc
+    if kv is None:
+        st = kv_pool_stats()
+        raise ServerOverloaded(
+            'KV slot pool exhausted (size=%d, busy=%d); retry later'
+            % (st['size'], st['busy']))
+    return kv
 
 
 def kv_slot_release(kv):
@@ -218,11 +235,13 @@ def kv_slot_release(kv):
 
 
 # ── KV 槽池的状态变量 ──
-#   ★ 2026-10-13: 池大小默认 2。
-#     每个槽在引擎侧占一个 CUDA 名额（按 TGKVCache* 指针记），
-#     且 CPU 侧已把容量压到 1（见 _engine.py new_kv_slot），
-#     所以 2 个槽的 host 开销可忽略，同时覆盖并发需求。
-#     需要更高并发可用环境变量 TGAI_KV_POOL_SIZE 覆盖。
+#   ★ 2026-10-13: 池大小默认 2（现为 4）。
+#     每个槽在引擎侧占一个 CUDA 名额（按 TGKVCache* 指针记）。
+#   ★ 2026-11-25：CPU 生效路径下每个槽有自己的 host KV（容量
+#     min(engine.max_seq, TGAI_KV_CPU_SLOT_SEQ=2048)；按旧注释实测 V2.7
+#     8192 位置≈1.88GB ⇒ 2048 位置约 0.5GB/槽）；
+#     CUDA 接管时仍只有 1 个位置，开销可忽略。
+#     需要更高并发/更大上下文可用 TGAI_KV_POOL_SIZE / TGAI_KV_CPU_SLOT_SEQ 覆盖。
 import os as _os
 import threading as _threading
 import time as _time
@@ -328,17 +347,25 @@ def _make_handler(h):
         def log_message(self, fmt, *a):     # 静音默认访问日志
             pass
 
-        def _json(self, code, obj):
+        def _json(self, code, obj, headers=None):
             body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
             self.send_response(code)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Content-Length', str(len(body)))
             self.send_header('Access-Control-Allow-Origin', '*')
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
         def _err(self, code, msg, etype='invalid_request_error'):
             self._json(code, {'error': {'message': msg, 'type': etype}})
+
+        def _overloaded(self, msg):
+            """503 + Retry-After：服务过载（KV 槽池耗尽），要求客户端稍后重试。"""
+            self._json(503,
+                       {'error': {'message': msg, 'type': 'server_overloaded'}},
+                       headers={'Retry-After': '1'})
 
         def _read_body(self):
             n = int(self.headers.get('Content-Length') or 0)
@@ -399,27 +426,27 @@ def _make_handler(h):
                 params[chr(95) + "think_mode"] = (_tm == "think")
             except Exception:
                 pass
-            # _DBG_THINKREQ: 打印本次请求的档位，便于排查链路
-            try:
-                import sys as _dbs
-                _dbs.stderr.write("[thinkreq] lv=%s tm=%s p_tm=%s stream=%s" % (_lv, _tm, params.get(chr(95) + "think_mode"), want_stream) + chr(10))
-                _dbs.stderr.flush()
-            except Exception:
-                pass
-            # _DBG_FULLPARAMS: 打印本次请求的完整参数（排查站点下发）
-            try:
-                import sys as _dbp, json as _dbj
-                _dbp.stderr.write("[fullparams] body=%s" % _dbj.dumps({k: v for k, v in body.items() if k != "messages"}, ensure_ascii=False)[:600] + chr(10))
-                _dbp.stderr.write("[fullparams] eff=%s" % _dbj.dumps({k: v for k, v in params.items() if not k.startswith(chr(95))}, ensure_ascii=False)[:400] + chr(10))
-                _dbp.stderr.write("[fullparams] prompt_tail=%r ids=%d" % (user_text[-60:], len(ids)) + chr(10))
-                _dbp.stderr.flush()
-            except Exception:
-                pass
+
+            # ★ 2026-11-25 缺陷 D：删掉每请求 stderr 调试打印块
+            #   （原 [_DBG_THINKREQ] / [_DBG_FULLPARAMS] 会打印用户 prompt 尾巴，
+            #    且 `ids` 在赋值前被引用 ⇒ NameError 被 except 吞掉。
+            #    排查需要时用 logging.debug，默认关闭。）
 
             # ★ 2026-10-13: 默认并发（KV 多槽改造后引擎已支持多序列）
             #   设 TGAI_SERIALIZE=1 可回退串行
             with (h.lock if serialize_enabled() else _NullLock()):
                 chat = h.new_session()
+                # ★ 2026-11-25（配合缺陷 B）：本请求的生成统一用下面借的池槽
+                #   (kv=_req_kv)，ChatSession 自带的槽用不到。CPU 生效路径下
+                #   那个槽也是一份 2048 位置的 host KV（V2.7 约 0.5GB）⇒ 立即
+                #   归还，避免"池槽 + 会话槽"双份内存把并发峰值翻倍。
+                _skv = getattr(chat, 'kv', None)
+                if _skv is not None:
+                    try:
+                        _skv.release()
+                    except Exception:                       # noqa: BLE001
+                        pass
+                    chat.kv = None
                 try:
                     chat.think_mode = _tm
                 except Exception:        # noqa: BLE001
@@ -434,6 +461,9 @@ def _make_handler(h):
                         self._once(chat, ids, params, _is_chat)
                 except BrokenPipeError:
                     pass             # 客户端断开，正常
+                except ServerOverloaded as exc:                 # noqa: PERF203
+                    # ★ 缺陷 D：KV 槽池耗尽 ⇒ 503 + Retry-After（不再 kv=None 降级）
+                    self._overloaded(str(exc))
                 except Exception as exc:                        # noqa: BLE001
                     try:
                         self._err(500, '%s: %s' % (type(exc).__name__, exc),
@@ -443,21 +473,32 @@ def _make_handler(h):
 
         # ── 两种响应形态 ──
         def _collect(self, chat, ids, params):
+            """非流式收集；返回 (文本, state)。
+
+            ★ 缺陷 D：用 try/finally 保证异常时也归还 KV 槽
+              （旧实现 release 在 generate 之后，异常时槽泄漏，池很快耗尽）。
+            ★ 过载时 kv_for_request 抛 ServerOverloaded，由 do_POST 统一回 503。
+            """
             _req_kv = kv_for_request(h.engine)
             out = []
-            for tok in generate(h.engine, ids, params, chat.eos,
-                                eos_set=chat.eos_set,
-                                kv=_req_kv):
-                out.append(tok)
-            kv_slot_release(_req_kv)
-            return ''.join(out)
+            state = {}
+            try:
+                for tok in generate(h.engine, ids, params, chat.eos,
+                                    eos_set=chat.eos_set,
+                                    kv=_req_kv, state=state):
+                    out.append(tok)
+            finally:
+                kv_slot_release(_req_kv)
+            return ''.join(out), state
 
         def _once(self, chat, ids, params, is_chat=True):
-            txt = self._collect(chat, ids, params)
+            txt, state = self._collect(chat, ids, params)
             txt = _apply_think_prefix(txt, chat)  # _THINK_PREFIX
             n = len(txt)
             h.n_tokens += n
             now = int(time.time())
+            # ★ 缺陷 D：截断（撞 max_seq/max_tokens）时如实报 finish_reason=length
+            finish = (state or {}).get('finish_reason') or 'stop'
             # ★ _STD_COMPLETIONS: /v1/completions 用 OpenAI 标准 text 形态；
             #   /v1/chat/completions 保持 chat 形态不变。
             if not is_chat:
@@ -467,7 +508,7 @@ def _make_handler(h):
                     'created': now,
                     'model': h.model_name,
                     'choices': [{'text': txt, 'index': 0, 'logprobs': None,
-                                 'finish_reason': 'stop'}],
+                                 'finish_reason': finish}],
                     'usage': {'prompt_tokens': len(ids),
                               'completion_tokens': n,
                               'total_tokens': len(ids) + n},
@@ -478,7 +519,7 @@ def _make_handler(h):
                 'object': 'chat.completion',
                 'created': now,
                 'model': h.model_name,
-                'choices': [{'index': 0, 'finish_reason': 'stop',
+                'choices': [{'index': 0, 'finish_reason': finish,
                              'message': {'role': 'assistant', 'content': txt}}],
                 'usage': {'prompt_tokens': len(ids), 'completion_tokens': n,
                           'total_tokens': len(ids) + n},
@@ -494,22 +535,29 @@ def _make_handler(h):
                     用户感受就是"第一个 token 死活出不来"。
               改法：与 _collect 走同一条已验证的生成路径，只把输出改成 SSE 格式；
                     出错也要发 [DONE]，避免客户端永久挂起。
+                      （一个 token 都没产出就出错 ⇒ 抛给 do_POST，回 500/503 JSON）
               代价：失去增量流式的观感（首字节 = 整段生成时间）。正确性优先。
             """
-            _req_kv = kv_for_request(h.engine)
+            _req_kv = kv_for_request(h.engine)      # 过载时抛 ServerOverloaded
             toks = []
+            state = {}
             _err = None
             try:
                 for tok in generate(h.engine, ids, params, chat.eos,
                                     eos_set=chat.eos_set,
-                                    kv=_req_kv):
+                                    kv=_req_kv, state=state):
                     if tok:
                         toks.append(tok)
-            except Exception as _e:
+            except Exception as _e:                             # noqa: BLE001
                 _err = _e
             finally:
                 kv_slot_release(_req_kv)
-            
+            # ★ 缺陷 D：一个 token 都没产出就出错 ⇒ 直接把异常抛给 do_POST，
+            #   由它回 500/503 JSON（旧实现在这时仍返回 200 + 空 body + [DONE]，
+            #   客户端以为"模型答了空"，问题被掩盖）。
+            if _err is not None and not toks:
+                raise _err
+
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
             self.send_header('Cache-Control', 'no-cache')
@@ -554,7 +602,8 @@ def _make_handler(h):
                     send({'content': tok})
                     n += 1
                 h.n_tokens += n
-                send({}, 'stop')
+                # ★ 缺陷 D：撞 max_seq/max_tokens 截断时 finish_reason=length
+                send({}, (state or {}).get('finish_reason') or 'stop')
                 self.wfile.write(b'data: [DONE]\n\n')
                 self.wfile.flush()
             except BrokenPipeError:
