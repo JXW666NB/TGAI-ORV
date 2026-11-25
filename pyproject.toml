@@ -69,3 +69,5 @@ include = ["tgai_go*"]
 "tgai_go.train" = ["kernels/*.cu", "kernels/*.cuh"]
 "tgai_go" = ["_native/*.dll", "_native/*.so", "_native/*.dylib", "wiki/*.txt"]
 
+[tool.setuptools.exclude-package-data]
+"*" = ["*.pyc", "__pycache__/*", "*.pyo"]
