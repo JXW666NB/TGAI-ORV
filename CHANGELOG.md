@@ -1,3 +1,11 @@
+## [1.0.32] - 2026-11-25
+
+- **重建 Vulkan 引擎** `_native/libtgai_engine_vk.dll`：用 1.0.31 的修复后源码在
+  MSVC 19.44 + CUDA 12.4 主机上重新编译（自带 volk loader + 预编译 SPIR-V，无需 Vulkan SDK）。
+  验证：与 CPU DLL 在同一模型上的 logits **逐位一致**（max diff = 0）、TG4 容器挂接成功、
+  导出 `tg_gpu_matmul` / `tg_gpu_backend_init` / `tg_vk_probe` 全部通过。
+  在此之前的 vk DLL 是旧二进制，缺少 1.0.31 的 KV 溢出守卫。
+
 ## [1.0.31] - 2026-11-25
 
 引擎正确性与服务语义修复（全部经 V100 实机重编 + 数值验证）。
