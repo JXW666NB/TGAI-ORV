@@ -1,0 +1,159 @@
+ 
+=== score seq=512 policy=speed === 
+[data] 8 shards {'npz': 8}  seq=512  windows=512  tokens=262144  scan=0.04s
+[data] 1 epoch = 512 windows = 262144 tokens; steps/epoch @B=1 = 512
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=512 layers=8 E=4 d_ff=2048 vocab=96000 n_q=8 top_k=2 csa=4 (csa=6 global=2) tensors=215 params=230.585M build=3.31s seed=42
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=12 eta_min=3.000e-05 horizon=12
+step      0/12 loss=11.554002 lr=3.000e-04 gnorm=    7.029 0.208s tok/s=  2465.3 peak_live=4.44GiB consumed=1
+step     11/12 loss=11.551098 lr=3.460e-05 gnorm=    2.157 0.102s tok/s=  5022.1 peak_live=4.44GiB consumed=12
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 512, "d_ff": 2048, "E": 4, "layers": 8, "n_q": 8, "n_kv": 2, "vocab": 96000, "seq": 512, "top_k": 2, "moe_balance": "sign", "csa": 4, "n_kv_attn": 8, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 12], "loss_first": 11.554001808166504, "loss_last": 11.551097869873047, "step_s_mean": 0.1175466416607378, "step_s_steady": 0.10775343999557663, "tok_s_steady": 4751.588441362225, "batch": 1, "world": 1, "global_batch": 1, "dp": null, "comm_s_median": null, "comm_s_min": null, "comm_s_max": null, "comm_frac": null, "gpu_index": null, "pool_peak_live_bytes": 4764740608, "pool_peak_bytes": 5539365376, "pool_peak_live_gib": 4.438, "nvidia_base_mib": 330, "nvidia_peak_mib": 5780, "data": {"shards": 8, "windows": 512, "tokens": 262144, "seq": 512, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95976, "scan_sec": 0.045}, "consumed": 12, "data_state": {"epoch": 0, "rank": 0, "offset": 12, "consumed": 12, "n_shards": 8, "seq": 512, "seed": 42, "windows_per_epoch": 512}, "params": 230584582, "wall_sec": 1.641, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [11.55400181, 11.58716488, 11.56826401, 11.5898447, 11.57005882, 11.55722332, 11.55365467, 11.59371948, 11.57023716, 11.57039928, 11.5986166, 11.55109787]
+=== score seq=512 policy=memory === 
+[data] 8 shards {'npz': 8}  seq=512  windows=512  tokens=262144  scan=0.00s
+[data] 1 epoch = 512 windows = 262144 tokens; steps/epoch @B=1 = 512
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=512 layers=8 E=4 d_ff=2048 vocab=96000 n_q=8 top_k=2 csa=4 (csa=6 global=2) tensors=215 params=230.585M build=4.14s seed=42
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=12 eta_min=3.000e-05 horizon=12
+step      0/12 loss=11.554002 lr=3.000e-04 gnorm=    7.029 0.209s tok/s=  2450.8 peak_live=4.44GiB consumed=1
+step     11/12 loss=11.551098 lr=3.460e-05 gnorm=    2.157 0.103s tok/s=  4982.5 peak_live=4.44GiB consumed=12
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 512, "d_ff": 2048, "E": 4, "layers": 8, "n_q": 8, "n_kv": 2, "vocab": 96000, "seq": 512, "top_k": 2, "moe_balance": "sign", "csa": 4, "n_kv_attn": 8, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 12], "loss_first": 11.554001808166504, "loss_last": 11.551097869873047, "step_s_mean": 0.11715109166834736, "step_s_steady": 0.10775354000215884, "tok_s_steady": 4751.584031389986, "batch": 1, "world": 1, "global_batch": 1, "dp": null, "comm_s_median": null, "comm_s_min": null, "comm_s_max": null, "comm_frac": null, "gpu_index": null, "pool_peak_live_bytes": 4764740608, "pool_peak_bytes": 5539365376, "pool_peak_live_gib": 4.438, "nvidia_base_mib": 330, "nvidia_peak_mib": 5736, "data": {"shards": 8, "windows": 512, "tokens": 262144, "seq": 512, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95976, "scan_sec": 0.003}, "consumed": 12, "data_state": {"epoch": 0, "rank": 0, "offset": 12, "consumed": 12, "n_shards": 8, "seq": 512, "seed": 42, "windows_per_epoch": 512}, "params": 230584582, "wall_sec": 1.416, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [11.55400181, 11.58716488, 11.56826401, 11.5898447, 11.57005882, 11.55722427, 11.55365562, 11.59371853, 11.57023716, 11.57039928, 11.5986166, 11.55109787]
+=== score seq=2048 policy=speed === 
+[data] 8 shards {'npz': 8}  seq=2048  windows=128  tokens=262144  scan=0.00s
+[data] 1 epoch = 128 windows = 262144 tokens; steps/epoch @B=1 = 128
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=512 layers=8 E=4 d_ff=2048 vocab=96000 n_q=8 top_k=2 csa=4 (csa=6 global=2) tensors=215 params=230.585M build=3.34s seed=42
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=12 eta_min=3.000e-05 horizon=12
+step      0/12 loss=11.594895 lr=3.000e-04 gnorm=    3.967 0.339s tok/s=  6048.4 peak_live=8.58GiB consumed=1
+step     11/12 loss=11.579609 lr=3.460e-05 gnorm=    1.002 0.248s tok/s=  8265.9 peak_live=8.59GiB consumed=12
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 512, "d_ff": 2048, "E": 4, "layers": 8, "n_q": 8, "n_kv": 2, "vocab": 96000, "seq": 2048, "top_k": 2, "moe_balance": "sign", "csa": 4, "n_kv_attn": 8, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 12], "loss_first": 11.594895362854004, "loss_last": 11.579608917236328, "step_s_mean": 0.2507995416672202, "step_s_steady": 0.24231526000075973, "tok_s_steady": 8451.799527580635, "batch": 1, "world": 1, "global_batch": 1, "dp": null, "comm_s_median": null, "comm_s_min": null, "comm_s_max": null, "comm_frac": null, "gpu_index": null, "pool_peak_live_bytes": 9221741568, "pool_peak_bytes": 12554936832, "pool_peak_live_gib": 8.588, "nvidia_base_mib": 330, "nvidia_peak_mib": 12674, "data": {"shards": 8, "windows": 128, "tokens": 262144, "seq": 2048, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95992, "scan_sec": 0.003}, "consumed": 12, "data_state": {"epoch": 0, "rank": 0, "offset": 12, "consumed": 12, "n_shards": 8, "seq": 2048, "seed": 42, "windows_per_epoch": 128}, "params": 230584582, "wall_sec": 3.051, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [11.59489536, 11.56702137, 11.57574749, 11.56082249, 11.57981682, 11.57172489, 11.58795834, 11.5672226, 11.56593037, 11.56869411, 11.56262589, 11.57960892]
+=== score seq=2048 policy=memory === 
+[data] 8 shards {'npz': 8}  seq=2048  windows=128  tokens=262144  scan=0.00s
+[data] 1 epoch = 128 windows = 262144 tokens; steps/epoch @B=1 = 128
+[data] vocab check: first 16 rows of shard_000.npz -> id range [4, 95999]
+[model] d=512 layers=8 E=4 d_ff=2048 vocab=96000 n_q=8 top_k=2 csa=4 (csa=6 global=2) tensors=215 params=230.585M build=3.33s seed=42
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=12 eta_min=3.000e-05 horizon=12
+step      0/12 loss=11.594895 lr=3.000e-04 gnorm=    3.967 0.355s tok/s=  5771.7 peak_live=8.58GiB consumed=1
+step     11/12 loss=11.579609 lr=3.460e-05 gnorm=    1.002 0.240s tok/s=  8550.3 peak_live=8.59GiB consumed=12
+RESULT {"status": "ok", "schema": 1, "seed": 42, "cfg": {"d": 512, "d_ff": 2048, "E": 4, "layers": 8, "n_q": 8, "n_kv": 2, "vocab": 96000, "seq": 2048, "top_k": 2, "moe_balance": "sign", "csa": 4, "n_kv_attn": 8, "rope_theta": 500000.0, "csa_compress": 4, "csa_conv_kernel": 3, "csa_local_window": 0}, "kinds": ["csa", "csa", "csa", "global", "csa", "csa", "csa", "global"], "step_range": [0, 12], "loss_first": 11.594895362854004, "loss_last": 11.579608917236328, "step_s_mean": 0.2502366416665609, "step_s_steady": 0.24055377000186126, "tok_s_steady": 8513.689059972554, "batch": 1, "world": 1, "global_batch": 1, "dp": null, "comm_s_median": null, "comm_s_min": null, "comm_s_max": null, "comm_frac": null, "gpu_index": null, "pool_peak_live_bytes": 9221741568, "pool_peak_bytes": 12554936832, "pool_peak_live_gib": 8.588, "nvidia_base_mib": 330, "nvidia_peak_mib": 12674, "data": {"shards": 8, "windows": 128, "tokens": 262144, "seq": 2048, "tokens_per_epoch": 262144, "shards_without_labels": 0, "max_id_seen": 95992, "scan_sec": 0.003}, "consumed": 12, "data_state": {"epoch": 0, "rank": 0, "offset": 12, "consumed": 12, "n_shards": 8, "seq": 2048, "seed": 42, "windows_per_epoch": 128}, "params": 230584582, "wall_sec": 3.062, "log": null, "resume": null, "out": null, "final_ckpt": null}
+losses [11.59489536, 11.56702042, 11.57574749, 11.56082249, 11.57981396, 11.57172489, 11.58795929, 11.5672226, 11.56593037, 11.56869507, 11.56262493, 11.57960892]
+=== score seq=8192 policy=speed === 
+[data] SKIP shard_000.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_001.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_002.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_003.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_004.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_005.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_006.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_007.npz (windows=0, width=2048 < seq=8192)
+所有分片都切不出 seq=8192 的窗口。修法：检查 --seq 与分片宽度（真 V3 分片是 512/1024/2048）
+=== score seq=8192 policy=memory === 
+[data] SKIP shard_000.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_001.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_002.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_003.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_004.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_005.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_006.npz (windows=0, width=2048 < seq=8192)
+[data] SKIP shard_007.npz (windows=0, width=2048 < seq=8192)
+所有分片都切不出 seq=8192 的窗口。修法：检查 --seq 与分片宽度（真 V3 分片是 512/1024/2048）
+=== score seq=8192 policy=speed === 
+D:\orv_bench\data8192_v96000\shard_000.npz 里没有 input_ids.npy（成员：['ids.npy', 'labels.npy']）。修法：这不是 data_v3.py 产出的打包分片；要么换目录，要么用 --data 指到正确的分片
+=== score seq=8192 policy=memory === 
+D:\orv_bench\data8192_v96000\shard_000.npz 里没有 input_ids.npy（成员：['ids.npy', 'labels.npy']）。修法：这不是 data_v3.py 产出的打包分片；要么换目录，要么用 --data 指到正确的分片
+=== score seq=8192 policy=speed === 
+[data] 4 shards {'npz': 4}  seq=8192  windows=16  tokens=131072  scan=0.02s
+[data] 1 epoch = 16 windows = 131072 tokens; steps/epoch @B=1 = 16
+[data] vocab check: first 4 rows of shard_000.npz -> id range [4, 95996]
+[model] d=512 layers=8 E=4 d_ff=2048 vocab=96000 n_q=8 top_k=2 csa=4 (csa=6 global=2) tensors=215 params=230.585M build=3.33s seed=42
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=12 eta_min=3.000e-05 horizon=12
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\v3_pretrain.py", line 2140, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\v3_pretrain.py", line 1857, in main
+    loss, fmeta = forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\v3_pretrain.py", line 1168, in forward_loss
+    logits = xh @ P["head"].transpose(0, 1)
+             ~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\__init__.py", line 1043, in __matmul__
+    return self._matmul_cuda(other)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\__init__.py", line 1128, in _matmul_cuda
+    buf = rt.gemm_nt(self._gpu, src._gpu)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\cuda.py", line 8946, in gemm_nt
+    C = self.empty((M, N), dtype=np.float32)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\cuda.py", line 5922, in _empty_pool_fast
+    return CudaRuntime.empty(self, shape, dt)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\cuda.py", line 5839, in empty
+    ptr = self._alloc(nbytes)
+          ^^^^^^^^^^^^^^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\cuda.py", line 5772, in _alloc
+    self._raise_alloc_failed(int(bucket), int(rc))
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\cuda.py", line 5809, in _raise_alloc_failed
+    raise CudaError(msg)
+tgai_go.train.cuda.CudaError: 显存不足：本次申请 3.00 GiB；当前活张量 29.70 GiB、池缓存 0.00 GiB；设备总共 31.86 GiB、当前可用 1.77 GiB（rc=2）
+  怎么办：
+   1) 调小 --batch —— 显存只与 batch 有关，与语料大小无关；
+   2) 调小 CFG 里的 MAXLEN(S) 或层数 L；
+   3) 不要调用 graph_arm()（图捕获会额外占一份显存）；
+   4) 用 nvidia-smi 确认没有别的进程占卡；
+   5) 若是池缓存挤占，调大池上限或调用 empty_cache()。
+=== score seq=8192 policy=memory === 
+[data] 4 shards {'npz': 4}  seq=8192  windows=16  tokens=131072  scan=0.00s
+[data] 1 epoch = 16 windows = 131072 tokens; steps/epoch @B=1 = 16
+[data] vocab check: first 4 rows of shard_000.npz -> id range [4, 95996]
+[model] d=512 layers=8 E=4 d_ff=2048 vocab=96000 n_q=8 top_k=2 csa=4 (csa=6 global=2) tensors=215 params=230.585M build=3.33s seed=42
+[optim] AdamW lr=3.000e-04 wd=0.1 betas=(0.9,0.999) eps=1.0e-08 clip=1
+[sched] CosineLR warmup=0 t_max=12 eta_min=3.000e-05 horizon=12
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\v3_pretrain.py", line 2140, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\v3_pretrain.py", line 1857, in main
+    loss, fmeta = forward_loss(P, cfg, kinds, cos, sin, ids, labels, seg,
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\v3_pretrain.py", line 1168, in forward_loss
+    logits = xh @ P["head"].transpose(0, 1)
+             ~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\__init__.py", line 1043, in __matmul__
+    return self._matmul_cuda(other)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\__init__.py", line 1128, in _matmul_cuda
+    buf = rt.gemm_nt(self._gpu, src._gpu)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\cuda.py", line 8946, in gemm_nt
+    C = self.empty((M, N), dtype=np.float32)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\cuda.py", line 5922, in _empty_pool_fast
+    return CudaRuntime.empty(self, shape, dt)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\cuda.py", line 5839, in empty
+    ptr = self._alloc(nbytes)
+          ^^^^^^^^^^^^^^^^^^^
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\cuda.py", line 5772, in _alloc
+    self._raise_alloc_failed(int(bucket), int(rc))
+  File "D:\orv_pip_0962\Lib\site-packages\tgai_go\train\cuda.py", line 5809, in _raise_alloc_failed
+    raise CudaError(msg)
+tgai_go.train.cuda.CudaError: 显存不足：本次申请 3.00 GiB；当前活张量 29.70 GiB、池缓存 0.00 GiB；设备总共 31.86 GiB、当前可用 1.77 GiB（rc=2）
+  怎么办：
+   1) 调小 --batch —— 显存只与 batch 有关，与语料大小无关；
+   2) 调小 CFG 里的 MAXLEN(S) 或层数 L；
+   3) 不要调用 graph_arm()（图捕获会额外占一份显存）；
+   4) 用 nvidia-smi 确认没有别的进程占卡；
+   5) 若是池缓存挤占，调大池上限或调用 empty_cache()。

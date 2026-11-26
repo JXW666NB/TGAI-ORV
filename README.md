@@ -132,6 +132,22 @@ CSA 全局分支默认 `cq=2048`：**seq ≤ 2048 自动走原路径、逐位不
 口径：Tesla V100 32GB；0.9.97 引入 query 分块 + 反向重算，README 标注为 1.0.32 复测口径；小模型 d=128 / 2 层，
 真实训练步；数学上前向与物化路径 max_abs = 0.000e+00（逐位一致）。来源：[`docs/LONG_CONTEXT_RESULTS.md`](docs/LONG_CONTEXT_RESULTS.md)。
 
+### 现行：1.0.32 复测（V100 32GB · 2026-11-26 · 8 层 / d=512 / 8 头 / MoE E=4+top_k=2 / vocab 96000 / fp32 AdamW / batch 1 / 12 步）
+
+| seq | 步时（稳态）| tok/s | 峰值显存 | loss（首→末）|
+| ---: | ---: | ---: | ---: | --- |
+| 512 | **0.108 s** | 4,752 | **4.44 GiB** | 11.554 → 11.551 |
+| 2048 | **0.241 s** | 8,514 | **8.59 GiB** | 11.595 → 11.580 |
+| 8192 | —（本配置 **OOM**）| — | — | — |
+
+口径与结论：
+- 命令：`python -m tgai_go.train.v3_pretrain --seq S --d 512 --layers 8 --n_q 8 --d_ff 2048 --E 4 --top_k 2 --csa 4 --opt adamw --batch 1 --steps 12 --log-every 12 --policy speed|memory --amp off --no-final-save`；ORV **1.0.32**（PyPI），数字取 RESULT 的 `step_s_steady` / `pool_peak_live_gib`（含 warmup，稳态口径）。
+- `speed` 与 `memory` 两档在本配置下结果一致（该形状未触发差异化路径），故合并一行。
+- **同机没有 PyTorch**（远程环境无 torch），因此**本表不含 PyTorch 列**，也不宣称速度领先；旧 PyTorch 对照数字保留在历史归档中并已标注版本。
+- **seq 8192 在本配置仍 OOM**：README 的 64K 能力来自 **d=128 / 2 层小模型**的 CSA 分块测量（见上节），
+  不代表 8 层 d=512 MoE 在 32 GB 上能开 8192；旧表「8192 跑不了」对**大模型配置**仍然成立。
+- 原始日志：`docs/measurements/rebench_1032_v100.txt`。
+
 ### 历史：四档执行策略的相对关系（V100 32GB · 数据 ≤ v1.0.2x · 2026-11-15）
 
 | 档位 | 峰值显存 | 步时 | 相对 PyTorch |
